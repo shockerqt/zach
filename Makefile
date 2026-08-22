@@ -1,10 +1,14 @@
-.PHONY: dev test build
+.PHONY: dev test build lint
 
 dev:
-	@echo "TODO: dev command for zach"
+	cargo run -- --health
 
 test:
-	@echo "TODO: test command for zach"
+	cargo test
 
 build:
-	@echo "TODO: build command for zach"
+	cargo build --locked
+
+lint:
+	cargo fmt --check
+	cargo clippy -- -D warnings

@@ -10,3 +10,7 @@ Created by `INF-011`.
 - `make dev`
 - `make test`
 - `make build`
+- `make lint`
+
+Do not commit credentials, GitHub App private keys, webhook secrets, or
+environment-specific deployment configuration.
