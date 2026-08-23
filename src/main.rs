@@ -44,7 +44,10 @@ fn run_audit(args: &[String]) {
         eprintln!("configuration error: {error}");
         std::process::exit(2);
     });
-    let request = AuditRequest { task_id, request_id };
+    let request = AuditRequest {
+        task_id,
+        request_id,
+    };
 
     match audit_task_integration(&config, &request) {
         Ok(receipt) => println!("{}", receipt.to_json()),

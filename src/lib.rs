@@ -217,7 +217,11 @@ fn stable_receipt_id(snapshot: &AuditSnapshot, ci: &WorkflowEvidence) -> String 
         snapshot.request_id,
         snapshot.governance_sha,
         snapshot.audited_implementation.implementation_sha,
-        snapshot.pull_request.merge_commit_sha.as_deref().unwrap_or(""),
+        snapshot
+            .pull_request
+            .merge_commit_sha
+            .as_deref()
+            .unwrap_or(""),
         ci.id,
         branch_identity
     );
@@ -247,8 +251,7 @@ impl GithubConfig {
             ));
         }
         Ok(Self {
-            api_url: env::var("GITHUB_API_URL")
-                .unwrap_or_else(|_| "https://api.github.com".into()),
+            api_url: env::var("GITHUB_API_URL").unwrap_or_else(|_| "https://api.github.com".into()),
             token,
             governance_repository: env::var("GOVERNANCE_REPOSITORY")
                 .unwrap_or_else(|_| "shockerqt/workspace-governance".into()),
@@ -274,11 +277,8 @@ pub fn audit_task_integration(
         &governance_sha,
     )?;
     let route = parse_manifest_task(&manifest, &request.task_id)?;
-    let task_markdown = github.raw_content(
-        &config.governance_repository,
-        &route.path,
-        &governance_sha,
-    )?;
+    let task_markdown =
+        github.raw_content(&config.governance_repository, &route.path, &governance_sha)?;
     let canonical_branch = frontmatter_value(&task_markdown, "branch")?
         .ok_or_else(|| AuditError::CanonicalState("task.branch is missing".into()))?;
     if matches!(canonical_branch.as_str(), "null" | "none") {
@@ -286,9 +286,8 @@ pub fn audit_task_integration(
             "task.branch is not a code branch".into(),
         ));
     }
-    let target_key = frontmatter_value(&task_markdown, "target_repository")?.ok_or_else(|| {
-        AuditError::CanonicalState("task.target_repository is missing".into())
-    })?;
+    let target_key = frontmatter_value(&task_markdown, "target_repository")?
+        .ok_or_else(|| AuditError::CanonicalState("task.target_repository is missing".into()))?;
     let projects = github.raw_content(
         &config.governance_repository,
         "projects.yaml",
@@ -298,8 +297,7 @@ pub fn audit_task_integration(
 
     let mut runs = Vec::new();
     for path in route.run_paths.iter().rev() {
-        let markdown =
-            github.raw_content(&config.governance_repository, path, &governance_sha)?;
+        let markdown = github.raw_content(&config.governance_repository, path, &governance_sha)?;
         if let Some(evidence) = parse_run_evidence(path, &markdown)? {
             runs.push(evidence);
         }
@@ -347,9 +345,10 @@ fn validate_request(request: &AuditRequest) -> Result<(), AuditError> {
     }
     let request_valid = !request.request_id.is_empty()
         && request.request_id.len() <= 128
-        && request.request_id.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
-        });
+        && request
+            .request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'));
     if !request_valid {
         return Err(AuditError::InvalidRequest(
             "request_id contains unsupported characters".into(),
@@ -470,8 +469,7 @@ fn extract_section<'a>(markdown: &'a str, heading: &str) -> Option<&'a str> {
 }
 
 fn required_scalar(text: &str, key: &str) -> Result<String, AuditError> {
-    scalar_line(text, key)?
-        .ok_or_else(|| AuditError::CanonicalState(format!("missing {key}")))
+    scalar_line(text, key)?.ok_or_else(|| AuditError::CanonicalState(format!("missing {key}")))
 }
 
 fn scalar_line(text: &str, key: &str) -> Result<Option<String>, AuditError> {
@@ -523,9 +521,9 @@ fn parse_pr_url(url: &str) -> Result<PrLocation, AuditError> {
             "pull_request_url has unexpected shape".into(),
         ));
     }
-    let number = parts[3].parse::<u64>().map_err(|_| {
-        AuditError::CanonicalState("pull request number is invalid".into())
-    })?;
+    let number = parts[3]
+        .parse::<u64>()
+        .map_err(|_| AuditError::CanonicalState("pull request number is invalid".into()))?;
     Ok(PrLocation {
         repository: format!("{}/{}", parts[0], parts[1]),
         number,
@@ -548,12 +546,7 @@ impl<'a> GithubHttp<'a> {
             .ok_or_else(|| AuditError::Github("commit response lacks sha".into()))
     }
 
-    fn raw_content(
-        &self,
-        repo: &str,
-        path: &str,
-        reference: &str,
-    ) -> Result<String, AuditError> {
+    fn raw_content(&self, repo: &str, path: &str, reference: &str) -> Result<String, AuditError> {
         let endpoint = format!(
             "/repos/{repo}/contents/{}?ref={}",
             pct_path(path),
@@ -591,9 +584,9 @@ impl<'a> GithubHttp<'a> {
             "/repos/{repo}/actions/runs?head_sha={}&event=push&status=completed&per_page=100",
             pct(sha)
         ))?;
-        let runs = json
-            .get_array("workflow_runs")
-            .ok_or_else(|| AuditError::Github("workflow runs response lacks workflow_runs".into()))?;
+        let runs = json.get_array("workflow_runs").ok_or_else(|| {
+            AuditError::Github("workflow runs response lacks workflow_runs".into())
+        })?;
         let mut result = Vec::new();
         for run in runs {
             let Some(object) = run.as_object() else {
@@ -665,17 +658,8 @@ impl<'a> GithubHttp<'a> {
         JsonValue::parse(&body)
     }
 
-    fn request(
-        &self,
-        endpoint: &str,
-        fail: bool,
-        raw: bool,
-    ) -> Result<(u16, String), AuditError> {
-        let url = format!(
-            "{}{}",
-            self.config.api_url.trim_end_matches('/'),
-            endpoint
-        );
+    fn request(&self, endpoint: &str, fail: bool, raw: bool) -> Result<(u16, String), AuditError> {
+        let url = format!("{}{}", self.config.api_url.trim_end_matches('/'), endpoint);
         let output = Command::new("curl")
             .args(["--silent", "--show-error", "--location", "--request", "GET"])
             .arg("--header")
@@ -817,20 +801,14 @@ impl JsonValue {
     }
 }
 
-fn object_string<'a>(
-    object: &'a BTreeMap<String, JsonValue>,
-    key: &str,
-) -> Option<&'a str> {
+fn object_string<'a>(object: &'a BTreeMap<String, JsonValue>, key: &str) -> Option<&'a str> {
     match object.get(key)? {
         JsonValue::String(value) => Some(value),
         _ => None,
     }
 }
 
-fn object_nullable_string(
-    object: &BTreeMap<String, JsonValue>,
-    key: &str,
-) -> Option<String> {
+fn object_nullable_string(object: &BTreeMap<String, JsonValue>, key: &str) -> Option<String> {
     match object.get(key)? {
         JsonValue::String(value) => Some(value.clone()),
         JsonValue::Null => None,
@@ -917,35 +895,32 @@ impl JsonParser<'_> {
                         b'r' => output.push('\r'),
                         b't' => output.push('\t'),
                         b'u' => {
-                            let hex = self.bytes.get(self.pos..self.pos + 4).ok_or_else(|| {
-                                AuditError::Github("short unicode escape".into())
-                            })?;
+                            let hex = self
+                                .bytes
+                                .get(self.pos..self.pos + 4)
+                                .ok_or_else(|| AuditError::Github("short unicode escape".into()))?;
                             self.pos += 4;
-                            let text = std::str::from_utf8(hex).map_err(|_| {
-                                AuditError::Github("invalid unicode escape".into())
-                            })?;
-                            let code = u16::from_str_radix(text, 16).map_err(|_| {
-                                AuditError::Github("invalid unicode escape".into())
-                            })?;
+                            let text = std::str::from_utf8(hex)
+                                .map_err(|_| AuditError::Github("invalid unicode escape".into()))?;
+                            let code = u16::from_str_radix(text, 16)
+                                .map_err(|_| AuditError::Github("invalid unicode escape".into()))?;
                             output.push(char::from_u32(u32::from(code)).unwrap_or('\u{fffd}'));
                         }
                         _ => return Err(AuditError::Github("invalid JSON escape".into())),
                     }
                 }
                 value if value < 0x20 => {
-                    return Err(AuditError::Github(
-                        "control byte in JSON string".into(),
-                    ));
+                    return Err(AuditError::Github("control byte in JSON string".into()));
                 }
                 value if value.is_ascii() => output.push(value as char),
                 _ => {
                     let start = self.pos - 1;
-                    let text = std::str::from_utf8(&self.bytes[start..]).map_err(|_| {
-                        AuditError::Github("invalid UTF-8 JSON string".into())
-                    })?;
-                    let character = text.chars().next().ok_or_else(|| {
-                        AuditError::Github("invalid UTF-8 JSON string".into())
-                    })?;
+                    let text = std::str::from_utf8(&self.bytes[start..])
+                        .map_err(|_| AuditError::Github("invalid UTF-8 JSON string".into()))?;
+                    let character = text
+                        .chars()
+                        .next()
+                        .ok_or_else(|| AuditError::Github("invalid UTF-8 JSON string".into()))?;
                     output.push(character);
                     self.pos = start + character.len_utf8();
                 }
@@ -1007,9 +982,7 @@ impl JsonParser<'_> {
             let key = self.string()?;
             self.ws();
             if self.bytes.get(self.pos) != Some(&b':') {
-                return Err(AuditError::Github(
-                    "missing JSON object colon".into(),
-                ));
+                return Err(AuditError::Github("missing JSON object colon".into()));
             }
             self.pos += 1;
             let value = self.value()?;
@@ -1062,12 +1035,14 @@ mod tests {
 
     #[test]
     fn minimal_json_parser_reads_nested_github_shapes() {
-        let value = JsonValue::parse(
-            r#"{"merged":true,"head":{"sha":"abc"},"workflow_runs":[{"id":1}]}"#,
-        )
-        .unwrap();
+        let value =
+            JsonValue::parse(r#"{"merged":true,"head":{"sha":"abc"},"workflow_runs":[{"id":1}]}"#)
+                .unwrap();
         assert_eq!(value.get_bool("merged"), Some(true));
-        assert_eq!(object_string(value.get_object("head").unwrap(), "sha"), Some("abc"));
+        assert_eq!(
+            object_string(value.get_object("head").unwrap(), "sha"),
+            Some("abc")
+        );
         assert_eq!(
             object_u64(
                 value.get_array("workflow_runs").unwrap()[0]
