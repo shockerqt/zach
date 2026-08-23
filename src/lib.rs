@@ -426,16 +426,14 @@ fn resolve_repository(projects: &str, key: &str) -> Result<String, AuditError> {
         let trimmed = line.trim();
         if let Some(repository) = trimmed.strip_prefix("- repository:") {
             active = repository.trim() == key;
-        } else if active {
-            if let Some(url) = trimmed.strip_prefix("clone_url:") {
-                let value = url.trim().trim_end_matches('/').trim_end_matches(".git");
-                if let Some(full_name) = value.strip_prefix("https://github.com/") {
-                    return Ok(full_name.to_owned());
-                }
-                return Err(AuditError::CanonicalState(
-                    "unsupported project clone_url".into(),
-                ));
+        } else if active && let Some(url) = trimmed.strip_prefix("clone_url:") {
+            let value = url.trim().trim_end_matches('/').trim_end_matches(".git");
+            if let Some(full_name) = value.strip_prefix("https://github.com/") {
+                return Ok(full_name.to_owned());
             }
+            return Err(AuditError::CanonicalState(
+                "unsupported project clone_url".into(),
+            ));
         }
     }
     Err(AuditError::CanonicalState(format!(
