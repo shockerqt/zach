@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
 use std::process::Command;
@@ -12,6 +12,15 @@ pub struct AuditRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunEvidenceRole {
+    Implementation,
+    IntegrationAudit {
+        audited_implementation_sha: String,
+        audited_pull_request_url: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunEvidence {
     pub run_path: String,
     pub publication_sha: String,
@@ -20,6 +29,7 @@ pub struct RunEvidence {
     pub ci_conclusion: String,
     pub pull_request_url: String,
     pub pull_request_head_sha: String,
+    pub role: RunEvidenceRole,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,14 +59,22 @@ pub enum BranchObservation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepresentationEvidence {
+    pub implementation_is_ancestor_or_equal_of_pr_head: bool,
+    pub pr_head_is_ancestor_or_equal_of_merge: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditSnapshot {
     pub task_id: String,
     pub request_id: String,
+    pub request_digest: String,
     pub governance_sha: String,
     pub target_repository: String,
     pub canonical_branch: String,
     pub audited_implementation: RunEvidence,
     pub pull_request: PullRequestEvidence,
+    pub representation: RepresentationEvidence,
     pub post_merge_runs: Vec<WorkflowEvidence>,
     pub branch: BranchObservation,
 }
@@ -83,11 +101,12 @@ impl AuditReceipt {
                     .join(",")
             ),
         };
+        let merge_sha = s.pull_request.merge_commit_sha.as_deref().unwrap_or("");
         format!(
             concat!(
                 "{{\"schema_version\":1,",
                 "\"operation\":{},\"receipt_id\":{},",
-                "\"request\":{{\"task_id\":{},\"request_id\":{},\"governance_sha\":{}}},",
+                "\"request\":{{\"task_id\":{},\"request_id\":{},\"request_digest\":{},\"governance_sha\":{}}},",
                 "\"audit_run_publication\":null,",
                 "\"audited_implementation\":{{",
                 "\"source_run_path\":{},\"publication_sha\":{},\"implementation_sha\":{},",
@@ -98,7 +117,10 @@ impl AuditReceipt {
                 "\"target_repository\":{},\"canonical_branch\":{},",
                 "\"pull_request_merged\":true,\"merge_commit_sha\":{},\"merged_at\":{},",
                 "\"implementation_represented\":true,",
-                "\"representation_method\":\"merged_pr_exact_head\",",
+                "\"representation\":{{",
+                "\"method\":\"git_ancestry_through_merged_pr_head\",",
+                "\"implementation_sha\":{},\"merged_pr_head_sha\":{},\"merge_commit_sha\":{}",
+                "}},",
                 "\"post_merge_ci\":{{\"sha\":{},\"conclusion\":\"success\",\"run_id\":{},\"url\":{}}},",
                 "\"branch_observation\":{}",
                 "}}}}"
@@ -107,6 +129,7 @@ impl AuditReceipt {
             json_string(&self.receipt_id),
             json_string(&s.task_id),
             json_string(&s.request_id),
+            json_string(&s.request_digest),
             json_string(&s.governance_sha),
             json_string(&s.audited_implementation.run_path),
             json_string(&s.audited_implementation.publication_sha),
@@ -116,8 +139,11 @@ impl AuditReceipt {
             json_string(&s.audited_implementation.pull_request_url),
             json_string(&s.target_repository),
             json_string(&s.canonical_branch),
-            json_string(s.pull_request.merge_commit_sha.as_deref().unwrap_or("")),
+            json_string(merge_sha),
             json_string(s.pull_request.merged_at.as_deref().unwrap_or("")),
+            json_string(&s.audited_implementation.implementation_sha),
+            json_string(&s.pull_request.head_sha),
+            json_string(merge_sha),
             json_string(&self.selected_ci.head_sha),
             self.selected_ci.id,
             json_string(&self.selected_ci.url),
@@ -133,6 +159,7 @@ pub enum AuditError {
     Github(String),
     CanonicalState(String),
     AmbiguousEvidence(String),
+    Idempotency(String),
     Verification(String),
 }
 
@@ -144,6 +171,7 @@ impl fmt::Display for AuditError {
             Self::Github(value) => write!(f, "github: {value}"),
             Self::CanonicalState(value) => write!(f, "canonical state: {value}"),
             Self::AmbiguousEvidence(value) => write!(f, "ambiguous evidence: {value}"),
+            Self::Idempotency(value) => write!(f, "idempotency: {value}"),
             Self::Verification(value) => write!(f, "verification failed: {value}"),
         }
     }
@@ -151,22 +179,202 @@ impl fmt::Display for AuditError {
 
 impl std::error::Error for AuditError {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdempotencyClaim {
+    Claimed,
+    Existing {
+        request_digest: String,
+        terminal_receipt: Option<String>,
+    },
+}
+
+pub trait AuditIdempotencyStore {
+    fn claim(
+        &mut self,
+        request_id: &str,
+        request_digest: &str,
+    ) -> Result<IdempotencyClaim, AuditError>;
+
+    fn complete(
+        &mut self,
+        request_id: &str,
+        request_digest: &str,
+        terminal_receipt: &str,
+    ) -> Result<(), AuditError>;
+}
+
+struct UnavailableDurableStore;
+
+impl AuditIdempotencyStore for UnavailableDurableStore {
+    fn claim(
+        &mut self,
+        _request_id: &str,
+        _request_digest: &str,
+    ) -> Result<IdempotencyClaim, AuditError> {
+        Err(AuditError::Configuration(
+            "durable audit idempotency store is unavailable; canonical persistent SQLite idempotency is owned by ZACH-001 and is not implemented yet"
+                .into(),
+        ))
+    }
+
+    fn complete(
+        &mut self,
+        _request_id: &str,
+        _request_digest: &str,
+        _terminal_receipt: &str,
+    ) -> Result<(), AuditError> {
+        Err(AuditError::Configuration(
+            "durable audit idempotency store is unavailable".into(),
+        ))
+    }
+}
+
+pub fn canonical_request_digest(request: &AuditRequest) -> Result<String, AuditError> {
+    validate_request(request)?;
+    let canonical = format!(
+        "{{\"operation\":{},\"request_id\":{},\"task_id\":{}}}",
+        json_string(OPERATION),
+        json_string(&request.request_id),
+        json_string(&request.task_id)
+    );
+    Ok(sha256_hex(canonical.as_bytes()))
+}
+
+pub fn execute_idempotent_audit<S, F>(
+    store: &mut S,
+    request: &AuditRequest,
+    action: F,
+) -> Result<String, AuditError>
+where
+    S: AuditIdempotencyStore,
+    F: FnOnce(&str) -> Result<AuditReceipt, AuditError>,
+{
+    let digest = canonical_request_digest(request)?;
+    match store.claim(&request.request_id, &digest)? {
+        IdempotencyClaim::Existing {
+            request_digest,
+            terminal_receipt,
+        } => {
+            if request_digest != digest {
+                return Err(AuditError::Idempotency(
+                    "request_id is already bound to a different request digest".into(),
+                ));
+            }
+            terminal_receipt.ok_or_else(|| {
+                AuditError::Idempotency(
+                    "request_id has a non-terminal durable claim; ambiguous recovery fails closed"
+                        .into(),
+                )
+            })
+        }
+        IdempotencyClaim::Claimed => {
+            let receipt = action(&digest)?;
+            if receipt.snapshot.task_id != request.task_id
+                || receipt.snapshot.request_id != request.request_id
+                || receipt.snapshot.request_digest != digest
+            {
+                return Err(AuditError::Idempotency(
+                    "terminal receipt does not match the claimed canonical request identity".into(),
+                ));
+            }
+            let json = receipt.to_json();
+            store.complete(&request.request_id, &digest, &json)?;
+            Ok(json)
+        }
+    }
+}
+
+fn coherent_terminal(run: &RunEvidence) -> bool {
+    run.publication_sha == run.implementation_sha
+        && run.implementation_sha == run.ci_sha
+        && run.implementation_sha == run.pull_request_head_sha
+        && run.ci_conclusion == "success"
+}
+
 pub fn select_audited_implementation(runs: &[RunEvidence]) -> Result<RunEvidence, AuditError> {
-    runs.iter()
-        .find(|run| {
-            run.publication_sha == run.implementation_sha
-                && run.implementation_sha == run.ci_sha
-                && run.implementation_sha == run.pull_request_head_sha
-                && run.ci_conclusion == "success"
+    let candidates = runs
+        .iter()
+        .filter(|run| {
+            matches!(run.role, RunEvidenceRole::Implementation) && coherent_terminal(run)
         })
-        .cloned()
-        .ok_or_else(|| {
-            AuditError::Verification("no coherent implementation terminal evidence found".into())
-        })
+        .collect::<Vec<_>>();
+
+    let mut explicit = BTreeSet::new();
+    for run in runs {
+        if let RunEvidenceRole::IntegrationAudit {
+            audited_implementation_sha,
+            audited_pull_request_url,
+        } = &run.role
+        {
+            if !coherent_terminal(run) {
+                return Err(AuditError::Verification(
+                    "integration audit carries incoherent historical implementation terminal evidence"
+                        .into(),
+                ));
+            }
+            explicit.insert((
+                audited_implementation_sha.clone(),
+                audited_pull_request_url.clone(),
+            ));
+        }
+    }
+
+    if explicit.len() > 1 {
+        return Err(AuditError::AmbiguousEvidence(
+            "integration records disagree on the audited implementation identity".into(),
+        ));
+    }
+
+    if let Some((implementation_sha, pull_request_url)) = explicit.into_iter().next() {
+        let matches = candidates
+            .iter()
+            .filter(|run| {
+                run.implementation_sha == implementation_sha
+                    && run.pull_request_url == pull_request_url
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        return match matches.len() {
+            1 => Ok(matches[0].clone()),
+            0 => Err(AuditError::Verification(
+                "explicit audited implementation is not backed by one canonical implementation run"
+                    .into(),
+            )),
+            _ => Err(AuditError::AmbiguousEvidence(
+                "multiple implementation runs match the explicit audited implementation".into(),
+            )),
+        };
+    }
+
+    match candidates.len() {
+        0 => Err(AuditError::Verification(
+            "no coherent implementation terminal evidence found".into(),
+        )),
+        1 => Ok(candidates[0].clone()),
+        _ => Err(AuditError::AmbiguousEvidence(
+            "multiple coherent implementation runs exist without one explicit audited implementation"
+                .into(),
+        )),
+    }
 }
 
 pub fn evaluate_snapshot(snapshot: AuditSnapshot) -> Result<AuditReceipt, AuditError> {
+    let expected_digest = canonical_request_digest(&AuditRequest {
+        task_id: snapshot.task_id.clone(),
+        request_id: snapshot.request_id.clone(),
+    })?;
+    if snapshot.request_digest != expected_digest {
+        return Err(AuditError::Verification(
+            "snapshot request digest does not bind the canonical request identity".into(),
+        ));
+    }
+
     let implementation = &snapshot.audited_implementation;
+    if !coherent_terminal(implementation) {
+        return Err(AuditError::Verification(
+            "audited implementation terminal evidence is incoherent".into(),
+        ));
+    }
     let pr = &snapshot.pull_request;
     if !pr.merged {
         return Err(AuditError::Verification(
@@ -181,9 +389,19 @@ pub fn evaluate_snapshot(snapshot: AuditSnapshot) -> Result<AuditReceipt, AuditE
             "merged pull request has no merge timestamp".into(),
         ));
     }
-    if pr.head_sha != implementation.implementation_sha {
+    if pr.url != implementation.pull_request_url {
         return Err(AuditError::Verification(
-            "implementation SHA is not the exact merged pull-request head".into(),
+            "merged pull request identity differs from canonical implementation evidence".into(),
+        ));
+    }
+    if !snapshot
+        .representation
+        .implementation_is_ancestor_or_equal_of_pr_head
+        || !snapshot.representation.pr_head_is_ancestor_or_equal_of_merge
+    {
+        return Err(AuditError::Verification(
+            "implementation SHA is not represented by immutable ancestry through the merged pull-request head"
+                .into(),
         ));
     }
 
@@ -212,25 +430,21 @@ fn stable_receipt_id(snapshot: &AuditSnapshot, ci: &WorkflowEvidence) -> String 
         BranchObservation::Present { sha, .. } => sha,
     };
     let material = format!(
-        "{}|{}|{}|{}|{}|{}|{}",
-        snapshot.task_id,
-        snapshot.request_id,
+        "{}|{}|{}|{}|{}|{}|{}|{}",
+        snapshot.request_digest,
         snapshot.governance_sha,
         snapshot.audited_implementation.implementation_sha,
+        snapshot.pull_request.head_sha,
         snapshot
             .pull_request
             .merge_commit_sha
             .as_deref()
             .unwrap_or(""),
+        ci.head_sha,
         ci.id,
         branch_identity
     );
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in material.bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("zach-audit-{hash:016x}")
+    format!("zach-audit-{}", sha256_hex(material.as_bytes()))
 }
 
 #[derive(Debug, Clone)]
@@ -264,9 +478,29 @@ impl GithubConfig {
 pub fn audit_task_integration(
     config: &GithubConfig,
     request: &AuditRequest,
+) -> Result<String, AuditError> {
+    let mut store = UnavailableDurableStore;
+    audit_task_integration_with_store(config, request, &mut store)
+}
+
+pub fn audit_task_integration_with_store<S: AuditIdempotencyStore>(
+    config: &GithubConfig,
+    request: &AuditRequest,
+    store: &mut S,
+) -> Result<String, AuditError> {
+    execute_idempotent_audit(store, request, |request_digest| {
+        collect_audit_receipt(config, request, request_digest)
+    })
+}
+
+fn collect_audit_receipt(
+    config: &GithubConfig,
+    request: &AuditRequest,
+    request_digest: &str,
 ) -> Result<AuditReceipt, AuditError> {
-    validate_request(request)?;
     let github = GithubHttp::new(config);
+
+    // Resolve Governance exactly once. Every canonical task/run/project read below is pinned to it.
     let governance_sha = github.commit_sha(
         &config.governance_repository,
         &config.governance_default_branch,
@@ -296,7 +530,7 @@ pub fn audit_task_integration(
     let target_repository = resolve_repository(&projects, &target_key)?;
 
     let mut runs = Vec::new();
-    for path in route.run_paths.iter().rev() {
+    for path in &route.run_paths {
         let markdown = github.raw_content(&config.governance_repository, path, &governance_sha)?;
         if let Some(evidence) = parse_run_evidence(path, &markdown)? {
             runs.push(evidence);
@@ -310,22 +544,38 @@ pub fn audit_task_integration(
             pr_location.repository, target_repository
         )));
     }
+
     let pull_request = github.pull_request(&pr_location)?;
     let merge_sha = pull_request
         .merge_commit_sha
         .as_deref()
         .ok_or_else(|| AuditError::Verification("pull request lacks merge SHA".into()))?;
+    let representation = RepresentationEvidence {
+        implementation_is_ancestor_or_equal_of_pr_head: github.is_ancestor_or_equal(
+            &target_repository,
+            &implementation.implementation_sha,
+            &pull_request.head_sha,
+        )?,
+        pr_head_is_ancestor_or_equal_of_merge: github.is_ancestor_or_equal(
+            &target_repository,
+            &pull_request.head_sha,
+            merge_sha,
+        )?,
+    };
     let post_merge_runs = github.workflow_runs(&target_repository, merge_sha)?;
+    // Observe the exact canonical branch once after immutable integration evidence is collected.
     let branch = github.branch_observation(&target_repository, &canonical_branch)?;
 
     evaluate_snapshot(AuditSnapshot {
         task_id: request.task_id.clone(),
         request_id: request.request_id.clone(),
+        request_digest: request_digest.to_owned(),
         governance_sha,
         target_repository,
         canonical_branch,
         audited_implementation: implementation,
         pull_request,
+        representation,
         post_merge_runs,
         branch,
     })
@@ -442,11 +692,25 @@ fn resolve_repository(projects: &str, key: &str) -> Result<String, AuditError> {
 }
 
 fn parse_run_evidence(path: &str, markdown: &str) -> Result<Option<RunEvidence>, AuditError> {
+    if frontmatter_value(markdown, "status")?.as_deref() != Some("completed")
+        || frontmatter_value(markdown, "run_type")?.as_deref() != Some("execution")
+    {
+        return Ok(None);
+    }
     let Some(publication) = extract_section(markdown, "## Remote publication evidence") else {
         return Ok(None);
     };
     let Some(terminal) = extract_section(markdown, "## Remote terminal evidence") else {
         return Ok(None);
+    };
+    let role = if let Some(integration) = extract_section(markdown, "## Remote integration evidence")
+    {
+        RunEvidenceRole::IntegrationAudit {
+            audited_implementation_sha: required_scalar(integration, "implementation_sha:")?,
+            audited_pull_request_url: required_scalar(integration, "pull_request_url:")?,
+        }
+    } else {
+        RunEvidenceRole::Implementation
     };
     Ok(Some(RunEvidence {
         run_path: path.to_owned(),
@@ -456,6 +720,7 @@ fn parse_run_evidence(path: &str, markdown: &str) -> Result<Option<RunEvidence>,
         ci_conclusion: required_scalar(terminal, "ci_conclusion:")?,
         pull_request_url: required_scalar(terminal, "pull_request_url:")?,
         pull_request_head_sha: required_scalar(terminal, "pull_request_head_sha:")?,
+        role,
     }))
 }
 
@@ -499,6 +764,9 @@ fn unquote(value: &str) -> String {
     value
         .strip_prefix('"')
         .and_then(|inner| inner.strip_suffix('"'))
+        .unwrap_or(value)
+        .strip_prefix('\'')
+        .and_then(|inner| inner.strip_suffix('\''))
         .unwrap_or(value)
         .to_owned()
 }
@@ -577,6 +845,32 @@ impl<'a> GithubHttp<'a> {
         })
     }
 
+    fn is_ancestor_or_equal(
+        &self,
+        repo: &str,
+        ancestor: &str,
+        descendant: &str,
+    ) -> Result<bool, AuditError> {
+        if ancestor == descendant {
+            return Ok(true);
+        }
+        let json = self.get_json(&format!(
+            "/repos/{repo}/compare/{}...{}",
+            pct(ancestor),
+            pct(descendant)
+        ))?;
+        match json.get_string("status") {
+            Some("ahead") | Some("identical") => Ok(true),
+            Some("behind") | Some("diverged") => Ok(false),
+            Some(other) => Err(AuditError::Github(format!(
+                "unexpected GitHub compare status {other}"
+            ))),
+            None => Err(AuditError::Github(
+                "GitHub compare response lacks status".into(),
+            )),
+        }
+    }
+
     fn workflow_runs(&self, repo: &str, sha: &str) -> Result<Vec<WorkflowEvidence>, AuditError> {
         let json = self.get_json(&format!(
             "/repos/{repo}/actions/runs?head_sha={}&event=push&status=completed&per_page=100",
@@ -648,6 +942,8 @@ impl<'a> GithubHttp<'a> {
                 }
             }
         }
+        open_pr_urls.sort();
+        open_pr_urls.dedup();
         Ok(BranchObservation::Present { sha, open_pr_urls })
     }
 
@@ -733,6 +1029,103 @@ fn json_string(value: &str) -> String {
     }
     output.push('"');
     output
+}
+
+fn sha256_hex(input: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
+        0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
+        0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+        0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
+        0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+    let mut h = [
+        0x6a09e667_u32,
+        0xbb67ae85,
+        0x3c6ef372,
+        0xa54ff53a,
+        0x510e527f,
+        0x9b05688c,
+        0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let bit_len = (input.len() as u64).wrapping_mul(8);
+    let mut message = input.to_vec();
+    message.push(0x80);
+    while message.len() % 64 != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in message.chunks_exact(64) {
+        let mut w = [0_u32; 64];
+        for (index, word) in w.iter_mut().take(16).enumerate() {
+            let offset = index * 4;
+            *word = u32::from_be_bytes([
+                chunk[offset],
+                chunk[offset + 1],
+                chunk[offset + 2],
+                chunk[offset + 3],
+            ]);
+        }
+        for index in 16..64 {
+            let s0 = w[index - 15].rotate_right(7)
+                ^ w[index - 15].rotate_right(18)
+                ^ (w[index - 15] >> 3);
+            let s1 = w[index - 2].rotate_right(17)
+                ^ w[index - 2].rotate_right(19)
+                ^ (w[index - 2] >> 10);
+            w[index] = w[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[index - 7])
+                .wrapping_add(s1);
+        }
+
+        let mut a = h[0];
+        let mut b = h[1];
+        let mut c = h[2];
+        let mut d = h[3];
+        let mut e = h[4];
+        let mut f = h[5];
+        let mut g = h[6];
+        let mut hh = h[7];
+        for index in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[index])
+                .wrapping_add(w[index]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+
+    h.iter().map(|value| format!("{value:08x}")).collect()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1003,23 +1396,92 @@ impl JsonParser<'_> {
 mod tests {
     use super::*;
 
-    fn implementation(sha: &str) -> RunEvidence {
+    fn implementation(path: &str, sha: &str) -> RunEvidence {
         RunEvidence {
-            run_path: "runs/GOV-999/implementation.md".into(),
+            run_path: path.into(),
             publication_sha: sha.into(),
             implementation_sha: sha.into(),
             ci_sha: sha.into(),
             ci_conclusion: "success".into(),
             pull_request_url: "https://github.com/shockerqt/example/pull/7".into(),
             pull_request_head_sha: sha.into(),
+            role: RunEvidenceRole::Implementation,
+        }
+    }
+
+    fn integration_audit(sha: &str) -> RunEvidence {
+        RunEvidence {
+            run_path: "runs/GOV-999/integration.md".into(),
+            publication_sha: sha.into(),
+            implementation_sha: sha.into(),
+            ci_sha: sha.into(),
+            ci_conclusion: "success".into(),
+            pull_request_url: "https://github.com/shockerqt/example/pull/7".into(),
+            pull_request_head_sha: sha.into(),
+            role: RunEvidenceRole::IntegrationAudit {
+                audited_implementation_sha: sha.into(),
+                audited_pull_request_url: "https://github.com/shockerqt/example/pull/7".into(),
+            },
         }
     }
 
     #[test]
-    fn administrative_publication_cannot_impersonate_audited_implementation() {
-        let mut mixed = implementation("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        mixed.publication_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
-        assert!(select_audited_implementation(&[mixed]).is_err());
+    fn integration_audit_explicitly_selects_the_audited_implementation() {
+        let old = implementation(
+            "runs/GOV-999/old.md",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        let selected = implementation(
+            "runs/GOV-999/final.md",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        let audit = integration_audit("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        assert_eq!(
+            select_audited_implementation(&[old, selected.clone(), audit]).unwrap(),
+            selected
+        );
+    }
+
+    #[test]
+    fn multiple_implementation_candidates_without_explicit_audit_are_ambiguous() {
+        let one = implementation(
+            "runs/GOV-999/one.md",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        let two = implementation(
+            "runs/GOV-999/two.md",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        assert!(matches!(
+            select_audited_implementation(&[one, two]),
+            Err(AuditError::AmbiguousEvidence(_))
+        ));
+    }
+
+    #[test]
+    fn administrative_integration_run_is_not_itself_an_implementation_candidate() {
+        let implementation = implementation(
+            "runs/GOV-999/implementation.md",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        let audit = integration_audit("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(
+            select_audited_implementation(&[implementation.clone(), audit]).unwrap(),
+            implementation
+        );
+    }
+
+    #[test]
+    fn administrative_hint_without_matching_implementation_fails_closed() {
+        let implementation = implementation(
+            "runs/GOV-999/implementation.md",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        let audit = integration_audit("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        assert!(matches!(
+            select_audited_implementation(&[implementation, audit]),
+            Err(AuditError::Verification(_))
+        ));
     }
 
     #[test]
@@ -1032,10 +1494,19 @@ mod tests {
     }
 
     #[test]
+    fn sha256_matches_known_vector() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
     fn minimal_json_parser_reads_nested_github_shapes() {
-        let value =
-            JsonValue::parse(r#"{"merged":true,"head":{"sha":"abc"},"workflow_runs":[{"id":1}]}"#)
-                .unwrap();
+        let value = JsonValue::parse(
+            r#"{"merged":true,"head":{"sha":"abc"},"workflow_runs":[{"id":1}],"status":"ahead"}"#,
+        )
+        .unwrap();
         assert_eq!(value.get_bool("merged"), Some(true));
         assert_eq!(
             object_string(value.get_object("head").unwrap(), "sha"),
@@ -1050,5 +1521,6 @@ mod tests {
             ),
             Some(1)
         );
+        assert_eq!(value.get_string("status"), Some("ahead"));
     }
 }

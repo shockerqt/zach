@@ -50,7 +50,7 @@ fn run_audit(args: &[String]) {
     };
 
     match audit_task_integration(&config, &request) {
-        Ok(receipt) => println!("{}", receipt.to_json()),
+        Ok(receipt_json) => println!("{receipt_json}"),
         Err(error) => {
             eprintln!("audit failed: {error}");
             std::process::exit(1);
