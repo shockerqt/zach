@@ -387,7 +387,11 @@ impl FileStore {
         let terminal = match state {
             "pending" => None,
             "terminal" => Some(lines.collect::<Vec<_>>().join("\n")),
-            _ => return Err(AuditError::Idempotency("test store has invalid state".into())),
+            _ => {
+                return Err(AuditError::Idempotency(
+                    "test store has invalid state".into(),
+                ));
+            }
         };
         Ok(Some((request_id.into(), digest.into(), terminal)))
     }
