@@ -88,8 +88,8 @@ pub struct AuditReceipt {
 
 impl AuditReceipt {
     pub fn to_json(&self) -> String {
-        let s = &self.snapshot;
-        let branch = match &s.branch {
+        let snapshot = &self.snapshot;
+        let branch = match &snapshot.branch {
             BranchObservation::Absent => "{\"state\":\"absent\"}".to_owned(),
             BranchObservation::Present { sha, open_pr_urls } => format!(
                 "{{\"state\":\"present\",\"sha\":{},\"open_pr_urls\":[{}]}}",
@@ -101,7 +101,11 @@ impl AuditReceipt {
                     .join(",")
             ),
         };
-        let merge_sha = s.pull_request.merge_commit_sha.as_deref().unwrap_or("");
+        let merge_sha = snapshot
+            .pull_request
+            .merge_commit_sha
+            .as_deref()
+            .unwrap_or("");
         format!(
             concat!(
                 "{{\"schema_version\":1,",
@@ -127,22 +131,22 @@ impl AuditReceipt {
             ),
             json_string(OPERATION),
             json_string(&self.receipt_id),
-            json_string(&s.task_id),
-            json_string(&s.request_id),
-            json_string(&s.request_digest),
-            json_string(&s.governance_sha),
-            json_string(&s.audited_implementation.run_path),
-            json_string(&s.audited_implementation.publication_sha),
-            json_string(&s.audited_implementation.implementation_sha),
-            json_string(&s.audited_implementation.ci_sha),
-            json_string(&s.audited_implementation.ci_conclusion),
-            json_string(&s.audited_implementation.pull_request_url),
-            json_string(&s.target_repository),
-            json_string(&s.canonical_branch),
+            json_string(&snapshot.task_id),
+            json_string(&snapshot.request_id),
+            json_string(&snapshot.request_digest),
+            json_string(&snapshot.governance_sha),
+            json_string(&snapshot.audited_implementation.run_path),
+            json_string(&snapshot.audited_implementation.publication_sha),
+            json_string(&snapshot.audited_implementation.implementation_sha),
+            json_string(&snapshot.audited_implementation.ci_sha),
+            json_string(&snapshot.audited_implementation.ci_conclusion),
+            json_string(&snapshot.audited_implementation.pull_request_url),
+            json_string(&snapshot.target_repository),
+            json_string(&snapshot.canonical_branch),
             json_string(merge_sha),
-            json_string(s.pull_request.merged_at.as_deref().unwrap_or("")),
-            json_string(&s.audited_implementation.implementation_sha),
-            json_string(&s.pull_request.head_sha),
+            json_string(snapshot.pull_request.merged_at.as_deref().unwrap_or("")),
+            json_string(&snapshot.audited_implementation.implementation_sha),
+            json_string(&snapshot.pull_request.head_sha),
             json_string(merge_sha),
             json_string(&self.selected_ci.head_sha),
             self.selected_ci.id,
@@ -375,21 +379,21 @@ pub fn evaluate_snapshot(snapshot: AuditSnapshot) -> Result<AuditReceipt, AuditE
             "audited implementation terminal evidence is incoherent".into(),
         ));
     }
-    let pr = &snapshot.pull_request;
-    if !pr.merged {
+    let pull_request = &snapshot.pull_request;
+    if !pull_request.merged {
         return Err(AuditError::Verification(
             "target pull request is not merged".into(),
         ));
     }
-    let merge_sha = pr.merge_commit_sha.as_deref().ok_or_else(|| {
+    let merge_sha = pull_request.merge_commit_sha.as_deref().ok_or_else(|| {
         AuditError::Verification("merged pull request has no merge commit SHA".into())
     })?;
-    if pr.merged_at.is_none() {
+    if pull_request.merged_at.is_none() {
         return Err(AuditError::Verification(
             "merged pull request has no merge timestamp".into(),
         ));
     }
-    if pr.url != implementation.pull_request_url {
+    if pull_request.url != implementation.pull_request_url {
         return Err(AuditError::Verification(
             "merged pull request identity differs from canonical implementation evidence".into(),
         ));
@@ -501,49 +505,21 @@ fn collect_audit_receipt(
     request_digest: &str,
 ) -> Result<AuditReceipt, AuditError> {
     let github = GithubHttp::new(config);
-
-    // Resolve Governance exactly once. Every canonical task/run/project read below is pinned to it.
     let governance_sha = github.commit_sha(
         &config.governance_repository,
         &config.governance_default_branch,
     )?;
-    let manifest = github.raw_content(
-        &config.governance_repository,
-        "governance-manifest.yaml",
-        &governance_sha,
-    )?;
-    let route = parse_manifest_task(&manifest, &request.task_id)?;
-    let task_markdown =
-        github.raw_content(&config.governance_repository, &route.path, &governance_sha)?;
-    let canonical_branch = frontmatter_value(&task_markdown, "branch")?
-        .ok_or_else(|| AuditError::CanonicalState("task.branch is missing".into()))?;
-    if matches!(canonical_branch.as_str(), "null" | "none") {
-        return Err(AuditError::CanonicalState(
-            "task.branch is not a code branch".into(),
-        ));
-    }
-    let target_key = frontmatter_value(&task_markdown, "target_repository")?
-        .ok_or_else(|| AuditError::CanonicalState("task.target_repository is missing".into()))?;
-    let projects = github.raw_content(
-        &config.governance_repository,
-        "projects.yaml",
-        &governance_sha,
-    )?;
-    let target_repository = resolve_repository(&projects, &target_key)?;
-
-    let mut runs = Vec::new();
-    for path in &route.run_paths {
-        let markdown = github.raw_content(&config.governance_repository, path, &governance_sha)?;
-        if let Some(evidence) = parse_run_evidence(path, &markdown)? {
-            runs.push(evidence);
-        }
-    }
-    let implementation = select_audited_implementation(&runs)?;
+    let mut reader = GithubGovernanceReader {
+        github: &github,
+        repository: &config.governance_repository,
+    };
+    let state = resolve_governance_state(&mut reader, &governance_sha, &request.task_id)?;
+    let implementation = select_audited_implementation(&state.runs)?;
     let pr_location = parse_pr_url(&implementation.pull_request_url)?;
-    if pr_location.repository != target_repository {
+    if pr_location.repository != state.target_repository {
         return Err(AuditError::Verification(format!(
             "terminal evidence PR repository {} does not match canonical target {}",
-            pr_location.repository, target_repository
+            pr_location.repository, state.target_repository
         )));
     }
 
@@ -554,27 +530,26 @@ fn collect_audit_receipt(
         .ok_or_else(|| AuditError::Verification("pull request lacks merge SHA".into()))?;
     let representation = RepresentationEvidence {
         implementation_is_ancestor_or_equal_of_pr_head: github.is_ancestor_or_equal(
-            &target_repository,
+            &state.target_repository,
             &implementation.implementation_sha,
             &pull_request.head_sha,
         )?,
         pr_head_is_ancestor_or_equal_of_merge: github.is_ancestor_or_equal(
-            &target_repository,
+            &state.target_repository,
             &pull_request.head_sha,
             merge_sha,
         )?,
     };
-    let post_merge_runs = github.workflow_runs(&target_repository, merge_sha)?;
-    // Observe the exact canonical branch once after immutable integration evidence is collected.
-    let branch = github.branch_observation(&target_repository, &canonical_branch)?;
+    let post_merge_runs = github.workflow_runs(&state.target_repository, merge_sha)?;
+    let branch = github.branch_observation(&state.target_repository, &state.canonical_branch)?;
 
     evaluate_snapshot(AuditSnapshot {
         task_id: request.task_id.clone(),
         request_id: request.request_id.clone(),
         request_digest: request_digest.to_owned(),
         governance_sha,
-        target_repository,
-        canonical_branch,
+        target_repository: state.target_repository,
+        canonical_branch: state.canonical_branch,
         audited_implementation: implementation,
         pull_request,
         representation,
@@ -609,47 +584,435 @@ fn validate_request(request: &AuditRequest) -> Result<(), AuditError> {
     Ok(())
 }
 
-#[derive(Debug)]
-struct ManifestRoute {
-    path: String,
-    run_paths: Vec<String>,
+trait GovernanceReader {
+    fn read(&mut self, path: &str, governance_sha: &str) -> Result<String, AuditError>;
 }
 
-fn parse_manifest_task(manifest: &str, task_id: &str) -> Result<ManifestRoute, AuditError> {
-    let marker = format!("- id: {task_id}");
-    let start = manifest.find(&marker).ok_or_else(|| {
-        AuditError::CanonicalState(format!("task {task_id} is absent from manifest"))
-    })?;
-    let rest = &manifest[start..];
-    let end = rest[marker.len()..]
-        .find("\n- id: ")
-        .map(|offset| marker.len() + offset)
-        .unwrap_or(rest.len());
-    let block = &rest[..end];
-    let path = scalar_line(block, "path:")?
-        .ok_or_else(|| AuditError::CanonicalState("manifest task path is missing".into()))?;
-    let mut run_paths = Vec::new();
-    let mut in_runs = false;
-    for line in block.lines() {
-        let trimmed = line.trim();
-        if trimmed == "run_paths:" {
-            in_runs = true;
-            continue;
-        }
-        if in_runs {
-            if let Some(value) = trimmed.strip_prefix("- runs/") {
-                run_paths.push(format!("runs/{value}"));
-            } else if !trimmed.is_empty() && !trimmed.starts_with('-') {
-                break;
-            }
-        }
+struct GithubGovernanceReader<'a, 'b> {
+    github: &'a GithubHttp<'b>,
+    repository: &'a str,
+}
+
+impl GovernanceReader for GithubGovernanceReader<'_, '_> {
+    fn read(&mut self, path: &str, governance_sha: &str) -> Result<String, AuditError> {
+        self.github.raw_content(self.repository, path, governance_sha)
     }
-    if run_paths.is_empty() {
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiscoveryRouting {
+    global_tasks: String,
+    project_tasks_template: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CanonicalGovernanceState {
+    target_repository: String,
+    canonical_branch: String,
+    runs: Vec<RunEvidence>,
+}
+
+fn resolve_governance_state<R: GovernanceReader>(
+    reader: &mut R,
+    governance_sha: &str,
+    task_id: &str,
+) -> Result<CanonicalGovernanceState, AuditError> {
+    if governance_sha.len() != 40 || !governance_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(AuditError::CanonicalState(
-            "task has no execution runs".into(),
+            "Governance snapshot is not pinned to an immutable commit SHA".into(),
         ));
     }
-    Ok(ManifestRoute { path, run_paths })
+
+    let manifest = reader.read("governance-manifest.yaml", governance_sha)?;
+    let routing = parse_manifest_discovery(&manifest)?;
+    let global_index = reader.read(&routing.global_tasks, governance_sha)?;
+    let membership = resolve_global_task_membership(&global_index, &routing, task_id)?;
+    let shard = reader.read(&membership.index_path, governance_sha)?;
+    let task_path = resolve_project_shard(&shard, &membership.project, task_id)?;
+    let task_markdown = reader.read(&task_path, governance_sha)?;
+
+    let canonical_id = frontmatter_value(&task_markdown, "id")?
+        .ok_or_else(|| AuditError::CanonicalState("task.id is missing".into()))?;
+    if canonical_id != task_id {
+        return Err(AuditError::CanonicalState(format!(
+            "discovered canonical task id {canonical_id} does not match requested {task_id}"
+        )));
+    }
+    let canonical_project = frontmatter_value(&task_markdown, "project")?
+        .ok_or_else(|| AuditError::CanonicalState("task.project is missing".into()))?;
+    if canonical_project != membership.project {
+        return Err(AuditError::CanonicalState(format!(
+            "canonical task project {canonical_project} does not match discovery project {}",
+            membership.project
+        )));
+    }
+
+    let canonical_branch = frontmatter_value(&task_markdown, "branch")?
+        .ok_or_else(|| AuditError::CanonicalState("task.branch is missing".into()))?;
+    if matches!(canonical_branch.as_str(), "null" | "none") {
+        return Err(AuditError::CanonicalState(
+            "task.branch is not a code branch".into(),
+        ));
+    }
+    let target_key = frontmatter_value(&task_markdown, "target_repository")?
+        .ok_or_else(|| AuditError::CanonicalState("task.target_repository is missing".into()))?;
+    let projects = reader.read("projects.yaml", governance_sha)?;
+    let target_repository = resolve_repository(&projects, &target_key)?;
+
+    let links = parse_task_run_links(&task_markdown, task_id)?;
+    let mut runs = Vec::new();
+    let mut canonical_run_ids = BTreeSet::new();
+    for link in links {
+        let markdown = reader.read(&link.path, governance_sha)?;
+        let run_task = run_task_identity(&markdown)?.ok_or_else(|| {
+            AuditError::CanonicalState(format!("{} has no task identity", link.path))
+        })?;
+        if run_task != task_id {
+            return Err(AuditError::CanonicalState(format!(
+                "run {} belongs to task {run_task}, not {task_id}",
+                link.path
+            )));
+        }
+        let run_id = frontmatter_value(&markdown, "id")?
+            .ok_or_else(|| AuditError::CanonicalState(format!("{} has no run id", link.path)))?;
+        if run_id != link.id {
+            return Err(AuditError::CanonicalState(format!(
+                "run link id {} does not match canonical run id {run_id}",
+                link.id
+            )));
+        }
+        if !canonical_run_ids.insert(run_id) {
+            return Err(AuditError::AmbiguousEvidence(
+                "canonical task links the same run identity more than once".into(),
+            ));
+        }
+        if let Some(evidence) = parse_run_evidence(&link.path, &markdown)? {
+            runs.push(evidence);
+        }
+    }
+
+    Ok(CanonicalGovernanceState {
+        target_repository,
+        canonical_branch,
+        runs,
+    })
+}
+
+fn run_task_identity(markdown: &str) -> Result<Option<String>, AuditError> {
+    let task = frontmatter_value(markdown, "task")?;
+    let alias = frontmatter_value(markdown, "task_id")?;
+    match (task, alias) {
+        (Some(task), Some(alias)) if task != alias => Err(AuditError::AmbiguousEvidence(
+            "run frontmatter task and task_id aliases disagree".into(),
+        )),
+        (Some(task), _) => Ok(Some(task)),
+        (None, Some(alias)) => Ok(Some(alias)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn parse_manifest_discovery(manifest: &str) -> Result<DiscoveryRouting, AuditError> {
+    let schema = yaml_scalar_at_path(manifest, &["schema_version"])?
+        .ok_or_else(|| AuditError::CanonicalState("manifest schema_version is missing".into()))?;
+    if schema != "2" {
+        return Err(AuditError::CanonicalState(format!(
+            "unsupported governance manifest schema_version {schema}; no legacy fallback is permitted"
+        )));
+    }
+    let global_tasks = yaml_scalar_at_path(manifest, &["ledger", "discovery", "global_tasks"])?
+        .ok_or_else(|| {
+            AuditError::CanonicalState("manifest ledger.discovery.global_tasks is missing".into())
+        })?;
+    validate_repository_path(&global_tasks, "global task index")?;
+    let project_tasks_template =
+        yaml_scalar_at_path(manifest, &["ledger", "discovery", "project_tasks"])?
+            .ok_or_else(|| {
+                AuditError::CanonicalState(
+                    "manifest ledger.discovery.project_tasks is missing".into(),
+                )
+            })?;
+    validate_project_index_template(&project_tasks_template)?;
+    Ok(DiscoveryRouting {
+        global_tasks,
+        project_tasks_template,
+    })
+}
+
+fn yaml_scalar_at_path(text: &str, path: &[&str]) -> Result<Option<String>, AuditError> {
+    let mut stack: Vec<(usize, String)> = Vec::new();
+    let mut values = Vec::new();
+    for raw_line in text.lines() {
+        if raw_line.contains('\t') {
+            return Err(AuditError::CanonicalState(
+                "tabs are not supported in Governance routing YAML".into(),
+            ));
+        }
+        let indent = raw_line.len() - raw_line.trim_start_matches(' ').len();
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('-') {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        while stack.last().is_some_and(|(level, _)| *level >= indent) {
+            stack.pop();
+        }
+        let key = key.trim();
+        let value = value.trim();
+        if value.is_empty() {
+            stack.push((indent, key.to_owned()));
+            continue;
+        }
+        let mut current = stack
+            .iter()
+            .map(|(_, key)| key.as_str())
+            .collect::<Vec<_>>();
+        current.push(key);
+        if current.as_slice() == path {
+            values.push(unquote(value));
+        }
+    }
+    match values.len() {
+        0 => Ok(None),
+        1 => Ok(values.pop()),
+        _ => Err(AuditError::AmbiguousEvidence(format!(
+            "duplicate routing scalar {}",
+            path.join(".")
+        ))),
+    }
+}
+
+fn validate_project_index_template(template: &str) -> Result<(), AuditError> {
+    if template.matches("<project>").count() != 1 {
+        return Err(AuditError::CanonicalState(
+            "project task index routing must contain exactly one <project> placeholder".into(),
+        ));
+    }
+    validate_repository_path(
+        &template.replace("<project>", "project"),
+        "project task index template",
+    )
+}
+
+fn project_index_path(template: &str, project: &str) -> Result<String, AuditError> {
+    if project.is_empty()
+        || !project
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(AuditError::CanonicalState(format!(
+            "invalid project id {project} in global task index"
+        )));
+    }
+    let path = template.replace("<project>", project);
+    validate_repository_path(&path, "project task index")?;
+    Ok(path)
+}
+
+fn validate_repository_path(path: &str, label: &str) -> Result<(), AuditError> {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.contains('\\')
+        || path.contains('?')
+        || path.contains('#')
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+    {
+        return Err(AuditError::CanonicalState(format!(
+            "{label} is not a safe repository path: {path}"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskMembership {
+    project: String,
+    index_path: String,
+}
+
+fn resolve_global_task_membership(
+    text: &str,
+    routing: &DiscoveryRouting,
+    task_id: &str,
+) -> Result<TaskMembership, AuditError> {
+    let json = parse_canonical_json(text, "global task index")?;
+    let root = json.as_object().ok_or_else(|| {
+        AuditError::CanonicalState("global task index root is not an object".into())
+    })?;
+    require_json_schema_one(root, "global task index")?;
+    let projects = object_array_required(root, "projects", "global task index")?;
+    let mut memberships = Vec::new();
+    let mut seen_projects = BTreeSet::new();
+    for value in projects {
+        let object = value.as_object().ok_or_else(|| {
+            AuditError::CanonicalState("global task index project entry is not an object".into())
+        })?;
+        let project = object_string_required(object, "project", "global task index project")?;
+        if !seen_projects.insert(project.clone()) {
+            return Err(AuditError::AmbiguousEvidence(format!(
+                "global task index contains duplicate project entry {project}"
+            )));
+        }
+        let index_path = object_string_required(object, "index", "global task index project")?;
+        validate_repository_path(&index_path, "global task project index")?;
+        let task_ids =
+            object_string_array_required(object, "task_ids", "global task index project")?;
+        let occurrences = task_ids
+            .iter()
+            .filter(|candidate| candidate.as_str() == task_id)
+            .count();
+        if occurrences > 1 {
+            return Err(AuditError::AmbiguousEvidence(format!(
+                "task {task_id} is duplicated inside global membership for project {project}"
+            )));
+        }
+        if occurrences == 1 {
+            memberships.push(TaskMembership {
+                project,
+                index_path,
+            });
+        }
+    }
+
+    let membership = match memberships.len() {
+        0 => {
+            return Err(AuditError::CanonicalState(format!(
+                "task {task_id} is absent from the global task index"
+            )))
+        }
+        1 => memberships.pop().expect("membership length checked"),
+        _ => {
+            return Err(AuditError::AmbiguousEvidence(format!(
+                "task {task_id} belongs to multiple project shards in the global task index"
+            )))
+        }
+    };
+    let expected = project_index_path(&routing.project_tasks_template, &membership.project)?;
+    if membership.index_path != expected {
+        return Err(AuditError::CanonicalState(format!(
+            "global task index routes project {} to {}, but manifest routing requires {expected}",
+            membership.project, membership.index_path
+        )));
+    }
+    Ok(membership)
+}
+
+fn resolve_project_shard(text: &str, project: &str, task_id: &str) -> Result<String, AuditError> {
+    let json = parse_canonical_json(text, "project task shard")?;
+    let root = json.as_object().ok_or_else(|| {
+        AuditError::CanonicalState("project task shard root is not an object".into())
+    })?;
+    require_json_schema_one(root, "project task shard")?;
+    let shard_project = object_string_required(root, "project", "project task shard")?;
+    if shard_project != project {
+        return Err(AuditError::CanonicalState(format!(
+            "project shard declares {shard_project}, expected {project}"
+        )));
+    }
+    let tasks = object_array_required(root, "tasks", "project task shard")?;
+    let mut matches = Vec::new();
+    for value in tasks {
+        let object = value.as_object().ok_or_else(|| {
+            AuditError::CanonicalState("project task shard entry is not an object".into())
+        })?;
+        let id = object_string_required(object, "id", "project task shard entry")?;
+        if id == task_id {
+            matches.push(object_string_required(
+                object,
+                "path",
+                "project task shard entry",
+            )?);
+        }
+    }
+    let path = match matches.len() {
+        0 => {
+            return Err(AuditError::CanonicalState(format!(
+                "task {task_id} is absent from routed project shard {project}"
+            )))
+        }
+        1 => matches.pop().expect("shard match length checked"),
+        _ => {
+            return Err(AuditError::AmbiguousEvidence(format!(
+                "task {task_id} has duplicate entries in project shard {project}"
+            )))
+        }
+    };
+    validate_repository_path(&path, "canonical task path")?;
+    if !path.starts_with("tasks/") || !path.ends_with(".md") {
+        return Err(AuditError::CanonicalState(format!(
+            "project shard task path is outside canonical tasks ledger: {path}"
+        )));
+    }
+    Ok(path)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunLink {
+    id: String,
+    path: String,
+}
+
+fn parse_task_run_links(markdown: &str, task_id: &str) -> Result<Vec<RunLink>, AuditError> {
+    let section = markdown_section(markdown, "## Runs")?
+        .ok_or_else(|| AuditError::CanonicalState("canonical task has no ## Runs section".into()))?;
+    let mut result = Vec::new();
+    let mut ids = BTreeSet::new();
+    let mut paths = BTreeSet::new();
+    for line in section.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("- [") {
+            if trimmed.contains("../runs/") || trimmed.contains("runs/") {
+                return Err(AuditError::CanonicalState(
+                    "malformed run reference in canonical task ## Runs".into(),
+                ));
+            }
+            continue;
+        }
+        let body = trimmed.strip_prefix("- [").expect("prefix checked");
+        let split = body.find("](").ok_or_else(|| {
+            AuditError::CanonicalState("malformed Markdown run link in canonical task".into())
+        })?;
+        if !body.ends_with(')') {
+            return Err(AuditError::CanonicalState(
+                "malformed Markdown run link target in canonical task".into(),
+            ));
+        }
+        let id = body[..split].trim().to_owned();
+        let target = &body[split + 2..body.len() - 1];
+        if id.is_empty() || !id.starts_with(&format!("{task_id}-")) {
+            return Err(AuditError::CanonicalState(format!(
+                "run link id {id} does not belong to task {task_id}"
+            )));
+        }
+        let prefix = format!("../runs/{task_id}/");
+        let filename = target.strip_prefix(&prefix).ok_or_else(|| {
+            AuditError::CanonicalState(format!(
+                "run link target {target} is outside canonical runs/{task_id}/ ledger"
+            ))
+        })?;
+        if filename.is_empty() || filename.contains('/') || !filename.ends_with(".md") {
+            return Err(AuditError::CanonicalState(format!(
+                "run link target {target} is not one canonical run record"
+            )));
+        }
+        let path = format!("runs/{task_id}/{filename}");
+        validate_repository_path(&path, "canonical run path")?;
+        if !ids.insert(id.clone()) || !paths.insert(path.clone()) {
+            return Err(AuditError::AmbiguousEvidence(
+                "canonical task contains duplicate or ambiguous run links".into(),
+            ));
+        }
+        result.push(RunLink { id, path });
+    }
+    if result.is_empty() {
+        return Err(AuditError::CanonicalState(
+            "canonical task has no linked run records".into(),
+        ));
+    }
+    Ok(result)
 }
 
 fn frontmatter_value(markdown: &str, key: &str) -> Result<Option<String>, AuditError> {
@@ -674,23 +1037,29 @@ fn frontmatter_value(markdown: &str, key: &str) -> Result<Option<String>, AuditE
 
 fn resolve_repository(projects: &str, key: &str) -> Result<String, AuditError> {
     let mut active = false;
+    let mut matches = Vec::new();
     for line in projects.lines() {
         let trimmed = line.trim();
         if let Some(repository) = trimmed.strip_prefix("- repository:") {
             active = repository.trim() == key;
         } else if active && let Some(url) = trimmed.strip_prefix("clone_url:") {
             let value = url.trim().trim_end_matches('/').trim_end_matches(".git");
-            if let Some(full_name) = value.strip_prefix("https://github.com/") {
-                return Ok(full_name.to_owned());
-            }
-            return Err(AuditError::CanonicalState(
-                "unsupported project clone_url".into(),
-            ));
+            let full_name = value.strip_prefix("https://github.com/").ok_or_else(|| {
+                AuditError::CanonicalState("unsupported project clone_url".into())
+            })?;
+            matches.push(full_name.to_owned());
+            active = false;
         }
     }
-    Err(AuditError::CanonicalState(format!(
-        "target repository key {key} is not registered"
-    )))
+    match matches.len() {
+        0 => Err(AuditError::CanonicalState(format!(
+            "target repository key {key} is not registered"
+        ))),
+        1 => Ok(matches.pop().expect("repository match length checked")),
+        _ => Err(AuditError::AmbiguousEvidence(format!(
+            "target repository key {key} is registered more than once"
+        ))),
+    }
 }
 
 fn parse_run_evidence(path: &str, markdown: &str) -> Result<Option<RunEvidence>, AuditError> {
@@ -699,38 +1068,54 @@ fn parse_run_evidence(path: &str, markdown: &str) -> Result<Option<RunEvidence>,
     {
         return Ok(None);
     }
-    let Some(publication) = extract_section(markdown, "## Remote publication evidence") else {
+    let Some(publication) = markdown_section(markdown, "## Remote publication evidence")? else {
         return Ok(None);
     };
-    let Some(terminal) = extract_section(markdown, "## Remote terminal evidence") else {
+    let Some(terminal) = markdown_section(markdown, "## Remote terminal evidence")? else {
         return Ok(None);
     };
-    let role =
-        if let Some(integration) = extract_section(markdown, "## Remote integration evidence") {
-            RunEvidenceRole::IntegrationAudit {
-                audited_implementation_sha: required_scalar(integration, "implementation_sha:")?,
-                audited_pull_request_url: required_scalar(integration, "pull_request_url:")?,
-            }
-        } else {
-            RunEvidenceRole::Implementation
-        };
+    let role = if let Some(integration) = markdown_section(markdown, "## Remote integration evidence")? {
+        RunEvidenceRole::IntegrationAudit {
+            audited_implementation_sha: required_scalar(&integration, "implementation_sha:")?,
+            audited_pull_request_url: required_scalar(&integration, "pull_request_url:")?,
+        }
+    } else {
+        RunEvidenceRole::Implementation
+    };
     Ok(Some(RunEvidence {
         run_path: path.to_owned(),
-        publication_sha: required_scalar(publication, "published_after_sha:")?,
-        implementation_sha: required_scalar(terminal, "implementation_sha:")?,
-        ci_sha: required_scalar(terminal, "ci_sha:")?,
-        ci_conclusion: required_scalar(terminal, "ci_conclusion:")?,
-        pull_request_url: required_scalar(terminal, "pull_request_url:")?,
-        pull_request_head_sha: required_scalar(terminal, "pull_request_head_sha:")?,
+        publication_sha: required_scalar(&publication, "published_after_sha:")?,
+        implementation_sha: required_scalar(&terminal, "implementation_sha:")?,
+        ci_sha: required_scalar(&terminal, "ci_sha:")?,
+        ci_conclusion: required_scalar(&terminal, "ci_conclusion:")?,
+        pull_request_url: required_scalar(&terminal, "pull_request_url:")?,
+        pull_request_head_sha: required_scalar(&terminal, "pull_request_head_sha:")?,
         role,
     }))
 }
 
-fn extract_section<'a>(markdown: &'a str, heading: &str) -> Option<&'a str> {
-    let start = markdown.find(heading)? + heading.len();
-    let rest = &markdown[start..];
-    let end = rest.find("\n## ").unwrap_or(rest.len());
-    Some(&rest[..end])
+fn markdown_section(markdown: &str, heading: &str) -> Result<Option<String>, AuditError> {
+    let lines = markdown.lines().collect::<Vec<_>>();
+    let indices = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| (*line == heading).then_some(index))
+        .collect::<Vec<_>>();
+    match indices.len() {
+        0 => Ok(None),
+        1 => {
+            let start = indices[0] + 1;
+            let end = lines[start..]
+                .iter()
+                .position(|line| line.starts_with("## "))
+                .map(|offset| start + offset)
+                .unwrap_or(lines.len());
+            Ok(Some(lines[start..end].join("\n")))
+        }
+        _ => Err(AuditError::AmbiguousEvidence(format!(
+            "record contains duplicate section {heading}"
+        ))),
+    }
 }
 
 fn required_scalar(text: &str, key: &str) -> Result<String, AuditError> {
@@ -776,6 +1161,63 @@ fn unquote(value: &str) -> String {
         return inner.to_owned();
     }
     value.to_owned()
+}
+
+fn parse_canonical_json(text: &str, label: &str) -> Result<JsonValue, AuditError> {
+    JsonValue::parse(text)
+        .map_err(|error| AuditError::CanonicalState(format!("invalid {label}: {error}")))
+}
+
+fn require_json_schema_one(
+    object: &BTreeMap<String, JsonValue>,
+    label: &str,
+) -> Result<(), AuditError> {
+    match object.get("schema_version") {
+        Some(JsonValue::Number(value)) if value == "1" => Ok(()),
+        Some(JsonValue::Number(value)) => Err(AuditError::CanonicalState(format!(
+            "unsupported {label} schema_version {value}"
+        ))),
+        _ => Err(AuditError::CanonicalState(format!(
+            "{label} schema_version is missing or invalid"
+        ))),
+    }
+}
+
+fn object_string_required(
+    object: &BTreeMap<String, JsonValue>,
+    key: &str,
+    label: &str,
+) -> Result<String, AuditError> {
+    object_string(object, key)
+        .map(str::to_owned)
+        .ok_or_else(|| AuditError::CanonicalState(format!("{label} missing string field {key}")))
+}
+
+fn object_array_required<'a>(
+    object: &'a BTreeMap<String, JsonValue>,
+    key: &str,
+    label: &str,
+) -> Result<&'a [JsonValue], AuditError> {
+    object
+        .get(key)
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| AuditError::CanonicalState(format!("{label} missing array field {key}")))
+}
+
+fn object_string_array_required(
+    object: &BTreeMap<String, JsonValue>,
+    key: &str,
+    label: &str,
+) -> Result<Vec<String>, AuditError> {
+    object_array_required(object, key, label)?
+        .iter()
+        .map(|value| match value {
+            JsonValue::String(value) => Ok(value.clone()),
+            _ => Err(AuditError::CanonicalState(format!(
+                "{label} field {key} contains a non-string value"
+            ))),
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -923,7 +1365,8 @@ impl<'a> GithubHttp<'a> {
                 "branch lookup returned HTTP {status}"
             )));
         }
-        let json = JsonValue::parse(&body)?;
+        let json = JsonValue::parse(&body)
+            .map_err(|error| AuditError::Github(format!("invalid branch JSON: {error}")))?;
         let object = json
             .get_object("object")
             .ok_or_else(|| AuditError::Github("branch response lacks object".into()))?;
@@ -957,6 +1400,7 @@ impl<'a> GithubHttp<'a> {
     fn get_json(&self, endpoint: &str) -> Result<JsonValue, AuditError> {
         let (_, body) = self.request(endpoint, true, false)?;
         JsonValue::parse(&body)
+            .map_err(|error| AuditError::Github(format!("invalid GitHub JSON: {error}")))
     }
 
     fn request(&self, endpoint: &str, fail: bool, raw: bool) -> Result<(u16, String), AuditError> {
@@ -1070,8 +1514,8 @@ fn sha256_hex(input: &[u8]) -> String {
     message.extend_from_slice(&bit_len.to_be_bytes());
 
     for chunk in message.as_chunks::<64>().0 {
-        let mut w = [0_u32; 64];
-        for (index, word) in w.iter_mut().take(16).enumerate() {
+        let mut words = [0_u32; 64];
+        for (index, word) in words.iter_mut().take(16).enumerate() {
             let offset = index * 4;
             *word = u32::from_be_bytes([
                 chunk[offset],
@@ -1081,15 +1525,15 @@ fn sha256_hex(input: &[u8]) -> String {
             ]);
         }
         for index in 16..64 {
-            let s0 = w[index - 15].rotate_right(7)
-                ^ w[index - 15].rotate_right(18)
-                ^ (w[index - 15] >> 3);
-            let s1 = w[index - 2].rotate_right(17)
-                ^ w[index - 2].rotate_right(19)
-                ^ (w[index - 2] >> 10);
-            w[index] = w[index - 16]
+            let s0 = words[index - 15].rotate_right(7)
+                ^ words[index - 15].rotate_right(18)
+                ^ (words[index - 15] >> 3);
+            let s1 = words[index - 2].rotate_right(17)
+                ^ words[index - 2].rotate_right(19)
+                ^ (words[index - 2] >> 10);
+            words[index] = words[index - 16]
                 .wrapping_add(s0)
-                .wrapping_add(w[index - 7])
+                .wrapping_add(words[index - 7])
                 .wrapping_add(s1);
         }
 
@@ -1108,7 +1552,7 @@ fn sha256_hex(input: &[u8]) -> String {
                 .wrapping_add(s1)
                 .wrapping_add(ch)
                 .wrapping_add(K[index])
-                .wrapping_add(w[index]);
+                .wrapping_add(words[index]);
             let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
             let maj = (a & b) ^ (a & c) ^ (b & c);
             let temp2 = s0.wrapping_add(maj);
@@ -1145,7 +1589,7 @@ enum JsonValue {
 }
 
 impl JsonValue {
-    fn parse(input: &str) -> Result<Self, AuditError> {
+    fn parse(input: &str) -> Result<Self, String> {
         let mut parser = JsonParser {
             bytes: input.as_bytes(),
             pos: 0,
@@ -1153,9 +1597,7 @@ impl JsonValue {
         let value = parser.value()?;
         parser.ws();
         if parser.pos != parser.bytes.len() {
-            return Err(AuditError::Github(
-                "trailing data in GitHub JSON response".into(),
-            ));
+            return Err("trailing data in JSON response".into());
         }
         Ok(value)
     }
@@ -1232,12 +1674,12 @@ impl JsonParser<'_> {
         }
     }
 
-    fn value(&mut self) -> Result<JsonValue, AuditError> {
+    fn value(&mut self) -> Result<JsonValue, String> {
         self.ws();
         let byte = *self
             .bytes
             .get(self.pos)
-            .ok_or_else(|| AuditError::Github("unexpected end of JSON".into()))?;
+            .ok_or_else(|| "unexpected end of JSON".to_owned())?;
         match byte {
             b'n' => {
                 self.literal(b"null")?;
@@ -1255,20 +1697,20 @@ impl JsonParser<'_> {
             b'[' => self.array(),
             b'{' => self.object(),
             b'-' | b'0'..=b'9' => self.number(),
-            _ => Err(AuditError::Github("unsupported JSON token".into())),
+            _ => Err("unsupported JSON token".into()),
         }
     }
 
-    fn literal(&mut self, literal: &[u8]) -> Result<(), AuditError> {
+    fn literal(&mut self, literal: &[u8]) -> Result<(), String> {
         if self.bytes.get(self.pos..self.pos + literal.len()) == Some(literal) {
             self.pos += literal.len();
             Ok(())
         } else {
-            Err(AuditError::Github("invalid JSON literal".into()))
+            Err("invalid JSON literal".into())
         }
     }
 
-    fn string(&mut self) -> Result<String, AuditError> {
+    fn string(&mut self) -> Result<String, String> {
         self.pos += 1;
         let mut output = String::new();
         while self.pos < self.bytes.len() {
@@ -1280,7 +1722,7 @@ impl JsonParser<'_> {
                     let escape = *self
                         .bytes
                         .get(self.pos)
-                        .ok_or_else(|| AuditError::Github("bad JSON escape".into()))?;
+                        .ok_or_else(|| "bad JSON escape".to_owned())?;
                     self.pos += 1;
                     match escape {
                         b'"' => output.push('"'),
@@ -1295,38 +1737,36 @@ impl JsonParser<'_> {
                             let hex = self
                                 .bytes
                                 .get(self.pos..self.pos + 4)
-                                .ok_or_else(|| AuditError::Github("short unicode escape".into()))?;
+                                .ok_or_else(|| "short unicode escape".to_owned())?;
                             self.pos += 4;
                             let text = std::str::from_utf8(hex)
-                                .map_err(|_| AuditError::Github("invalid unicode escape".into()))?;
+                                .map_err(|_| "invalid unicode escape".to_owned())?;
                             let code = u16::from_str_radix(text, 16)
-                                .map_err(|_| AuditError::Github("invalid unicode escape".into()))?;
+                                .map_err(|_| "invalid unicode escape".to_owned())?;
                             output.push(char::from_u32(u32::from(code)).unwrap_or('\u{fffd}'));
                         }
-                        _ => return Err(AuditError::Github("invalid JSON escape".into())),
+                        _ => return Err("invalid JSON escape".into()),
                     }
                 }
-                value if value < 0x20 => {
-                    return Err(AuditError::Github("control byte in JSON string".into()));
-                }
+                value if value < 0x20 => return Err("control byte in JSON string".into()),
                 value if value.is_ascii() => output.push(value as char),
                 _ => {
                     let start = self.pos - 1;
                     let text = std::str::from_utf8(&self.bytes[start..])
-                        .map_err(|_| AuditError::Github("invalid UTF-8 JSON string".into()))?;
+                        .map_err(|_| "invalid UTF-8 JSON string".to_owned())?;
                     let character = text
                         .chars()
                         .next()
-                        .ok_or_else(|| AuditError::Github("invalid UTF-8 JSON string".into()))?;
+                        .ok_or_else(|| "invalid UTF-8 JSON string".to_owned())?;
                     output.push(character);
                     self.pos = start + character.len_utf8();
                 }
             }
         }
-        Err(AuditError::Github("unterminated JSON string".into()))
+        Err("unterminated JSON string".into())
     }
 
-    fn number(&mut self) -> Result<JsonValue, AuditError> {
+    fn number(&mut self) -> Result<JsonValue, String> {
         let start = self.pos;
         while self.pos < self.bytes.len()
             && matches!(
@@ -1337,11 +1777,11 @@ impl JsonParser<'_> {
             self.pos += 1;
         }
         let text = std::str::from_utf8(&self.bytes[start..self.pos])
-            .map_err(|_| AuditError::Github("invalid JSON number".into()))?;
+            .map_err(|_| "invalid JSON number".to_owned())?;
         Ok(JsonValue::Number(text.to_owned()))
     }
 
-    fn array(&mut self) -> Result<JsonValue, AuditError> {
+    fn array(&mut self) -> Result<JsonValue, String> {
         self.pos += 1;
         let mut values = Vec::new();
         loop {
@@ -1358,13 +1798,13 @@ impl JsonParser<'_> {
                     self.pos += 1;
                     break;
                 }
-                _ => return Err(AuditError::Github("invalid JSON array".into())),
+                _ => return Err("invalid JSON array".into()),
             }
         }
         Ok(JsonValue::Array(values))
     }
 
-    fn object(&mut self) -> Result<JsonValue, AuditError> {
+    fn object(&mut self) -> Result<JsonValue, String> {
         self.pos += 1;
         let mut values = BTreeMap::new();
         loop {
@@ -1374,16 +1814,18 @@ impl JsonParser<'_> {
                 break;
             }
             if self.bytes.get(self.pos) != Some(&b'"') {
-                return Err(AuditError::Github("invalid JSON object key".into()));
+                return Err("invalid JSON object key".into());
             }
             let key = self.string()?;
             self.ws();
             if self.bytes.get(self.pos) != Some(&b':') {
-                return Err(AuditError::Github("missing JSON object colon".into()));
+                return Err("missing JSON object colon".into());
             }
             self.pos += 1;
             let value = self.value()?;
-            values.insert(key, value);
+            if values.insert(key, value).is_some() {
+                return Err("duplicate JSON object key".into());
+            }
             self.ws();
             match self.bytes.get(self.pos) {
                 Some(b',') => self.pos += 1,
@@ -1391,7 +1833,7 @@ impl JsonParser<'_> {
                     self.pos += 1;
                     break;
                 }
-                _ => return Err(AuditError::Github("invalid JSON object".into())),
+                _ => return Err("invalid JSON object".into()),
             }
         }
         Ok(JsonValue::Object(values))
@@ -1401,6 +1843,294 @@ impl JsonParser<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PINNED_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const IMPLEMENTATION_SHA: &str = "1111111111111111111111111111111111111111";
+    const TASK_PATH: &str = "tasks/ZACH-002-audit-governance-task-integration.md";
+    const RUN_PATH: &str =
+        "runs/ZACH-002/20260823-133201-audit-governance-task-integration.md";
+
+    #[derive(Clone)]
+    struct FixtureSet {
+        files: BTreeMap<String, String>,
+    }
+
+    impl FixtureSet {
+        fn phase_1a() -> Self {
+            let manifest = r#"schema_version: 2
+ledger:
+  canonical:
+    tasks: tasks/*.md
+    runs: runs/*/*.md
+  discovery:
+    global_tasks: indexes/tasks.yaml
+    project_tasks: indexes/tasks/<project>.yaml
+    generator: bin/ws-generate-task-indexes
+    canonical_record_wins_on_disagreement: true
+projects:
+- id: zach
+  repository: shockerqt/zach
+"#;
+            let global = r#"{
+  "schema_version": 1,
+  "generator": "bin/ws-generate-task-indexes",
+  "source": "tasks/*.md",
+  "projects": [
+    {"project":"zach","index":"indexes/tasks/zach.yaml","task_ids":["ZACH-002"]}
+  ]
+}"#;
+            let shard = r#"{
+  "schema_version": 1,
+  "generator": "bin/ws-generate-task-indexes",
+  "project": "zach",
+  "tasks": [
+    {"id":"ZACH-002","title":"Audit","summary":"stale","status":"planned","path":"tasks/ZACH-002-audit-governance-task-integration.md","branch":null}
+  ]
+}"#;
+            let task = r#"---
+kind: task
+schema_version: 1
+id: ZACH-002
+project: zach
+status: active
+status_history: [planned, active]
+target_repository: zach
+branch: task/ZACH-002-audit-governance-task-integration
+---
+
+# Audit
+
+## Runs
+
+- [ZACH-002-20260823-133201-audit-governance-task-integration](../runs/ZACH-002/20260823-133201-audit-governance-task-integration.md)
+"#;
+            let run = format!(
+                r#"---
+kind: run
+schema_version: 1
+id: ZACH-002-20260823-133201-audit-governance-task-integration
+task: ZACH-002
+status: completed
+status_history: [active, completed]
+run_type: execution
+execution_profile: github-connector
+---
+
+# Run
+
+## Remote publication evidence
+
+```yaml
+publication:
+  published_after_sha: {IMPLEMENTATION_SHA}
+```
+
+## Remote terminal evidence
+
+```yaml
+terminal:
+  implementation_sha: {IMPLEMENTATION_SHA}
+  ci_sha: {IMPLEMENTATION_SHA}
+  ci_conclusion: success
+  pull_request_url: https://github.com/shockerqt/zach/pull/2
+  pull_request_head_sha: {IMPLEMENTATION_SHA}
+```
+"#
+            );
+            let projects = r#"schema_version: 2
+projects:
+- repository: zach
+  clone_url: https://github.com/shockerqt/zach
+  default_branch: main
+"#;
+            let mut files = BTreeMap::new();
+            files.insert("governance-manifest.yaml".into(), manifest.into());
+            files.insert("indexes/tasks.yaml".into(), global.into());
+            files.insert("indexes/tasks/zach.yaml".into(), shard.into());
+            files.insert(TASK_PATH.into(), task.into());
+            files.insert(RUN_PATH.into(), run);
+            files.insert("projects.yaml".into(), projects.into());
+            Self { files }
+        }
+    }
+
+    struct FixtureReader {
+        files: BTreeMap<String, String>,
+        reads: Vec<(String, String)>,
+    }
+
+    impl FixtureReader {
+        fn new(fixtures: FixtureSet) -> Self {
+            Self {
+                files: fixtures.files,
+                reads: Vec::new(),
+            }
+        }
+    }
+
+    impl GovernanceReader for FixtureReader {
+        fn read(&mut self, path: &str, governance_sha: &str) -> Result<String, AuditError> {
+            self.reads.push((path.into(), governance_sha.into()));
+            self.files.get(path).cloned().ok_or_else(|| {
+                AuditError::CanonicalState(format!("fixture has no file {path}"))
+            })
+        }
+    }
+
+    fn resolve(fixtures: FixtureSet) -> Result<(CanonicalGovernanceState, FixtureReader), AuditError> {
+        let mut reader = FixtureReader::new(fixtures);
+        let state = resolve_governance_state(&mut reader, PINNED_SHA, "ZACH-002")?;
+        Ok((state, reader))
+    }
+
+    #[test]
+    fn phase_1a_schema_v2_bootstrap_discovers_task_and_runs() {
+        let (state, reader) = resolve(FixtureSet::phase_1a()).unwrap();
+        assert!(reader.reads.iter().any(|(path, _)| path == TASK_PATH));
+        assert!(reader
+            .reads
+            .iter()
+            .any(|(path, _)| path == "indexes/tasks/zach.yaml"));
+        assert_eq!(state.runs.len(), 1);
+        let selected = select_audited_implementation(&state.runs).unwrap();
+        assert_eq!(selected.implementation_sha, IMPLEMENTATION_SHA);
+    }
+
+    #[test]
+    fn canonical_task_metadata_wins_over_stale_derived_index_metadata() {
+        let (state, _) = resolve(FixtureSet::phase_1a()).unwrap();
+        assert_eq!(
+            state.canonical_branch,
+            "task/ZACH-002-audit-governance-task-integration"
+        );
+        assert_eq!(state.target_repository, "shockerqt/zach");
+    }
+
+    #[test]
+    fn task_absent_from_global_index_fails_closed() {
+        let mut fixtures = FixtureSet::phase_1a();
+        let global = fixtures.files.get_mut("indexes/tasks.yaml").unwrap();
+        *global = global.replace("\"ZACH-002\"", "\"ZACH-001\"");
+        assert!(matches!(
+            resolve(fixtures),
+            Err(AuditError::CanonicalState(message)) if message.contains("absent from the global task index")
+        ));
+    }
+
+    #[test]
+    fn task_membership_in_multiple_project_shards_is_ambiguous() {
+        let mut fixtures = FixtureSet::phase_1a();
+        fixtures.files.insert(
+            "indexes/tasks.yaml".into(),
+            r#"{"schema_version":1,"projects":[
+              {"project":"zach","index":"indexes/tasks/zach.yaml","task_ids":["ZACH-002"]},
+              {"project":"governance","index":"indexes/tasks/governance.yaml","task_ids":["ZACH-002"]}
+            ]}"#
+                .into(),
+        );
+        assert!(matches!(
+            resolve(fixtures),
+            Err(AuditError::AmbiguousEvidence(message)) if message.contains("multiple project shards")
+        ));
+    }
+
+    #[test]
+    fn duplicate_task_entry_inside_project_shard_is_ambiguous() {
+        let mut fixtures = FixtureSet::phase_1a();
+        fixtures.files.insert(
+            "indexes/tasks/zach.yaml".into(),
+            r#"{"schema_version":1,"project":"zach","tasks":[
+              {"id":"ZACH-002","path":"tasks/ZACH-002-audit-governance-task-integration.md"},
+              {"id":"ZACH-002","path":"tasks/ZACH-002-other.md"}
+            ]}"#
+                .into(),
+        );
+        assert!(matches!(
+            resolve(fixtures),
+            Err(AuditError::AmbiguousEvidence(message)) if message.contains("duplicate entries")
+        ));
+    }
+
+    #[test]
+    fn canonical_task_id_mismatch_is_rejected() {
+        let mut fixtures = FixtureSet::phase_1a();
+        let task = fixtures.files.get_mut(TASK_PATH).unwrap();
+        *task = task.replace("id: ZACH-002", "id: ZACH-003");
+        assert!(matches!(
+            resolve(fixtures),
+            Err(AuditError::CanonicalState(message)) if message.contains("does not match requested")
+        ));
+    }
+
+    #[test]
+    fn canonical_runs_are_discovered_from_structured_task_links() {
+        let (state, _) = resolve(FixtureSet::phase_1a()).unwrap();
+        assert_eq!(state.runs[0].run_path, RUN_PATH);
+    }
+
+    #[test]
+    fn duplicate_run_link_or_path_is_ambiguous() {
+        let mut fixtures = FixtureSet::phase_1a();
+        let task = fixtures.files.get_mut(TASK_PATH).unwrap();
+        let link = "- [ZACH-002-20260823-133201-audit-governance-task-integration](../runs/ZACH-002/20260823-133201-audit-governance-task-integration.md)";
+        task.push_str(link);
+        task.push('\n');
+        assert!(matches!(
+            resolve(fixtures),
+            Err(AuditError::AmbiguousEvidence(message)) if message.contains("duplicate or ambiguous run links")
+        ));
+    }
+
+    #[test]
+    fn linked_run_belonging_to_another_task_is_rejected() {
+        let mut fixtures = FixtureSet::phase_1a();
+        let run = fixtures.files.get_mut(RUN_PATH).unwrap();
+        *run = run.replace("task: ZACH-002", "task: ZACH-001");
+        assert!(matches!(
+            resolve(fixtures),
+            Err(AuditError::CanonicalState(message)) if message.contains("belongs to task")
+        ));
+    }
+
+    #[test]
+    fn every_governance_content_read_is_pinned_to_one_sha() {
+        let (_, reader) = resolve(FixtureSet::phase_1a()).unwrap();
+        assert!(reader.reads.len() >= 6);
+        assert!(reader.reads.iter().all(|(_, sha)| sha == PINNED_SHA));
+    }
+
+    #[test]
+    fn unsupported_manifest_schema_has_no_legacy_fallback() {
+        let mut fixtures = FixtureSet::phase_1a();
+        let manifest = fixtures.files.get_mut("governance-manifest.yaml").unwrap();
+        *manifest = manifest.replace("schema_version: 2", "schema_version: 1");
+        assert!(matches!(
+            resolve(fixtures),
+            Err(AuditError::CanonicalState(message)) if message.contains("no legacy fallback")
+        ));
+    }
+
+    #[test]
+    fn inconsistent_global_index_routing_is_rejected() {
+        let mut fixtures = FixtureSet::phase_1a();
+        let global = fixtures.files.get_mut("indexes/tasks.yaml").unwrap();
+        *global = global.replace("indexes/tasks/zach.yaml", "indexes/tasks/wrong.yaml");
+        assert!(matches!(
+            resolve(fixtures),
+            Err(AuditError::CanonicalState(message)) if message.contains("manifest routing requires")
+        ));
+    }
+
+    #[test]
+    fn conflicting_run_task_aliases_are_ambiguous() {
+        let mut fixtures = FixtureSet::phase_1a();
+        let run = fixtures.files.get_mut(RUN_PATH).unwrap();
+        *run = run.replace("task: ZACH-002", "task: ZACH-002\ntask_id: ZACH-001");
+        assert!(matches!(
+            resolve(fixtures),
+            Err(AuditError::AmbiguousEvidence(message)) if message.contains("aliases disagree")
+        ));
+    }
 
     fn implementation(path: &str, sha: &str) -> RunEvidence {
         RunEvidence {
