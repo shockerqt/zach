@@ -595,7 +595,8 @@ struct GithubGovernanceReader<'a, 'b> {
 
 impl GovernanceReader for GithubGovernanceReader<'_, '_> {
     fn read(&mut self, path: &str, governance_sha: &str) -> Result<String, AuditError> {
-        self.github.raw_content(self.repository, path, governance_sha)
+        self.github
+            .raw_content(self.repository, path, governance_sha)
     }
 }
 
@@ -724,13 +725,13 @@ fn parse_manifest_discovery(manifest: &str) -> Result<DiscoveryRouting, AuditErr
             AuditError::CanonicalState("manifest ledger.discovery.global_tasks is missing".into())
         })?;
     validate_repository_path(&global_tasks, "global task index")?;
-    let project_tasks_template =
-        yaml_scalar_at_path(manifest, &["ledger", "discovery", "project_tasks"])?
-            .ok_or_else(|| {
-                AuditError::CanonicalState(
-                    "manifest ledger.discovery.project_tasks is missing".into(),
-                )
-            })?;
+    let project_tasks_template = yaml_scalar_at_path(
+        manifest,
+        &["ledger", "discovery", "project_tasks"],
+    )?
+    .ok_or_else(|| {
+        AuditError::CanonicalState("manifest ledger.discovery.project_tasks is missing".into())
+    })?;
     validate_project_index_template(&project_tasks_template)?;
     Ok(DiscoveryRouting {
         global_tasks,
@@ -881,13 +882,13 @@ fn resolve_global_task_membership(
         0 => {
             return Err(AuditError::CanonicalState(format!(
                 "task {task_id} is absent from the global task index"
-            )))
+            )));
         }
         1 => memberships.pop().expect("membership length checked"),
         _ => {
             return Err(AuditError::AmbiguousEvidence(format!(
                 "task {task_id} belongs to multiple project shards in the global task index"
-            )))
+            )));
         }
     };
     let expected = project_index_path(&routing.project_tasks_template, &membership.project)?;
@@ -931,13 +932,13 @@ fn resolve_project_shard(text: &str, project: &str, task_id: &str) -> Result<Str
         0 => {
             return Err(AuditError::CanonicalState(format!(
                 "task {task_id} is absent from routed project shard {project}"
-            )))
+            )));
         }
         1 => matches.pop().expect("shard match length checked"),
         _ => {
             return Err(AuditError::AmbiguousEvidence(format!(
                 "task {task_id} has duplicate entries in project shard {project}"
-            )))
+            )));
         }
     };
     validate_repository_path(&path, "canonical task path")?;
@@ -956,8 +957,9 @@ struct RunLink {
 }
 
 fn parse_task_run_links(markdown: &str, task_id: &str) -> Result<Vec<RunLink>, AuditError> {
-    let section = markdown_section(markdown, "## Runs")?
-        .ok_or_else(|| AuditError::CanonicalState("canonical task has no ## Runs section".into()))?;
+    let section = markdown_section(markdown, "## Runs")?.ok_or_else(|| {
+        AuditError::CanonicalState("canonical task has no ## Runs section".into())
+    })?;
     let mut result = Vec::new();
     let mut ids = BTreeSet::new();
     let mut paths = BTreeSet::new();
@@ -1074,14 +1076,15 @@ fn parse_run_evidence(path: &str, markdown: &str) -> Result<Option<RunEvidence>,
     let Some(terminal) = markdown_section(markdown, "## Remote terminal evidence")? else {
         return Ok(None);
     };
-    let role = if let Some(integration) = markdown_section(markdown, "## Remote integration evidence")? {
-        RunEvidenceRole::IntegrationAudit {
-            audited_implementation_sha: required_scalar(&integration, "implementation_sha:")?,
-            audited_pull_request_url: required_scalar(&integration, "pull_request_url:")?,
-        }
-    } else {
-        RunEvidenceRole::Implementation
-    };
+    let role =
+        if let Some(integration) = markdown_section(markdown, "## Remote integration evidence")? {
+            RunEvidenceRole::IntegrationAudit {
+                audited_implementation_sha: required_scalar(&integration, "implementation_sha:")?,
+                audited_pull_request_url: required_scalar(&integration, "pull_request_url:")?,
+            }
+        } else {
+            RunEvidenceRole::Implementation
+        };
     Ok(Some(RunEvidence {
         run_path: path.to_owned(),
         publication_sha: required_scalar(&publication, "published_after_sha:")?,
@@ -1847,8 +1850,7 @@ mod tests {
     const PINNED_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const IMPLEMENTATION_SHA: &str = "1111111111111111111111111111111111111111";
     const TASK_PATH: &str = "tasks/ZACH-002-audit-governance-task-integration.md";
-    const RUN_PATH: &str =
-        "runs/ZACH-002/20260823-133201-audit-governance-task-integration.md";
+    const RUN_PATH: &str = "runs/ZACH-002/20260823-133201-audit-governance-task-integration.md";
 
     #[derive(Clone)]
     struct FixtureSet {
@@ -1971,13 +1973,16 @@ projects:
     impl GovernanceReader for FixtureReader {
         fn read(&mut self, path: &str, governance_sha: &str) -> Result<String, AuditError> {
             self.reads.push((path.into(), governance_sha.into()));
-            self.files.get(path).cloned().ok_or_else(|| {
-                AuditError::CanonicalState(format!("fixture has no file {path}"))
-            })
+            self.files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| AuditError::CanonicalState(format!("fixture has no file {path}")))
         }
     }
 
-    fn resolve(fixtures: FixtureSet) -> Result<(CanonicalGovernanceState, FixtureReader), AuditError> {
+    fn resolve(
+        fixtures: FixtureSet,
+    ) -> Result<(CanonicalGovernanceState, FixtureReader), AuditError> {
         let mut reader = FixtureReader::new(fixtures);
         let state = resolve_governance_state(&mut reader, PINNED_SHA, "ZACH-002")?;
         Ok((state, reader))
@@ -1987,10 +1992,12 @@ projects:
     fn phase_1a_schema_v2_bootstrap_discovers_task_and_runs() {
         let (state, reader) = resolve(FixtureSet::phase_1a()).unwrap();
         assert!(reader.reads.iter().any(|(path, _)| path == TASK_PATH));
-        assert!(reader
-            .reads
-            .iter()
-            .any(|(path, _)| path == "indexes/tasks/zach.yaml"));
+        assert!(
+            reader
+                .reads
+                .iter()
+                .any(|(path, _)| path == "indexes/tasks/zach.yaml")
+        );
         assert_eq!(state.runs.len(), 1);
         let selected = select_audited_implementation(&state.runs).unwrap();
         assert_eq!(selected.implementation_sha, IMPLEMENTATION_SHA);
@@ -2043,7 +2050,7 @@ projects:
               {"id":"ZACH-002","path":"tasks/ZACH-002-audit-governance-task-integration.md"},
               {"id":"ZACH-002","path":"tasks/ZACH-002-other.md"}
             ]}"#
-                .into(),
+            .into(),
         );
         assert!(matches!(
             resolve(fixtures),
