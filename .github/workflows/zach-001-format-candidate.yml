@@ -55,8 +55,8 @@ jobs:
               '    PinnedGovernanceValidator, TRUSTED_CONTRACT_REVISION, enforce_result_limits,',
               '    PinnedGovernanceValidator, enforce_result_limits,')
           rewrite('src/ledger/mod.rs',
-              '    fn publish_terminal(\n',
-              '    #[allow(clippy::too_many_arguments)] // Private orchestration helper keeps terminal/outbox identities explicit.\n    fn publish_terminal(\n')
+              '    fn publish_terminal(\n        &self,\n        store: &mut SqliteStore,',
+              '    #[allow(clippy::too_many_arguments)] // Private orchestration helper keeps terminal/outbox identities explicit.\n    fn publish_terminal(\n        &self,\n        store: &mut SqliteStore,')
           rewrite('src/ledger/mod.rs', '        terminal_result_id: String,', '        _terminal_result_id: String,')
           rewrite('src/ledger/mod.rs',
               'mod tests {\n    use super::*;\n',
