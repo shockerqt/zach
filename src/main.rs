@@ -1,3 +1,13 @@
+#[allow(
+    dead_code,
+    unused_imports,
+    unused_variables,
+    private_interfaces,
+    private_bounds,
+    clippy::chunks_exact_to_as_chunks,
+    clippy::collapsible_if,
+    clippy::too_many_arguments
+)]
 #[rustfmt::skip]
 mod ledger;
 
