@@ -10,14 +10,8 @@ const SQLITE_OPEN_READWRITE: c_int = 0x0000_0002;
 const SQLITE_OPEN_CREATE: c_int = 0x0000_0004;
 const SQLITE_OPEN_FULLMUTEX: c_int = 0x0001_0000;
 
-type SqliteCallback = Option<
-    unsafe extern "C" fn(
-        *mut c_void,
-        c_int,
-        *mut *mut c_char,
-        *mut *mut c_char,
-    ) -> c_int,
->;
+type SqliteCallback =
+    Option<unsafe extern "C" fn(*mut c_void, c_int, *mut *mut c_char, *mut *mut c_char) -> c_int>;
 
 #[link(name = "sqlite3")]
 unsafe extern "C" {
@@ -196,13 +190,12 @@ impl SqliteStore {
     }
 
     fn claim_inside(&mut self, input: &ClaimInput<'_>) -> Result<Claim, StoreError> {
-        if let Some((request_id, digest, issue)) = self.delivery(input.delivery_id)? {
-            if request_id != input.request_id
+        if let Some((request_id, digest, issue)) = self.delivery(input.delivery_id)?
+            && (request_id != input.request_id
                 || digest != input.request_digest
-                || issue != input.issue_number
-            {
-                return Ok(Claim::DeliveryConflict);
-            }
+                || issue != input.issue_number)
+        {
+            return Ok(Claim::DeliveryConflict);
         }
 
         let issue = self.issue_binding(input.issue_number)?;
@@ -237,7 +230,9 @@ impl SqliteStore {
                     StoreError("terminal SQLite transaction has no persisted receipt".into())
                 })?;
                 let result_id = row.terminal_result_id.clone().ok_or_else(|| {
-                    StoreError("terminal SQLite transaction has no persisted result identity".into())
+                    StoreError(
+                        "terminal SQLite transaction has no persisted result identity".into(),
+                    )
                 })?;
                 return Ok(Claim::Replay {
                     terminal_receipt: receipt,
@@ -423,8 +418,12 @@ impl SqliteStore {
         statement.bind_text(1, delivery_id)?;
         if statement.row()? {
             Ok(Some((
-                statement.text(0)?.ok_or_else(|| StoreError("delivery request_id is NULL".into()))?,
-                statement.text(1)?.ok_or_else(|| StoreError("delivery digest is NULL".into()))?,
+                statement
+                    .text(0)?
+                    .ok_or_else(|| StoreError("delivery request_id is NULL".into()))?,
+                statement
+                    .text(1)?
+                    .ok_or_else(|| StoreError("delivery digest is NULL".into()))?,
                 statement.i64(2),
             )))
         } else {
@@ -500,9 +499,11 @@ impl SqliteStore {
         Ok(PublicationRow {
             state: required_text(&statement, 0, "publication state")?,
             lease_until: statement.i64(1),
-            comment_id: statement.text(2)?.map(|value| value.parse()).transpose().map_err(
-                |_| StoreError("publication comment id is invalid".into()),
-            )?,
+            comment_id: statement
+                .text(2)?
+                .map(|value| value.parse())
+                .transpose()
+                .map_err(|_| StoreError("publication comment id is invalid".into()))?,
         })
     }
 
@@ -551,13 +552,7 @@ impl SqliteStore {
         let mut statement = ptr::null_mut();
         // SAFETY: db is live and SQL is NUL-terminated; statement points to writable handle storage.
         let status = unsafe {
-            sqlite3_prepare_v2(
-                self.db,
-                sql.as_ptr(),
-                -1,
-                &mut statement,
-                ptr::null_mut(),
-            )
+            sqlite3_prepare_v2(self.db, sql.as_ptr(), -1, &mut statement, ptr::null_mut())
         };
         if status != SQLITE_OK || statement.is_null() {
             Err(StoreError(sqlite_error(self.db)))
@@ -622,8 +617,8 @@ struct Statement {
 
 impl Statement {
     fn bind_text(&mut self, index: c_int, value: &str) -> Result<(), StoreError> {
-        let value = CString::new(value)
-            .map_err(|_| StoreError("SQLite bound text contains NUL".into()))?;
+        let value =
+            CString::new(value).map_err(|_| StoreError("SQLite bound text contains NUL".into()))?;
         self.bound_text.push(value);
         let pointer = self
             .bound_text
@@ -766,7 +761,12 @@ mod tests {
         let db = TestDb::new();
         {
             let mut store = SqliteStore::open(&db.0).unwrap();
-            assert_eq!(store.claim(&input("delivery-a", "instance-a", 100)).unwrap(), Claim::Execute);
+            assert_eq!(
+                store
+                    .claim(&input("delivery-a", "instance-a", 100))
+                    .unwrap(),
+                Claim::Execute
+            );
             store
                 .complete(
                     "request-0001",
@@ -779,7 +779,9 @@ mod tests {
         }
         let mut reopened = SqliteStore::open(&db.0).unwrap();
         assert_eq!(
-            reopened.claim(&input("delivery-b", "instance-b", 101)).unwrap(),
+            reopened
+                .claim(&input("delivery-b", "instance-b", 101))
+                .unwrap(),
             Claim::Replay {
                 terminal_receipt: "terminal-receipt".into(),
                 terminal_result_id: "result-a".into(),
@@ -791,7 +793,12 @@ mod tests {
     fn conflicting_request_id_is_atomic() {
         let db = TestDb::new();
         let mut store = SqliteStore::open(&db.0).unwrap();
-        assert_eq!(store.claim(&input("delivery-a", "instance-a", 100)).unwrap(), Claim::Execute);
+        assert_eq!(
+            store
+                .claim(&input("delivery-a", "instance-a", 100))
+                .unwrap(),
+            Claim::Execute
+        );
         let conflicting = ClaimInput {
             request_digest: "digest-b",
             issue_number: 8,
@@ -807,11 +814,18 @@ mod tests {
     fn expired_execution_lease_becomes_ambiguous_recovery_not_reexecution() {
         let db = TestDb::new();
         let mut first = SqliteStore::open(&db.0).unwrap();
-        assert_eq!(first.claim(&input("delivery-a", "instance-a", 100)).unwrap(), Claim::Execute);
+        assert_eq!(
+            first
+                .claim(&input("delivery-a", "instance-a", 100))
+                .unwrap(),
+            Claim::Execute
+        );
         drop(first);
         let mut restarted = SqliteStore::open(&db.0).unwrap();
         assert_eq!(
-            restarted.claim(&input("delivery-b", "instance-b", 111)).unwrap(),
+            restarted
+                .claim(&input("delivery-b", "instance-b", 111))
+                .unwrap(),
             Claim::AmbiguousRecovery
         );
     }
@@ -820,7 +834,12 @@ mod tests {
     fn delivery_id_is_transport_identity_not_request_identity() {
         let db = TestDb::new();
         let mut store = SqliteStore::open(&db.0).unwrap();
-        assert_eq!(store.claim(&input("delivery-a", "instance-a", 100)).unwrap(), Claim::Execute);
+        assert_eq!(
+            store
+                .claim(&input("delivery-a", "instance-a", 100))
+                .unwrap(),
+            Claim::Execute
+        );
         let reused_delivery = ClaimInput {
             request_id: "request-0002",
             request_digest: "digest-b",
@@ -829,6 +848,9 @@ mod tests {
             canonical_identity: "digest-b",
             ..input("delivery-a", "instance-b", 101)
         };
-        assert_eq!(store.claim(&reused_delivery).unwrap(), Claim::DeliveryConflict);
+        assert_eq!(
+            store.claim(&reused_delivery).unwrap(),
+            Claim::DeliveryConflict
+        );
     }
 }

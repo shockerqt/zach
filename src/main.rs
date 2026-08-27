@@ -1,14 +1,3 @@
-#[allow(
-    dead_code,
-    unused_imports,
-    unused_variables,
-    private_interfaces,
-    private_bounds,
-    clippy::chunks_exact_to_as_chunks,
-    clippy::collapsible_if,
-    clippy::too_many_arguments
-)]
-#[rustfmt::skip]
 mod ledger;
 
 use std::env;
@@ -38,7 +27,9 @@ fn main() {
     match command {
         "--health" => println!("zach: healthy"),
         "--config" => println!("bind_addr={}", config.bind_addr),
-        "governance.validate-ledger" => run_ledger_validator(&config),
+        operation if ledger::PUBLIC_WEBHOOK_OPERATIONS.contains(&operation) => {
+            run_ledger_validator(&config)
+        }
         "governance.audit-task-integration" => run_audit(&args[2..]),
         "--help" | "-h" => print_usage(),
         unknown => {
@@ -93,7 +84,7 @@ fn usage_error(message: &str) -> ! {
 
 fn print_usage() {
     println!("Usage: zach [--health | --config]");
-    println!("       zach governance.validate-ledger");
+    println!("       zach {}", ledger::PUBLIC_WEBHOOK_OPERATIONS[0]);
     println!(
         "       zach governance.audit-task-integration --task-id <TASK-ID> --request-id <REQUEST-ID>"
     );

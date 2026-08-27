@@ -3,20 +3,21 @@ mod publisher;
 mod store;
 mod validator;
 
-use json::{Json, hmac_sha256_hex, jcs, object_get, object_string, object_u64, sha256_hex, verify_github_signature};
-use publisher::{GithubAppReceiptPublisher, GithubCredential, ReceiptPublisher, TrustedReceiptAuth};
+use json::{Json, jcs, object_get, object_string, object_u64, sha256_hex, verify_github_signature};
+use publisher::{
+    GithubAppReceiptPublisher, GithubCredential, ReceiptPublisher, TrustedReceiptAuth,
+};
 use std::env;
 use std::fmt;
-use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use store::{Claim, ClaimInput, PublicationClaim, SqliteStore};
 use validator::{
     ChangeOperation, LedgerChange, LedgerRequest, LedgerValidator, MAX_RECEIPT_UTF8_BYTES,
-    PinnedGovernanceValidator, TRUSTED_CONTRACT_REVISION, enforce_result_limits,
+    PinnedGovernanceValidator, enforce_result_limits,
 };
 
 pub const PUBLIC_WEBHOOK_OPERATIONS: &[&str] = &["governance.validate-ledger"];
@@ -133,11 +134,7 @@ where
     }
 
     pub fn handle(&self, headers: &WebhookHeaders, raw_body: &[u8]) -> WebhookOutcome {
-        if !verify_github_signature(
-            &self.webhook_secret,
-            raw_body,
-            headers.signature_256.trim(),
-        ) {
+        if !verify_github_signature(&self.webhook_secret, raw_body, headers.signature_256.trim()) {
             return WebhookOutcome::simple(401, "signature-invalid");
         }
         if headers.event != "issues" {
@@ -298,13 +295,14 @@ where
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // Private orchestration helper keeps terminal/outbox identities explicit.
     fn publish_terminal(
         &self,
         store: &mut SqliteStore,
         request: &LedgerRequest,
         issue_number: u64,
         terminal_receipt: String,
-        terminal_result_id: String,
+        _terminal_result_id: String,
         replayed: bool,
         now_epoch: i64,
     ) -> WebhookOutcome {
@@ -434,8 +432,8 @@ fn parse_canonical_request(body: &str) -> Result<AcceptedRequest, &'static str> 
     {
         return Err("request-envelope-invalid");
     }
-    let declared_digest = object_string(envelope_object, "request_digest")
-        .ok_or("request-digest-invalid")?;
+    let declared_digest =
+        object_string(envelope_object, "request_digest").ok_or("request-digest-invalid")?;
     if !hex64(declared_digest) {
         return Err("request-digest-invalid");
     }
@@ -464,8 +462,8 @@ fn parse_canonical_request(body: &str) -> Result<AcceptedRequest, &'static str> 
     let created_at = object_string(request_object, "created_at").ok_or("request-time-invalid")?;
     let expires_at = object_string(request_object, "expires_at").ok_or("request-time-invalid")?;
     let base_sha = object_string(request_object, "base_sha").ok_or("base-sha-invalid")?;
-    let contract_revision = object_string(request_object, "contract_revision")
-        .ok_or("contract-revision-invalid")?;
+    let contract_revision =
+        object_string(request_object, "contract_revision").ok_or("contract-revision-invalid")?;
     if !sha40(base_sha) || !sha40(contract_revision) {
         return Err("request-invalid");
     }
@@ -499,9 +497,7 @@ fn parse_canonical_request(body: &str) -> Result<AcceptedRequest, &'static str> 
 
 fn require_exact_keys(object: &[(String, Json)], expected: &[&str]) -> Result<(), &'static str> {
     if object.len() != expected.len()
-        || expected
-            .iter()
-            .any(|key| object_get(object, key).is_none())
+        || expected.iter().any(|key| object_get(object, key).is_none())
     {
         return Err("request-invalid");
     }
@@ -520,30 +516,31 @@ fn build_success_receipt(
     mut changes: Vec<LedgerChange>,
     validated_tree_sha: &str,
 ) -> TerminalReceipt {
-    if validator_revision.len() != 40
-        || !sha40(validator_revision)
-        || !sha40(validated_tree_sha)
-    {
+    if validator_revision.len() != 40 || !sha40(validator_revision) || !sha40(validated_tree_sha) {
         return build_rejection_receipt(request, validator_revision, "validator-output-invalid");
     }
     changes.sort_by(|left, right| left.path.cmp(&right.path));
-    if changes
-        .windows(2)
-        .any(|pair| pair[0].path == pair[1].path)
+    if changes.windows(2).any(|pair| pair[0].path == pair[1].path)
         || enforce_result_limits(&changes).is_err()
     {
         return build_rejection_receipt(request, validator_revision, "result-too-large");
     }
-    let changes_json = changes
-        .iter()
-        .map(change_json)
-        .collect::<Vec<_>>();
+    let changes_json = changes.iter().map(change_json).collect::<Vec<_>>();
     let core = Json::Object(vec![
-        ("kind".into(), Json::String("governance-ledger-receipt".into())),
+        (
+            "kind".into(),
+            Json::String("governance-ledger-receipt".into()),
+        ),
         ("schema_version".into(), Json::Number("1".into())),
         ("status".into(), Json::String("succeeded".into())),
-        ("request_id".into(), Json::String(request.request_id.clone())),
-        ("request_digest".into(), Json::String(request.request_digest.clone())),
+        (
+            "request_id".into(),
+            Json::String(request.request_id.clone()),
+        ),
+        (
+            "request_digest".into(),
+            Json::String(request.request_digest.clone()),
+        ),
         ("base_sha".into(), Json::String(request.base_sha.clone())),
         (
             "contract_revision".into(),
@@ -571,11 +568,20 @@ fn build_rejection_receipt(
     reason: &str,
 ) -> TerminalReceipt {
     let core = Json::Object(vec![
-        ("kind".into(), Json::String("governance-ledger-receipt".into())),
+        (
+            "kind".into(),
+            Json::String("governance-ledger-receipt".into()),
+        ),
         ("schema_version".into(), Json::Number("1".into())),
         ("status".into(), Json::String("rejected".into())),
-        ("request_id".into(), Json::String(request.request_id.clone())),
-        ("request_digest".into(), Json::String(request.request_digest.clone())),
+        (
+            "request_id".into(),
+            Json::String(request.request_id.clone()),
+        ),
+        (
+            "request_digest".into(),
+            Json::String(request.request_digest.clone()),
+        ),
         ("base_sha".into(), Json::String(request.base_sha.clone())),
         (
             "contract_revision".into(),
@@ -603,10 +609,7 @@ fn finalize_receipt(mut core: Json) -> Result<TerminalReceipt, ServiceError> {
         Json::Object(value) => value,
         _ => return Err(ServiceError("receipt core is not an object".into())),
     };
-    object.push((
-        "terminal_result_id".into(),
-        Json::String(result_id.clone()),
-    ));
+    object.push(("terminal_result_id".into(), Json::String(result_id.clone())));
     let payload = jcs(&core).map_err(|error| ServiceError(error.to_string()))?;
     Ok(TerminalReceipt {
         body: format!("{RECEIPT_MARKER}\n```json\n{payload}\n```\n"),
@@ -681,10 +684,9 @@ fn parse_utc_epoch(value: &str) -> Option<i64> {
     if second > 59 || day == 0 || day > days_in_month(year, month) {
         return None;
     }
-    let days = days_before_year(year)
-        + i64::from(days_before_month(year, month))
-        + i64::from(day - 1)
-        - days_before_year(1970);
+    let days =
+        days_before_year(year) + i64::from(days_before_month(year, month)) + i64::from(day - 1)
+            - days_before_year(1970);
     Some(days * 86_400 + i64::from(hour * 3600 + minute * 60 + second))
 }
 
@@ -739,13 +741,9 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
 
 fn valid_request_id(value: &str) -> bool {
     (8..=128).contains(&value.len())
-        && value
-            .bytes()
-            .enumerate()
-            .all(|(index, byte)| {
-                byte.is_ascii_alphanumeric()
-                    || (index > 0 && matches!(byte, b'.' | b'_' | b':' | b'-'))
-            })
+        && value.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphanumeric() || (index > 0 && matches!(byte, b'.' | b'_' | b':' | b'-'))
+        })
 }
 
 fn valid_delivery_id(value: &str) -> bool {
@@ -795,8 +793,8 @@ pub fn serve_from_env(bind_addr: &str) -> Result<(), ServiceError> {
         app_id,
     })
     .map_err(|error| ServiceError(error.to_string()))?;
-    let validator = PinnedGovernanceValidator::new(mirror)
-        .map_err(|error| ServiceError(error.to_string()))?;
+    let validator =
+        PinnedGovernanceValidator::new(mirror).map_err(|error| ServiceError(error.to_string()))?;
     let publisher = GithubAppReceiptPublisher::new(GOVERNANCE_REPOSITORY.into())
         .map_err(|error| ServiceError(error.to_string()))?;
     let clock = SystemClock;
@@ -908,7 +906,9 @@ fn read_http_request(stream: &mut TcpStream) -> Result<(WebhookHeaders, Vec<u8>)
     }
     let length = length.ok_or_else(|| ServiceError("Content-Length is required".into()))?;
     if length > MAX_HTTP_BODY_BYTES {
-        return Err(ServiceError("webhook body exceeds configured hard limit".into()));
+        return Err(ServiceError(
+            "webhook body exceeds configured hard limit".into(),
+        ));
     }
     while bytes.len() - header_end < length {
         let count = stream
@@ -922,7 +922,8 @@ fn read_http_request(stream: &mut TcpStream) -> Result<(WebhookHeaders, Vec<u8>)
     let body = bytes[header_end..header_end + length].to_vec();
     Ok((
         WebhookHeaders {
-            signature_256: signature.ok_or_else(|| ServiceError("missing signature header".into()))?,
+            signature_256: signature
+                .ok_or_else(|| ServiceError("missing signature header".into()))?,
             delivery_id: delivery.ok_or_else(|| ServiceError("missing delivery header".into()))?,
             event: event.ok_or_else(|| ServiceError("missing event header".into()))?,
         },
@@ -932,7 +933,11 @@ fn read_http_request(stream: &mut TcpStream) -> Result<(WebhookHeaders, Vec<u8>)
 
 #[cfg(test)]
 mod tests {
+    use super::json::hmac_sha256_hex;
+    use super::validator::TRUSTED_CONTRACT_REVISION;
     use super::*;
+    use std::fs;
+    use std::path::Path;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -1106,7 +1111,10 @@ mod tests {
             ("request_digest".into(), Json::String(digest)),
             ("request".into(), request),
         ]);
-        format!("{REQUEST_MARKER}\n```json\n{}\n```\n", jcs(&envelope).unwrap())
+        format!(
+            "{REQUEST_MARKER}\n```json\n{}\n```\n",
+            jcs(&envelope).unwrap()
+        )
     }
 
     fn webhook_body(issue_number: u64, action: &str, issue_body: &str) -> Vec<u8> {
@@ -1142,7 +1150,9 @@ mod tests {
     fn default_validator(calls: Arc<AtomicUsize>) -> FakeValidator {
         FakeValidator {
             calls,
-            result: Arc::new(Mutex::new(Ok(validator_result(vec![one_change("active\n")])))),
+            result: Arc::new(Mutex::new(Ok(validator_result(vec![one_change(
+                "active\n",
+            )])))),
             sleep_ms: 0,
         }
     }
@@ -1157,7 +1167,13 @@ mod tests {
         let db = TestDb::new();
         let calls = Arc::new(AtomicUsize::new(0));
         let publisher = FakePublisher::default();
-        let service = service(&db.0, default_validator(Arc::clone(&calls)), publisher.clone(), FixedClock(NOW), "a");
+        let service = service(
+            &db.0,
+            default_validator(Arc::clone(&calls)),
+            publisher.clone(),
+            FixedClock(NOW),
+            "a",
+        );
         let request = canonical_request(
             "request-allowed-0001",
             "task.transition_status",
@@ -1169,7 +1185,12 @@ mod tests {
         let body = webhook_body(1, "opened", &issue_body(request, None));
         let outcome = service.handle(&headers(&body, "delivery-a"), &body);
         assert_eq!(outcome.status_code, 200);
-        assert!(outcome.terminal_receipt.unwrap().contains("\"status\":\"succeeded\""));
+        assert!(
+            outcome
+                .terminal_receipt
+                .unwrap()
+                .contains("\"status\":\"succeeded\"")
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(publisher.calls.load(Ordering::SeqCst), 1);
     }
@@ -1178,16 +1199,25 @@ mod tests {
     fn invalid_signature_is_rejected_before_json_parsing() {
         let db = TestDb::new();
         let calls = Arc::new(AtomicUsize::new(0));
-        let service = service(&db.0, default_validator(Arc::clone(&calls)), FakePublisher::default(), FixedClock(NOW), "a");
-        let body = b"definitely not json";
-        let outcome = service.handle(
-            &WebhookHeaders {
-                signature_256: "sha256=0000000000000000000000000000000000000000000000000000000000000000".into(),
-                delivery_id: "delivery-a".into(),
-                event: "issues".into(),
-            },
-            body,
+        let service = service(
+            &db.0,
+            default_validator(Arc::clone(&calls)),
+            FakePublisher::default(),
+            FixedClock(NOW),
+            "a",
         );
+        let body = b"definitely not json";
+        let outcome =
+            service.handle(
+                &WebhookHeaders {
+                    signature_256:
+                        "sha256=0000000000000000000000000000000000000000000000000000000000000000"
+                            .into(),
+                    delivery_id: "delivery-a".into(),
+                    event: "issues".into(),
+                },
+                body,
+            );
         assert_eq!(outcome.code, "signature-invalid");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
@@ -1196,7 +1226,13 @@ mod tests {
     fn prohibited_mutation_is_terminally_rejected() {
         let db = TestDb::new();
         let calls = Arc::new(AtomicUsize::new(0));
-        let service = service(&db.0, default_validator(Arc::clone(&calls)), FakePublisher::default(), FixedClock(NOW), "a");
+        let service = service(
+            &db.0,
+            default_validator(Arc::clone(&calls)),
+            FakePublisher::default(),
+            FixedClock(NOW),
+            "a",
+        );
         let request = canonical_request("request-prohibit-1", "repo.delete", Json::Object(vec![]));
         let body = webhook_body(2, "opened", &issue_body(request, None));
         let outcome = service.handle(&headers(&body, "delivery-b"), &body);
@@ -1209,12 +1245,25 @@ mod tests {
     fn request_digest_mismatch_fails_closed() {
         let db = TestDb::new();
         let calls = Arc::new(AtomicUsize::new(0));
-        let service = service(&db.0, default_validator(Arc::clone(&calls)), FakePublisher::default(), FixedClock(NOW), "a");
-        let request = canonical_request("request-digest-1", "task.transition_status", Json::Object(vec![]));
+        let service = service(
+            &db.0,
+            default_validator(Arc::clone(&calls)),
+            FakePublisher::default(),
+            FixedClock(NOW),
+            "a",
+        );
+        let request = canonical_request(
+            "request-digest-1",
+            "task.transition_status",
+            Json::Object(vec![]),
+        );
         let body = webhook_body(
             3,
             "opened",
-            &issue_body(request, Some("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")),
+            &issue_body(
+                request,
+                Some("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+            ),
         );
         let outcome = service.handle(&headers(&body, "delivery-c"), &body);
         assert_eq!(outcome.code, "request-digest-mismatch");
@@ -1226,16 +1275,32 @@ mod tests {
         let db = TestDb::new();
         let calls = Arc::new(AtomicUsize::new(0));
         let publisher = FakePublisher::default();
-        let request = canonical_request("request-replay-1", "task.transition_status", Json::Object(vec![]));
+        let request = canonical_request(
+            "request-replay-1",
+            "task.transition_status",
+            Json::Object(vec![]),
+        );
         let body = webhook_body(4, "opened", &issue_body(request.clone(), None));
         let first_receipt = {
-            let service = service(&db.0, default_validator(Arc::clone(&calls)), publisher.clone(), FixedClock(NOW), "a");
+            let service = service(
+                &db.0,
+                default_validator(Arc::clone(&calls)),
+                publisher.clone(),
+                FixedClock(NOW),
+                "a",
+            );
             service
                 .handle(&headers(&body, "delivery-d"), &body)
                 .terminal_receipt
                 .unwrap()
         };
-        let reopened = service(&db.0, default_validator(Arc::clone(&calls)), publisher.clone(), FixedClock(NOW + 1), "b");
+        let reopened = service(
+            &db.0,
+            default_validator(Arc::clone(&calls)),
+            publisher.clone(),
+            FixedClock(NOW + 1),
+            "b",
+        );
         let replay = reopened.handle(&headers(&body, "delivery-e"), &body);
         assert!(replay.replayed);
         assert_eq!(replay.terminal_receipt.unwrap(), first_receipt);
@@ -1247,11 +1312,30 @@ mod tests {
     fn conflicting_request_id_never_executes_second_transaction() {
         let db = TestDb::new();
         let calls = Arc::new(AtomicUsize::new(0));
-        let service = service(&db.0, default_validator(Arc::clone(&calls)), FakePublisher::default(), FixedClock(NOW), "a");
-        let first = canonical_request("request-conflict-1", "task.transition_status", Json::Object(vec![]));
+        let service = service(
+            &db.0,
+            default_validator(Arc::clone(&calls)),
+            FakePublisher::default(),
+            FixedClock(NOW),
+            "a",
+        );
+        let first = canonical_request(
+            "request-conflict-1",
+            "task.transition_status",
+            Json::Object(vec![]),
+        );
         let first_body = webhook_body(5, "opened", &issue_body(first, None));
-        assert_eq!(service.handle(&headers(&first_body, "delivery-f"), &first_body).status_code, 200);
-        let second = canonical_request("request-conflict-1", "task.append_run", Json::Object(vec![]));
+        assert_eq!(
+            service
+                .handle(&headers(&first_body, "delivery-f"), &first_body)
+                .status_code,
+            200
+        );
+        let second = canonical_request(
+            "request-conflict-1",
+            "task.append_run",
+            Json::Object(vec![]),
+        );
         let second_body = webhook_body(6, "opened", &issue_body(second, None));
         let outcome = service.handle(&headers(&second_body, "delivery-g"), &second_body);
         assert_eq!(outcome.code, "request-id-conflict");
@@ -1262,11 +1346,27 @@ mod tests {
     fn first_issue_request_is_immutable_after_body_edit() {
         let db = TestDb::new();
         let calls = Arc::new(AtomicUsize::new(0));
-        let service = service(&db.0, default_validator(Arc::clone(&calls)), FakePublisher::default(), FixedClock(NOW), "a");
-        let first = canonical_request("request-freeze-01", "task.transition_status", Json::Object(vec![]));
+        let service = service(
+            &db.0,
+            default_validator(Arc::clone(&calls)),
+            FakePublisher::default(),
+            FixedClock(NOW),
+            "a",
+        );
+        let first = canonical_request(
+            "request-freeze-01",
+            "task.transition_status",
+            Json::Object(vec![]),
+        );
         let first_body = webhook_body(7, "opened", &issue_body(first, None));
-        assert_eq!(service.handle(&headers(&first_body, "delivery-h"), &first_body).status_code, 200);
-        let edited = canonical_request("request-freeze-02", "task.append_run", Json::Object(vec![]));
+        assert_eq!(
+            service
+                .handle(&headers(&first_body, "delivery-h"), &first_body)
+                .status_code,
+            200
+        );
+        let edited =
+            canonical_request("request-freeze-02", "task.append_run", Json::Object(vec![]));
         let edited_body = webhook_body(7, "edited", &issue_body(edited, None));
         let outcome = service.handle(&headers(&edited_body, "delivery-i"), &edited_body);
         assert_eq!(outcome.code, "issue-request-frozen");
@@ -1281,12 +1381,24 @@ mod tests {
             sleep_ms: 120,
             ..default_validator(Arc::clone(&calls))
         };
-        let service = Arc::new(service(&db.0, validator, FakePublisher::default(), FixedClock(NOW), "a"));
-        let request = canonical_request("request-concurr-1", "task.transition_status", Json::Object(vec![]));
+        let service = Arc::new(service(
+            &db.0,
+            validator,
+            FakePublisher::default(),
+            FixedClock(NOW),
+            "a",
+        ));
+        let request = canonical_request(
+            "request-concurr-1",
+            "task.transition_status",
+            Json::Object(vec![]),
+        );
         let body = Arc::new(webhook_body(8, "opened", &issue_body(request, None)));
         let first_service = Arc::clone(&service);
         let first_body = Arc::clone(&body);
-        let first = thread::spawn(move || first_service.handle(&headers(&first_body, "delivery-j"), &first_body));
+        let first = thread::spawn(move || {
+            first_service.handle(&headers(&first_body, "delivery-j"), &first_body)
+        });
         thread::sleep(Duration::from_millis(20));
         let second = service.handle(&headers(&body, "delivery-k"), &body);
         let first = first.join().unwrap();
@@ -1298,7 +1410,11 @@ mod tests {
     #[test]
     fn ambiguous_intermediate_state_fails_closed_without_revalidation() {
         let db = TestDb::new();
-        let request = canonical_request("request-ambig-01", "task.transition_status", Json::Object(vec![]));
+        let request = canonical_request(
+            "request-ambig-01",
+            "task.transition_status",
+            Json::Object(vec![]),
+        );
         let issue = issue_body(request.clone(), None);
         let accepted = parse_canonical_request(&issue).unwrap();
         {
@@ -1321,10 +1437,21 @@ mod tests {
             );
         }
         let calls = Arc::new(AtomicUsize::new(0));
-        let service = service(&db.0, default_validator(Arc::clone(&calls)), FakePublisher::default(), FixedClock(NOW), "new-instance");
+        let service = service(
+            &db.0,
+            default_validator(Arc::clone(&calls)),
+            FakePublisher::default(),
+            FixedClock(NOW),
+            "new-instance",
+        );
         let body = webhook_body(9, "edited", &issue);
         let outcome = service.handle(&headers(&body, "delivery-m"), &body);
-        assert!(outcome.terminal_receipt.unwrap().contains("ambiguous-recovery"));
+        assert!(
+            outcome
+                .terminal_receipt
+                .unwrap()
+                .contains("ambiguous-recovery")
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
@@ -1332,15 +1459,33 @@ mod tests {
     fn expired_request_is_terminally_rejected_before_validator() {
         let db = TestDb::new();
         let calls = Arc::new(AtomicUsize::new(0));
-        let service = service(&db.0, default_validator(Arc::clone(&calls)), FakePublisher::default(), FixedClock(NOW), "a");
-        let mut request = canonical_request("request-expired-1", "task.transition_status", Json::Object(vec![]));
+        let service = service(
+            &db.0,
+            default_validator(Arc::clone(&calls)),
+            FakePublisher::default(),
+            FixedClock(NOW),
+            "a",
+        );
+        let mut request = canonical_request(
+            "request-expired-1",
+            "task.transition_status",
+            Json::Object(vec![]),
+        );
         if let Json::Object(ref mut object) = request {
-            let expires = object.iter_mut().find(|(key, _)| key == "expires_at").unwrap();
+            let expires = object
+                .iter_mut()
+                .find(|(key, _)| key == "expires_at")
+                .unwrap();
             expires.1 = Json::String("2020-01-01T00:00:00Z".into());
         }
         let body = webhook_body(10, "opened", &issue_body(request, None));
         let outcome = service.handle(&headers(&body, "delivery-n"), &body);
-        assert!(outcome.terminal_receipt.unwrap().contains("request-time-invalid"));
+        assert!(
+            outcome
+                .terminal_receipt
+                .unwrap()
+                .contains("request-time-invalid")
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
@@ -1352,17 +1497,31 @@ mod tests {
             expires_at: "2027-01-01T00:00:00Z".into(),
             base_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             operation: "task.transition_status".into(),
-            parameters: Json::Object(vec![("max_changed_files".into(), Json::Number("999".into()))]),
+            parameters: Json::Object(vec![(
+                "max_changed_files".into(),
+                Json::Number("999".into()),
+            )]),
             contract_revision: TRUSTED_CONTRACT_REVISION.into(),
             canonical_json: "{}".into(),
-            request_digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            request_digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .into(),
         };
         let receipt = build_success_receipt(
             &request,
             validator::TRUSTED_VALIDATOR_REVISION,
             vec![
-                LedgerChange { path: "tasks/B.md".into(), operation: ChangeOperation::Delete, content: None, blob_sha: None },
-                LedgerChange { path: "tasks/A.md".into(), operation: ChangeOperation::Delete, content: None, blob_sha: None },
+                LedgerChange {
+                    path: "tasks/B.md".into(),
+                    operation: ChangeOperation::Delete,
+                    content: None,
+                    blob_sha: None,
+                },
+                LedgerChange {
+                    path: "tasks/A.md".into(),
+                    operation: ChangeOperation::Delete,
+                    content: None,
+                    blob_sha: None,
+                },
             ],
             "cccccccccccccccccccccccccccccccccccccccc",
         );
@@ -1371,7 +1530,12 @@ mod tests {
         assert!(a < b);
 
         let nine = (0..9)
-            .map(|index| LedgerChange { path: format!("tasks/{index}.md"), operation: ChangeOperation::Delete, content: None, blob_sha: None })
+            .map(|index| LedgerChange {
+                path: format!("tasks/{index}.md"),
+                operation: ChangeOperation::Delete,
+                content: None,
+                blob_sha: None,
+            })
             .collect::<Vec<_>>();
         let overflow = build_success_receipt(
             &request,
@@ -1393,7 +1557,8 @@ mod tests {
             parameters: Json::Object(vec![]),
             contract_revision: TRUSTED_CONTRACT_REVISION.into(),
             canonical_json: "{}".into(),
-            request_digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            request_digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .into(),
         };
         let change = LedgerChange {
             path: "tasks/A.md".into(),
@@ -1423,7 +1588,8 @@ mod tests {
             parameters: Json::Object(vec![]),
             contract_revision: TRUSTED_CONTRACT_REVISION.into(),
             canonical_json: "{}".into(),
-            request_digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            request_digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .into(),
         };
         let receipt = build_success_receipt(
             &request,
@@ -1456,7 +1622,11 @@ mod tests {
             "candidate-invalid",
         );
         assert!(receipt.body.contains(validator::TRUSTED_VALIDATOR_REVISION));
-        assert!(!receipt.body.contains("ffffffffffffffffffffffffffffffffffffffff"));
+        assert!(
+            !receipt
+                .body
+                .contains("ffffffffffffffffffffffffffffffffffffffff")
+        );
     }
 
     #[test]

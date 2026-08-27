@@ -3,7 +3,7 @@ use std::fmt;
 pub(super) const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Json {
+pub(crate) enum Json {
     Null,
     Bool(bool),
     Number(String),
@@ -268,7 +268,9 @@ impl Parser<'_> {
                 continue;
             }
             if byte < 0x20 {
-                return Err(JsonError("unescaped control character in JSON string".into()));
+                return Err(JsonError(
+                    "unescaped control character in JSON string".into(),
+                ));
             }
             let remaining = &self.input[self.pos..];
             let character = remaining
@@ -292,9 +294,7 @@ impl Parser<'_> {
             if !(0xdc00..=0xdfff).contains(&second) {
                 return Err(JsonError("invalid JSON surrogate pair".into()));
             }
-            let code = 0x10000
-                + ((u32::from(first) - 0xd800) << 10)
-                + (u32::from(second) - 0xdc00);
+            let code = 0x10000 + ((u32::from(first) - 0xd800) << 10) + (u32::from(second) - 0xdc00);
             char::from_u32(code).ok_or_else(|| JsonError("invalid Unicode scalar".into()))
         } else if (0xdc00..=0xdfff).contains(&first) {
             Err(JsonError("unpaired low surrogate in JSON string".into()))
@@ -454,7 +454,7 @@ pub(super) fn sha256(input: &[u8]) -> [u8; 32] {
         message.push(0);
     }
     message.extend_from_slice(&bit_len.to_be_bytes());
-    for chunk in message.chunks_exact(64) {
+    for chunk in message.as_chunks::<64>().0 {
         let mut words = [0_u32; 64];
         for (index, word) in words.iter_mut().take(16).enumerate() {
             let offset = index * 4;

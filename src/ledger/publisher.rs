@@ -10,11 +10,13 @@ pub(super) enum GithubCredential {
         installation_id: u64,
         app_id: u64,
     },
+    #[allow(dead_code)]
+    // Deliberate negative credential class for the App-only authorship boundary.
     UserToken(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct TrustedReceiptAuth {
+pub(crate) struct TrustedReceiptAuth {
     token: String,
     pub installation_id: u64,
     pub app_id: u64,
@@ -54,7 +56,7 @@ impl TrustedReceiptAuth {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct PublicationError(pub String);
+pub(crate) struct PublicationError(pub String);
 
 impl fmt::Display for PublicationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -64,7 +66,7 @@ impl fmt::Display for PublicationError {
 
 impl std::error::Error for PublicationError {}
 
-pub(super) trait ReceiptPublisher: Send + Sync {
+pub(crate) trait ReceiptPublisher: Send + Sync {
     fn publish_terminal(
         &self,
         auth: &TrustedReceiptAuth,
@@ -181,7 +183,13 @@ impl GithubAppReceiptPublisher {
         let url = format!("https://api.github.com{endpoint}");
         let mut command = Command::new("curl");
         command
-            .args(["--silent", "--show-error", "--location", "--request", method])
+            .args([
+                "--silent",
+                "--show-error",
+                "--location",
+                "--request",
+                method,
+            ])
             .arg("--header")
             .arg("X-GitHub-Api-Version: 2022-11-28")
             .arg("--header")
@@ -196,9 +204,14 @@ impl GithubAppReceiptPublisher {
                 .args(["--data-binary", "@-"])
                 .stdin(Stdio::piped());
         }
-        command.arg(url).stdout(Stdio::piped()).stderr(Stdio::piped());
+        command
+            .arg(url)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = command.spawn().map_err(|error| {
-            PublicationError(format!("could not execute bounded GitHub HTTP client: {error}"))
+            PublicationError(format!(
+                "could not execute bounded GitHub HTTP client: {error}"
+            ))
         })?;
         if let Some(body) = body {
             let mut stdin = child
@@ -219,9 +232,9 @@ impl GithubAppReceiptPublisher {
         }
         let stdout = String::from_utf8(output.stdout)
             .map_err(|_| PublicationError("GitHub response is not UTF-8".into()))?;
-        let (body, status) = stdout.rsplit_once('\n').ok_or_else(|| {
-            PublicationError("GitHub response lacks HTTP status trailer".into())
-        })?;
+        let (body, status) = stdout
+            .rsplit_once('\n')
+            .ok_or_else(|| PublicationError("GitHub response lacks HTTP status trailer".into()))?;
         let status = status
             .parse::<u16>()
             .map_err(|_| PublicationError("GitHub HTTP status trailer is invalid".into()))?;
@@ -241,7 +254,9 @@ impl ReceiptPublisher for GithubAppReceiptPublisher {
         issue_number: u64,
         receipt: &str,
     ) -> Result<i64, PublicationError> {
-        if let Some(id) = self.trusted_matching_comment(&self.comments(auth, issue_number)?, auth, receipt)? {
+        if let Some(id) =
+            self.trusted_matching_comment(&self.comments(auth, issue_number)?, auth, receipt)?
+        {
             self.ensure_closed(auth, issue_number)?;
             return Ok(id);
         }
@@ -256,17 +271,16 @@ impl ReceiptPublisher for GithubAppReceiptPublisher {
             &format!("/repos/{}/issues/{issue_number}/comments", self.repository),
             Some(&body),
         )?;
-        let object = response.as_object().ok_or_else(|| {
-            PublicationError("GitHub comment response is not an object".into())
-        })?;
+        let object = response
+            .as_object()
+            .ok_or_else(|| PublicationError("GitHub comment response is not an object".into()))?;
         let user = object_get(object, "user")
             .and_then(Json::as_object)
             .ok_or_else(|| PublicationError("GitHub comment user metadata unavailable".into()))?;
         let app = object_get(object, "performed_via_github_app")
             .and_then(Json::as_object)
             .ok_or_else(|| PublicationError("GitHub App attribution unavailable".into()))?;
-        if object_string(user, "type") != Some("Bot")
-            || object_u64(app, "id") != Some(auth.app_id)
+        if object_string(user, "type") != Some("Bot") || object_u64(app, "id") != Some(auth.app_id)
         {
             return Err(PublicationError(
                 "terminal comment author metadata does not match configured GitHub App".into(),
@@ -314,7 +328,8 @@ mod tests {
 
     #[test]
     fn copied_receipt_body_without_app_metadata_is_not_trusted() {
-        let publisher = GithubAppReceiptPublisher::new("shockerqt/workspace-governance".into()).unwrap();
+        let publisher =
+            GithubAppReceiptPublisher::new("shockerqt/workspace-governance".into()).unwrap();
         let auth = TrustedReceiptAuth::try_from_credential(GithubCredential::AppInstallation {
             token: "ghs_12345678901234567890".into(),
             installation_id: 7,

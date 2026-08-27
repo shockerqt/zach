@@ -1,16 +1,13 @@
-use super::json::{Json, jcs, object_bool, object_get, object_string, sha256_hex};
+use super::json::{Json, object_bool, object_get, object_string};
 use std::collections::BTreeSet;
-use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub(super) const TRUSTED_CONTRACT_REVISION: &str =
-    "3bbbb3463573893571f45ee92625a54414f8df13";
-pub(super) const TRUSTED_VALIDATOR_REVISION: &str =
-    "3bbbb3463573893571f45ee92625a54414f8df13";
+pub(super) const TRUSTED_CONTRACT_REVISION: &str = "3bbbb3463573893571f45ee92625a54414f8df13";
+pub(super) const TRUSTED_VALIDATOR_REVISION: &str = "3bbbb3463573893571f45ee92625a54414f8df13";
 const TRUSTED_CONTRACT_BLOB: &str = "8c6e1a0e502e1e71582586d5db766f7f3dbd8a13";
 const TRUSTED_MUTATOR_BLOB: &str = "470db19c42f7184d068d42c273071aa60ec3a039";
 pub(super) const MAX_CHANGED_FILES: usize = 8;
@@ -20,7 +17,7 @@ pub(super) const MAX_RECEIPT_UTF8_BYTES: usize = 60_000;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct LedgerRequest {
+pub(crate) struct LedgerRequest {
     pub request_id: String,
     pub created_at: String,
     pub expires_at: String,
@@ -33,13 +30,13 @@ pub(super) struct LedgerRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum ChangeOperation {
+pub(crate) enum ChangeOperation {
     Upsert,
     Delete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct LedgerChange {
+pub(crate) struct LedgerChange {
     pub path: String,
     pub operation: ChangeOperation,
     pub content: Option<String>,
@@ -47,13 +44,13 @@ pub(super) struct LedgerChange {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ValidatedLedgerResult {
+pub(crate) struct ValidatedLedgerResult {
     pub changes: Vec<LedgerChange>,
     pub validated_tree_sha: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ValidationError {
+pub(crate) struct ValidationError {
     pub code: String,
     pub detail: String,
 }
@@ -75,7 +72,7 @@ impl fmt::Display for ValidationError {
 
 impl std::error::Error for ValidationError {}
 
-pub(super) trait LedgerValidator: Send + Sync {
+pub(crate) trait LedgerValidator: Send + Sync {
     fn validator_revision(&self) -> &str;
     fn validate(
         &self,
@@ -188,11 +185,13 @@ impl LedgerValidator for PinnedGovernanceValidator {
                 format!("could not read trusted validator result: {error}"),
             )
         })?;
-        let result = Json::parse(&result_text).map_err(|error| {
-            ValidationError::new("validator-output-invalid", error.to_string())
-        })?;
+        let result = Json::parse(&result_text)
+            .map_err(|error| ValidationError::new("validator-output-invalid", error.to_string()))?;
         let object = result.as_object().ok_or_else(|| {
-            ValidationError::new("validator-output-invalid", "validator result is not an object")
+            ValidationError::new(
+                "validator-output-invalid",
+                "validator result is not an object",
+            )
         })?;
         if object_string(object, "request_digest") != Some(request.request_digest.as_str())
             || object_bool(object, "candidate_validated") != Some(true)
@@ -259,7 +258,10 @@ fn verify_tooling_pin(root: &Path) -> Result<(), ValidationError> {
         ));
     }
     for (path, expected) in [
-        ("contracts/governance-ledger-fast-path.yaml", TRUSTED_CONTRACT_BLOB),
+        (
+            "contracts/governance-ledger-fast-path.yaml",
+            TRUSTED_CONTRACT_BLOB,
+        ),
         ("bin/ws-ledger-mutate", TRUSTED_MUTATOR_BLOB),
     ] {
         let selector = format!("HEAD:{path}");
@@ -381,9 +383,7 @@ pub(super) fn enforce_result_limits(changes: &[LedgerChange]) -> Result<(), Vali
     if total > MAX_TOTAL_RESULT_UTF8_BYTES {
         return Err(ValidationError::new(
             "result-too-large",
-            format!(
-                "result UTF-8 bytes {total}; maximum is {MAX_TOTAL_RESULT_UTF8_BYTES}"
-            ),
+            format!("result UTF-8 bytes {total}; maximum is {MAX_TOTAL_RESULT_UTF8_BYTES}"),
         ));
     }
     Ok(())
@@ -481,15 +481,12 @@ pub(super) fn materialize_and_verify_result(
                         .arg(&change.path),
                     "read staged Governance blob identity",
                 )?;
-                let observed = output
-                    .split_whitespace()
-                    .nth(1)
-                    .ok_or_else(|| {
-                        ValidationError::new(
-                            "validator-output-invalid",
-                            "staged upsert lacks Git blob identity",
-                        )
-                    })?;
+                let observed = output.split_whitespace().nth(1).ok_or_else(|| {
+                    ValidationError::new(
+                        "validator-output-invalid",
+                        "staged upsert lacks Git blob identity",
+                    )
+                })?;
                 if change.blob_sha.as_deref() != Some(observed) {
                     return Err(ValidationError::new(
                         "validator-output-invalid",
@@ -517,10 +514,7 @@ pub(super) fn materialize_and_verify_result(
     }
 
     let tree = command_text(
-        Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .arg("write-tree"),
+        Command::new("git").arg("-C").arg(root).arg("write-tree"),
         "derive exact validated Governance result tree",
     )?;
     let tree = tree.trim().to_owned();
@@ -535,7 +529,10 @@ pub(super) fn materialize_and_verify_result(
 
 fn ensure_no_symlink_ancestor(root: &Path, path: &Path) -> Result<(), ValidationError> {
     let relative = path.strip_prefix(root).map_err(|_| {
-        ValidationError::new("result-conflict", "candidate path escaped materialized root")
+        ValidationError::new(
+            "result-conflict",
+            "candidate path escaped materialized root",
+        )
     })?;
     let mut current = root.to_path_buf();
     let component_count = relative.components().count();
@@ -595,7 +592,7 @@ fn sha1_hex(input: &[u8]) -> String {
         message.push(0);
     }
     message.extend_from_slice(&bit_len.to_be_bytes());
-    for chunk in message.chunks_exact(64) {
+    for chunk in message.as_chunks::<64>().0 {
         let mut words = [0_u32; 80];
         for (index, word) in words.iter_mut().take(16).enumerate() {
             let offset = index * 4;
@@ -607,11 +604,9 @@ fn sha1_hex(input: &[u8]) -> String {
             ]);
         }
         for index in 16..80 {
-            words[index] = (words[index - 3]
-                ^ words[index - 8]
-                ^ words[index - 14]
-                ^ words[index - 16])
-                .rotate_left(1);
+            words[index] =
+                (words[index - 3] ^ words[index - 8] ^ words[index - 14] ^ words[index - 16])
+                    .rotate_left(1);
         }
         let mut a = h[0];
         let mut b = h[1];
@@ -711,10 +706,7 @@ struct TempDirectory {
 impl TempDirectory {
     fn new(prefix: &str) -> Result<Self, ValidationError> {
         let id = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "{prefix}-{}-{id}",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("{prefix}-{}-{id}", std::process::id()));
         fs::create_dir(&path).map_err(|error| {
             ValidationError::new(
                 "validator-io",
@@ -733,6 +725,7 @@ impl Drop for TempDirectory {
 
 #[cfg(test)]
 mod tests {
+    use super::super::json::{jcs, sha256_hex};
     use super::*;
 
     fn run(command: &mut Command) {
@@ -747,28 +740,30 @@ mod tests {
     #[test]
     fn deterministic_tree_derivation_matches_native_git() {
         let repo = TempDirectory::new("zach-tree-test").unwrap();
-        run(Command::new("git").arg("init").arg("--quiet").arg(&repo.path));
-        run(
-            Command::new("git")
-                .arg("-C")
-                .arg(&repo.path)
-                .args(["config", "user.name", "Zach Test"]),
-        );
-        run(
-            Command::new("git")
-                .arg("-C")
-                .arg(&repo.path)
-                .args(["config", "user.email", "zach-test@example.invalid"]),
-        );
+        run(Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .arg(&repo.path));
+        run(Command::new("git").arg("-C").arg(&repo.path).args([
+            "config",
+            "user.name",
+            "Zach Test",
+        ]));
+        run(Command::new("git").arg("-C").arg(&repo.path).args([
+            "config",
+            "user.email",
+            "zach-test@example.invalid",
+        ]));
         fs::create_dir_all(repo.path.join("tasks")).unwrap();
         fs::write(repo.path.join("tasks/A.md"), "before\n").unwrap();
-        run(Command::new("git").arg("-C").arg(&repo.path).args(["add", "."]));
-        run(
-            Command::new("git")
-                .arg("-C")
-                .arg(&repo.path)
-                .args(["commit", "--quiet", "-m", "base"]),
-        );
+        run(Command::new("git")
+            .arg("-C")
+            .arg(&repo.path)
+            .args(["add", "."]));
+        run(Command::new("git")
+            .arg("-C")
+            .arg(&repo.path)
+            .args(["commit", "--quiet", "-m", "base"]));
         let content = "after\n";
         let changes = vec![LedgerChange {
             path: "tasks/A.md".into(),
@@ -802,10 +797,7 @@ mod tests {
             content: None,
             blob_sha: None,
         };
-        let raw = Json::Array(vec![
-            change_json(&first),
-            change_json(&second),
-        ]);
+        let raw = Json::Array(vec![change_json(&first), change_json(&second)]);
         assert!(parse_changes(raw.as_array().unwrap()).is_err());
     }
 
@@ -822,7 +814,10 @@ mod tests {
             content: Some("x".repeat(MAX_TOTAL_RESULT_UTF8_BYTES + 1)),
             ..exact[0].clone()
         }];
-        assert_eq!(enforce_result_limits(&over).unwrap_err().code, "result-too-large");
+        assert_eq!(
+            enforce_result_limits(&over).unwrap_err().code,
+            "result-too-large"
+        );
         let nine = (0..=MAX_CHANGED_FILES)
             .map(|index| LedgerChange {
                 path: format!("tasks/{index}.md"),
@@ -831,7 +826,10 @@ mod tests {
                 blob_sha: None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(enforce_result_limits(&nine).unwrap_err().code, "result-too-large");
+        assert_eq!(
+            enforce_result_limits(&nine).unwrap_err().code,
+            "result-too-large"
+        );
     }
 
     fn change_json(change: &LedgerChange) -> Json {
@@ -872,6 +870,9 @@ mod tests {
         let canonical = jcs(&request_data).unwrap();
         assert!(canonical.contains("ffffffff"));
         assert_eq!(TRUSTED_VALIDATOR_REVISION, TRUSTED_CONTRACT_REVISION);
-        assert_ne!(TRUSTED_VALIDATOR_REVISION, "ffffffffffffffffffffffffffffffffffffffff");
+        assert_ne!(
+            TRUSTED_VALIDATOR_REVISION,
+            "ffffffffffffffffffffffffffffffffffffffff"
+        );
     }
 }
