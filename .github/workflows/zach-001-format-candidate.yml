@@ -57,7 +57,9 @@ jobs:
           rewrite('src/ledger/mod.rs',
               '    fn publish_terminal(\n        &self,\n        store: &mut SqliteStore,',
               '    #[allow(clippy::too_many_arguments)] // Private orchestration helper keeps terminal/outbox identities explicit.\n    fn publish_terminal(\n        &self,\n        store: &mut SqliteStore,')
-          rewrite('src/ledger/mod.rs', '        terminal_result_id: String,', '        _terminal_result_id: String,')
+          rewrite('src/ledger/mod.rs',
+              '        terminal_receipt: String,\n        terminal_result_id: String,\n        replayed: bool,',
+              '        terminal_receipt: String,\n        _terminal_result_id: String,\n        replayed: bool,')
           rewrite('src/ledger/mod.rs',
               'mod tests {\n    use super::*;\n',
               'mod tests {\n    use super::*;\n    use super::json::hmac_sha256_hex;\n    use super::validator::TRUSTED_CONTRACT_REVISION;\n    use std::fs;\n    use std::path::Path;\n')
