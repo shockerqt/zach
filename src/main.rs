@@ -1,3 +1,5 @@
+mod ledger;
+
 use std::env;
 
 use zach::{AuditRequest, GithubConfig, audit_task_integration};
@@ -25,6 +27,7 @@ fn main() {
     match command {
         "--health" => println!("zach: healthy"),
         "--config" => println!("bind_addr={}", config.bind_addr),
+        "governance.validate-ledger" => run_ledger_validator(&config),
         "governance.audit-task-integration" => run_audit(&args[2..]),
         "--help" | "-h" => print_usage(),
         unknown => {
@@ -32,6 +35,13 @@ fn main() {
             print_usage();
             std::process::exit(2);
         }
+    }
+}
+
+fn run_ledger_validator(config: &BootstrapConfig) {
+    if let Err(error) = ledger::serve_from_env(&config.bind_addr) {
+        eprintln!("ledger validator failed: {error}");
+        std::process::exit(1);
     }
 }
 
@@ -72,6 +82,7 @@ fn usage_error(message: &str) -> ! {
 
 fn print_usage() {
     println!("Usage: zach [--health | --config]");
+    println!("       zach governance.validate-ledger");
     println!(
         "       zach governance.audit-task-integration --task-id <TASK-ID> --request-id <REQUEST-ID>"
     );
@@ -84,5 +95,10 @@ mod tests {
     #[test]
     fn default_bind_address_is_loopback() {
         assert_eq!(DEFAULT_BIND_ADDR, "127.0.0.1:8090");
+    }
+
+    #[test]
+    fn ledger_is_the_only_public_webhook_operation() {
+        assert_eq!(ledger::PUBLIC_WEBHOOK_OPERATIONS, &["governance.validate-ledger"]);
     }
 }
