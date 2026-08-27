@@ -340,11 +340,7 @@ where
                     }
                 };
                 if store
-                    .mark_reconciled(
-                        &request.request_id,
-                        &request.request_digest,
-                        comment_id,
-                    )
+                    .mark_reconciled(&request.request_id, &request.request_digest, comment_id)
                     .is_err()
                 {
                     return WebhookOutcome {
@@ -1335,16 +1331,17 @@ mod tests {
             "a",
         );
         let body = b"definitely not json";
-        let outcome = service.handle(
-            &WebhookHeaders {
-                signature_256:
-                    "sha256=0000000000000000000000000000000000000000000000000000000000000000"
-                        .into(),
-                delivery_id: "delivery-a".into(),
-                event: "issues".into(),
-            },
-            body,
-        );
+        let outcome =
+            service.handle(
+                &WebhookHeaders {
+                    signature_256:
+                        "sha256=0000000000000000000000000000000000000000000000000000000000000000"
+                            .into(),
+                    delivery_id: "delivery-a".into(),
+                    event: "issues".into(),
+                },
+                body,
+            );
         assert_eq!(outcome.code, "signature-invalid");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }

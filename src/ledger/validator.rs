@@ -507,7 +507,11 @@ pub(super) fn materialize_and_verify_result(
 }
 
 #[cfg(target_os = "linux")]
-fn secure_candidate_upsert(root: &Path, path: &Path, content: &[u8]) -> Result<(), ValidationError> {
+fn secure_candidate_upsert(
+    root: &Path,
+    path: &Path,
+    content: &[u8],
+) -> Result<(), ValidationError> {
     secure_linux::with_candidate_parent(root, path, true, |parent_fd, leaf| {
         secure_linux::write_leaf_no_follow(parent_fd, leaf, content)
     })
@@ -724,10 +728,7 @@ mod secure_linux {
     }
 
     fn candidate_io(action: &str, error: std::io::Error) -> ValidationError {
-        ValidationError::new(
-            "result-conflict",
-            format!("could not {action}: {error}"),
-        )
+        ValidationError::new("result-conflict", format!("could not {action}: {error}"))
     }
 }
 
