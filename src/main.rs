@@ -1,3 +1,4 @@
+#[rustfmt::skip]
 mod ledger;
 
 use std::env;
@@ -99,6 +100,9 @@ mod tests {
 
     #[test]
     fn ledger_is_the_only_public_webhook_operation() {
-        assert_eq!(ledger::PUBLIC_WEBHOOK_OPERATIONS, &["governance.validate-ledger"]);
+        assert_eq!(
+            ledger::PUBLIC_WEBHOOK_OPERATIONS,
+            &["governance.validate-ledger"]
+        );
     }
 }
