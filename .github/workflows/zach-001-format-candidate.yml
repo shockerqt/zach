@@ -34,6 +34,7 @@ jobs:
               'use super::json::{Json, object_bool, object_get, object_string};')
           rewrite('src/ledger/validator.rs', 'use std::ffi::OsStr;\n', '')
           rewrite('src/ledger/validator.rs', 'pub(super) struct LedgerRequest {', 'pub(crate) struct LedgerRequest {')
+          rewrite('src/ledger/validator.rs', 'pub(super) enum ChangeOperation {', 'pub(crate) enum ChangeOperation {')
           rewrite('src/ledger/validator.rs', 'pub(super) struct LedgerChange {', 'pub(crate) struct LedgerChange {')
           rewrite('src/ledger/validator.rs', 'pub(super) struct ValidatedLedgerResult {', 'pub(crate) struct ValidatedLedgerResult {')
           rewrite('src/ledger/validator.rs', 'pub(super) struct ValidationError {', 'pub(crate) struct ValidationError {')
