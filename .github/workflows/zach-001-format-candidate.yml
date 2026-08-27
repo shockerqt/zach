@@ -26,6 +26,7 @@ jobs:
                   raise SystemExit(f"{path}: expected {count} matches, found {actual}: {old!r}")
               p.write_text(text.replace(old, new, count))
 
+          rewrite('src/ledger/json.rs', 'pub(super) enum Json {', 'pub(crate) enum Json {')
           rewrite('src/ledger/json.rs', 'for chunk in message.chunks_exact(64) {', 'for chunk in message.as_chunks::<64>().0 {')
 
           rewrite('src/ledger/validator.rs',
@@ -33,6 +34,7 @@ jobs:
               'use super::json::{Json, object_bool, object_get, object_string};')
           rewrite('src/ledger/validator.rs', 'use std::ffi::OsStr;\n', '')
           rewrite('src/ledger/validator.rs', 'pub(super) struct LedgerRequest {', 'pub(crate) struct LedgerRequest {')
+          rewrite('src/ledger/validator.rs', 'pub(super) struct LedgerChange {', 'pub(crate) struct LedgerChange {')
           rewrite('src/ledger/validator.rs', 'pub(super) struct ValidatedLedgerResult {', 'pub(crate) struct ValidatedLedgerResult {')
           rewrite('src/ledger/validator.rs', 'pub(super) struct ValidationError {', 'pub(crate) struct ValidationError {')
           rewrite('src/ledger/validator.rs', 'pub(super) trait LedgerValidator: Send + Sync {', 'pub(crate) trait LedgerValidator: Send + Sync {')
