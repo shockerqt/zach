@@ -3,6 +3,8 @@ use std::fmt;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+const COMMENTS_PER_PAGE: usize = 100;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum GithubCredential {
     AppInstallation {
@@ -73,6 +75,13 @@ pub(crate) trait ReceiptPublisher: Send + Sync {
         issue_number: u64,
         receipt: &str,
     ) -> Result<i64, PublicationError>;
+
+    fn reconcile_terminal(
+        &self,
+        auth: &TrustedReceiptAuth,
+        issue_number: u64,
+        receipt: &str,
+    ) -> Result<Option<i64>, PublicationError>;
 }
 
 #[derive(Debug, Clone)]
@@ -90,63 +99,21 @@ impl GithubAppReceiptPublisher {
         Ok(Self { repository })
     }
 
-    fn comments(
+    fn comments_page(
         &self,
         auth: &TrustedReceiptAuth,
         issue_number: u64,
+        page: u64,
     ) -> Result<Json, PublicationError> {
         self.request_json(
             auth,
             "GET",
             &format!(
-                "/repos/{}/issues/{issue_number}/comments?per_page=100",
+                "/repos/{}/issues/{issue_number}/comments?per_page={COMMENTS_PER_PAGE}&page={page}",
                 self.repository
             ),
             None,
         )
-    }
-
-    fn trusted_matching_comment(
-        &self,
-        comments: &Json,
-        auth: &TrustedReceiptAuth,
-        receipt: &str,
-    ) -> Result<Option<i64>, PublicationError> {
-        let array = comments
-            .as_array()
-            .ok_or_else(|| PublicationError("GitHub comments response is not an array".into()))?;
-        let mut matches = Vec::new();
-        for comment in array {
-            let Some(object) = comment.as_object() else {
-                continue;
-            };
-            if object_string(object, "body") != Some(receipt) {
-                continue;
-            }
-            let user = object_get(object, "user").and_then(Json::as_object);
-            let app = object_get(object, "performed_via_github_app").and_then(Json::as_object);
-            let trusted = user
-                .and_then(|value| object_string(value, "type"))
-                .is_some_and(|value| value == "Bot")
-                && app
-                    .and_then(|value| object_u64(value, "id"))
-                    .is_some_and(|value| value == auth.app_id);
-            if trusted {
-                let id = object_u64(object, "id").ok_or_else(|| {
-                    PublicationError("trusted matching GitHub comment has no numeric id".into())
-                })?;
-                matches.push(id);
-            }
-        }
-        match matches.as_slice() {
-            [] => Ok(None),
-            [id] => i64::try_from(*id)
-                .map(Some)
-                .map_err(|_| PublicationError("GitHub comment id exceeds i64".into())),
-            _ => Err(PublicationError(
-                "multiple trusted terminal comments match one transaction".into(),
-            )),
-        }
     }
 
     fn ensure_closed(
@@ -254,12 +221,6 @@ impl ReceiptPublisher for GithubAppReceiptPublisher {
         issue_number: u64,
         receipt: &str,
     ) -> Result<i64, PublicationError> {
-        if let Some(id) =
-            self.trusted_matching_comment(&self.comments(auth, issue_number)?, auth, receipt)?
-        {
-            self.ensure_closed(auth, issue_number)?;
-            return Ok(id);
-        }
         let body = jcs(&Json::Object(vec![(
             "body".into(),
             Json::String(receipt.to_owned()),
@@ -274,23 +235,96 @@ impl ReceiptPublisher for GithubAppReceiptPublisher {
         let object = response
             .as_object()
             .ok_or_else(|| PublicationError("GitHub comment response is not an object".into()))?;
-        let user = object_get(object, "user")
-            .and_then(Json::as_object)
-            .ok_or_else(|| PublicationError("GitHub comment user metadata unavailable".into()))?;
-        let app = object_get(object, "performed_via_github_app")
-            .and_then(Json::as_object)
-            .ok_or_else(|| PublicationError("GitHub App attribution unavailable".into()))?;
-        if object_string(user, "type") != Some("Bot") || object_u64(app, "id") != Some(auth.app_id)
-        {
-            return Err(PublicationError(
-                "terminal comment author metadata does not match configured GitHub App".into(),
-            ));
-        }
-        let id = object_u64(object, "id")
-            .ok_or_else(|| PublicationError("GitHub comment response lacks id".into()))?;
+        let id = trusted_comment_id(object, auth, receipt)?.ok_or_else(|| {
+            PublicationError(
+                "terminal comment author/body metadata does not match configured GitHub App".into(),
+            )
+        })?;
         self.ensure_closed(auth, issue_number)?;
         i64::try_from(id).map_err(|_| PublicationError("GitHub comment id exceeds i64".into()))
     }
+
+    fn reconcile_terminal(
+        &self,
+        auth: &TrustedReceiptAuth,
+        issue_number: u64,
+        receipt: &str,
+    ) -> Result<Option<i64>, PublicationError> {
+        let comment_id = reconcile_paginated_comments(auth, receipt, |page| {
+            self.comments_page(auth, issue_number, page)
+        })?;
+        if comment_id.is_some() {
+            self.ensure_closed(auth, issue_number)?;
+        }
+        Ok(comment_id)
+    }
+}
+
+fn reconcile_paginated_comments(
+    auth: &TrustedReceiptAuth,
+    receipt: &str,
+    mut fetch_page: impl FnMut(u64) -> Result<Json, PublicationError>,
+) -> Result<Option<i64>, PublicationError> {
+    let mut page = 1_u64;
+    let mut matching_id = None::<u64>;
+    loop {
+        let comments = fetch_page(page)?;
+        let array = comments
+            .as_array()
+            .ok_or_else(|| PublicationError("GitHub comments response is not an array".into()))?;
+        if array.len() > COMMENTS_PER_PAGE {
+            return Err(PublicationError(
+                "GitHub comments page exceeds requested page size".into(),
+            ));
+        }
+        for comment in array {
+            let Some(object) = comment.as_object() else {
+                continue;
+            };
+            let Some(id) = trusted_comment_id(object, auth, receipt)? else {
+                continue;
+            };
+            if matching_id.replace(id).is_some() {
+                return Err(PublicationError(
+                    "multiple trusted terminal comments match one transaction".into(),
+                ));
+            }
+        }
+        if array.len() < COMMENTS_PER_PAGE {
+            break;
+        }
+        page = page
+            .checked_add(1)
+            .ok_or_else(|| PublicationError("GitHub comments pagination overflow".into()))?;
+    }
+    matching_id
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| PublicationError("GitHub comment id exceeds i64".into()))
+}
+
+fn trusted_comment_id(
+    object: &[(String, Json)],
+    auth: &TrustedReceiptAuth,
+    receipt: &str,
+) -> Result<Option<u64>, PublicationError> {
+    if object_string(object, "body") != Some(receipt) {
+        return Ok(None);
+    }
+    let user = object_get(object, "user").and_then(Json::as_object);
+    let app = object_get(object, "performed_via_github_app").and_then(Json::as_object);
+    let trusted = user
+        .and_then(|value| object_string(value, "type"))
+        .is_some_and(|value| value == "Bot")
+        && app
+            .and_then(|value| object_u64(value, "id"))
+            .is_some_and(|value| value == auth.app_id);
+    if !trusted {
+        return Ok(None);
+    }
+    object_u64(object, "id")
+        .map(Some)
+        .ok_or_else(|| PublicationError("trusted matching GitHub comment has no numeric id".into()))
 }
 
 fn valid_repository(repository: &str) -> bool {
@@ -310,41 +344,125 @@ fn valid_repository(repository: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn auth() -> TrustedReceiptAuth {
+        TrustedReceiptAuth::try_from_credential(GithubCredential::AppInstallation {
+            token: "ghs_12345678901234567890".into(),
+            installation_id: 7,
+            app_id: 9,
+        })
+        .unwrap()
+    }
+
+    fn comment(id: u64, body: &str, trusted: bool) -> Json {
+        Json::Object(vec![
+            ("id".into(), Json::Number(id.to_string())),
+            ("body".into(), Json::String(body.into())),
+            (
+                "user".into(),
+                Json::Object(vec![(
+                    "type".into(),
+                    Json::String(if trusted { "Bot" } else { "User" }.into()),
+                )]),
+            ),
+            (
+                "performed_via_github_app".into(),
+                if trusted {
+                    Json::Object(vec![("id".into(), Json::Number("9".into()))])
+                } else {
+                    Json::Null
+                },
+            ),
+        ])
+    }
+
     #[test]
     fn receipt_authorship_requires_app_installation_identity() {
         let user = TrustedReceiptAuth::try_from_credential(GithubCredential::UserToken(
             "github_pat_not_trusted".into(),
         ));
         assert!(user.is_err());
-        let app = TrustedReceiptAuth::try_from_credential(GithubCredential::AppInstallation {
-            token: "ghs_12345678901234567890".into(),
-            installation_id: 7,
-            app_id: 9,
-        })
-        .unwrap();
+        let app = auth();
         assert_eq!(app.installation_id, 7);
         assert_eq!(app.app_id, 9);
     }
 
     #[test]
     fn copied_receipt_body_without_app_metadata_is_not_trusted() {
-        let publisher =
-            GithubAppReceiptPublisher::new("shockerqt/workspace-governance".into()).unwrap();
-        let auth = TrustedReceiptAuth::try_from_credential(GithubCredential::AppInstallation {
-            token: "ghs_12345678901234567890".into(),
-            installation_id: 7,
-            app_id: 9,
-        })
-        .unwrap();
-        let comments = Json::parse(
-            r#"[{"id":1,"body":"receipt","user":{"type":"User"},"performed_via_github_app":null}]"#,
-        )
-        .unwrap();
+        let comments = Json::Array(vec![comment(1, "receipt", false)]);
         assert_eq!(
-            publisher
-                .trusted_matching_comment(&comments, &auth, "receipt")
-                .unwrap(),
+            reconcile_paginated_comments(&auth(), "receipt", |_| Ok(comments.clone())).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn reconciliation_finds_trusted_receipt_after_first_hundred_comments() {
+        let mut first = (0..COMMENTS_PER_PAGE)
+            .map(|index| comment(index as u64 + 1, "decoy", false))
+            .collect::<Vec<_>>();
+        assert_eq!(first.len(), COMMENTS_PER_PAGE);
+        let second = vec![comment(777, "receipt", true)];
+        let mut calls = 0_u64;
+        let found = reconcile_paginated_comments(&auth(), "receipt", |page| {
+            calls += 1;
+            match page {
+                1 => Ok(Json::Array(std::mem::take(&mut first))),
+                2 => Ok(Json::Array(second.clone())),
+                _ => panic!("unexpected page {page}"),
+            }
+        })
+        .unwrap();
+        assert_eq!(found, Some(777));
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn reconciliation_exhausts_pagination_when_no_receipt_matches() {
+        let first = (0..COMMENTS_PER_PAGE)
+            .map(|index| comment(index as u64 + 1, "decoy", false))
+            .collect::<Vec<_>>();
+        let second = vec![comment(501, "receipt", false)];
+        let mut calls = 0_u64;
+        let found = reconcile_paginated_comments(&auth(), "receipt", |page| {
+            calls += 1;
+            match page {
+                1 => Ok(Json::Array(first.clone())),
+                2 => Ok(Json::Array(second.clone())),
+                _ => panic!("unexpected page {page}"),
+            }
+        })
+        .unwrap();
+        assert_eq!(found, None);
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn multiple_trusted_matching_receipts_fail_closed_across_pages() {
+        let mut first = (0..COMMENTS_PER_PAGE - 1)
+            .map(|index| comment(index as u64 + 1, "decoy", false))
+            .collect::<Vec<_>>();
+        first.push(comment(600, "receipt", true));
+        let second = vec![comment(601, "receipt", true)];
+        let error = reconcile_paginated_comments(&auth(), "receipt", |page| match page {
+            1 => Ok(Json::Array(first.clone())),
+            2 => Ok(Json::Array(second.clone())),
+            _ => panic!("unexpected page {page}"),
+        })
+        .unwrap_err();
+        assert!(error.0.contains("multiple trusted"));
+    }
+
+    #[test]
+    fn pagination_http_error_is_not_treated_as_exhaustion() {
+        let first = (0..COMMENTS_PER_PAGE)
+            .map(|index| comment(index as u64 + 1, "decoy", false))
+            .collect::<Vec<_>>();
+        let error = reconcile_paginated_comments(&auth(), "receipt", |page| match page {
+            1 => Ok(Json::Array(first.clone())),
+            2 => Err(PublicationError("HTTP 503".into())),
+            _ => panic!("unexpected page {page}"),
+        })
+        .unwrap_err();
+        assert_eq!(error.0, "HTTP 503");
     }
 }

@@ -397,33 +397,12 @@ pub(super) fn materialize_and_verify_result(
     for change in changes {
         validate_change_path(&change.path)?;
         let path = root.join(&change.path);
-        ensure_no_symlink_ancestor(root, &path)?;
         match (&change.operation, &change.content) {
             (ChangeOperation::Upsert, Some(content)) => {
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent).map_err(|error| {
-                        ValidationError::new(
-                            "validator-io",
-                            format!("could not create candidate parent: {error}"),
-                        )
-                    })?;
-                }
-                fs::write(&path, content.as_bytes()).map_err(|error| {
-                    ValidationError::new(
-                        "validator-io",
-                        format!("could not materialize candidate change: {error}"),
-                    )
-                })?;
+                secure_candidate_upsert(root, &path, content.as_bytes())?;
             }
             (ChangeOperation::Delete, None) => {
-                if path.exists() {
-                    fs::remove_file(&path).map_err(|error| {
-                        ValidationError::new(
-                            "validator-io",
-                            format!("could not materialize candidate deletion: {error}"),
-                        )
-                    })?;
-                }
+                secure_candidate_delete(root, &path)?;
             }
             _ => {
                 return Err(ValidationError::new(
@@ -527,30 +506,229 @@ pub(super) fn materialize_and_verify_result(
     Ok(tree)
 }
 
-fn ensure_no_symlink_ancestor(root: &Path, path: &Path) -> Result<(), ValidationError> {
-    let relative = path.strip_prefix(root).map_err(|_| {
-        ValidationError::new(
-            "result-conflict",
-            "candidate path escaped materialized root",
-        )
-    })?;
-    let mut current = root.to_path_buf();
-    let component_count = relative.components().count();
-    for (index, component) in relative.components().enumerate() {
-        if index + 1 == component_count {
-            break;
-        }
-        current.push(component.as_os_str());
-        if let Ok(metadata) = fs::symlink_metadata(&current)
-            && metadata.file_type().is_symlink()
-        {
-            return Err(ValidationError::new(
+#[cfg(target_os = "linux")]
+fn secure_candidate_upsert(root: &Path, path: &Path, content: &[u8]) -> Result<(), ValidationError> {
+    secure_linux::with_candidate_parent(root, path, true, |parent_fd, leaf| {
+        secure_linux::write_leaf_no_follow(parent_fd, leaf, content)
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn secure_candidate_upsert(
+    _root: &Path,
+    _path: &Path,
+    _content: &[u8],
+) -> Result<(), ValidationError> {
+    Err(ValidationError::new(
+        "validator-io",
+        "secure candidate materialization is unavailable on this platform",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn secure_candidate_delete(root: &Path, path: &Path) -> Result<(), ValidationError> {
+    secure_linux::with_candidate_parent(root, path, false, |parent_fd, leaf| {
+        secure_linux::delete_leaf_no_follow(parent_fd, leaf)
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn secure_candidate_delete(_root: &Path, _path: &Path) -> Result<(), ValidationError> {
+    Err(ValidationError::new(
+        "validator-io",
+        "secure candidate materialization is unavailable on this platform",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+mod secure_linux {
+    use super::ValidationError;
+    use std::ffi::{CString, OsStr, c_char, c_int};
+    use std::fs::{File, OpenOptions};
+    use std::io::{ErrorKind, Write};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::{Component, Path};
+
+    const O_RDONLY: c_int = 0;
+    const O_WRONLY: c_int = 1;
+    const O_CREAT: c_int = 0o100;
+    const O_TRUNC: c_int = 0o1000;
+    const O_CLOEXEC: c_int = 0o2000000;
+    const O_DIRECTORY: c_int = 0o200000;
+    const O_NOFOLLOW: c_int = 0o400000;
+
+    unsafe extern "C" {
+        fn openat(dirfd: c_int, pathname: *const c_char, flags: c_int, ...) -> c_int;
+        fn mkdirat(dirfd: c_int, pathname: *const c_char, mode: u32) -> c_int;
+        fn unlinkat(dirfd: c_int, pathname: *const c_char, flags: c_int) -> c_int;
+    }
+
+    pub(super) fn with_candidate_parent<T>(
+        root: &Path,
+        path: &Path,
+        create_parents: bool,
+        operation: impl FnOnce(c_int, &OsStr) -> Result<T, ValidationError>,
+    ) -> Result<T, ValidationError> {
+        let relative = path.strip_prefix(root).map_err(|_| {
+            ValidationError::new(
                 "result-conflict",
-                "candidate path traverses a symbolic link",
+                "candidate path escaped materialized root",
+            )
+        })?;
+        let components = relative
+            .components()
+            .map(|component| match component {
+                Component::Normal(value) => Ok(value),
+                _ => Err(ValidationError::new(
+                    "result-conflict",
+                    "candidate path contains a non-normal component",
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (leaf, parents) = components.split_last().ok_or_else(|| {
+            ValidationError::new("result-conflict", "candidate path has no leaf component")
+        })?;
+
+        let root_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            .open(root)
+            .map_err(|error| candidate_io("open materialized candidate root", error))?;
+        let mut current_fd = root_file.as_raw_fd();
+        let mut opened = Vec::<OwnedFd>::with_capacity(parents.len());
+        for component in parents {
+            let name = c_name(component)?;
+            let next = match open_dir_at(current_fd, &name) {
+                Ok(value) => value,
+                Err(error) if error.kind() == ErrorKind::NotFound && create_parents => {
+                    create_dir_at(current_fd, &name)?;
+                    open_dir_at(current_fd, &name).map_err(|error| {
+                        candidate_io("open newly created candidate directory", error)
+                    })?
+                }
+                Err(error) => {
+                    return Err(candidate_io(
+                        "open candidate ancestor without following symbolic links",
+                        error,
+                    ));
+                }
+            };
+            opened.push(next);
+            current_fd = opened
+                .last()
+                .expect("candidate ancestor descriptor was just pushed")
+                .as_raw_fd();
+        }
+        operation(current_fd, leaf)
+    }
+
+    pub(super) fn write_leaf_no_follow(
+        parent_fd: c_int,
+        leaf: &OsStr,
+        content: &[u8],
+    ) -> Result<(), ValidationError> {
+        let name = c_name(leaf)?;
+        // SAFETY: parent_fd is held open by with_candidate_parent, name is NUL-terminated,
+        // and the flags force the kernel to reject a symbolic-link leaf.
+        let fd = unsafe {
+            openat(
+                parent_fd,
+                name.as_ptr(),
+                O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
+                0o666_u32,
+            )
+        };
+        if fd < 0 {
+            return Err(candidate_io(
+                "open candidate leaf without following symbolic links",
+                std::io::Error::last_os_error(),
             ));
         }
+        // SAFETY: openat returned a new owned descriptor on success.
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut file = File::from(owned);
+        file.write_all(content)
+            .map_err(|error| candidate_io("write candidate leaf", error))
     }
-    Ok(())
+
+    pub(super) fn delete_leaf_no_follow(
+        parent_fd: c_int,
+        leaf: &OsStr,
+    ) -> Result<(), ValidationError> {
+        let name = c_name(leaf)?;
+        // Probe with O_NOFOLLOW first. A symbolic-link leaf fails here rather than being deleted
+        // as if it were a normal candidate file.
+        // SAFETY: parent_fd is live and name is NUL-terminated.
+        let fd = unsafe { openat(parent_fd, name.as_ptr(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == ErrorKind::NotFound {
+                return Ok(());
+            }
+            return Err(candidate_io(
+                "inspect candidate deletion leaf without following symbolic links",
+                error,
+            ));
+        }
+        // SAFETY: openat returned a new owned descriptor on success. Holding it closes the
+        // check/unlink replacement window for the underlying inode; unlinkat remains parent-fd relative.
+        let _leaf_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        // SAFETY: parent_fd remains live and unlinkat with flags=0 never follows a leaf symlink.
+        if unsafe { unlinkat(parent_fd, name.as_ptr(), 0) } != 0 {
+            return Err(candidate_io(
+                "delete candidate leaf without path traversal",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn open_dir_at(parent_fd: c_int, name: &CString) -> std::io::Result<OwnedFd> {
+        // SAFETY: parent_fd is live and name is NUL-terminated. O_DIRECTORY|O_NOFOLLOW rejects
+        // both non-directories and symbolic-link ancestors atomically in the kernel.
+        let fd = unsafe {
+            openat(
+                parent_fd,
+                name.as_ptr(),
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            // SAFETY: openat returned a new owned descriptor on success.
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        }
+    }
+
+    fn create_dir_at(parent_fd: c_int, name: &CString) -> Result<(), ValidationError> {
+        // SAFETY: parent_fd is live and name is NUL-terminated. mkdirat is relative to the held
+        // descriptor and cannot traverse a replacement path prefix.
+        if unsafe { mkdirat(parent_fd, name.as_ptr(), 0o777_u32) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == ErrorKind::AlreadyExists {
+            Ok(())
+        } else {
+            Err(candidate_io("create candidate directory", error))
+        }
+    }
+
+    fn c_name(name: &OsStr) -> Result<CString, ValidationError> {
+        CString::new(name.as_bytes()).map_err(|_| {
+            ValidationError::new("result-conflict", "candidate path component contains NUL")
+        })
+    }
+
+    fn candidate_io(action: &str, error: std::io::Error) -> ValidationError {
+        ValidationError::new(
+            "result-conflict",
+            format!("could not {action}: {error}"),
+        )
+    }
 }
 
 fn validate_change_path(path: &str) -> Result<(), ValidationError> {
@@ -737,9 +915,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn deterministic_tree_derivation_matches_native_git() {
-        let repo = TempDirectory::new("zach-tree-test").unwrap();
+    fn init_repo(repo: &TempDirectory) {
         run(Command::new("git")
             .arg("init")
             .arg("--quiet")
@@ -754,6 +930,12 @@ mod tests {
             "user.email",
             "zach-test@example.invalid",
         ]));
+    }
+
+    #[test]
+    fn deterministic_tree_derivation_matches_native_git() {
+        let repo = TempDirectory::new("zach-tree-test").unwrap();
+        init_repo(&repo);
         fs::create_dir_all(repo.path.join("tasks")).unwrap();
         fs::write(repo.path.join("tasks/A.md"), "before\n").unwrap();
         run(Command::new("git")
@@ -781,6 +963,75 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first, second.trim());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn leaf_symlink_upsert_fails_closed_without_changing_external_target() {
+        use std::os::unix::fs::symlink;
+
+        let repo = TempDirectory::new("zach-leaf-symlink-test").unwrap();
+        init_repo(&repo);
+        fs::create_dir_all(repo.path.join("tasks")).unwrap();
+        fs::write(repo.path.join("tasks/base.md"), "base\n").unwrap();
+        run(Command::new("git")
+            .arg("-C")
+            .arg(&repo.path)
+            .args(["add", "."]));
+        run(Command::new("git")
+            .arg("-C")
+            .arg(&repo.path)
+            .args(["commit", "--quiet", "-m", "base"]));
+
+        let external = TempDirectory::new("zach-external-leaf").unwrap();
+        let external_file = external.path.join("outside.md");
+        let original = b"outside stays byte-identical\n";
+        fs::write(&external_file, original).unwrap();
+        symlink(&external_file, repo.path.join("tasks/escape.md")).unwrap();
+
+        let replacement = "attacker-controlled overwrite\n";
+        let changes = vec![LedgerChange {
+            path: "tasks/escape.md".into(),
+            operation: ChangeOperation::Upsert,
+            content: Some(replacement.into()),
+            blob_sha: Some(git_blob_sha(replacement.as_bytes())),
+        }];
+        assert!(materialize_and_verify_result(&repo.path, &changes).is_err());
+        assert_eq!(fs::read(&external_file).unwrap(), original);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ancestor_symlink_upsert_fails_closed_without_changing_external_target() {
+        use std::os::unix::fs::symlink;
+
+        let repo = TempDirectory::new("zach-ancestor-symlink-test").unwrap();
+        init_repo(&repo);
+        fs::write(repo.path.join("README.md"), "base\n").unwrap();
+        run(Command::new("git")
+            .arg("-C")
+            .arg(&repo.path)
+            .args(["add", "."]));
+        run(Command::new("git")
+            .arg("-C")
+            .arg(&repo.path)
+            .args(["commit", "--quiet", "-m", "base"]));
+
+        let external = TempDirectory::new("zach-external-ancestor").unwrap();
+        let external_file = external.path.join("outside.md");
+        let original = b"ancestor target stays unchanged\n";
+        fs::write(&external_file, original).unwrap();
+        symlink(&external.path, repo.path.join("tasks")).unwrap();
+
+        let replacement = "attacker-controlled overwrite\n";
+        let changes = vec![LedgerChange {
+            path: "tasks/outside.md".into(),
+            operation: ChangeOperation::Upsert,
+            content: Some(replacement.into()),
+            blob_sha: Some(git_blob_sha(replacement.as_bytes())),
+        }];
+        assert!(materialize_and_verify_result(&repo.path, &changes).is_err());
+        assert_eq!(fs::read(&external_file).unwrap(), original);
     }
 
     #[test]
@@ -818,6 +1069,15 @@ mod tests {
             enforce_result_limits(&over).unwrap_err().code,
             "result-too-large"
         );
+        let eight = (0..MAX_CHANGED_FILES)
+            .map(|index| LedgerChange {
+                path: format!("tasks/{index}.md"),
+                operation: ChangeOperation::Delete,
+                content: None,
+                blob_sha: None,
+            })
+            .collect::<Vec<_>>();
+        assert!(enforce_result_limits(&eight).is_ok());
         let nine = (0..=MAX_CHANGED_FILES)
             .map(|index| LedgerChange {
                 path: format!("tasks/{index}.md"),
@@ -874,5 +1134,6 @@ mod tests {
             TRUSTED_VALIDATOR_REVISION,
             "ffffffffffffffffffffffffffffffffffffffff"
         );
+        assert_eq!(sha256_hex(canonical.as_bytes()).len(), 64);
     }
 }

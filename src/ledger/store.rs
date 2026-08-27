@@ -94,6 +94,7 @@ pub(super) struct ClaimInput<'a> {
 pub(super) enum PublicationClaim {
     Publish,
     InFlight,
+    Reconcile,
     Sent(i64),
 }
 
@@ -358,12 +359,13 @@ impl SqliteStore {
                 "sending" if publication.lease_until > now_epoch => {
                     Ok(PublicationClaim::InFlight)
                 }
-                "pending" | "sending" => {
+                "sending" => Ok(PublicationClaim::Reconcile),
+                "pending" => {
                     let lease_until = now_epoch.saturating_add(lease_seconds.max(1));
                     let mut statement = store.prepare(
                         "UPDATE transactions SET publication_state='sending', publication_owner=?1, \
                          publication_lease_until=?2 WHERE request_id=?3 AND request_digest=?4 \
-                         AND state='terminal'",
+                         AND state='terminal' AND publication_state='pending'",
                     )?;
                     statement.bind_text(1, instance_id)?;
                     statement.bind_i64(2, lease_until)?;
@@ -393,7 +395,8 @@ impl SqliteStore {
         self.transaction(|store| {
             let mut statement = store.prepare(
                 "UPDATE transactions SET publication_state='sent', publication_comment_id=?1, \
-                 publication_lease_until=0 WHERE request_id=?2 AND request_digest=?3 \
+                 publication_owner=NULL, publication_lease_until=0 \
+                 WHERE request_id=?2 AND request_digest=?3 \
                  AND publication_state='sending' AND publication_owner=?4 AND state='terminal'",
             )?;
             statement.bind_i64(1, comment_id)?;
@@ -402,12 +405,49 @@ impl SqliteStore {
             statement.bind_text(4, instance_id)?;
             statement.done()?;
             drop(statement);
-            if store.changes() != 1 {
-                return Err(StoreError(
-                    "published comment could not be bound to its SQLite outbox claim".into(),
-                ));
+            if store.changes() == 1 {
+                return Ok(());
             }
-            Ok(())
+            let publication = store.publication_row(request_id)?;
+            if publication.state == "sent" && publication.comment_id == Some(comment_id) {
+                Ok(())
+            } else {
+                Err(StoreError(
+                    "published comment could not be bound to its SQLite outbox claim".into(),
+                ))
+            }
+        })
+    }
+
+    pub(super) fn mark_reconciled(
+        &mut self,
+        request_id: &str,
+        request_digest: &str,
+        comment_id: i64,
+    ) -> Result<(), StoreError> {
+        self.transaction(|store| {
+            let mut statement = store.prepare(
+                "UPDATE transactions SET publication_state='sent', publication_comment_id=?1, \
+                 publication_owner=NULL, publication_lease_until=0 \
+                 WHERE request_id=?2 AND request_digest=?3 \
+                 AND publication_state='sending' AND state='terminal'",
+            )?;
+            statement.bind_i64(1, comment_id)?;
+            statement.bind_text(2, request_id)?;
+            statement.bind_text(3, request_digest)?;
+            statement.done()?;
+            drop(statement);
+            if store.changes() == 1 {
+                return Ok(());
+            }
+            let publication = store.publication_row(request_id)?;
+            if publication.state == "sent" && publication.comment_id == Some(comment_id) {
+                Ok(())
+            } else {
+                Err(StoreError(
+                    "trusted reconciled comment could not be bound to its SQLite outbox".into(),
+                ))
+            }
         })
     }
 
@@ -756,25 +796,39 @@ mod tests {
         }
     }
 
+    fn terminal_store(db: &TestDb) -> SqliteStore {
+        let mut store = SqliteStore::open(&db.0).unwrap();
+        assert_eq!(
+            store
+                .claim(&input("delivery-a", "instance-a", 100))
+                .unwrap(),
+            Claim::Execute
+        );
+        store
+            .complete(
+                "request-0001",
+                "digest-a",
+                "instance-a",
+                "terminal-receipt",
+                "result-a",
+            )
+            .unwrap();
+        store
+    }
+
     #[test]
     fn exact_replay_survives_new_sqlite_instance() {
         let db = TestDb::new();
         {
-            let mut store = SqliteStore::open(&db.0).unwrap();
+            let mut store = terminal_store(&db);
             assert_eq!(
                 store
-                    .claim(&input("delivery-a", "instance-a", 100))
+                    .claim_publication("request-0001", "digest-a", "instance-a", 100, 10)
                     .unwrap(),
-                Claim::Execute
+                PublicationClaim::Publish
             );
             store
-                .complete(
-                    "request-0001",
-                    "digest-a",
-                    "instance-a",
-                    "terminal-receipt",
-                    "result-a",
-                )
+                .mark_published("request-0001", "digest-a", "instance-a", 77)
                 .unwrap();
         }
         let mut reopened = SqliteStore::open(&db.0).unwrap();
@@ -786,6 +840,12 @@ mod tests {
                 terminal_receipt: "terminal-receipt".into(),
                 terminal_result_id: "result-a".into(),
             }
+        );
+        assert_eq!(
+            reopened
+                .claim_publication("request-0001", "digest-a", "instance-b", 101, 10)
+                .unwrap(),
+            PublicationClaim::Sent(77)
         );
     }
 
@@ -851,6 +911,63 @@ mod tests {
         assert_eq!(
             store.claim(&reused_delivery).unwrap(),
             Claim::DeliveryConflict
+        );
+    }
+
+    #[test]
+    fn expired_sending_is_reconciliation_only_and_never_grants_second_post() {
+        let db = TestDb::new();
+        let mut first = terminal_store(&db);
+        assert_eq!(
+            first
+                .claim_publication("request-0001", "digest-a", "publisher-a", 100, 10)
+                .unwrap(),
+            PublicationClaim::Publish
+        );
+        drop(first);
+
+        let mut second = SqliteStore::open(&db.0).unwrap();
+        assert_eq!(
+            second
+                .claim_publication("request-0001", "digest-a", "publisher-b", 111, 10)
+                .unwrap(),
+            PublicationClaim::Reconcile
+        );
+        assert_eq!(
+            second
+                .claim_publication("request-0001", "digest-a", "publisher-c", 999, 10)
+                .unwrap(),
+            PublicationClaim::Reconcile
+        );
+    }
+
+    #[test]
+    fn trusted_reconciliation_can_persist_sent_after_original_owner_disappears() {
+        let db = TestDb::new();
+        let mut first = terminal_store(&db);
+        assert_eq!(
+            first
+                .claim_publication("request-0001", "digest-a", "publisher-a", 100, 10)
+                .unwrap(),
+            PublicationClaim::Publish
+        );
+        drop(first);
+
+        let mut restarted = SqliteStore::open(&db.0).unwrap();
+        assert_eq!(
+            restarted
+                .claim_publication("request-0001", "digest-a", "publisher-b", 111, 10)
+                .unwrap(),
+            PublicationClaim::Reconcile
+        );
+        restarted
+            .mark_reconciled("request-0001", "digest-a", 88)
+            .unwrap();
+        assert_eq!(
+            restarted
+                .claim_publication("request-0001", "digest-a", "publisher-c", 112, 10)
+                .unwrap(),
+            PublicationClaim::Sent(88)
         );
     }
 }

@@ -207,7 +207,6 @@ where
                     event.issue_number,
                     terminal,
                     false,
-                    now_epoch,
                 )
             }
             Claim::AmbiguousRecovery => {
@@ -222,7 +221,6 @@ where
                     event.issue_number,
                     terminal,
                     false,
-                    now_epoch,
                 )
             }
             Claim::Replay {
@@ -234,7 +232,6 @@ where
                 event.issue_number,
                 terminal_receipt,
                 terminal_result_id,
-                now_epoch,
             ),
             Claim::InFlight => WebhookOutcome::simple(202, "transaction-in-flight"),
             Claim::RequestConflict => WebhookOutcome::simple(409, "request-id-conflict"),
@@ -250,7 +247,6 @@ where
         issue_number: u64,
         terminal: TerminalReceipt,
         replayed: bool,
-        now_epoch: i64,
     ) -> WebhookOutcome {
         if store
             .complete(
@@ -271,7 +267,6 @@ where
             terminal.body,
             terminal.result_id,
             replayed,
-            now_epoch,
         )
     }
 
@@ -282,7 +277,6 @@ where
         issue_number: u64,
         terminal_receipt: String,
         terminal_result_id: String,
-        now_epoch: i64,
     ) -> WebhookOutcome {
         self.publish_terminal(
             store,
@@ -291,11 +285,9 @@ where
             terminal_receipt,
             terminal_result_id,
             true,
-            now_epoch,
         )
     }
 
-    #[allow(clippy::too_many_arguments)] // Private orchestration helper keeps terminal/outbox identities explicit.
     fn publish_terminal(
         &self,
         store: &mut SqliteStore,
@@ -304,13 +296,15 @@ where
         terminal_receipt: String,
         _terminal_result_id: String,
         replayed: bool,
-        now_epoch: i64,
     ) -> WebhookOutcome {
+        // Publication gets its own fresh clock read. Validation duration must not consume the
+        // publication lease before the sole POST permission is even claimed.
+        let publication_now = self.clock.now_epoch();
         let claim = match store.claim_publication(
             &request.request_id,
             &request.request_digest,
             &self.instance_id,
-            now_epoch,
+            publication_now,
             PUBLICATION_LEASE_SECONDS,
         ) {
             Ok(value) => value,
@@ -329,6 +323,44 @@ where
                 terminal_receipt: Some(terminal_receipt),
                 replayed,
             },
+            PublicationClaim::Reconcile => {
+                let comment_id = match self.publisher.reconcile_terminal(
+                    &self.receipt_auth,
+                    issue_number,
+                    &terminal_receipt,
+                ) {
+                    Ok(Some(value)) => value,
+                    Ok(None) | Err(_) => {
+                        return WebhookOutcome {
+                            status_code: 503,
+                            code: "receipt-publication-ambiguous".into(),
+                            terminal_receipt: Some(terminal_receipt),
+                            replayed: true,
+                        };
+                    }
+                };
+                if store
+                    .mark_reconciled(
+                        &request.request_id,
+                        &request.request_digest,
+                        comment_id,
+                    )
+                    .is_err()
+                {
+                    return WebhookOutcome {
+                        status_code: 503,
+                        code: "receipt-publication-record-failed".into(),
+                        terminal_receipt: Some(terminal_receipt),
+                        replayed: true,
+                    };
+                }
+                WebhookOutcome {
+                    status_code: 200,
+                    code: "terminal-replayed".into(),
+                    terminal_receipt: Some(terminal_receipt),
+                    replayed: true,
+                }
+            }
             PublicationClaim::Publish => {
                 let comment_id = match self.publisher.publish_terminal(
                     &self.receipt_auth,
@@ -339,7 +371,7 @@ where
                     Err(_) => {
                         return WebhookOutcome {
                             status_code: 503,
-                            code: "receipt-publication-failed".into(),
+                            code: "receipt-publication-ambiguous".into(),
                             terminal_receipt: Some(terminal_receipt),
                             replayed,
                         };
@@ -955,6 +987,25 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct SequenceClock {
+        values: Arc<Mutex<Vec<i64>>>,
+    }
+
+    impl SequenceClock {
+        fn new(values: Vec<i64>) -> Self {
+            Self {
+                values: Arc::new(Mutex::new(values)),
+            }
+        }
+    }
+
+    impl Clock for SequenceClock {
+        fn now_epoch(&self) -> i64 {
+            self.values.lock().unwrap().remove(0)
+        }
+    }
+
+    #[derive(Clone)]
     struct FakeValidator {
         calls: Arc<AtomicUsize>,
         result: Arc<Mutex<Result<validator::ValidatedLedgerResult, validator::ValidationError>>>,
@@ -995,17 +1046,57 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct FakePublisher {
-        calls: Arc<AtomicUsize>,
+        post_calls: Arc<AtomicUsize>,
+        reconcile_calls: Arc<AtomicUsize>,
+        remote: Arc<Mutex<Vec<(String, i64)>>>,
+        fail_after_accept: bool,
+        post_sleep_ms: u64,
     }
+
     impl ReceiptPublisher for FakePublisher {
         fn publish_terminal(
             &self,
             _auth: &TrustedReceiptAuth,
             _issue_number: u64,
-            _receipt: &str,
+            receipt: &str,
         ) -> Result<i64, publisher::PublicationError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(123)
+            let call = self.post_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.post_sleep_ms != 0 {
+                thread::sleep(Duration::from_millis(self.post_sleep_ms));
+            }
+            let id = i64::try_from(1000 + call).unwrap();
+            self.remote.lock().unwrap().push((receipt.to_owned(), id));
+            if self.fail_after_accept {
+                Err(publisher::PublicationError(
+                    "simulated crash/transport ambiguity after remote acceptance".into(),
+                ))
+            } else {
+                Ok(id)
+            }
+        }
+
+        fn reconcile_terminal(
+            &self,
+            _auth: &TrustedReceiptAuth,
+            _issue_number: u64,
+            receipt: &str,
+        ) -> Result<Option<i64>, publisher::PublicationError> {
+            self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
+            let matches = self
+                .remote
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(body, _)| body == receipt)
+                .map(|(_, id)| *id)
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [] => Ok(None),
+                [id] => Ok(Some(*id)),
+                _ => Err(publisher::PublicationError(
+                    "multiple trusted terminal comments match one transaction".into(),
+                )),
+            }
         }
     }
 
@@ -1052,13 +1143,13 @@ mod tests {
         }
     }
 
-    fn service(
+    fn service<C: Clock>(
         db: &Path,
         validator: FakeValidator,
         publisher: FakePublisher,
-        clock: FixedClock,
+        clock: C,
         instance: &str,
-    ) -> WebhookService<FakeValidator, FakePublisher, FixedClock> {
+    ) -> WebhookService<FakeValidator, FakePublisher, C> {
         WebhookService::new(ServiceConfig {
             webhook_secret: b"secret".to_vec(),
             repository: GOVERNANCE_REPOSITORY.into(),
@@ -1157,6 +1248,43 @@ mod tests {
         }
     }
 
+    fn persist_terminal(db: &Path, request: Json, issue_number: u64, now: i64) -> Vec<u8> {
+        let issue = issue_body(request, None);
+        let accepted = parse_canonical_request(&issue).unwrap();
+        let terminal = build_rejection_receipt(
+            &accepted.request,
+            validator::TRUSTED_VALIDATOR_REVISION,
+            "test-terminal",
+        );
+        let mut store = SqliteStore::open(db).unwrap();
+        assert_eq!(
+            store
+                .claim(&ClaimInput {
+                    request_id: &accepted.request.request_id,
+                    request_digest: &accepted.request.request_digest,
+                    issue_number: i64::try_from(issue_number).unwrap(),
+                    canonical_request: &accepted.request.canonical_json,
+                    canonical_identity: &accepted.request.request_digest,
+                    delivery_id: "seed-delivery",
+                    instance_id: "seed-instance",
+                    now_epoch: now,
+                    lease_seconds: 10,
+                })
+                .unwrap(),
+            Claim::Execute
+        );
+        store
+            .complete(
+                &accepted.request.request_id,
+                &accepted.request.request_digest,
+                "seed-instance",
+                &terminal.body,
+                &terminal.result_id,
+            )
+            .unwrap();
+        webhook_body(issue_number, "edited", &issue)
+    }
+
     #[test]
     fn public_webhook_surface_is_only_validate_ledger() {
         assert_eq!(PUBLIC_WEBHOOK_OPERATIONS, &["governance.validate-ledger"]);
@@ -1192,7 +1320,7 @@ mod tests {
                 .contains("\"status\":\"succeeded\"")
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(publisher.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(publisher.post_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1207,17 +1335,16 @@ mod tests {
             "a",
         );
         let body = b"definitely not json";
-        let outcome =
-            service.handle(
-                &WebhookHeaders {
-                    signature_256:
-                        "sha256=0000000000000000000000000000000000000000000000000000000000000000"
-                            .into(),
-                    delivery_id: "delivery-a".into(),
-                    event: "issues".into(),
-                },
-                body,
-            );
+        let outcome = service.handle(
+            &WebhookHeaders {
+                signature_256:
+                    "sha256=0000000000000000000000000000000000000000000000000000000000000000"
+                        .into(),
+                delivery_id: "delivery-a".into(),
+                event: "issues".into(),
+            },
+            body,
+        );
         assert_eq!(outcome.code, "signature-invalid");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
@@ -1305,7 +1432,8 @@ mod tests {
         assert!(replay.replayed);
         assert_eq!(replay.terminal_receipt.unwrap(), first_receipt);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(publisher.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(publisher.post_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(publisher.reconcile_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -1490,6 +1618,171 @@ mod tests {
     }
 
     #[test]
+    fn publication_claim_uses_fresh_clock_after_validation() {
+        let db = TestDb::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let publisher = FakePublisher {
+            fail_after_accept: true,
+            ..FakePublisher::default()
+        };
+        let service = service(
+            &db.0,
+            default_validator(Arc::clone(&calls)),
+            publisher,
+            SequenceClock::new(vec![NOW, NOW + 1_000]),
+            "slow-validator-instance",
+        );
+        let request = canonical_request(
+            "request-fresh-clock",
+            "task.transition_status",
+            Json::Object(vec![]),
+        );
+        let body = webhook_body(11, "opened", &issue_body(request.clone(), None));
+        let outcome = service.handle(&headers(&body, "delivery-fresh"), &body);
+        assert_eq!(outcome.code, "receipt-publication-ambiguous");
+
+        let accepted = parse_canonical_request(&issue_body(request, None)).unwrap();
+        let mut store = SqliteStore::open(&db.0).unwrap();
+        assert_eq!(
+            store
+                .claim_publication(
+                    &accepted.request.request_id,
+                    &accepted.request.request_digest,
+                    "observer",
+                    NOW + 1_001,
+                    PUBLICATION_LEASE_SECONDS,
+                )
+                .unwrap(),
+            PublicationClaim::InFlight
+        );
+    }
+
+    #[test]
+    fn crash_after_remote_post_reconciles_without_second_post() {
+        let db = TestDb::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let publisher = FakePublisher {
+            fail_after_accept: true,
+            ..FakePublisher::default()
+        };
+        let request = canonical_request(
+            "request-post-crash",
+            "task.transition_status",
+            Json::Object(vec![]),
+        );
+        let body = webhook_body(12, "opened", &issue_body(request, None));
+        let first = service(
+            &db.0,
+            default_validator(Arc::clone(&calls)),
+            publisher.clone(),
+            FixedClock(NOW),
+            "publisher-a",
+        )
+        .handle(&headers(&body, "delivery-crash-a"), &body);
+        assert_eq!(first.code, "receipt-publication-ambiguous");
+        assert_eq!(publisher.post_calls.load(Ordering::SeqCst), 1);
+
+        let replay = service(
+            &db.0,
+            default_validator(Arc::clone(&calls)),
+            publisher.clone(),
+            FixedClock(NOW + PUBLICATION_LEASE_SECONDS + 1),
+            "publisher-b",
+        )
+        .handle(&headers(&body, "delivery-crash-b"), &body);
+        assert_eq!(replay.status_code, 200);
+        assert_eq!(replay.code, "terminal-replayed");
+        assert_eq!(publisher.post_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(publisher.reconcile_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn uncertain_sending_with_no_remote_match_fails_closed_without_post() {
+        let db = TestDb::new();
+        let request = canonical_request(
+            "request-no-match-1",
+            "task.transition_status",
+            Json::Object(vec![]),
+        );
+        let body = persist_terminal(&db.0, request.clone(), 13, NOW);
+        let accepted = parse_canonical_request(&issue_body(request, None)).unwrap();
+        {
+            let mut store = SqliteStore::open(&db.0).unwrap();
+            assert_eq!(
+                store
+                    .claim_publication(
+                        &accepted.request.request_id,
+                        &accepted.request.request_digest,
+                        "publisher-a",
+                        NOW,
+                        PUBLICATION_LEASE_SECONDS,
+                    )
+                    .unwrap(),
+                PublicationClaim::Publish
+            );
+        }
+
+        let publisher = FakePublisher::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let outcome = service(
+            &db.0,
+            default_validator(Arc::clone(&calls)),
+            publisher.clone(),
+            FixedClock(NOW + PUBLICATION_LEASE_SECONDS + 1),
+            "publisher-b",
+        )
+        .handle(&headers(&body, "delivery-no-match"), &body);
+        assert_eq!(outcome.status_code, 503);
+        assert_eq!(outcome.code, "receipt-publication-ambiguous");
+        assert_eq!(publisher.post_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(publisher.reconcile_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn independent_concurrent_publishers_emit_at_most_one_terminal_post() {
+        let db = TestDb::new();
+        let request = canonical_request(
+            "request-publish-race",
+            "task.transition_status",
+            Json::Object(vec![]),
+        );
+        let body = Arc::new(persist_terminal(&db.0, request, 14, NOW));
+        let publisher = FakePublisher {
+            post_sleep_ms: 120,
+            ..FakePublisher::default()
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let first_service = service(
+            &db.0,
+            default_validator(Arc::clone(&calls)),
+            publisher.clone(),
+            FixedClock(NOW),
+            "publisher-a",
+        );
+        let second_service = service(
+            &db.0,
+            default_validator(Arc::clone(&calls)),
+            publisher.clone(),
+            FixedClock(NOW),
+            "publisher-b",
+        );
+        let first_body = Arc::clone(&body);
+        let first = thread::spawn(move || {
+            first_service.handle(&headers(&first_body, "delivery-race-a"), &first_body)
+        });
+        thread::sleep(Duration::from_millis(20));
+        let second = second_service.handle(&headers(&body, "delivery-race-b"), &body);
+        let first = first.join().unwrap();
+        assert_eq!(first.status_code, 200);
+        assert_eq!(second.code, "receipt-publication-in-flight");
+        assert!(publisher.post_calls.load(Ordering::SeqCst) <= 1);
+        assert_eq!(publisher.post_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn result_changes_are_sorted_and_boundaries_cannot_be_overridden() {
         let request = LedgerRequest {
             request_id: "request-sort-0001".into(),
@@ -1546,9 +1839,8 @@ mod tests {
         assert!(overflow.body.contains("result-too-large"));
     }
 
-    #[test]
-    fn receipt_over_60000_bytes_becomes_terminal_failure_not_truncated_success() {
-        let request = LedgerRequest {
+    fn receipt_boundary_request() -> LedgerRequest {
+        LedgerRequest {
             request_id: "request-receipt-1".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             expires_at: "2027-01-01T00:00:00Z".into(),
@@ -1559,7 +1851,55 @@ mod tests {
             canonical_json: "{}".into(),
             request_digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                 .into(),
-        };
+        }
+    }
+
+    #[test]
+    fn receipt_60000_bytes_is_accepted_and_60001_is_rejected() {
+        let request = receipt_boundary_request();
+        let empty = build_success_receipt(
+            &request,
+            validator::TRUSTED_VALIDATOR_REVISION,
+            vec![one_change("")],
+            "cccccccccccccccccccccccccccccccccccccccc",
+        );
+        let one_nul = build_success_receipt(
+            &request,
+            validator::TRUSTED_VALIDATOR_REVISION,
+            vec![one_change("\0")],
+            "cccccccccccccccccccccccccccccccccccccccc",
+        );
+        let escaped_unit = one_nul.body.len() - empty.body.len();
+        let target_delta = MAX_RECEIPT_UTF8_BYTES - empty.body.len();
+        let nul_count = target_delta / escaped_unit;
+        let remainder = target_delta % escaped_unit;
+        let mut content = "\0".repeat(nul_count);
+        content.push_str(&"x".repeat(remainder));
+        assert!(content.len() <= validator::MAX_TOTAL_RESULT_UTF8_BYTES);
+
+        let exact = build_success_receipt(
+            &request,
+            validator::TRUSTED_VALIDATOR_REVISION,
+            vec![one_change(&content)],
+            "cccccccccccccccccccccccccccccccccccccccc",
+        );
+        assert_eq!(exact.body.len(), MAX_RECEIPT_UTF8_BYTES);
+        assert!(exact.body.contains("\"status\":\"succeeded\""));
+
+        content.push('x');
+        let over = build_success_receipt(
+            &request,
+            validator::TRUSTED_VALIDATOR_REVISION,
+            vec![one_change(&content)],
+            "cccccccccccccccccccccccccccccccccccccccc",
+        );
+        assert!(over.body.contains("receipt-too-large"));
+        assert!(!over.body.contains("\"status\":\"succeeded\""));
+    }
+
+    #[test]
+    fn receipt_over_60000_bytes_becomes_terminal_failure_not_truncated_success() {
+        let request = receipt_boundary_request();
         let change = LedgerChange {
             path: "tasks/A.md".into(),
             operation: ChangeOperation::Upsert,
@@ -1579,18 +1919,7 @@ mod tests {
 
     #[test]
     fn result_over_48000_bytes_is_rejected() {
-        let request = LedgerRequest {
-            request_id: "request-result-01".into(),
-            created_at: "2026-01-01T00:00:00Z".into(),
-            expires_at: "2027-01-01T00:00:00Z".into(),
-            base_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-            operation: "task.transition_status".into(),
-            parameters: Json::Object(vec![]),
-            contract_revision: TRUSTED_CONTRACT_REVISION.into(),
-            canonical_json: "{}".into(),
-            request_digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                .into(),
-        };
+        let request = receipt_boundary_request();
         let receipt = build_success_receipt(
             &request,
             validator::TRUSTED_VALIDATOR_REVISION,
