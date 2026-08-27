@@ -32,6 +32,9 @@ jobs:
               'use super::json::{Json, jcs, object_bool, object_get, object_string, sha256_hex};',
               'use super::json::{Json, object_bool, object_get, object_string};')
           rewrite('src/ledger/validator.rs', 'use std::ffi::OsStr;\n', '')
+          rewrite('src/ledger/validator.rs', 'pub(super) struct LedgerRequest {', 'pub(crate) struct LedgerRequest {')
+          rewrite('src/ledger/validator.rs', 'pub(super) struct ValidatedLedgerResult {', 'pub(crate) struct ValidatedLedgerResult {')
+          rewrite('src/ledger/validator.rs', 'pub(super) struct ValidationError {', 'pub(crate) struct ValidationError {')
           rewrite('src/ledger/validator.rs', 'pub(super) trait LedgerValidator: Send + Sync {', 'pub(crate) trait LedgerValidator: Send + Sync {')
           rewrite('src/ledger/validator.rs', 'for chunk in message.chunks_exact(64) {', 'for chunk in message.as_chunks::<64>().0 {')
           rewrite('src/ledger/validator.rs',
@@ -39,6 +42,7 @@ jobs:
               'mod tests {\n    use super::*;\n    use super::super::json::{jcs, sha256_hex};\n')
 
           rewrite('src/ledger/publisher.rs', 'pub(super) struct TrustedReceiptAuth {', 'pub(crate) struct TrustedReceiptAuth {')
+          rewrite('src/ledger/publisher.rs', 'pub(super) struct PublicationError(pub String);', 'pub(crate) struct PublicationError(pub String);')
           rewrite('src/ledger/publisher.rs', 'pub(super) trait ReceiptPublisher: Send + Sync {', 'pub(crate) trait ReceiptPublisher: Send + Sync {')
           rewrite('src/ledger/publisher.rs', '    UserToken(String),', '    #[allow(dead_code)] // Deliberate negative credential class for the App-only authorship boundary.\n    UserToken(String),')
 
