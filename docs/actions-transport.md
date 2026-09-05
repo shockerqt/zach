@@ -106,8 +106,22 @@ checks the actual ref/parent/tree. A lost update response can succeed only when
 that independent readback proves the exact candidate. Unresolved publication
 blocks execution; it is never an automatic retry. No native CAS API is claimed.
 
-The live HTTP transport, Rust transition callback and Actions job wiring remain
-pending. The branch must be provisioned explicitly; missing/inaccessible refs
+The Rust transition callback and Actions job wiring remain pending. The branch must be provisioned explicitly; missing/inaccessible refs
 and truncated trees fail closed. Repository Contents can follow symlinks, so
 its file-shaped response alone is not used as proof of a regular journal file.
 See [GitHub Contents behavior](https://docs.github.com/en/rest/repos/contents).
+
+
+## Authenticated HTTP transport
+
+`scripts/actions_github_api.py` implements the journal transport interface using
+GitHub's fixed HTTPS API host and an explicit subset of the four configured
+repository namespaces. It rejects redirects, encoded traversal, oversized URLs,
+ambiguous request keys and non-finite or duplicate response JSON. Requests have
+an 8 KiB ASCII path limit, 256 KiB body limit and 20-second timeout; responses are
+bounded to 2 MiB. Errors omit credentials and response bodies. Mutations are never
+automatically retried. Installation tokens are injected only by trusted runtime
+code; the transport does not establish actor authorization or transition policy.
+The pinned REST API version is 2026-03-10. A read-only live repository lookup was
+verified with existing user authentication; App provisioning and workflow
+activation remain pending.
