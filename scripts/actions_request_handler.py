@@ -375,72 +375,35 @@ class ActionsRequestHandler:
         expected_digest = record["request_digest"]
         expected_operation = record["operation"]
 
+        # Finding 1: Full dual-scan paginated observation to guarantee observation stability
+        snapshot_1, comments_1 = self._scan_comments(repo_full_name, issue_number)
+        snapshot_2, comments_2 = self._scan_comments(repo_full_name, issue_number)
+
+        if snapshot_1 != snapshot_2:
+            raise ActionsHandlerError("reconciliation_observation_unstable")
+
         matching_receipts: list[tuple[dict[str, Any], str]] = []
-        page = 1
-        first_page_comments: Optional[list[Any]] = None
+        for item in comments_1:
+            body = item.get("body")
+            if not isinstance(body, str):
+                continue
 
-        while True:
-            if page > MAX_RECONCILIATION_PAGES:
-                raise ActionsHandlerError("reconciliation_pagination_exceeded")
-
-            path = f"/repos/{repo_full_name}/issues/{issue_number}/comments?per_page={RECONCILIATION_PER_PAGE}&page={page}"
-            try:
-                comments_page = self._api_transport("GET", path, body=None)
-            except Exception:
-                raise ActionsHandlerError("reconciliation_api_failed") from None
-
-            if not isinstance(comments_page, list) or len(comments_page) > RECONCILIATION_PER_PAGE:
-                raise ActionsHandlerError("reconciliation_malformed_response")
-
-            if page == 1:
-                first_page_comments = list(comments_page)
-
-            for item in comments_page:
-                if not isinstance(item, dict):
-                    raise ActionsHandlerError("reconciliation_malformed_response")
-                comment_id = item.get("id")
-                if type(comment_id) is not int or comment_id <= 0:
-                    raise ActionsHandlerError("reconciliation_malformed_response")
-                body = item.get("body")
-                if not isinstance(body, str):
+            if f"request_id={expected_req_id}" in body and "zach-actions:receipt:v1:" in body:
+                # Enforce trusted GitHub App and bot authorship
+                if not self.is_trusted_comment_author(item, repo_full_name, issue_number):
                     continue
 
-                if f"request_id={expected_req_id}" in body and "zach-actions:receipt:v1:" in body:
-                    # Finding 1: Enforce trusted GitHub App and bot authorship
-                    if not self.is_trusted_comment_author(item, repo_full_name, issue_number):
-                        # Untrusted or forged authorship must not become a trusted receipt
-                        continue
-
-                    # Finding 3: Strict canonical receipt parsing
-                    envelope = self._parse_receipt_comment(
-                        body=body,
-                        expected_request_id=expected_req_id,
-                        expected_digest=expected_digest,
-                        expected_operation=expected_operation,
-                    )
-                    if envelope is not None:
-                        ref = f"https://github.com/{repo_full_name}/issues/{issue_number}#issuecomment-{comment_id}"
-                        matching_receipts.append((envelope, ref))
-
-            if len(comments_page) < RECONCILIATION_PER_PAGE:
-                break
-            page += 1
-
-        # Finding 3: Final consistency safeguard to ensure observation stability
-        check_path = f"/repos/{repo_full_name}/issues/{issue_number}/comments?per_page={RECONCILIATION_PER_PAGE}&page=1"
-        try:
-            check_page = self._api_transport("GET", check_path, body=None)
-        except Exception:
-            raise ActionsHandlerError("reconciliation_api_failed") from None
-
-        if not isinstance(check_page, list) or len(check_page) > RECONCILIATION_PER_PAGE:
-            raise ActionsHandlerError("reconciliation_malformed_response")
-
-        if first_page_comments is not None:
-            initial_ids = [c.get("id") for c in first_page_comments if isinstance(c, dict)]
-            current_ids = [c.get("id") for c in check_page if isinstance(c, dict)]
-            if initial_ids != current_ids:
-                raise ActionsHandlerError("reconciliation_observation_unstable")
+                # Strict canonical receipt parsing
+                envelope = self._parse_receipt_comment(
+                    body=body,
+                    expected_request_id=expected_req_id,
+                    expected_digest=expected_digest,
+                    expected_operation=expected_operation,
+                )
+                if envelope is not None:
+                    comment_id = item["id"]
+                    ref = f"https://github.com/{repo_full_name}/issues/{issue_number}#issuecomment-{comment_id}"
+                    matching_receipts.append((envelope, ref))
 
         if len(matching_receipts) > 1:
             raise ActionsHandlerError("duplicate_receipts_found")
@@ -466,28 +429,77 @@ class ActionsRequestHandler:
                 reconciled=True,
             )
 
-        # 0 matching receipts found
-        if expected_operation == "github.ci.inspect":
-            observation = TrustedReconciliationObservation(
-                terminal_state="rejected",
-                terminal_code="no_result_published",
-                terminal_reference=None,
-            )
-            try:
-                mutation = self._coordinator.reconcile(request_id, owner_exec_id, observation)
-            except CoordinatorError as e:
-                raise ActionsHandlerError(e.code) from None
-            return ExecutionReceipt(
-                request_id=request_id,
-                durable_revision=mutation.durable_revision,
-                terminal_state="rejected",
-                terminal_code="no_result_published",
-                terminal_reference=None,
-                envelope={"error": "no_result_published"},
-                reconciled=True,
-            )
+        # 0 matching receipts found: uncertainty without positive trusted evidence remains uncertainty.
+        # Finding 2: DO NOT terminalize to rejected or invent negative certainty.
+        # Leave journal in ambiguous state and return a non-terminal receipt.
+        return ExecutionReceipt(
+            request_id=request_id,
+            durable_revision=head_sha,
+            terminal_state="ambiguous",
+            terminal_code="reconciliation_required",
+            terminal_reference=None,
+            envelope={},
+            replayed=False,
+            reconciled=False,
+        )
 
-        raise ActionsHandlerError("reconciliation_no_receipt")
+    def _scan_comments(
+        self,
+        repo_full_name: str,
+        issue_number: int,
+    ) -> tuple[tuple[Any, ...], list[dict[str, Any]]]:
+        """Perform a single bounded paginated read of all comments on the issue.
+
+        Returns:
+            A tuple of (snapshot_fingerprint, list_of_raw_comment_dicts).
+        """
+        all_comments: list[dict[str, Any]] = []
+        seen_ids: set[int] = set()
+        snapshot_items: list[tuple[Any, ...]] = []
+        page = 1
+
+        while True:
+            if page > MAX_RECONCILIATION_PAGES:
+                raise ActionsHandlerError("reconciliation_pagination_exceeded")
+
+            path = f"/repos/{repo_full_name}/issues/{issue_number}/comments?per_page={RECONCILIATION_PER_PAGE}&page={page}"
+            try:
+                comments_page = self._api_transport("GET", path, body=None)
+            except Exception:
+                raise ActionsHandlerError("reconciliation_api_failed") from None
+
+            if not isinstance(comments_page, list) or len(comments_page) > RECONCILIATION_PER_PAGE:
+                raise ActionsHandlerError("reconciliation_malformed_response")
+
+            for item in comments_page:
+                if not isinstance(item, dict):
+                    raise ActionsHandlerError("reconciliation_malformed_response")
+
+                comment_id = item.get("id")
+                if type(comment_id) is not int or comment_id <= 0:
+                    raise ActionsHandlerError("reconciliation_malformed_response")
+
+                if comment_id in seen_ids:
+                    raise ActionsHandlerError("reconciliation_duplicate_comment_ids")
+                seen_ids.add(comment_id)
+
+                body = item.get("body")
+                user = item.get("user")
+                user_id = user.get("id") if isinstance(user, dict) else None
+                user_type = user.get("type") if isinstance(user, dict) else None
+                app = item.get("performed_via_github_app")
+                app_id = app.get("id") if isinstance(app, dict) else None
+                issue_url = item.get("issue_url")
+                html_url = item.get("html_url")
+
+                snapshot_items.append((comment_id, body, user_id, user_type, app_id, issue_url, html_url))
+                all_comments.append(item)
+
+            if len(comments_page) < RECONCILIATION_PER_PAGE:
+                break
+            page += 1
+
+        return tuple(snapshot_items), all_comments
 
     def _publish_result_comment(
         self,

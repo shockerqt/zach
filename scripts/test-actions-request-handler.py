@@ -188,6 +188,8 @@ class UnifiedFakeApi:
         self.comment_pagination_page_limit: Optional[int] = None
         self.comment_page_changes_on_second_call = False
         self._comment_get_call_count = 0
+        self.on_comments_get: Optional[Any] = None
+        self.duplicate_comment_ids_in_pagination = False
 
     def request(self, method: str, path: str, body: Any = None) -> Any:
         self.calls.append((method, path, body))
@@ -316,6 +318,14 @@ class UnifiedFakeApi:
 
         if method == "GET" and path.startswith(f"/repos/{repo}/issues/42/comments?"):
             self._comment_get_call_count += 1
+            parsed = urlsplit(path)
+            query = parse_qs(parsed.query)
+            page = int(query.get("page", ["1"])[0])
+            per_page = int(query.get("per_page", ["100"])[0])
+
+            if self.on_comments_get is not None:
+                self.on_comments_get(page, self._comment_get_call_count)
+
             if self.bad_comments_pagination:
                 raise ApiError(500, "pagination_failed")
             if self.comment_page_changes_on_second_call and self._comment_get_call_count >= 2:
@@ -329,14 +339,15 @@ class UnifiedFakeApi:
                         "performed_via_github_app": {"id": TRUSTED_RECEIPT_POLICY.app_id},
                     }
                 ]
-            parsed = urlsplit(path)
-            query = parse_qs(parsed.query)
-            page = int(query.get("page", ["1"])[0])
-            per_page = int(query.get("per_page", ["100"])[0])
             if self.comment_pagination_page_limit and page > self.comment_pagination_page_limit:
                 # Infinite loop simulation
                 return [dict(self.comments[1])] if self.comments else []
-            all_items = list(self.comments.values())
+
+            all_items = sorted(self.comments.values(), key=lambda c: c["id"])
+            if self.duplicate_comment_ids_in_pagination and page == 2 and all_items:
+                dup_item = dict(all_items[0])
+                return [dup_item]
+
             start = (page - 1) * per_page
             return all_items[start : start + per_page]
 
@@ -488,7 +499,9 @@ class TestActionsRequestHandler(unittest.TestCase):
 
         # Calling handle_request encounters ClaimDisposition.RECONCILIATION_REQUIRED
         receipt = self.handler.handle_request(event, "run-second", ACCEPTED_AT, POLICY_REVISION)
-        self.assertTrue(receipt.reconciled)
+        self.assertFalse(receipt.reconciled)
+        self.assertEqual(receipt.terminal_state, "ambiguous")
+        self.assertEqual(receipt.terminal_code, "reconciliation_required")
 
         # No CI calls made during reconciliation
         ci_calls_after = len([call for call in self.api.calls if "actions/workflows" in call[1]])
@@ -646,7 +659,9 @@ class TestActionsRequestHandler(unittest.TestCase):
         post_calls_after = len([call for call in self.api.calls if call[0] == "POST" and "comments" in call[1]])
         # Did NOT attempt another comment POST
         self.assertEqual(post_calls_before, post_calls_after)
-        self.assertTrue(receipt.reconciled)
+        self.assertFalse(receipt.reconciled)
+        self.assertEqual(receipt.terminal_state, "ambiguous")
+        self.assertEqual(receipt.terminal_code, "reconciliation_required")
 
     # 21. ambiguous request can reconcile from exactly one bound receipt
     def test_21_ambiguous_request_can_reconcile_from_exactly_one_bound_receipt(self) -> None:
@@ -915,11 +930,13 @@ class TestActionsRequestHandler(unittest.TestCase):
             # Missing performed_via_github_app
         }
 
-        # Reconciliation ignores the human-authored receipt and terminalizes as rejected:no_result_published
+        # Reconciliation ignores the human-authored receipt and leaves journal ambiguous
         receipt = self.handler.reconcile_request("untrusted-author-01")
-        self.assertTrue(receipt.reconciled)
-        self.assertEqual(receipt.terminal_state, "rejected")
-        self.assertEqual(receipt.terminal_code, "no_result_published")
+        self.assertFalse(receipt.reconciled)
+        self.assertEqual(receipt.terminal_state, "ambiguous")
+        self.assertEqual(receipt.terminal_code, "reconciliation_required")
+        _, record = self.coordinator.load_record("untrusted-author-01")
+        self.assertEqual(record["state"], "ambiguous")
 
     # 36. Finding 1: reconciliation ignores receipt with mismatched GitHub App ID
     def test_36_reconciliation_ignores_receipt_with_wrong_app_id(self) -> None:
@@ -953,9 +970,11 @@ class TestActionsRequestHandler(unittest.TestCase):
         }
 
         receipt = self.handler.reconcile_request("wrong-app-reconcile-01")
-        self.assertTrue(receipt.reconciled)
-        self.assertEqual(receipt.terminal_state, "rejected")
-        self.assertEqual(receipt.terminal_code, "no_result_published")
+        self.assertFalse(receipt.reconciled)
+        self.assertEqual(receipt.terminal_state, "ambiguous")
+        self.assertEqual(receipt.terminal_code, "reconciliation_required")
+        _, record = self.coordinator.load_record("wrong-app-reconcile-01")
+        self.assertEqual(record["state"], "ambiguous")
 
     # 37. Finding 1: authentic receipt succeeds even when human spoof comment is present
     def test_37_trusted_app_receipt_succeeds_even_with_human_spoof_present(self) -> None:
@@ -1096,21 +1115,21 @@ class TestActionsRequestHandler(unittest.TestCase):
             self.handler.reconcile_request("foreign-owner-exec-01", execution_id="worker-imposter")
         self.assertEqual(ctx.exception.code, "execution_owner_mismatch")
 
-    # 41. Finding 2: reconcile already ambiguous request with zero comments rejects
-    def test_41_reconcile_already_ambiguous_request_with_zero_comments_rejects(self) -> None:
+    # 41. Finding 2: reconcile already ambiguous request with zero comments leaves journal ambiguous
+    def test_41_reconcile_already_ambiguous_request_with_zero_comments_leaves_ambiguous(self) -> None:
         event = make_event(request_id="ambiguous-zero-comments-01")
         acceptance = self.coordinator.accept(event, TRUSTED_POLICY, ACCEPTED_AT, POLICY_REVISION)
         self.coordinator.claim(acceptance.request_id, "worker-1")
         self.coordinator.mark_ambiguous(acceptance.request_id, "worker-1")
 
         receipt = self.handler.reconcile_request("ambiguous-zero-comments-01")
-        self.assertTrue(receipt.reconciled)
-        self.assertEqual(receipt.terminal_state, "rejected")
-        self.assertEqual(receipt.terminal_code, "no_result_published")
+        self.assertFalse(receipt.reconciled)
+        self.assertEqual(receipt.terminal_state, "ambiguous")
+        self.assertEqual(receipt.terminal_code, "reconciliation_required")
 
         _, record = self.coordinator.load_record("ambiguous-zero-comments-01")
-        self.assertEqual(record["state"], "rejected")
-        self.assertEqual(record["terminal_code"], "no_result_published")
+        self.assertEqual(record["state"], "ambiguous")
+        self.assertIsNone(record.get("terminal_code"))
 
     # 42. Finding 2: reconcile already ambiguous request with authentic receipt succeeds
     def test_42_reconcile_already_ambiguous_request_with_authentic_receipt_succeeds(self) -> None:
@@ -1381,6 +1400,319 @@ class TestActionsRequestHandler(unittest.TestCase):
             TrustedReceiptPolicy(app_id=2**54, bot_user_id=100)
         with self.assertRaises(ValueError):
             TrustedReceiptPolicy(app_id="100", bot_user_id=100)  # type: ignore[arg-type]
+
+    # 52. 101+ comments, stable receipt on second page succeeds
+    def test_52_stable_receipt_on_second_page_with_101_plus_comments_succeeds(self) -> None:
+        event = make_event(request_id="page2-receipt-01")
+        acceptance = self.coordinator.accept(event, TRUSTED_POLICY, ACCEPTED_AT, POLICY_REVISION)
+        claim = self.coordinator.claim(acceptance.request_id, "run-p2")
+        self.coordinator.mark_ambiguous(acceptance.request_id, "run-p2")
+
+        repo = TRUSTED_POLICY.repository_full_name
+        # Add 100 dummy comments for page 1
+        for cid in range(1, 101):
+            self.api.comments[cid] = {
+                "id": cid,
+                "body": f"Human discussion comment #{cid}",
+                "issue_url": f"https://api.github.com/repos/{repo}/issues/42",
+                "html_url": f"https://github.com/{repo}/issues/42#issuecomment-{cid}",
+                "user": {"id": 2001, "type": "User"},
+            }
+
+        # Add authentic receipt on page 2 (comment ID 101)
+        _, record = self.coordinator.load_record("page2-receipt-01")
+        envelope = {
+            "schema_version": 1,
+            "kind": "actions.request.receipt",
+            "request_id": "page2-receipt-01",
+            "request_digest": record["request_digest"],
+            "operation": "github.ci.inspect",
+            "accepted_revision": acceptance.durable_revision,
+            "claim_revision": claim.durable_revision,
+            "terminal_state": "succeeded",
+            "terminal_code": "found",
+            "result": {"run_id": 33958090021},
+        }
+        comment_body = ActionsRequestHandler._format_receipt_comment(envelope)
+        self.api.comments[101] = {
+            "id": 101,
+            "body": comment_body,
+            "issue_url": f"https://api.github.com/repos/{repo}/issues/42",
+            "html_url": f"https://github.com/{repo}/issues/42#issuecomment-101",
+            "user": {"id": TRUSTED_RECEIPT_POLICY.bot_user_id, "type": "Bot"},
+            "performed_via_github_app": {"id": TRUSTED_RECEIPT_POLICY.app_id},
+        }
+
+        receipt = self.handler.reconcile_request("page2-receipt-01")
+        self.assertTrue(receipt.reconciled)
+        self.assertEqual(receipt.terminal_state, "succeeded")
+        self.assertEqual(receipt.terminal_code, "found")
+        self.assertEqual(
+            receipt.terminal_reference,
+            f"https://github.com/{repo}/issues/42#issuecomment-101",
+        )
+        _, record = self.coordinator.load_record("page2-receipt-01")
+        self.assertEqual(record["state"], "succeeded")
+
+    # 53. page 1 unchanged but page 2 changes between scans => fail closed
+    def test_53_page_1_unchanged_but_page_2_changes_fails_closed(self) -> None:
+        event = make_event(request_id="p2-unstable-01")
+        acceptance = self.coordinator.accept(event, TRUSTED_POLICY, ACCEPTED_AT, POLICY_REVISION)
+        claim = self.coordinator.claim(acceptance.request_id, "run-p2-unstable")
+        self.coordinator.mark_ambiguous(acceptance.request_id, "run-p2-unstable")
+
+        repo = TRUSTED_POLICY.repository_full_name
+        for cid in range(1, 101):
+            self.api.comments[cid] = {
+                "id": cid,
+                "body": f"Human discussion comment #{cid}",
+                "issue_url": f"https://api.github.com/repos/{repo}/issues/42",
+                "html_url": f"https://github.com/{repo}/issues/42#issuecomment-{cid}",
+                "user": {"id": 2001, "type": "User"},
+            }
+        self.api.comments[101] = {
+            "id": 101,
+            "body": "Page 2 original comment",
+            "issue_url": f"https://api.github.com/repos/{repo}/issues/42",
+            "html_url": f"https://github.com/{repo}/issues/42#issuecomment-101",
+            "user": {"id": 2001, "type": "User"},
+        }
+
+        def on_get(page: int, call_count: int) -> None:
+            if call_count == 3:  # start of scan 2 (page 1)
+                self.api.comments[101]["body"] = "Page 2 mutated comment"
+
+        self.api.on_comments_get = on_get
+
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.handler.reconcile_request("p2-unstable-01")
+        self.assertEqual(ctx.exception.code, "reconciliation_observation_unstable")
+
+    # 54. second matching trusted receipt appears on later page between scans => fail closed
+    def test_54_second_matching_receipt_appears_on_later_page_between_scans_fails_closed(self) -> None:
+        event = make_event(request_id="dup-race-01")
+        acceptance = self.coordinator.accept(event, TRUSTED_POLICY, ACCEPTED_AT, POLICY_REVISION)
+        claim = self.coordinator.claim(acceptance.request_id, "run-dup-race")
+        self.coordinator.mark_ambiguous(acceptance.request_id, "run-dup-race")
+
+        repo = TRUSTED_POLICY.repository_full_name
+        _, record = self.coordinator.load_record("dup-race-01")
+        envelope = {
+            "schema_version": 1,
+            "kind": "actions.request.receipt",
+            "request_id": "dup-race-01",
+            "request_digest": record["request_digest"],
+            "operation": "github.ci.inspect",
+            "accepted_revision": acceptance.durable_revision,
+            "claim_revision": claim.durable_revision,
+            "terminal_state": "succeeded",
+            "terminal_code": "found",
+            "result": {},
+        }
+        comment_body = ActionsRequestHandler._format_receipt_comment(envelope)
+
+        # Receipt 1 is on page 1
+        self.api.comments[1] = {
+            "id": 1,
+            "body": comment_body,
+            "issue_url": f"https://api.github.com/repos/{repo}/issues/42",
+            "html_url": f"https://github.com/{repo}/issues/42#issuecomment-1",
+            "user": {"id": TRUSTED_RECEIPT_POLICY.bot_user_id, "type": "Bot"},
+            "performed_via_github_app": {"id": TRUSTED_RECEIPT_POLICY.app_id},
+        }
+        # Fill page 1 with 99 more dummy comments
+        for cid in range(2, 101):
+            self.api.comments[cid] = {
+                "id": cid,
+                "body": f"Human discussion comment #{cid}",
+                "issue_url": f"https://api.github.com/repos/{repo}/issues/42",
+                "html_url": f"https://github.com/{repo}/issues/42#issuecomment-{cid}",
+                "user": {"id": 2001, "type": "User"},
+            }
+
+        def on_get(page: int, call_count: int) -> None:
+            if call_count == 3:  # At start of scan 2 (page 1), add second receipt to page 2
+                self.api.comments[101] = {
+                    "id": 101,
+                    "body": comment_body,
+                    "issue_url": f"https://api.github.com/repos/{repo}/issues/42",
+                    "html_url": f"https://github.com/{repo}/issues/42#issuecomment-101",
+                    "user": {"id": TRUSTED_RECEIPT_POLICY.bot_user_id, "type": "Bot"},
+                    "performed_via_github_app": {"id": TRUSTED_RECEIPT_POLICY.app_id},
+                }
+
+        self.api.on_comments_get = on_get
+
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.handler.reconcile_request("dup-race-01")
+        self.assertEqual(ctx.exception.code, "reconciliation_observation_unstable")
+
+    # 55. duplicate comment IDs across pagination fails closed
+    def test_55_duplicate_comment_ids_across_pagination_fails_closed(self) -> None:
+        event = make_event(request_id="dup-id-pagination-01")
+        acceptance = self.coordinator.accept(event, TRUSTED_POLICY, ACCEPTED_AT, POLICY_REVISION)
+        self.coordinator.claim(acceptance.request_id, "run-dup-id")
+        self.coordinator.mark_ambiguous(acceptance.request_id, "run-dup-id")
+
+        repo = TRUSTED_POLICY.repository_full_name
+        for cid in range(1, 101):
+            self.api.comments[cid] = {
+                "id": cid,
+                "body": f"Comment #{cid}",
+                "issue_url": f"https://api.github.com/repos/{repo}/issues/42",
+                "html_url": f"https://github.com/{repo}/issues/42#issuecomment-{cid}",
+                "user": {"id": 2001, "type": "User"},
+            }
+        self.api.duplicate_comment_ids_in_pagination = True
+
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.handler.reconcile_request("dup-id-pagination-01")
+        self.assertEqual(ctx.exception.code, "reconciliation_duplicate_comment_ids")
+
+    # 56. zero trusted receipts on ambiguous request leaves journal ambiguous
+    def test_56_zero_trusted_receipts_leaves_journal_ambiguous(self) -> None:
+        event = make_event(request_id="zero-receipts-01")
+        acceptance = self.coordinator.accept(event, TRUSTED_POLICY, ACCEPTED_AT, POLICY_REVISION)
+        self.coordinator.claim(acceptance.request_id, "run-zero")
+        self.coordinator.mark_ambiguous(acceptance.request_id, "run-zero")
+
+        self.assertEqual(len(self.api.comments), 0)
+        receipt = self.handler.reconcile_request("zero-receipts-01")
+        self.assertFalse(receipt.reconciled)
+        self.assertEqual(receipt.terminal_state, "ambiguous")
+        self.assertEqual(receipt.terminal_code, "reconciliation_required")
+
+        _, record = self.coordinator.load_record("zero-receipts-01")
+        self.assertEqual(record["state"], "ambiguous")
+
+    # 57. zero trusted receipts causes no journal terminal mutation
+    def test_57_zero_trusted_receipts_causes_no_journal_terminal_mutation(self) -> None:
+        event = make_event(request_id="no-terminal-mutation-01")
+        acceptance = self.coordinator.accept(event, TRUSTED_POLICY, ACCEPTED_AT, POLICY_REVISION)
+        self.coordinator.claim(acceptance.request_id, "run-no-term")
+        self.coordinator.mark_ambiguous(acceptance.request_id, "run-no-term")
+
+        ref_before = self.api.refs[FIXED_REF]
+        patch_calls_before = [c for c in self.api.calls if c[0] == "PATCH"]
+
+        receipt = self.handler.reconcile_request("no-terminal-mutation-01")
+        self.assertEqual(receipt.terminal_state, "ambiguous")
+
+        ref_after = self.api.refs[FIXED_REF]
+        patch_calls_after = [c for c in self.api.calls if c[0] == "PATCH"]
+
+        self.assertEqual(ref_before, ref_after)
+        self.assertEqual(len(patch_calls_before), len(patch_calls_after))
+
+        _, record = self.coordinator.load_record("no-terminal-mutation-01")
+        self.assertEqual(record["state"], "ambiguous")
+        self.assertIsNone(record.get("terminal_code"))
+        self.assertIsNone(record.get("terminal_reference"))
+
+    # 58. zero trusted receipts causes no effect execution
+    def test_58_zero_trusted_receipts_causes_no_effect_execution(self) -> None:
+        event = make_event(request_id="no-effect-01")
+        acceptance = self.coordinator.accept(event, TRUSTED_POLICY, ACCEPTED_AT, POLICY_REVISION)
+        self.coordinator.claim(acceptance.request_id, "run-no-effect")
+        self.coordinator.mark_ambiguous(acceptance.request_id, "run-no-effect")
+
+        ci_calls_before = [c for c in self.api.calls if "actions/workflows" in c[1]]
+        self.handler.reconcile_request("no-effect-01")
+        ci_calls_after = [c for c in self.api.calls if "actions/workflows" in c[1]]
+
+        self.assertEqual(len(ci_calls_before), len(ci_calls_after))
+
+    # 59. zero trusted receipts causes no comment POST
+    def test_59_zero_trusted_receipts_causes_no_comment_post(self) -> None:
+        event = make_event(request_id="no-post-01")
+        acceptance = self.coordinator.accept(event, TRUSTED_POLICY, ACCEPTED_AT, POLICY_REVISION)
+        self.coordinator.claim(acceptance.request_id, "run-no-post")
+        self.coordinator.mark_ambiguous(acceptance.request_id, "run-no-post")
+
+        post_calls_before = [c for c in self.api.calls if c[0] == "POST" and "comments" in c[1]]
+        self.handler.reconcile_request("no-post-01")
+        post_calls_after = [c for c in self.api.calls if c[0] == "POST" and "comments" in c[1]]
+
+        self.assertEqual(len(post_calls_before), len(post_calls_after))
+        self.assertEqual(len(self.api.comments), 0)
+
+    # 60. later reconciliation can succeed if a trusted receipt appears after earlier zero-match observation
+    def test_60_later_reconciliation_succeeds_after_earlier_zero_match_observation(self) -> None:
+        event = make_event(request_id="delayed-receipt-01")
+        acceptance = self.coordinator.accept(event, TRUSTED_POLICY, ACCEPTED_AT, POLICY_REVISION)
+        claim = self.coordinator.claim(acceptance.request_id, "run-delayed")
+        self.coordinator.mark_ambiguous(acceptance.request_id, "run-delayed")
+
+        # 1. First observation: 0 matching receipts -> stays ambiguous
+        receipt1 = self.handler.reconcile_request("delayed-receipt-01")
+        self.assertFalse(receipt1.replayed)
+        self.assertFalse(receipt1.reconciled)
+        self.assertEqual(receipt1.terminal_state, "ambiguous")
+        self.assertEqual(receipt1.terminal_code, "reconciliation_required")
+
+        _, record = self.coordinator.load_record("delayed-receipt-01")
+        self.assertEqual(record["state"], "ambiguous")
+
+        # 2. Delayed receipt arrives on GitHub
+        repo = TRUSTED_POLICY.repository_full_name
+        envelope = {
+            "schema_version": 1,
+            "kind": "actions.request.receipt",
+            "request_id": "delayed-receipt-01",
+            "request_digest": record["request_digest"],
+            "operation": "github.ci.inspect",
+            "accepted_revision": acceptance.durable_revision,
+            "claim_revision": claim.durable_revision,
+            "terminal_state": "succeeded",
+            "terminal_code": "found",
+            "result": {"run_id": 33958090021},
+        }
+        comment_body = ActionsRequestHandler._format_receipt_comment(envelope)
+        self.api.comments[1] = {
+            "id": 1,
+            "body": comment_body,
+            "issue_url": f"https://api.github.com/repos/{repo}/issues/42",
+            "html_url": f"https://github.com/{repo}/issues/42#issuecomment-1",
+            "user": {"id": TRUSTED_RECEIPT_POLICY.bot_user_id, "type": "Bot"},
+            "performed_via_github_app": {"id": TRUSTED_RECEIPT_POLICY.app_id},
+        }
+
+        # 3. Second reconciliation: finds trusted receipt and successfully reconciles
+        receipt2 = self.handler.reconcile_request("delayed-receipt-01")
+        self.assertTrue(receipt2.reconciled)
+        self.assertEqual(receipt2.terminal_state, "succeeded")
+        self.assertEqual(receipt2.terminal_code, "found")
+        self.assertEqual(
+            receipt2.terminal_reference,
+            f"https://github.com/{repo}/issues/42#issuecomment-1",
+        )
+
+        _, final_record = self.coordinator.load_record("delayed-receipt-01")
+        self.assertEqual(final_record["state"], "succeeded")
+        self.assertEqual(final_record["terminal_code"], "found")
+
+    # 61. executing owner protections remain authoritative
+    def test_61_executing_owner_protections_remain_authoritative(self) -> None:
+        event = make_event(request_id="exec-owner-auth-01")
+        acceptance = self.coordinator.accept(event, TRUSTED_POLICY, ACCEPTED_AT, POLICY_REVISION)
+        self.coordinator.claim(acceptance.request_id, "owner-real")
+
+        # Concurrent worker arrives via handle_request
+        receipt = self.handler.handle_request(event, "owner-imposter", ACCEPTED_AT, POLICY_REVISION)
+        self.assertFalse(receipt.replayed)
+        self.assertFalse(receipt.reconciled)
+        self.assertEqual(receipt.terminal_state, "executing")
+        self.assertEqual(receipt.terminal_code, "reconciliation_required")
+
+        # Foreign execution ID explicitly reconciling raises execution_owner_mismatch
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.handler.reconcile_request("exec-owner-auth-01", execution_id="owner-imposter")
+        self.assertEqual(ctx.exception.code, "execution_owner_mismatch")
+
+        # Journal is still executing under owner-real
+        _, record = self.coordinator.load_record("exec-owner-auth-01")
+        self.assertEqual(record["state"], "executing")
+        self.assertEqual(record["execution_id"], "owner-real")
 
 
 if __name__ == "__main__":
