@@ -76,3 +76,14 @@ parameter. Publication uses a single-parent commit, non-forced fast-forward and
 readback of parent/tree; receipts describe those checks without claiming native
 compare-and-swap. See [GitHub reference API](https://docs.github.com/en/rest/git/refs)
 and [workflow concurrency](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax).
+
+## Implemented journal boundary
+
+The pure `ledger::actions_journal::JournalRecord` API freezes acceptance and
+exposes state through read-only accessors. Its transitions grant execution once,
+require reconciliation on repeated claims, and retain the original owner after
+ambiguous effects. Terminal outcomes permit only identical replay. Serialized
+records are bounded and revalidated on restart, including canonical request
+bindings and state consistency. Storage must enforce global request-ID uniqueness
+and durable claim publication before executing an effect. This module does not
+provide persistence, workflow handlers or independent effect observations.

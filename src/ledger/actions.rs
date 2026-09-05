@@ -189,7 +189,7 @@ impl AcceptedIssue {
     }
 }
 
-fn check_json_depth(input: &str, max_depth: usize) -> Result<(), ActionsRequestError> {
+pub(super) fn check_json_depth(input: &str, max_depth: usize) -> Result<(), ActionsRequestError> {
     let mut depth: usize = 0;
     let mut in_string = false;
     let mut chars = input.chars();
