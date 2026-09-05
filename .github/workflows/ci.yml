@@ -9,6 +9,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - name: Install native SQLite linker dependency
         run: sudo apt-get update && sudo apt-get install --yes libsqlite3-dev
