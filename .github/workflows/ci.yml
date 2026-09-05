@@ -10,6 +10,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install native SQLite linker dependency
+        run: sudo apt-get update && sudo apt-get install --yes libsqlite3-dev
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
       - run: cargo test

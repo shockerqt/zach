@@ -1,4 +1,4 @@
-mod ledger;
+use zach::ledger;
 
 use std::env;
 

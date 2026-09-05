@@ -15,6 +15,12 @@ make build
 make lint
 ```
 
-The current binary is deliberately limited to bootstrap health and configuration
-output. GitHub App credentials, webhook secrets, deployment configuration and
-the command protocol belong to later, governed work.
+Linux builds require the SQLite development linker library (`libsqlite3-dev`
+on Ubuntu). Secure materialization uses platform-specific libc bindings rather
+than assuming identical numeric open flags on x86_64 and ARM64.
+
+The existing binary provides bootstrap commands, the v1 ledger webhook and
+the integration-audit command. The new ordinary-JSON Issue decoder is exposed
+through `zach::ledger::actions`; see [the transport contract](docs/actions-transport.md).
+Actions execution and journal-backed side effects remain gated by ZACH-003
+and the Governance Web-only pilot. No credentials belong in this repository.
