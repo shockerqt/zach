@@ -87,3 +87,27 @@ records are bounded and revalidated on restart, including canonical request
 bindings and state consistency. Storage must enforce global request-ID uniqueness
 and durable claim publication before executing an effect. This module does not
 provide persistence, workflow handlers or independent effect observations.
+
+## Local Actions adapter and Git persistence
+
+`zach-actions` exposes accept, replay, claim, complete, ambiguous and reconcile.
+It reads bounded event/record files and writes the validated record to stdout;
+trusted workflows must redirect that output to files rather than logs. Claim
+returns 0 only for a new grant, 75 for required reconciliation and 10 for a
+terminal replay. The CLI never persists its output or verifies reconciliation
+observations itself. Existing `cargo run` continues to select `zach`.
+
+`scripts/actions_git_journal.py` stores each request at its global SHA-256-derived
+path on the fixed Governance automation/requests branch. It requires an injected
+authenticated API transport and transition validator. Reads bind Git tree modes,
+blob identity and exact commit; publication validates a fresh complete snapshot,
+creates one changed path and a single-parent commit, updates without force and
+checks the actual ref/parent/tree. A lost update response can succeed only when
+that independent readback proves the exact candidate. Unresolved publication
+blocks execution; it is never an automatic retry. No native CAS API is claimed.
+
+The live HTTP transport, Rust transition callback and Actions job wiring remain
+pending. The branch must be provisioned explicitly; missing/inaccessible refs
+and truncated trees fail closed. Repository Contents can follow symlinks, so
+its file-shaped response alone is not used as proof of a regular journal file.
+See [GitHub Contents behavior](https://docs.github.com/en/rest/repos/contents).

@@ -17,5 +17,5 @@ jobs:
         run: sudo apt-get update && sudo apt-get install --yes libsqlite3-dev
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
-      - run: cargo test
+      - run: make test
       - run: cargo build --locked
