@@ -5,7 +5,7 @@ This module composes the already-integrated pieces:
   -> trusted decode & durable journal acceptance (via ActionsJournalCoordinator.accept)
   -> durable execution claim (via ActionsJournalCoordinator.claim)
   -> typed effect handler (github.ci.inspect canary; deterministic rejection for unsupported)
-  -> durable bounded connector-readable result (Issue comment with readback)
+  -> durable bounded connector-readable result (authenticated Issue comment with readback)
   -> journal terminalization / reconciliation (via ActionsJournalCoordinator.complete/reconcile)
 """
 
@@ -41,10 +41,12 @@ RECONCILIATION_PER_PAGE: Final[int] = 100
 MAX_TERMINAL_CODE_BYTES: Final[int] = 128
 MAX_TERMINAL_REFERENCE_BYTES: Final[int] = 512
 
+SHA40_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{40}$")
+
 RECEIPT_MARKER_RE: Final[re.Pattern[str]] = re.compile(
-    r"<!-- zach-actions:receipt:v1:request_id=([A-Za-z0-9_.:-]{1,128}):"
+    r"^<!-- zach-actions:receipt:v1:request_id=([A-Za-z0-9_.:-]{1,128}):"
     r"digest=([0-9a-f]{64}):op=([a-z0-9_.-]{1,64}):"
-    r"revision=([0-9a-f]{40}) -->"
+    r"accepted_revision=([0-9a-f]{40}):claim_revision=([0-9a-f]{40}) -->$"
 )
 
 EXECUTABLE_OPERATIONS: Final[frozenset[str]] = frozenset({"github.ci.inspect"})
@@ -73,6 +75,20 @@ class ActionsHandlerError(Exception):
 
 
 @dataclass(frozen=True)
+class TrustedReceiptPolicy:
+    """Trusted GitHub App and bot identity required for valid result receipts."""
+
+    app_id: int
+    bot_user_id: int
+
+    def __post_init__(self) -> None:
+        if type(self.app_id) is not int or not (0 < self.app_id <= 2**53 - 1):
+            raise ValueError("invalid_app_id")
+        if type(self.bot_user_id) is not int or not (0 < self.bot_user_id <= 2**53 - 1):
+            raise ValueError("invalid_bot_user_id")
+
+
+@dataclass(frozen=True)
 class ExecutionReceipt:
     """Bounded, machine-readable result receipt for a handled or reconciled request."""
 
@@ -94,6 +110,7 @@ class ActionsRequestHandler:
         coordinator: ActionsJournalCoordinator,
         api_transport: Callable[..., Any],
         trusted_issue_policy: TrustedIssuePolicy,
+        trusted_receipt_policy: TrustedReceiptPolicy,
         ci_policy: Optional[CiInspectionPolicy] = None,
     ) -> None:
         if not isinstance(coordinator, ActionsJournalCoordinator):
@@ -102,13 +119,80 @@ class ActionsRequestHandler:
             raise TypeError("api_transport must be callable")
         if not isinstance(trusted_issue_policy, TrustedIssuePolicy):
             raise TypeError("trusted_issue_policy must be a TrustedIssuePolicy instance")
+        if not isinstance(trusted_receipt_policy, TrustedReceiptPolicy):
+            raise TypeError("trusted_receipt_policy must be a TrustedReceiptPolicy instance")
         if ci_policy is not None and not isinstance(ci_policy, CiInspectionPolicy):
             raise TypeError("ci_policy must be a CiInspectionPolicy instance or None")
 
         self._coordinator = coordinator
         self._api_transport = api_transport
         self._trusted_issue_policy = trusted_issue_policy
+        self._trusted_receipt_policy = trusted_receipt_policy
         self._ci_policy = ci_policy
+
+    def validate_comment_identity(
+        self,
+        comment: Any,
+        expected_repo: str,
+        expected_issue_number: int,
+        expected_body: Optional[str] = None,
+    ) -> int:
+        """Validate all mandatory identity and authorship fields of a GitHub comment."""
+        if not isinstance(comment, dict):
+            raise ActionsHandlerError("comment_identity_mismatch")
+
+        comment_id = comment.get("id")
+        if type(comment_id) is not int or comment_id <= 0:
+            raise ActionsHandlerError("comment_identity_mismatch")
+
+        # 1. Mandatory authorship: bot user
+        user = comment.get("user")
+        if not isinstance(user, dict):
+            raise ActionsHandlerError("comment_authorship_missing")
+        if user.get("id") != self._trusted_receipt_policy.bot_user_id:
+            raise ActionsHandlerError("comment_bot_id_mismatch")
+        if user.get("type") != "Bot":
+            raise ActionsHandlerError("comment_user_not_bot")
+
+        # 2. Mandatory authorship: GitHub App
+        app = comment.get("performed_via_github_app")
+        if not isinstance(app, dict):
+            raise ActionsHandlerError("comment_app_metadata_missing")
+        if app.get("id") != self._trusted_receipt_policy.app_id:
+            raise ActionsHandlerError("comment_app_id_mismatch")
+
+        # 3. Mandatory canonical URLs
+        issue_url = comment.get("issue_url")
+        expected_issue_url = f"https://api.github.com/repos/{expected_repo}/issues/{expected_issue_number}"
+        if issue_url != expected_issue_url:
+            raise ActionsHandlerError("comment_issue_url_mismatch")
+
+        html_url = comment.get("html_url")
+        expected_html_url = (
+            f"https://github.com/{expected_repo}/issues/{expected_issue_number}#issuecomment-{comment_id}"
+        )
+        if html_url != expected_html_url:
+            raise ActionsHandlerError("comment_html_url_mismatch")
+
+        # 4. Mandatory exact canonical body if provided
+        if expected_body is not None:
+            if comment.get("body") != expected_body:
+                raise ActionsHandlerError("comment_body_mismatch")
+
+        return comment_id
+
+    def is_trusted_comment_author(
+        self,
+        comment: Any,
+        expected_repo: str,
+        expected_issue_number: int,
+    ) -> bool:
+        """Check whether a comment satisfies the trusted App/bot authorship contract."""
+        try:
+            self.validate_comment_identity(comment, expected_repo, expected_issue_number)
+            return True
+        except ActionsHandlerError:
+            return False
 
     def handle_request(
         self,
@@ -192,14 +276,15 @@ class ActionsRequestHandler:
             terminal_code = "unsupported_operation"
             result_payload = {"error": "unsupported_operation", "operation": operation}
 
-        # 5. Build bounded result envelope
+        # 5. Build bounded result envelope carrying both accepted_revision and claim_revision
         envelope = {
             "schema_version": 1,
             "kind": "actions.request.receipt",
             "request_id": request_id,
             "request_digest": request_digest,
             "operation": operation,
-            "accepted_revision": claim.durable_revision,
+            "accepted_revision": acceptance.durable_revision,
+            "claim_revision": claim.durable_revision,
             "terminal_state": terminal_state,
             "terminal_code": terminal_code,
             "result": result_payload,
@@ -207,7 +292,7 @@ class ActionsRequestHandler:
 
         comment_body = self._format_receipt_comment(envelope)
 
-        # 6. Result comment publication with readback
+        # 6. Result comment publication with authenticated readback
         terminal_reference = self._publish_result_comment(
             repo_full_name=repo_full_name,
             issue_number=issue_number,
@@ -242,7 +327,7 @@ class ActionsRequestHandler:
         request_id: str,
         execution_id: Optional[str] = None,
     ) -> ExecutionReceipt:
-        """Independently observe issue comments to reconcile an ambiguous or executing request."""
+        """Independently observe issue comments to reconcile an ambiguous request."""
         validate_request_id(request_id)
         head_sha, record = self._coordinator.load_record(request_id)
 
@@ -256,6 +341,26 @@ class ActionsRequestHandler:
                 envelope={},
                 replayed=True,
             )
+
+        if record["state"] == "executing":
+            owner_exec_id = record.get("execution_id")
+            if execution_id is not None and execution_id != owner_exec_id:
+                raise ActionsHandlerError("execution_owner_mismatch")
+            # Finding 2: The original owner is still executing and authoritative.
+            # Reconciliation MUST NOT infer owner death, mark ambiguous, or mutate journal state.
+            return ExecutionReceipt(
+                request_id=request_id,
+                durable_revision=head_sha,
+                terminal_state="executing",
+                terminal_code="reconciliation_required",
+                terminal_reference=None,
+                envelope={},
+                replayed=False,
+                reconciled=False,
+            )
+
+        if record["state"] != "ambiguous":
+            raise ActionsHandlerError("reconciliation_invalid_state")
 
         owner_exec_id = record.get("execution_id")
         if owner_exec_id is None:
@@ -272,6 +377,7 @@ class ActionsRequestHandler:
 
         matching_receipts: list[tuple[dict[str, Any], str]] = []
         page = 1
+        first_page_comments: Optional[list[Any]] = None
 
         while True:
             if page > MAX_RECONCILIATION_PAGES:
@@ -283,11 +389,11 @@ class ActionsRequestHandler:
             except Exception:
                 raise ActionsHandlerError("reconciliation_api_failed") from None
 
-            if not isinstance(comments_page, list):
+            if not isinstance(comments_page, list) or len(comments_page) > RECONCILIATION_PER_PAGE:
                 raise ActionsHandlerError("reconciliation_malformed_response")
 
-            if len(comments_page) > RECONCILIATION_PER_PAGE:
-                raise ActionsHandlerError("reconciliation_malformed_response")
+            if page == 1:
+                first_page_comments = list(comments_page)
 
             for item in comments_page:
                 if not isinstance(item, dict):
@@ -300,6 +406,12 @@ class ActionsRequestHandler:
                     continue
 
                 if f"request_id={expected_req_id}" in body and "zach-actions:receipt:v1:" in body:
+                    # Finding 1: Enforce trusted GitHub App and bot authorship
+                    if not self.is_trusted_comment_author(item, repo_full_name, issue_number):
+                        # Untrusted or forged authorship must not become a trusted receipt
+                        continue
+
+                    # Finding 3: Strict canonical receipt parsing
                     envelope = self._parse_receipt_comment(
                         body=body,
                         expected_request_id=expected_req_id,
@@ -307,14 +419,28 @@ class ActionsRequestHandler:
                         expected_operation=expected_operation,
                     )
                     if envelope is not None:
-                        ref = f"https://github/{repo_full_name}/issues/{issue_number}#issuecomment-{comment_id}".replace(
-                            "https://github/", "https://github.com/"
-                        )
+                        ref = f"https://github.com/{repo_full_name}/issues/{issue_number}#issuecomment-{comment_id}"
                         matching_receipts.append((envelope, ref))
 
             if len(comments_page) < RECONCILIATION_PER_PAGE:
                 break
             page += 1
+
+        # Finding 3: Final consistency safeguard to ensure observation stability
+        check_path = f"/repos/{repo_full_name}/issues/{issue_number}/comments?per_page={RECONCILIATION_PER_PAGE}&page=1"
+        try:
+            check_page = self._api_transport("GET", check_path, body=None)
+        except Exception:
+            raise ActionsHandlerError("reconciliation_api_failed") from None
+
+        if not isinstance(check_page, list) or len(check_page) > RECONCILIATION_PER_PAGE:
+            raise ActionsHandlerError("reconciliation_malformed_response")
+
+        if first_page_comments is not None:
+            initial_ids = [c.get("id") for c in first_page_comments if isinstance(c, dict)]
+            current_ids = [c.get("id") for c in check_page if isinstance(c, dict)]
+            if initial_ids != current_ids:
+                raise ActionsHandlerError("reconciliation_observation_unstable")
 
         if len(matching_receipts) > 1:
             raise ActionsHandlerError("duplicate_receipts_found")
@@ -326,8 +452,6 @@ class ActionsRequestHandler:
                 terminal_code=envelope["terminal_code"],
                 terminal_reference=canonical_reference,
             )
-            if record["state"] == "executing":
-                self._coordinator.mark_ambiguous(request_id, owner_exec_id)
             try:
                 mutation = self._coordinator.reconcile(request_id, owner_exec_id, observation)
             except CoordinatorError as e:
@@ -349,8 +473,6 @@ class ActionsRequestHandler:
                 terminal_code="no_result_published",
                 terminal_reference=None,
             )
-            if record["state"] == "executing":
-                self._coordinator.mark_ambiguous(request_id, owner_exec_id)
             try:
                 mutation = self._coordinator.reconcile(request_id, owner_exec_id, observation)
             except CoordinatorError as e:
@@ -386,21 +508,16 @@ class ActionsRequestHandler:
             self._safe_mark_ambiguous(request_id, execution_id)
             raise ActionsHandlerError("comment_publication_ambiguous") from None
 
-        if not isinstance(post_res, dict):
+        try:
+            comment_id = self.validate_comment_identity(
+                comment=post_res,
+                expected_repo=repo_full_name,
+                expected_issue_number=issue_number,
+                expected_body=comment_body,
+            )
+        except ActionsHandlerError:
             self._safe_mark_ambiguous(request_id, execution_id)
-            raise ActionsHandlerError("comment_publication_ambiguous")
-
-        comment_id = post_res.get("id")
-        if type(comment_id) is not int or comment_id <= 0:
-            self._safe_mark_ambiguous(request_id, execution_id)
-            raise ActionsHandlerError("comment_publication_ambiguous")
-
-        issue_url = post_res.get("issue_url")
-        if isinstance(issue_url, str):
-            expected_suffix = f"/repos/{repo_full_name}/issues/{issue_number}"
-            if not issue_url.endswith(expected_suffix):
-                self._safe_mark_ambiguous(request_id, execution_id)
-                raise ActionsHandlerError("comment_identity_mismatch")
+            raise
 
         # Read back by immutable ID
         get_path = f"/repos/{repo_full_name}/issues/comments/{comment_id}"
@@ -410,18 +527,20 @@ class ActionsRequestHandler:
             self._safe_mark_ambiguous(request_id, execution_id)
             raise ActionsHandlerError("comment_publication_ambiguous") from None
 
-        if not isinstance(get_res, dict):
+        try:
+            readback_id = self.validate_comment_identity(
+                comment=get_res,
+                expected_repo=repo_full_name,
+                expected_issue_number=issue_number,
+                expected_body=comment_body,
+            )
+        except ActionsHandlerError:
             self._safe_mark_ambiguous(request_id, execution_id)
-            raise ActionsHandlerError("comment_publication_ambiguous")
+            raise
 
-        if get_res.get("id") != comment_id:
+        if readback_id != comment_id:
             self._safe_mark_ambiguous(request_id, execution_id)
             raise ActionsHandlerError("comment_readback_identity_mismatch")
-
-        readback_body = get_res.get("body")
-        if readback_body != comment_body:
-            self._safe_mark_ambiguous(request_id, execution_id)
-            raise ActionsHandlerError("comment_body_mismatch")
 
         canonical_reference = (
             f"https://github.com/{repo_full_name}/issues/{issue_number}#issuecomment-{comment_id}"
@@ -447,41 +566,61 @@ class ActionsRequestHandler:
         marker = (
             f"<!-- zach-actions:receipt:v1:request_id={envelope['request_id']}:"
             f"digest={envelope['request_digest']}:op={envelope['operation']}:"
-            f"revision={envelope['accepted_revision']} -->"
+            f"accepted_revision={envelope['accepted_revision']}:"
+            f"claim_revision={envelope['claim_revision']} -->"
         )
         comment_body = f"{marker}\n```json\n{envelope_json}\n```\n"
         if len(comment_body.encode("utf-8")) > MAX_COMMENT_BODY_BYTES:
             raise ActionsHandlerError("comment_body_too_large")
         return comment_body
 
-    @staticmethod
+    @classmethod
     def _parse_receipt_comment(
+        cls,
         body: str,
         expected_request_id: str,
         expected_digest: str,
         expected_operation: str,
     ) -> Optional[dict[str, Any]]:
-        marker_match = RECEIPT_MARKER_RE.search(body)
+        """Strictly parse a machine receipt, enforcing exact canonical format and bindings."""
+        if not isinstance(body, str):
+            return None
+
+        if "<!-- zach-actions:receipt:v1:" not in body:
+            return None
+
+        # Must have exactly one marker and one fenced json block
+        if body.count("<!-- zach-actions:receipt:v1:") != 1:
+            raise ActionsHandlerError("receipt_canonical_body_mismatch")
+        if body.count("```json\n") != 1 or body.count("\n```\n") != 1:
+            raise ActionsHandlerError("receipt_canonical_body_mismatch")
+
+        lines = body.split("\n")
+        if not lines:
+            raise ActionsHandlerError("receipt_canonical_body_mismatch")
+
+        # First line MUST be the exact marker
+        first_line = lines[0]
+        marker_match = RECEIPT_MARKER_RE.fullmatch(first_line)
         if not marker_match:
+            raise ActionsHandlerError("receipt_canonical_body_mismatch")
+
+        req_id, digest, op, acc_rev, claim_rev = marker_match.groups()
+        if req_id != expected_request_id:
             return None
 
-        marker_req_id, marker_digest, marker_op, marker_rev = marker_match.groups()
-        if (
-            marker_req_id != expected_request_id
-            or marker_digest != expected_digest
-            or marker_op != expected_operation
-        ):
-            return None
+        if digest != expected_digest or op != expected_operation:
+            raise ActionsHandlerError("receipt_binding_mismatch")
 
-        json_match = re.search(r"```json\s*([\s\S]*?)\s*```", body)
-        if not json_match:
-            raise ActionsHandlerError("receipt_json_missing")
+        # Must start with marker followed immediately by ```json
+        if len(lines) < 4 or lines[1] != "```json" or lines[-2] != "```" or lines[-1] != "":
+            raise ActionsHandlerError("receipt_canonical_body_mismatch")
 
-        json_str = json_match.group(1).strip()
+        json_str = "\n".join(lines[2:-2])
         try:
             envelope = json.loads(json_str)
         except Exception:
-            raise ActionsHandlerError("receipt_json_invalid")
+            raise ActionsHandlerError("receipt_json_invalid") from None
 
         if not isinstance(envelope, dict):
             raise ActionsHandlerError("receipt_envelope_invalid")
@@ -495,7 +634,9 @@ class ActionsRequestHandler:
             raise ActionsHandlerError("receipt_digest_mismatch")
         if envelope.get("operation") != expected_operation:
             raise ActionsHandlerError("receipt_operation_mismatch")
-        if envelope.get("accepted_revision") != marker_rev:
+        if envelope.get("accepted_revision") != acc_rev:
+            raise ActionsHandlerError("receipt_revision_mismatch")
+        if envelope.get("claim_revision") != claim_rev:
             raise ActionsHandlerError("receipt_revision_mismatch")
 
         state = envelope.get("terminal_state")
@@ -508,5 +649,10 @@ class ActionsRequestHandler:
 
         if not isinstance(envelope.get("result"), dict):
             raise ActionsHandlerError("receipt_result_invalid")
+
+        # Exact canonical body check: regenerate from envelope and verify byte equality
+        canonical = cls._format_receipt_comment(envelope)
+        if body != canonical:
+            raise ActionsHandlerError("receipt_canonical_body_mismatch")
 
         return envelope

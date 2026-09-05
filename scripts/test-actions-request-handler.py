@@ -35,6 +35,7 @@ from actions_request_handler import (
     MAX_COMMENT_BODY_BYTES,
     MAX_EVENT_BYTES,
     MAX_RESULT_ENVELOPE_BYTES,
+    TrustedReceiptPolicy,
 )
 
 
@@ -57,6 +58,11 @@ TRUSTED_POLICY = TrustedIssuePolicy(
     repository_id=1001,
     repository_full_name="shockerqt/zach",
     allowed_actor_ids=(2001,),
+)
+
+TRUSTED_RECEIPT_POLICY = TrustedReceiptPolicy(
+    app_id=9876,
+    bot_user_id=54321,
 )
 
 
@@ -172,10 +178,16 @@ class UnifiedFakeApi:
         self.next_comment_id = 1
         self.bad_post_comment = False
         self.bad_post_identity = False
+        self.bad_post_bot_id = False
+        self.bad_post_user_type = False
+        self.missing_post_app = False
+        self.bad_post_app_id = False
         self.bad_get_comment_readback = False
         self.bad_comment_body_on_readback = False
         self.bad_comments_pagination = False
         self.comment_pagination_page_limit: Optional[int] = None
+        self.comment_page_changes_on_second_call = False
+        self._comment_get_call_count = 0
 
     def request(self, method: str, path: str, body: Any = None) -> Any:
         self.calls.append((method, path, body))
@@ -276,12 +288,18 @@ class UnifiedFakeApi:
                 if self.bad_post_identity
                 else f"https://api.github.com/repos/{repo}/issues/42"
             )
-            item = {
+            user_id = 99999 if self.bad_post_bot_id else TRUSTED_RECEIPT_POLICY.bot_user_id
+            user_type = "User" if self.bad_post_user_type else "Bot"
+            item: dict[str, Any] = {
                 "id": comment_id,
                 "body": body["body"],
                 "issue_url": issue_url,
                 "html_url": f"https://github.com/{repo}/issues/42#issuecomment-{comment_id}",
+                "user": {"id": user_id, "type": user_type},
             }
+            if not self.missing_post_app:
+                app_id = 11111 if self.bad_post_app_id else TRUSTED_RECEIPT_POLICY.app_id
+                item["performed_via_github_app"] = {"id": app_id}
             self.comments[comment_id] = item
             return item
 
@@ -297,8 +315,20 @@ class UnifiedFakeApi:
             return res
 
         if method == "GET" and path.startswith(f"/repos/{repo}/issues/42/comments?"):
+            self._comment_get_call_count += 1
             if self.bad_comments_pagination:
                 raise ApiError(500, "pagination_failed")
+            if self.comment_page_changes_on_second_call and self._comment_get_call_count >= 2:
+                return [
+                    {
+                        "id": 999999,
+                        "body": "unstable comment",
+                        "issue_url": f"https://api.github.com/repos/{repo}/issues/42",
+                        "html_url": f"https://github.com/{repo}/issues/42#issuecomment-999999",
+                        "user": {"id": TRUSTED_RECEIPT_POLICY.bot_user_id, "type": "Bot"},
+                        "performed_via_github_app": {"id": TRUSTED_RECEIPT_POLICY.app_id},
+                    }
+                ]
             parsed = urlsplit(path)
             query = parse_qs(parsed.query)
             page = int(query.get("page", ["1"])[0])
@@ -354,6 +384,7 @@ class TestActionsRequestHandler(unittest.TestCase):
             coordinator=self.coordinator,
             api_transport=lambda method, path, body=None: self.api.request(method, path, body),
             trusted_issue_policy=TRUSTED_POLICY,
+            trusted_receipt_policy=TRUSTED_RECEIPT_POLICY,
             ci_policy=CI_POLICY,
         )
 
@@ -554,7 +585,7 @@ class TestActionsRequestHandler(unittest.TestCase):
         event = make_event(request_id="identity-mismatch-01")
         with self.assertRaises(ActionsHandlerError) as ctx:
             self.handler.handle_request(event, EXECUTION_ID, ACCEPTED_AT, POLICY_REVISION)
-        self.assertEqual(ctx.exception.code, "comment_identity_mismatch")
+        self.assertEqual(ctx.exception.code, "comment_issue_url_mismatch")
 
         # Journal is marked ambiguous
         _, record = self.coordinator.load_record("identity-mismatch-01")
@@ -654,6 +685,7 @@ class TestActionsRequestHandler(unittest.TestCase):
             "request_digest": "0" * 64,
             "operation": "github.ci.inspect",
             "accepted_revision": acceptance.durable_revision,
+            "claim_revision": "b" * 40,
             "terminal_state": "succeeded",
             "terminal_code": "found",
             "result": {},
@@ -664,8 +696,23 @@ class TestActionsRequestHandler(unittest.TestCase):
         envelope["request_digest"] = digest
         comment_body = ActionsRequestHandler._format_receipt_comment(envelope)
 
-        self.api.comments[1] = {"id": 1, "body": comment_body}
-        self.api.comments[2] = {"id": 2, "body": comment_body}
+        repo = TRUSTED_POLICY.repository_full_name
+        self.api.comments[1] = {
+            "id": 1,
+            "body": comment_body,
+            "issue_url": f"https://api.github.com/repos/{repo}/issues/42",
+            "html_url": f"https://github.com/{repo}/issues/42#issuecomment-1",
+            "user": {"id": TRUSTED_RECEIPT_POLICY.bot_user_id, "type": "Bot"},
+            "performed_via_github_app": {"id": TRUSTED_RECEIPT_POLICY.app_id},
+        }
+        self.api.comments[2] = {
+            "id": 2,
+            "body": comment_body,
+            "issue_url": f"https://api.github.com/repos/{repo}/issues/42",
+            "html_url": f"https://github.com/{repo}/issues/42#issuecomment-2",
+            "user": {"id": TRUSTED_RECEIPT_POLICY.bot_user_id, "type": "Bot"},
+            "performed_via_github_app": {"id": TRUSTED_RECEIPT_POLICY.app_id},
+        }
 
         with self.assertRaises(ActionsHandlerError) as ctx:
             self.handler.reconcile_request("dup-receipts-01")
@@ -791,6 +838,549 @@ class TestActionsRequestHandler(unittest.TestCase):
         with self.assertRaises(CoordinatorError) as ctx:
             self.coordinator.reconcile("req-1", "owner-1", {"terminal_state": "succeeded"})  # type: ignore[arg-type]
         self.assertEqual(ctx.exception.code, "invalid_reconciliation_observation")
+
+    # 31. Finding 1: result publication requires trusted bot user ID
+    def test_31_receipt_requires_trusted_bot_user_id(self) -> None:
+        self.api.bad_post_bot_id = True
+        event = make_event(request_id="bot-id-mismatch-01")
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.handler.handle_request(event, EXECUTION_ID, ACCEPTED_AT, POLICY_REVISION)
+        self.assertEqual(ctx.exception.code, "comment_bot_id_mismatch")
+
+        _, record = self.coordinator.load_record("bot-id-mismatch-01")
+        self.assertEqual(record["state"], "ambiguous")
+
+    # 32. Finding 1: result publication requires user type "Bot"
+    def test_32_receipt_requires_user_type_bot(self) -> None:
+        self.api.bad_post_user_type = True
+        event = make_event(request_id="user-type-mismatch-01")
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.handler.handle_request(event, EXECUTION_ID, ACCEPTED_AT, POLICY_REVISION)
+        self.assertEqual(ctx.exception.code, "comment_user_not_bot")
+
+        _, record = self.coordinator.load_record("user-type-mismatch-01")
+        self.assertEqual(record["state"], "ambiguous")
+
+    # 33. Finding 1: result publication requires performed_via_github_app metadata
+    def test_33_receipt_requires_github_app_metadata(self) -> None:
+        self.api.missing_post_app = True
+        event = make_event(request_id="missing-app-01")
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.handler.handle_request(event, EXECUTION_ID, ACCEPTED_AT, POLICY_REVISION)
+        self.assertEqual(ctx.exception.code, "comment_app_metadata_missing")
+
+        _, record = self.coordinator.load_record("missing-app-01")
+        self.assertEqual(record["state"], "ambiguous")
+
+    # 34. Finding 1: result publication requires trusted GitHub App ID
+    def test_34_receipt_requires_trusted_app_id(self) -> None:
+        self.api.bad_post_app_id = True
+        event = make_event(request_id="app-id-mismatch-01")
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.handler.handle_request(event, EXECUTION_ID, ACCEPTED_AT, POLICY_REVISION)
+        self.assertEqual(ctx.exception.code, "comment_app_id_mismatch")
+
+        _, record = self.coordinator.load_record("app-id-mismatch-01")
+        self.assertEqual(record["state"], "ambiguous")
+
+    # 35. Finding 1: reconciliation ignores copied receipt from untrusted human collaborator
+    def test_35_reconciliation_ignores_untrusted_author_receipt(self) -> None:
+        event = make_event(request_id="untrusted-author-01")
+        acceptance = self.coordinator.accept(event, TRUSTED_POLICY, ACCEPTED_AT, POLICY_REVISION)
+        claim = self.coordinator.claim(acceptance.request_id, "run-untrusted")
+        self.coordinator.mark_ambiguous(acceptance.request_id, "run-untrusted")
+
+        # Fake comment posted by human actor with valid envelope and marker
+        _, record = self.coordinator.load_record("untrusted-author-01")
+        envelope = {
+            "schema_version": 1,
+            "kind": "actions.request.receipt",
+            "request_id": "untrusted-author-01",
+            "request_digest": record["request_digest"],
+            "operation": "github.ci.inspect",
+            "accepted_revision": acceptance.durable_revision,
+            "claim_revision": claim.durable_revision,
+            "terminal_state": "succeeded",
+            "terminal_code": "found",
+            "result": {},
+        }
+        comment_body = ActionsRequestHandler._format_receipt_comment(envelope)
+        repo = TRUSTED_POLICY.repository_full_name
+        self.api.comments[1] = {
+            "id": 1,
+            "body": comment_body,
+            "issue_url": f"https://api.github.com/repos/{repo}/issues/42",
+            "html_url": f"https://github.com/{repo}/issues/42#issuecomment-1",
+            "user": {"id": 2001, "type": "User"},  # Human collaborator, not bot!
+            # Missing performed_via_github_app
+        }
+
+        # Reconciliation ignores the human-authored receipt and terminalizes as rejected:no_result_published
+        receipt = self.handler.reconcile_request("untrusted-author-01")
+        self.assertTrue(receipt.reconciled)
+        self.assertEqual(receipt.terminal_state, "rejected")
+        self.assertEqual(receipt.terminal_code, "no_result_published")
+
+    # 36. Finding 1: reconciliation ignores receipt with mismatched GitHub App ID
+    def test_36_reconciliation_ignores_receipt_with_wrong_app_id(self) -> None:
+        event = make_event(request_id="wrong-app-reconcile-01")
+        acceptance = self.coordinator.accept(event, TRUSTED_POLICY, ACCEPTED_AT, POLICY_REVISION)
+        claim = self.coordinator.claim(acceptance.request_id, "run-wrong-app")
+        self.coordinator.mark_ambiguous(acceptance.request_id, "run-wrong-app")
+
+        _, record = self.coordinator.load_record("wrong-app-reconcile-01")
+        envelope = {
+            "schema_version": 1,
+            "kind": "actions.request.receipt",
+            "request_id": "wrong-app-reconcile-01",
+            "request_digest": record["request_digest"],
+            "operation": "github.ci.inspect",
+            "accepted_revision": acceptance.durable_revision,
+            "claim_revision": claim.durable_revision,
+            "terminal_state": "succeeded",
+            "terminal_code": "found",
+            "result": {},
+        }
+        comment_body = ActionsRequestHandler._format_receipt_comment(envelope)
+        repo = TRUSTED_POLICY.repository_full_name
+        self.api.comments[1] = {
+            "id": 1,
+            "body": comment_body,
+            "issue_url": f"https://api.github.com/repos/{repo}/issues/42",
+            "html_url": f"https://github.com/{repo}/issues/42#issuecomment-1",
+            "user": {"id": TRUSTED_RECEIPT_POLICY.bot_user_id, "type": "Bot"},
+            "performed_via_github_app": {"id": 11111},  # Untrusted App ID
+        }
+
+        receipt = self.handler.reconcile_request("wrong-app-reconcile-01")
+        self.assertTrue(receipt.reconciled)
+        self.assertEqual(receipt.terminal_state, "rejected")
+        self.assertEqual(receipt.terminal_code, "no_result_published")
+
+    # 37. Finding 1: authentic receipt succeeds even when human spoof comment is present
+    def test_37_trusted_app_receipt_succeeds_even_with_human_spoof_present(self) -> None:
+        event = make_event(request_id="spoof-and-authentic-01")
+        acceptance = self.coordinator.accept(event, TRUSTED_POLICY, ACCEPTED_AT, POLICY_REVISION)
+        claim = self.coordinator.claim(acceptance.request_id, "run-legit")
+        self.coordinator.mark_ambiguous(acceptance.request_id, "run-legit")
+
+        _, record = self.coordinator.load_record("spoof-and-authentic-01")
+        envelope = {
+            "schema_version": 1,
+            "kind": "actions.request.receipt",
+            "request_id": "spoof-and-authentic-01",
+            "request_digest": record["request_digest"],
+            "operation": "github.ci.inspect",
+            "accepted_revision": acceptance.durable_revision,
+            "claim_revision": claim.durable_revision,
+            "terminal_state": "succeeded",
+            "terminal_code": "found",
+            "result": {"run_id": 33958090021},
+        }
+        comment_body = ActionsRequestHandler._format_receipt_comment(envelope)
+        repo = TRUSTED_POLICY.repository_full_name
+
+        # Comment 1 is spoofed by a human
+        self.api.comments[1] = {
+            "id": 1,
+            "body": comment_body,
+            "issue_url": f"https://api.github.com/repos/{repo}/issues/42",
+            "html_url": f"https://github.com/{repo}/issues/42#issuecomment-1",
+            "user": {"id": 2001, "type": "User"},
+        }
+        # Comment 2 is authentic from the bot and App
+        self.api.comments[2] = {
+            "id": 2,
+            "body": comment_body,
+            "issue_url": f"https://api.github.com/repos/{repo}/issues/42",
+            "html_url": f"https://github.com/{repo}/issues/42#issuecomment-2",
+            "user": {"id": TRUSTED_RECEIPT_POLICY.bot_user_id, "type": "Bot"},
+            "performed_via_github_app": {"id": TRUSTED_RECEIPT_POLICY.app_id},
+        }
+
+        receipt = self.handler.reconcile_request("spoof-and-authentic-01")
+        self.assertTrue(receipt.reconciled)
+        self.assertEqual(receipt.terminal_state, "succeeded")
+        self.assertEqual(receipt.terminal_code, "found")
+        self.assertEqual(
+            receipt.terminal_reference,
+            f"https://github.com/{repo}/issues/42#issuecomment-2",
+        )
+
+    # 38. Finding 2: concurrent execution does not mutate executing journal
+    def test_38_concurrent_execution_does_not_mutate_executing_journal(self) -> None:
+        event = make_event(request_id="concurrent-exec-01")
+        acceptance = self.coordinator.accept(event, TRUSTED_POLICY, ACCEPTED_AT, POLICY_REVISION)
+        self.coordinator.claim(acceptance.request_id, "worker-1")
+
+        # Worker 1 is actively executing. Zero comments on issue.
+        self.assertEqual(len(self.api.comments), 0)
+
+        # Worker 2 arrives with the same event
+        receipt2 = self.handler.handle_request(event, "worker-2", ACCEPTED_AT, POLICY_REVISION)
+        self.assertEqual(receipt2.terminal_state, "executing")
+        self.assertEqual(receipt2.terminal_code, "reconciliation_required")
+        self.assertFalse(receipt2.replayed)
+        self.assertFalse(receipt2.reconciled)
+
+        # Verify journal remains executing under worker-1
+        _, record = self.coordinator.load_record("concurrent-exec-01")
+        self.assertEqual(record["state"], "executing")
+        self.assertEqual(record["execution_id"], "worker-1")
+
+        # Verify Worker 2 did NOT perform CI calls or comment POST
+        ci_calls = [call for call in self.api.calls if "actions/workflows" in call[1]]
+        self.assertEqual(len(ci_calls), 0)
+        self.assertEqual(len(self.api.comments), 0)
+
+        # Now Worker 1 completes cleanly
+        mutation = self.coordinator.complete(
+            request_id="concurrent-exec-01",
+            execution_id="worker-1",
+            state="succeeded",
+            terminal_code="found",
+            terminal_reference="https://github.com/shockerqt/zach/issues/42#issuecomment-10",
+        )
+        self.assertIsNotNone(mutation.durable_revision)
+        _, final_record = self.coordinator.load_record("concurrent-exec-01")
+        self.assertEqual(final_record["state"], "succeeded")
+
+    # 39. Finding 2: receipt appearing while owner executing does not permit takeover
+    def test_39_receipt_appearing_while_owner_executing_does_not_permit_takeover(self) -> None:
+        event = make_event(request_id="no-takeover-exec-01")
+        acceptance = self.coordinator.accept(event, TRUSTED_POLICY, ACCEPTED_AT, POLICY_REVISION)
+        claim = self.coordinator.claim(acceptance.request_id, "worker-original")
+
+        # Authentic comment is placed in comments (e.g. out of band or early)
+        _, record = self.coordinator.load_record("no-takeover-exec-01")
+        envelope = {
+            "schema_version": 1,
+            "kind": "actions.request.receipt",
+            "request_id": "no-takeover-exec-01",
+            "request_digest": record["request_digest"],
+            "operation": "github.ci.inspect",
+            "accepted_revision": acceptance.durable_revision,
+            "claim_revision": claim.durable_revision,
+            "terminal_state": "succeeded",
+            "terminal_code": "found",
+            "result": {},
+        }
+        comment_body = ActionsRequestHandler._format_receipt_comment(envelope)
+        repo = TRUSTED_POLICY.repository_full_name
+        self.api.comments[1] = {
+            "id": 1,
+            "body": comment_body,
+            "issue_url": f"https://api.github.com/repos/{repo}/issues/42",
+            "html_url": f"https://github.com/{repo}/issues/42#issuecomment-1",
+            "user": {"id": TRUSTED_RECEIPT_POLICY.bot_user_id, "type": "Bot"},
+            "performed_via_github_app": {"id": TRUSTED_RECEIPT_POLICY.app_id},
+        }
+
+        # Worker 2 cannot take over or reconcile while worker-original is still executing
+        receipt2 = self.handler.handle_request(event, "worker-takeover", ACCEPTED_AT, POLICY_REVISION)
+        self.assertEqual(receipt2.terminal_state, "executing")
+        self.assertEqual(receipt2.terminal_code, "reconciliation_required")
+
+        # Journal is still executing under worker-original
+        _, record = self.coordinator.load_record("no-takeover-exec-01")
+        self.assertEqual(record["state"], "executing")
+        self.assertEqual(record["execution_id"], "worker-original")
+
+    # 40. Finding 2: explicit foreign execution ID on executing request is rejected
+    def test_40_explicit_foreign_execution_id_on_executing_request_is_rejected(self) -> None:
+        event = make_event(request_id="foreign-owner-exec-01")
+        acceptance = self.coordinator.accept(event, TRUSTED_POLICY, ACCEPTED_AT, POLICY_REVISION)
+        self.coordinator.claim(acceptance.request_id, "worker-real")
+
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.handler.reconcile_request("foreign-owner-exec-01", execution_id="worker-imposter")
+        self.assertEqual(ctx.exception.code, "execution_owner_mismatch")
+
+    # 41. Finding 2: reconcile already ambiguous request with zero comments rejects
+    def test_41_reconcile_already_ambiguous_request_with_zero_comments_rejects(self) -> None:
+        event = make_event(request_id="ambiguous-zero-comments-01")
+        acceptance = self.coordinator.accept(event, TRUSTED_POLICY, ACCEPTED_AT, POLICY_REVISION)
+        self.coordinator.claim(acceptance.request_id, "worker-1")
+        self.coordinator.mark_ambiguous(acceptance.request_id, "worker-1")
+
+        receipt = self.handler.reconcile_request("ambiguous-zero-comments-01")
+        self.assertTrue(receipt.reconciled)
+        self.assertEqual(receipt.terminal_state, "rejected")
+        self.assertEqual(receipt.terminal_code, "no_result_published")
+
+        _, record = self.coordinator.load_record("ambiguous-zero-comments-01")
+        self.assertEqual(record["state"], "rejected")
+        self.assertEqual(record["terminal_code"], "no_result_published")
+
+    # 42. Finding 2: reconcile already ambiguous request with authentic receipt succeeds
+    def test_42_reconcile_already_ambiguous_request_with_authentic_receipt_succeeds(self) -> None:
+        event = make_event(request_id="ambiguous-authentic-receipt-01")
+        acceptance = self.coordinator.accept(event, TRUSTED_POLICY, ACCEPTED_AT, POLICY_REVISION)
+        claim = self.coordinator.claim(acceptance.request_id, "worker-1")
+        self.coordinator.mark_ambiguous(acceptance.request_id, "worker-1")
+
+        _, record = self.coordinator.load_record("ambiguous-authentic-receipt-01")
+        envelope = {
+            "schema_version": 1,
+            "kind": "actions.request.receipt",
+            "request_id": "ambiguous-authentic-receipt-01",
+            "request_digest": record["request_digest"],
+            "operation": "github.ci.inspect",
+            "accepted_revision": acceptance.durable_revision,
+            "claim_revision": claim.durable_revision,
+            "terminal_state": "succeeded",
+            "terminal_code": "found",
+            "result": {"run_id": 12345},
+        }
+        comment_body = ActionsRequestHandler._format_receipt_comment(envelope)
+        repo = TRUSTED_POLICY.repository_full_name
+        self.api.comments[1] = {
+            "id": 1,
+            "body": comment_body,
+            "issue_url": f"https://api.github.com/repos/{repo}/issues/42",
+            "html_url": f"https://github.com/{repo}/issues/42#issuecomment-1",
+            "user": {"id": TRUSTED_RECEIPT_POLICY.bot_user_id, "type": "Bot"},
+            "performed_via_github_app": {"id": TRUSTED_RECEIPT_POLICY.app_id},
+        }
+
+        receipt = self.handler.reconcile_request("ambiguous-authentic-receipt-01")
+        self.assertTrue(receipt.reconciled)
+        self.assertEqual(receipt.terminal_state, "succeeded")
+        self.assertEqual(receipt.terminal_code, "found")
+
+    # 43. Finding 3: receipt parsing rejects prefix text before marker
+    def test_43_receipt_parsing_rejects_prefix_text(self) -> None:
+        envelope = {
+            "schema_version": 1,
+            "kind": "actions.request.receipt",
+            "request_id": "canon-prefix-01",
+            "request_digest": "a" * 64,
+            "operation": "github.ci.inspect",
+            "accepted_revision": "1" * 40,
+            "claim_revision": "2" * 40,
+            "terminal_state": "succeeded",
+            "terminal_code": "found",
+            "result": {},
+        }
+        canonical = ActionsRequestHandler._format_receipt_comment(envelope)
+        corrupted = "Surrounding human note\n" + canonical
+
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            ActionsRequestHandler._parse_receipt_comment(corrupted, "canon-prefix-01", "a" * 64, "github.ci.inspect")
+        self.assertEqual(ctx.exception.code, "receipt_canonical_body_mismatch")
+
+    # 44. Finding 3: receipt parsing rejects suffix text after closing fence
+    def test_44_receipt_parsing_rejects_suffix_text(self) -> None:
+        envelope = {
+            "schema_version": 1,
+            "kind": "actions.request.receipt",
+            "request_id": "canon-suffix-01",
+            "request_digest": "a" * 64,
+            "operation": "github.ci.inspect",
+            "accepted_revision": "1" * 40,
+            "claim_revision": "2" * 40,
+            "terminal_state": "succeeded",
+            "terminal_code": "found",
+            "result": {},
+        }
+        canonical = ActionsRequestHandler._format_receipt_comment(envelope)
+        corrupted = canonical + "Trailing human signature\n"
+
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            ActionsRequestHandler._parse_receipt_comment(corrupted, "canon-suffix-01", "a" * 64, "github.ci.inspect")
+        self.assertEqual(ctx.exception.code, "receipt_canonical_body_mismatch")
+
+    # 45. Finding 3: receipt parsing rejects duplicate markers
+    def test_45_receipt_parsing_rejects_duplicate_markers(self) -> None:
+        envelope = {
+            "schema_version": 1,
+            "kind": "actions.request.receipt",
+            "request_id": "canon-dup-marker-01",
+            "request_digest": "a" * 64,
+            "operation": "github.ci.inspect",
+            "accepted_revision": "1" * 40,
+            "claim_revision": "2" * 40,
+            "terminal_state": "succeeded",
+            "terminal_code": "found",
+            "result": {},
+        }
+        canonical = ActionsRequestHandler._format_receipt_comment(envelope)
+        corrupted = canonical + canonical
+
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            ActionsRequestHandler._parse_receipt_comment(corrupted, "canon-dup-marker-01", "a" * 64, "github.ci.inspect")
+        self.assertEqual(ctx.exception.code, "receipt_canonical_body_mismatch")
+
+    # 46. Finding 3: receipt parsing rejects extra fenced code blocks
+    def test_46_receipt_parsing_rejects_extra_fenced_blocks(self) -> None:
+        envelope = {
+            "schema_version": 1,
+            "kind": "actions.request.receipt",
+            "request_id": "canon-extra-fence-01",
+            "request_digest": "a" * 64,
+            "operation": "github.ci.inspect",
+            "accepted_revision": "1" * 40,
+            "claim_revision": "2" * 40,
+            "terminal_state": "succeeded",
+            "terminal_code": "found",
+            "result": {},
+        }
+        canonical = ActionsRequestHandler._format_receipt_comment(envelope)
+        corrupted = canonical + "```json\n{\"extra\": 1}\n```\n"
+
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            ActionsRequestHandler._parse_receipt_comment(corrupted, "canon-extra-fence-01", "a" * 64, "github.ci.inspect")
+        self.assertEqual(ctx.exception.code, "receipt_canonical_body_mismatch")
+
+    # 47. Finding 3: receipt parsing rejects non-canonical JSON formatting
+    def test_47_receipt_parsing_rejects_non_canonical_json_formatting(self) -> None:
+        marker = (
+            "<!-- zach-actions:receipt:v1:request_id=canon-format-01:"
+            "digest=" + "a" * 64 + ":op=github.ci.inspect:"
+            "accepted_revision=" + "1" * 40 + ":claim_revision=" + "2" * 40 + " -->"
+        )
+        compact_json = '{"accepted_revision":"' + "1"*40 + '","claim_revision":"' + "2"*40 + '","kind":"actions.request.receipt","operation":"github.ci.inspect","request_digest":"' + "a"*64 + '","request_id":"canon-format-01","result":{},"schema_version":1,"terminal_code":"found","terminal_state":"succeeded"}'
+        non_canonical = f"{marker}\n```json\n{compact_json}\n```\n"
+
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            ActionsRequestHandler._parse_receipt_comment(non_canonical, "canon-format-01", "a" * 64, "github.ci.inspect")
+        self.assertEqual(ctx.exception.code, "receipt_canonical_body_mismatch")
+
+    # 48. Finding 3: receipt parsing enforces both accepted_revision and claim_revision
+    def test_48_receipt_parsing_enforces_both_accepted_and_claim_revisions(self) -> None:
+        envelope = {
+            "schema_version": 1,
+            "kind": "actions.request.receipt",
+            "request_id": "rev-bind-01",
+            "request_digest": "a" * 64,
+            "operation": "github.ci.inspect",
+            "accepted_revision": "1" * 40,
+            "claim_revision": "2" * 40,
+            "terminal_state": "succeeded",
+            "terminal_code": "found",
+            "result": {},
+        }
+        canonical = ActionsRequestHandler._format_receipt_comment(envelope)
+
+        # Parsing matches expected
+        parsed = ActionsRequestHandler._parse_receipt_comment(canonical, "rev-bind-01", "a" * 64, "github.ci.inspect")
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["accepted_revision"], "1" * 40)
+        self.assertEqual(parsed["claim_revision"], "2" * 40)
+
+        # Mismatch in claim_revision
+        tampered_envelope = dict(envelope)
+        tampered_envelope["claim_revision"] = "3" * 40
+        tampered_json = json.dumps(tampered_envelope, indent=2, sort_keys=True)
+        marker = (
+            "<!-- zach-actions:receipt:v1:request_id=rev-bind-01:"
+            "digest=" + "a" * 64 + ":op=github.ci.inspect:"
+            "accepted_revision=" + "1" * 40 + ":claim_revision=" + "2" * 40 + " -->"
+        )
+        tampered_body = f"{marker}\n```json\n{tampered_json}\n```\n"
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            ActionsRequestHandler._parse_receipt_comment(tampered_body, "rev-bind-01", "a" * 64, "github.ci.inspect")
+        self.assertEqual(ctx.exception.code, "receipt_revision_mismatch")
+
+    # 49. Finding 3: validate_comment_identity strictly checks all identity fields
+    def test_49_validate_comment_identity_requires_all_canonical_fields(self) -> None:
+        repo = "shockerqt/zach"
+        issue_no = 42
+        valid_comment = {
+            "id": 100,
+            "issue_url": f"https://api.github.com/repos/{repo}/issues/{issue_no}",
+            "html_url": f"https://github.com/{repo}/issues/{issue_no}#issuecomment-100",
+            "body": "exact body",
+            "user": {"id": TRUSTED_RECEIPT_POLICY.bot_user_id, "type": "Bot"},
+            "performed_via_github_app": {"id": TRUSTED_RECEIPT_POLICY.app_id},
+        }
+
+        # Valid comment passes
+        cid = self.handler.validate_comment_identity(valid_comment, repo, issue_no, "exact body")
+        self.assertEqual(cid, 100)
+
+        # Not a dict
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.handler.validate_comment_identity("not-dict", repo, issue_no)
+        self.assertEqual(ctx.exception.code, "comment_identity_mismatch")
+
+        # Invalid comment ID
+        bad = dict(valid_comment, id=-1)
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.handler.validate_comment_identity(bad, repo, issue_no)
+        self.assertEqual(ctx.exception.code, "comment_identity_mismatch")
+
+        # User missing
+        bad = dict(valid_comment)
+        del bad["user"]
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.handler.validate_comment_identity(bad, repo, issue_no)
+        self.assertEqual(ctx.exception.code, "comment_authorship_missing")
+
+        # User ID mismatch
+        bad = dict(valid_comment, user={"id": 99999, "type": "Bot"})
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.handler.validate_comment_identity(bad, repo, issue_no)
+        self.assertEqual(ctx.exception.code, "comment_bot_id_mismatch")
+
+        # User type not Bot
+        bad = dict(valid_comment, user={"id": TRUSTED_RECEIPT_POLICY.bot_user_id, "type": "User"})
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.handler.validate_comment_identity(bad, repo, issue_no)
+        self.assertEqual(ctx.exception.code, "comment_user_not_bot")
+
+        # App missing
+        bad = dict(valid_comment)
+        del bad["performed_via_github_app"]
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.handler.validate_comment_identity(bad, repo, issue_no)
+        self.assertEqual(ctx.exception.code, "comment_app_metadata_missing")
+
+        # App ID mismatch
+        bad = dict(valid_comment, performed_via_github_app={"id": 11111})
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.handler.validate_comment_identity(bad, repo, issue_no)
+        self.assertEqual(ctx.exception.code, "comment_app_id_mismatch")
+
+        # Issue URL mismatch
+        bad = dict(valid_comment, issue_url="https://api.github.com/repos/shockerqt/zach/issues/999")
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.handler.validate_comment_identity(bad, repo, issue_no)
+        self.assertEqual(ctx.exception.code, "comment_issue_url_mismatch")
+
+        # Html URL mismatch
+        bad = dict(valid_comment, html_url="https://github.com/shockerqt/zach/issues/999#issuecomment-100")
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.handler.validate_comment_identity(bad, repo, issue_no)
+        self.assertEqual(ctx.exception.code, "comment_html_url_mismatch")
+
+        # Body mismatch
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.handler.validate_comment_identity(valid_comment, repo, issue_no, "different body")
+        self.assertEqual(ctx.exception.code, "comment_body_mismatch")
+
+    # 50. Finding 3: reconciliation fails closed when comment page observation is unstable
+    def test_50_reconciliation_observation_unstable_fails_closed(self) -> None:
+        event = make_event(request_id="unstable-obs-01")
+        acceptance = self.coordinator.accept(event, TRUSTED_POLICY, ACCEPTED_AT, POLICY_REVISION)
+        self.coordinator.claim(acceptance.request_id, "run-unstable")
+        self.coordinator.mark_ambiguous(acceptance.request_id, "run-unstable")
+
+        self.api.comment_page_changes_on_second_call = True
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.handler.reconcile_request("unstable-obs-01")
+        self.assertEqual(ctx.exception.code, "reconciliation_observation_unstable")
+
+    # 51. TrustedReceiptPolicy numeric validation
+    def test_51_trusted_receipt_policy_numeric_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            TrustedReceiptPolicy(app_id=0, bot_user_id=100)
+        with self.assertRaises(ValueError):
+            TrustedReceiptPolicy(app_id=100, bot_user_id=0)
+        with self.assertRaises(ValueError):
+            TrustedReceiptPolicy(app_id=2**54, bot_user_id=100)
+        with self.assertRaises(ValueError):
+            TrustedReceiptPolicy(app_id="100", bot_user_id=100)  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":
