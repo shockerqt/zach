@@ -104,6 +104,15 @@ class JournalMutationResult:
     replayed: bool
 
 
+@dataclass(frozen=True)
+class TrustedReconciliationObservation:
+    """Independently verified effect observation used to reconcile ambiguous records."""
+
+    terminal_state: str
+    terminal_code: str
+    terminal_reference: Optional[str] = None
+
+
 class _ExactTransitionValidator:
     """Allow exactly the old/new byte strings produced for one CLI transition."""
 
@@ -492,6 +501,40 @@ class ActionsJournalCoordinator:
         """Persist ambiguity only for the exact durable execution owner."""
         self._validate_execution_id(execution_id)
         return self._owned_mutation(request_id, execution_id, "ambiguous", (), None)
+
+    def reconcile(
+        self,
+        request_id: str,
+        execution_id: str,
+        observation: TrustedReconciliationObservation,
+    ) -> JournalMutationResult:
+        """Resolve an ambiguous record to a terminal outcome using an independently verified observation."""
+        self._validate_execution_id(execution_id)
+        if not isinstance(observation, TrustedReconciliationObservation):
+            raise CoordinatorError("invalid_reconciliation_observation")
+        if observation.terminal_state not in ("succeeded", "rejected"):
+            raise CoordinatorError("invalid_terminal_state")
+        self._validate_terminal_value(observation.terminal_code, 128, "invalid_terminal_code")
+        if observation.terminal_reference is not None:
+            self._validate_terminal_value(observation.terminal_reference, 512, "invalid_terminal_reference")
+        return self._owned_mutation(
+            request_id,
+            execution_id,
+            "reconcile",
+            ("--state", observation.terminal_state, "--code", observation.terminal_code),
+            observation.terminal_reference,
+        )
+
+    def load_record(self, request_id: str) -> tuple[str, dict[str, Any]]:
+        """Load and validate a stored journal record, returning (head_sha, record_dict)."""
+        snapshot = self._load(request_id)
+        if snapshot.record_json is None:
+            raise CoordinatorError("request_not_found")
+        try:
+            stored = parse_and_validate_record(snapshot.record_json, request_id)
+        except Exception:
+            raise CoordinatorError("stored_record_invalid") from None
+        return snapshot.head_sha, stored
 
     def _owned_mutation(
         self,
