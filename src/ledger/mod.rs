@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod actions_journal;
 mod json;
 mod publisher;
 mod store;
