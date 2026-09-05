@@ -19,6 +19,7 @@ from actions_journal_coordinator import (
     CliProcessResult,
     CoordinatorError,
     TrustedIssuePolicy,
+    TrustedReconciliationObservation,
     _ExactTransitionValidator,
 )
 
@@ -270,6 +271,44 @@ class TestActionsJournalCoordinator(unittest.TestCase):
             coordinator.accept(make_event(), self.policy, ACCEPTED_AT, POLICY_REVISION)
         self.assertEqual(error.exception.code, "cli_output_too_large")
         self.assertEqual(observed_modes, [0o600])
+
+    def test_reconcile_resolves_ambiguous_record_and_enforces_owner(self) -> None:
+        accepted = self.accept()
+        self.coordinator.claim(accepted.request_id, "run-owner")
+        self.coordinator.mark_ambiguous(accepted.request_id, "run-owner")
+
+        # Reconcile rejects execution owner mismatch
+        observation = TrustedReconciliationObservation("succeeded", "ci_passed", "https://github.com/shockerqt/zach/issues/42#issuecomment-1")
+        with self.assertRaises(CoordinatorError) as error:
+            self.coordinator.reconcile(accepted.request_id, "run-wrong-owner", observation)
+        self.assertEqual(error.exception.code, "execution_owner_mismatch")
+
+        # Reconcile rejects non-TrustedReconciliationObservation
+        with self.assertRaises(CoordinatorError) as error:
+            self.coordinator.reconcile(accepted.request_id, "run-owner", "not-an-observation")  # type: ignore[arg-type]
+        self.assertEqual(error.exception.code, "invalid_reconciliation_observation")
+
+        # Successful reconciliation by exact owner
+        reconciled = self.coordinator.reconcile(accepted.request_id, "run-owner", observation)
+        record = json.loads(reconciled.record_json)
+        self.assertEqual(record["state"], "succeeded")
+        self.assertEqual(record["terminal_code"], "ci_passed")
+        self.assertEqual(record["terminal_reference"], "https://github.com/shockerqt/zach/issues/42#issuecomment-1")
+
+        # Subsequent claim is terminal replay
+        terminal = self.coordinator.claim(accepted.request_id, "later-run")
+        self.assertEqual(terminal.disposition, ClaimDisposition.TERMINAL_REPLAY)
+
+    def test_load_record_returns_snapshot_and_parsed_record(self) -> None:
+        accepted = self.accept()
+        head_sha, record = self.coordinator.load_record(accepted.request_id)
+        self.assertEqual(head_sha, self.api.refs[FIXED_REF])
+        self.assertEqual(record["request_id"], accepted.request_id)
+        self.assertEqual(record["state"], "accepted")
+
+        with self.assertRaises(CoordinatorError) as error:
+            self.coordinator.load_record("req-non-existent")
+        self.assertEqual(error.exception.code, "request_not_found")
 
 
 if __name__ == "__main__":
