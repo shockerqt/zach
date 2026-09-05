@@ -547,27 +547,17 @@ fn secure_candidate_delete(_root: &Path, _path: &Path) -> Result<(), ValidationE
 #[cfg(target_os = "linux")]
 mod secure_linux {
     use super::ValidationError;
-    use std::ffi::{CString, OsStr, c_char, c_int};
+    use libc::{
+        O_CLOEXEC, O_CREAT, O_DIRECTORY, O_NOFOLLOW, O_RDONLY, O_TRUNC, O_WRONLY, mkdirat, openat,
+        unlinkat,
+    };
+    use std::ffi::{CString, OsStr, c_int};
     use std::fs::{File, OpenOptions};
     use std::io::{ErrorKind, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::{Component, Path};
-
-    const O_RDONLY: c_int = 0;
-    const O_WRONLY: c_int = 1;
-    const O_CREAT: c_int = 0o100;
-    const O_TRUNC: c_int = 0o1000;
-    const O_CLOEXEC: c_int = 0o2000000;
-    const O_DIRECTORY: c_int = 0o200000;
-    const O_NOFOLLOW: c_int = 0o400000;
-
-    unsafe extern "C" {
-        fn openat(dirfd: c_int, pathname: *const c_char, flags: c_int, ...) -> c_int;
-        fn mkdirat(dirfd: c_int, pathname: *const c_char, mode: u32) -> c_int;
-        fn unlinkat(dirfd: c_int, pathname: *const c_char, flags: c_int) -> c_int;
-    }
 
     pub(super) fn with_candidate_parent<T>(
         root: &Path,

@@ -1,3 +1,4 @@
+pub mod actions;
 mod json;
 mod publisher;
 mod store;
@@ -81,7 +82,7 @@ impl Clock for SystemClock {
     }
 }
 
-pub struct WebhookService<V, P, C> {
+pub(crate) struct WebhookService<V, P, C> {
     webhook_secret: Vec<u8>,
     repository: String,
     state_db: PathBuf,
@@ -92,7 +93,7 @@ pub struct WebhookService<V, P, C> {
     receipt_auth: TrustedReceiptAuth,
 }
 
-pub struct ServiceConfig<V, P, C> {
+pub(crate) struct ServiceConfig<V, P, C> {
     pub webhook_secret: Vec<u8>,
     pub repository: String,
     pub state_db: PathBuf,
