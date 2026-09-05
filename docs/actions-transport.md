@@ -144,3 +144,20 @@ operation results, keep credentials out of event/record content, and consume
 only the returned claim disposition as execution permission. Data fields are
 omitted from result representations to reduce accidental logging. This remains
 preparatory tooling; no Actions workflow is activated by the coordinator.
+
+
+## Read-only CI inspection
+
+`scripts/actions_ci_inspect.py` accepts only the configured repository alias and
+exact source SHA. Trusted configuration supplies numeric repository/workflow IDs
+and the registered CI path. Complete bounded API pagination, foreign-identity
+rejection and selected-attempt job checks precede its bounded response. It lists
+up to ten newest created runs and their current attempts, plus failed-step labels
+for the selected run. Raw logs and artifacts are not included. A final run-list
+and selected-run read reject observed races; the response remains a point-in-time
+observation, not permission to merge or deploy. No request is mutated or retried.
+The 16 KiB limit is enforced rather than silently dropping authoritative facts.
+
+Full Issue workflow wiring remains pending. A failed-step label identifies where
+CI failed; detailed compiler/test diagnostics will require a separately bounded
+reporting path before the complete Web debugging pilot can pass.
