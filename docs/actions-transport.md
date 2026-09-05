@@ -106,7 +106,7 @@ checks the actual ref/parent/tree. A lost update response can succeed only when
 that independent readback proves the exact candidate. Unresolved publication
 blocks execution; it is never an automatic retry. No native CAS API is claimed.
 
-The Rust transition callback and Actions job wiring remain pending. The branch must be provisioned explicitly; missing/inaccessible refs
+The Actions job wiring remains pending. The branch must be provisioned explicitly; missing/inaccessible refs
 and truncated trees fail closed. Repository Contents can follow symlinks, so
 its file-shaped response alone is not used as proof of a regular journal file.
 See [GitHub Contents behavior](https://docs.github.com/en/rest/repos/contents).
@@ -125,3 +125,22 @@ code; the transport does not establish actor authorization or transition policy.
 The pinned REST API version is 2026-03-10. A read-only live repository lookup was
 verified with existing user authentication; App provisioning and workflow
 activation remain pending.
+
+
+## Durable journal coordinator
+
+`scripts/actions_journal_coordinator.py` connects an explicitly pinned trusted
+`zach-actions` executable with the Git journal. Its publish callback binds the
+exact loaded record and exact Rust-generated replacement. Acceptance replay
+preserves the first timestamp and policy revision. A claim grants execution only
+after its record is durably published and read back; repeated claims, including
+the same execution owner, require reconciliation. Completion and ambiguity
+updates require the stored execution owner. Publication conflicts propagate and
+never trigger automatic retries. No reconciliation or effect handler is exposed.
+
+The child receives private bounded files, a minimal environment and bounded I/O
+with a timeout. Runtime code must supply the reviewed executable and trusted
+operation results, keep credentials out of event/record content, and consume
+only the returned claim disposition as execution permission. Data fields are
+omitted from result representations to reduce accidental logging. This remains
+preparatory tooling; no Actions workflow is activated by the coordinator.
