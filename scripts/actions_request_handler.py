@@ -25,6 +25,7 @@ from typing import Any, Callable, Final, Mapping, Optional
 from actions_ci_inspect import CiInspectError, CiInspectionPolicy, inspect_ci
 from actions_git_journal import (
     AmbiguousPublication,
+    ActionsGitJournal,
     ApiError,
     MAX_RECORD_BYTES,
     parse_and_validate_record,
@@ -202,6 +203,22 @@ class ExecutionBundle:
         except Exception:
             raise ActionsHandlerError("invalid_execution_bundle") from None
         return cls.from_dict(data)
+
+
+def _validate_execution_bundle(bundle: ExecutionBundle) -> dict[str, Any]:
+    """Bind the effect parameters and identities to the frozen publisher record."""
+    try:
+        record = parse_and_validate_record(bundle.canonical_record, bundle.request_id)
+        fields = ("request_id", "request_digest", "operation", "repository_id",
+                  "repository_full_name", "issue_id", "issue_number", "execution_id")
+        if any(record.get(key) != getattr(bundle, key) for key in fields):
+            raise ValueError("bundle binding")
+        request = json.loads(record["canonical_request"])
+        if record.get("state") != "executing" or request["parameters"] != bundle.parameters:
+            raise ValueError("bundle parameters")
+        return record
+    except Exception:
+        raise ActionsHandlerError("invalid_execution_bundle") from None
 
 
 @dataclass(frozen=True)
@@ -560,8 +577,40 @@ class PublisherPhase:
         if not isinstance(bundle, ExecutionBundle):
             raise TypeError("bundle must be an ExecutionBundle instance")
 
-        # 1. Load durable journal record
+        # Bind the original bundle to the independently loaded durable request.
+        frozen = _validate_execution_bundle(bundle)
         head_sha, record = self._coordinator.load_record(bundle.request_id)
+        mutable_fields = {"state", "terminal_code", "terminal_reference"}
+        if ({k: v for k, v in frozen.items() if k not in mutable_fields}
+                != {k: v for k, v in record.items() if k not in mutable_fields}):
+            raise ActionsHandlerError("bundle_journal_mismatch")
+
+        # Caller-supplied SHA strings are not proof: independently read both
+        # immutable journal snapshots and bind them to the accepted request/claim.
+        journal = ActionsGitJournal(request=self._read_api_transport,
+                                    validate_transition=lambda _old, _new: False)
+        try:
+            for base, head in ((bundle.accepted_revision, bundle.claim_revision),
+                               (bundle.claim_revision, head_sha)):
+                if base == head:
+                    continue
+                comparison = self._read_api_transport(
+                    "GET", f"/repos/{journal.REPOSITORY}/compare/{base}...{head}", body=None)
+                if (comparison.get("status") != "ahead"
+                        or comparison.get("base_commit", {}).get("sha") != base
+                        or comparison.get("merge_base_commit", {}).get("sha") != base):
+                    raise ValueError("not journal ancestry")
+            accepted = journal.load_at(bundle.request_id, bundle.accepted_revision)
+            claimed = journal.load_at(bundle.request_id, bundle.claim_revision)
+            if claimed.record_json != bundle.canonical_record or accepted.record_json is None:
+                raise ValueError("snapshot mismatch")
+            accepted_record = parse_and_validate_record(accepted.record_json, bundle.request_id)
+            expected_accepted = dict(frozen, state="accepted", execution_id=None,
+                                     terminal_code=None, terminal_reference=None)
+            if accepted_record != expected_accepted:
+                raise ValueError("acceptance mismatch")
+        except Exception:
+            raise ActionsHandlerError("bundle_revision_mismatch") from None
 
         if record["state"] in ("succeeded", "rejected"):
             return ExecutionReceipt(
@@ -756,25 +805,28 @@ class PublisherPhase:
             raise ActionsHandlerError("duplicate_receipts_found")
 
         if len(matching_receipts) == 1:
-            envelope, canonical_reference = matching_receipts[0]
-            observation = TrustedReconciliationObservation(
-                terminal_state=envelope["terminal_state"],
-                terminal_code=envelope["terminal_code"],
-                terminal_reference=canonical_reference,
-            )
+            envelope, _reference = matching_receipts[0]
+            # The receipt supplies candidates, never trusted revision facts.
+            # finalize independently checks these immutable journal snapshots.
+            journal = ActionsGitJournal(request=self._read_api_transport,
+                                        validate_transition=lambda _old, _new: False)
             try:
-                mutation = self._coordinator.reconcile(request_id, owner_exec_id, observation)
-            except CoordinatorError as e:
-                raise ActionsHandlerError(e.code) from None
-            return ExecutionReceipt(
-                request_id=request_id,
-                durable_revision=mutation.durable_revision,
-                terminal_state=envelope["terminal_state"],
-                terminal_code=envelope["terminal_code"],
-                terminal_reference=canonical_reference,
-                envelope=envelope,
-                reconciled=True,
-            )
+                claimed = journal.load_at(request_id, envelope["claim_revision"])
+                if claimed.record_json is None:
+                    raise ValueError("missing claim")
+                bundle = ExecutionBundle(
+                    request_id=request_id, request_digest=expected_digest,
+                    operation=expected_operation, repository_id=record["repository_id"],
+                    repository_full_name=repo_full_name, issue_id=record["issue_id"],
+                    issue_number=issue_number, execution_id=owner_exec_id,
+                    canonical_record=claimed.record_json,
+                    accepted_revision=envelope["accepted_revision"],
+                    claim_revision=envelope["claim_revision"],
+                    parameters=json.loads(record["canonical_request"])["parameters"],
+                )
+            except Exception:
+                raise ActionsHandlerError("bundle_revision_mismatch") from None
+            return self.finalize(bundle)
 
         # 0 matching receipts found: uncertainty without positive trusted evidence remains uncertainty.
         return ExecutionReceipt(
@@ -913,20 +965,7 @@ class ControlPhase:
             except Exception:
                 raise ActionsHandlerError("invalid_execution_bundle") from None
 
-        # Validate bundle against its canonical record
-        try:
-            rec = parse_and_validate_record(bundle.canonical_record, bundle.request_id)
-            if (
-                rec.get("request_digest") != bundle.request_digest
-                or rec.get("operation") != bundle.operation
-                or rec.get("repository_full_name") != bundle.repository_full_name
-                or rec.get("issue_number") != bundle.issue_number
-                or rec.get("execution_id") != bundle.execution_id
-                or rec.get("state") != "executing"
-            ):
-                raise ActionsHandlerError("invalid_execution_bundle")
-        except Exception:
-            raise ActionsHandlerError("invalid_execution_bundle") from None
+        _validate_execution_bundle(bundle)
 
         operation = bundle.operation
 

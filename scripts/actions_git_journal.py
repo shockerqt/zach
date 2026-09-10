@@ -198,6 +198,13 @@ class ActionsGitJournal:
         ref_path = f"/repos/{self.REPOSITORY}/git/ref/{self.REF}"
         head_sha = _extract_ref_sha(self.request("GET", ref_path))
         validate_sha40(head_sha, "head_sha")
+        return self.load_at(request_id, head_sha)
+
+    def load_at(self, request_id: str, head_sha: str) -> JournalSnapshot:
+        """Read a historical publisher snapshot through the same pinned-tree checks."""
+        validate_request_id(request_id)
+        validate_sha40(head_sha, "head_sha")
+        path = record_path_for_request_id(request_id)
 
         # 2. Read immutable commit to pin tree SHA
         commit_path = f"/repos/{self.REPOSITORY}/git/commits/{head_sha}"

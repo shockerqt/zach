@@ -161,3 +161,62 @@ The 16 KiB limit is enforced rather than silently dropping authoritative facts.
 Full Issue workflow wiring remains pending. A failed-step label identifies where
 CI failed; detailed compiler/test diagnostics will require a separately bounded
 reporting path before the complete Web debugging pilot can pass.
+
+## Isolated phase CLI
+
+`scripts/actions_phase_cli.py` is the minimal machine entry point for three
+separate trusted Actions jobs. It never fetches or synthesizes an Issue event.
+The sequential `ActionsRequestHandler` facade remains a compatibility/test
+composition and is not the credential-bearing Actions runtime.
+The Publisher workflow must fetch the actual Issue and construct a bounded event
+file with the GitHub-owned repository and Issue fields plus authenticated
+workflow actor metadata before calling `prepare`.
+
+Every invocation reads its installation token only from
+`ZACH_INSTALLATION_TOKEN` and writes its machine result to a newly created,
+mode-0600 `--output-file`; it writes no result or payload to stdout. The trusted
+policy is a checked-in or otherwise trusted workflow input with this exact shape:
+
+```json
+{
+  "schema_version": 1,
+  "repository": {"id": 1001, "full_name": "shockerqt/zach"},
+  "allowed_actor_ids": [2001],
+  "control_identity": {"app_id": 9876, "bot_user_id": 54321},
+  "ci": {
+    "repository_alias": "ui-design-sandbox",
+    "repository_id": 1002,
+    "repository_full_name": "shockerqt/ui-design-sandbox",
+    "workflow_id": 339778910,
+    "workflow_path": ".github/workflows/ci.yml"
+  },
+  "policy_revision": "4ae216576b054f528c9edbcfed4a2711bccaa476"
+}
+```
+
+The workflow, rather than Issue JSON, selects this policy and the absolute path
+to the reviewed, integrated `zach-actions` executable. The three calls are:
+
+```text
+python3 scripts/actions_phase_cli.py prepare \
+  --policy-file POLICY.json --event-file EVENT.json \
+  --execution-id RUN_ID --accepted-at 2026-09-10T22:21:00Z \
+  --rust-cli /absolute/path/to/zach-actions --output-file PREPARE.json
+
+python3 scripts/actions_phase_cli.py control \
+  --policy-file POLICY.json --prepare-result PREPARE.json \
+  --output-file CONTROL.json
+
+python3 scripts/actions_phase_cli.py finalize \
+  --policy-file POLICY.json --prepare-result PREPARE.json \
+  --rust-cli /absolute/path/to/zach-actions --output-file FINALIZE.json
+```
+
+`prepare` returns `granted`, `reconciliation_required`, or `terminal_replay`.
+Only `granted` includes an immutable execution bundle and permits the Control
+job to run. `control` uses only the bundle and its Control installation token;
+it never receives the Publisher coordinator. `finalize` reloads the durable
+journal and independently observes the authenticated receipt, without consuming
+the Control result file. Each job must expose only its own installation token.
+An ambiguous Control publication and every sanitized phase error return nonzero;
+the CLI performs no automatic retry or second effect.

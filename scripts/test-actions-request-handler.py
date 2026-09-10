@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import replace
 import base64
 import hashlib
 import json
@@ -204,6 +205,21 @@ class UnifiedFakeApi:
 
     def request(self, method: str, path: str, body: Any = None) -> Any:
         self.calls.append((method, path, body))
+
+        compare_prefix = f"/repos/{FIXED_REPOSITORY}/compare/"
+        if method == "GET" and path.startswith(compare_prefix):
+            base, head = path[len(compare_prefix):].split("...")
+            cursor = head
+            seen = set()
+            while cursor != base and cursor not in seen:
+                seen.add(cursor)
+                parents = self.commits[cursor]["parents"]
+                if not parents:
+                    break
+                cursor = parents[0]["sha"]
+            return {"status": "ahead" if cursor == base else "diverged",
+                    "base_commit": {"sha": base},
+                    "merge_base_commit": {"sha": base if cursor == base else head}}
 
         # 1. Git Data journal endpoints
         ref_path = f"/repos/{FIXED_REPOSITORY}/git/ref/{FIXED_REF}"
@@ -1807,6 +1823,75 @@ class SeparatedAuthorityPhasesTests(unittest.TestCase):
             publisher_api_transport=self.publisher_api,
             control_api_transport=self.control_api,
         )
+
+    def test_control_rejects_parameters_and_numeric_identity_tampering(self) -> None:
+        prep = self.publisher.prepare(make_event(request_id="binding-check-01"), "exec-binding", ACCEPTED_AT, POLICY_REVISION)
+        bundle = prep.bundle
+        assert bundle is not None
+        calls = len(self.api.calls)
+        for altered in (
+            replace(bundle, parameters={"repository": "ui-design-sandbox", "source_sha": "9" * 40}),
+            replace(bundle, repository_id=bundle.repository_id + 1),
+            replace(bundle, issue_id=bundle.issue_id + 1),
+        ):
+            with self.assertRaisesRegex(ActionsHandlerError, "invalid_execution_bundle"):
+                self.control.execute(altered)
+        self.assertEqual(len(self.api.calls), calls)
+
+    def test_finalize_rejects_invented_journal_revisions(self) -> None:
+        prep = self.publisher.prepare(make_event(request_id="revision-check-01"), "exec-revision", ACCEPTED_AT, POLICY_REVISION)
+        assert prep.bundle is not None
+        altered = replace(prep.bundle, accepted_revision="0" * 40, claim_revision="1" * 40)
+        with self.assertRaisesRegex(ActionsHandlerError, "bundle_revision_mismatch"):
+            self.publisher.finalize(altered)
+        _, record = self.coordinator.load_record(prep.request_id)
+        self.assertEqual(record["state"], "executing")
+
+    def test_finalize_rejects_matching_off_branch_claim(self) -> None:
+        prep = self.publisher.prepare(make_event(request_id="offbranch-claim-01"), "exec-branch", ACCEPTED_AT, POLICY_REVISION)
+        assert prep.bundle is not None
+        original = self.api.commits[prep.bundle.claim_revision]
+        detached = "f" * 40
+        self.api.commits[detached] = dict(original, sha=detached)
+        # Equal bytes exist, but this detached commit never became the journal ref.
+        altered = replace(prep.bundle, claim_revision=detached)
+        with self.assertRaisesRegex(ActionsHandlerError, "bundle_revision_mismatch"):
+            self.publisher.finalize(altered)
+
+    def test_reconciliation_rejects_receipt_with_invented_revisions(self) -> None:
+        prep = self.publisher.prepare(make_event(request_id="reconcile-revision-01"), "exec-revision", ACCEPTED_AT, POLICY_REVISION)
+        assert prep.bundle is not None
+        altered = replace(prep.bundle, accepted_revision="0" * 40, claim_revision="1" * 40)
+        self.control.execute(altered)
+        self.coordinator.mark_ambiguous(prep.request_id, altered.execution_id)
+        with self.assertRaisesRegex(ActionsHandlerError, "bundle_revision_mismatch"):
+            self.publisher.reconcile_request(prep.request_id)
+        _, record = self.coordinator.load_record(prep.request_id)
+        self.assertEqual(record["state"], "ambiguous")
+
+    def test_finalize_original_bundle_after_control_handoff_interruption(self) -> None:
+        prep = self.publisher.prepare(make_event(request_id="handoff-recover-01"), "original-owner", ACCEPTED_AT, POLICY_REVISION)
+        assert prep.bundle is not None
+        self.control.execute(prep.bundle)
+        # Phase C did not run. Reload the durable transfer artifact in a new process.
+        recovered = ExecutionBundle.from_json(prep.bundle.to_json())
+        resumed = PublisherPhase(self.coordinator, TRUSTED_POLICY, TRUSTED_RECEIPT_POLICY, self.publisher_api)
+        result = resumed.finalize(recovered)
+        self.assertEqual(result.terminal_state, "succeeded")
+        self.assertEqual(len(self.api.comments), 1)
+        self.assertTrue(resumed.finalize(recovered).replayed)
+
+    def test_finalize_binds_bundle_to_durable_request_before_observation(self) -> None:
+        prep = self.publisher.prepare(make_event(request_id="durable-binding-01"), "exec-binding", ACCEPTED_AT, POLICY_REVISION)
+        bundle = prep.bundle
+        assert bundle is not None
+        frozen = json.loads(bundle.canonical_record)
+        frozen["issue_number"] = 999
+        altered = replace(bundle, issue_number=999, canonical_record=json.dumps(frozen))
+        with self.assertRaisesRegex(ActionsHandlerError, "bundle_journal_mismatch"):
+            self.publisher.finalize(altered)
+        _, record = self.coordinator.load_record(bundle.request_id)
+        self.assertEqual(record["state"], "executing")
 
     # 1. Publisher prepare produce un frozen claimed execution con revisions reales.
     def test_01_publisher_prepare_produces_frozen_claimed_execution_with_real_revisions(self) -> None:
