@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import replace
 import base64
 import hashlib
 import json
@@ -29,14 +30,25 @@ from actions_journal_coordinator import (
     TrustedReconciliationObservation,
 )
 from actions_request_handler import (
+    ActionsControlPhase,
     ActionsHandlerError,
+    ActionsPublisherPhase,
     ActionsRequestHandler,
+    ControlExecutionResult,
+    ControlPhase,
+    ExecutionBundle,
     ExecutionReceipt,
     MAX_COMMENT_BODY_BYTES,
     MAX_EVENT_BYTES,
     MAX_RESULT_ENVELOPE_BYTES,
+    PrepareResult,
+    PublisherPhase,
+    SHA40_RE,
     TrustedReceiptPolicy,
+    _format_receipt_comment,
+    _parse_receipt_comment,
 )
+
 
 
 CLI = str((Path(__file__).resolve().parent.parent / "target" / "debug" / "zach-actions").resolve())
@@ -193,6 +205,21 @@ class UnifiedFakeApi:
 
     def request(self, method: str, path: str, body: Any = None) -> Any:
         self.calls.append((method, path, body))
+
+        compare_prefix = f"/repos/{FIXED_REPOSITORY}/compare/"
+        if method == "GET" and path.startswith(compare_prefix):
+            base, head = path[len(compare_prefix):].split("...")
+            cursor = head
+            seen = set()
+            while cursor != base and cursor not in seen:
+                seen.add(cursor)
+                parents = self.commits[cursor]["parents"]
+                if not parents:
+                    break
+                cursor = parents[0]["sha"]
+            return {"status": "ahead" if cursor == base else "diverged",
+                    "base_commit": {"sha": base},
+                    "merge_base_commit": {"sha": base if cursor == base else head}}
 
         # 1. Git Data journal endpoints
         ref_path = f"/repos/{FIXED_REPOSITORY}/git/ref/{FIXED_REF}"
@@ -1715,5 +1742,589 @@ class TestActionsRequestHandler(unittest.TestCase):
         self.assertEqual(record["execution_id"], "owner-real")
 
 
+class PublisherTransportAdapter:
+    """Restricted transport providing Publisher authority only.
+
+    Allowed:
+      - Git journal endpoints on shockerqt/workspace-governance
+      - GET /repos/{repo}/issues/{number}/comments
+    Forbidden:
+      - POST to issue comments (requires Control authority)
+      - CI inspection endpoints (requires Control authority)
+    """
+
+    def __init__(self, backend: UnifiedFakeApi) -> None:
+        self._backend = backend
+
+    def __call__(self, method: str, path: str, body: Any = None) -> Any:
+        if method == "POST" and "comments" in path:
+            raise PermissionError("Publisher authority cannot post comments")
+        if "actions/workflows" in path or "actions/runs" in path:
+            raise PermissionError("Publisher authority cannot access CI")
+        return self._backend.request(method, path, body)
+
+
+class ControlTransportAdapter:
+    """Restricted transport providing Control authority only.
+
+    Allowed:
+      - CI inspection endpoints
+      - POST /repos/{repo}/issues/{number}/comments
+      - GET /repos/{repo}/issues/comments/{id}
+    Forbidden:
+      - Git journal endpoints on shockerqt/workspace-governance
+    """
+
+    def __init__(self, backend: UnifiedFakeApi) -> None:
+        self._backend = backend
+
+    def __call__(self, method: str, path: str, body: Any = None) -> Any:
+        if FIXED_REPOSITORY in path or "automation/requests" in path:
+            raise PermissionError("Control authority cannot access Git journal")
+        return self._backend.request(method, path, body)
+
+
+class SeparatedAuthorityPhasesTests(unittest.TestCase):
+    """Rigorous tests for the separation of Publisher and Control authorities."""
+
+    def setUp(self) -> None:
+        self.api = UnifiedFakeApi()
+        self.publisher_api = PublisherTransportAdapter(self.api)
+        self.control_api = ControlTransportAdapter(self.api)
+
+        # Coordinator uses Publisher authority (journal persistence)
+        self.coordinator = ActionsJournalCoordinator(
+            cli_executable=CLI,
+            api_transport=self.publisher_api,
+        )
+
+        # PublisherPhase uses ONLY Publisher authority
+        self.publisher = PublisherPhase(
+            coordinator=self.coordinator,
+            trusted_issue_policy=TRUSTED_POLICY,
+            trusted_receipt_policy=TRUSTED_RECEIPT_POLICY,
+            read_api_transport=self.publisher_api,
+        )
+
+        # ControlPhase uses ONLY Control authority (no coordinator!)
+        self.control = ControlPhase(
+            api_transport=self.control_api,
+            trusted_receipt_policy=TRUSTED_RECEIPT_POLICY,
+            ci_policy=CI_POLICY,
+        )
+
+        # ActionsRequestHandler composing both with separated transports
+        self.handler = ActionsRequestHandler(
+            coordinator=self.coordinator,
+            api_transport=self.api,
+            trusted_issue_policy=TRUSTED_POLICY,
+            trusted_receipt_policy=TRUSTED_RECEIPT_POLICY,
+            ci_policy=CI_POLICY,
+            publisher_api_transport=self.publisher_api,
+            control_api_transport=self.control_api,
+        )
+
+    def test_control_rejects_parameters_and_numeric_identity_tampering(self) -> None:
+        prep = self.publisher.prepare(make_event(request_id="binding-check-01"), "exec-binding", ACCEPTED_AT, POLICY_REVISION)
+        bundle = prep.bundle
+        assert bundle is not None
+        calls = len(self.api.calls)
+        for altered in (
+            replace(bundle, parameters={"repository": "ui-design-sandbox", "source_sha": "9" * 40}),
+            replace(bundle, repository_id=bundle.repository_id + 1),
+            replace(bundle, issue_id=bundle.issue_id + 1),
+        ):
+            with self.assertRaisesRegex(ActionsHandlerError, "invalid_execution_bundle"):
+                self.control.execute(altered)
+        self.assertEqual(len(self.api.calls), calls)
+
+    def test_finalize_rejects_invented_journal_revisions(self) -> None:
+        prep = self.publisher.prepare(make_event(request_id="revision-check-01"), "exec-revision", ACCEPTED_AT, POLICY_REVISION)
+        assert prep.bundle is not None
+        altered = replace(prep.bundle, accepted_revision="0" * 40, claim_revision="1" * 40)
+        with self.assertRaisesRegex(ActionsHandlerError, "bundle_revision_mismatch"):
+            self.publisher.finalize(altered)
+        _, record = self.coordinator.load_record(prep.request_id)
+        self.assertEqual(record["state"], "executing")
+
+    def test_finalize_rejects_matching_off_branch_claim(self) -> None:
+        prep = self.publisher.prepare(make_event(request_id="offbranch-claim-01"), "exec-branch", ACCEPTED_AT, POLICY_REVISION)
+        assert prep.bundle is not None
+        original = self.api.commits[prep.bundle.claim_revision]
+        detached = "f" * 40
+        self.api.commits[detached] = dict(original, sha=detached)
+        # Equal bytes exist, but this detached commit never became the journal ref.
+        altered = replace(prep.bundle, claim_revision=detached)
+        with self.assertRaisesRegex(ActionsHandlerError, "bundle_revision_mismatch"):
+            self.publisher.finalize(altered)
+
+    def test_reconciliation_rejects_receipt_with_invented_revisions(self) -> None:
+        prep = self.publisher.prepare(make_event(request_id="reconcile-revision-01"), "exec-revision", ACCEPTED_AT, POLICY_REVISION)
+        assert prep.bundle is not None
+        altered = replace(prep.bundle, accepted_revision="0" * 40, claim_revision="1" * 40)
+        self.control.execute(altered)
+        self.coordinator.mark_ambiguous(prep.request_id, altered.execution_id)
+        with self.assertRaisesRegex(ActionsHandlerError, "bundle_revision_mismatch"):
+            self.publisher.reconcile_request(prep.request_id)
+        _, record = self.coordinator.load_record(prep.request_id)
+        self.assertEqual(record["state"], "ambiguous")
+
+    def test_finalize_original_bundle_after_control_handoff_interruption(self) -> None:
+        prep = self.publisher.prepare(make_event(request_id="handoff-recover-01"), "original-owner", ACCEPTED_AT, POLICY_REVISION)
+        assert prep.bundle is not None
+        self.control.execute(prep.bundle)
+        # Phase C did not run. Reload the durable transfer artifact in a new process.
+        recovered = ExecutionBundle.from_json(prep.bundle.to_json())
+        resumed = PublisherPhase(self.coordinator, TRUSTED_POLICY, TRUSTED_RECEIPT_POLICY, self.publisher_api)
+        result = resumed.finalize(recovered)
+        self.assertEqual(result.terminal_state, "succeeded")
+        self.assertEqual(len(self.api.comments), 1)
+        self.assertTrue(resumed.finalize(recovered).replayed)
+
+    def test_finalize_binds_bundle_to_durable_request_before_observation(self) -> None:
+        prep = self.publisher.prepare(make_event(request_id="durable-binding-01"), "exec-binding", ACCEPTED_AT, POLICY_REVISION)
+        bundle = prep.bundle
+        assert bundle is not None
+        frozen = json.loads(bundle.canonical_record)
+        frozen["issue_number"] = 999
+        altered = replace(bundle, issue_number=999, canonical_record=json.dumps(frozen))
+        with self.assertRaisesRegex(ActionsHandlerError, "bundle_journal_mismatch"):
+            self.publisher.finalize(altered)
+        _, record = self.coordinator.load_record(bundle.request_id)
+        self.assertEqual(record["state"], "executing")
+
+    # 1. Publisher prepare produce un frozen claimed execution con revisions reales.
+    def test_01_publisher_prepare_produces_frozen_claimed_execution_with_real_revisions(self) -> None:
+        event = make_event(request_id="sep-prep-01")
+        prep = self.publisher.prepare(event, "exec-01", ACCEPTED_AT, POLICY_REVISION)
+
+        self.assertEqual(prep.disposition, ClaimDisposition.GRANTED)
+        self.assertIsNotNone(prep.bundle)
+        bundle = prep.bundle
+        self.assertEqual(bundle.request_id, "sep-prep-01")
+        self.assertEqual(bundle.operation, "github.ci.inspect")
+        self.assertEqual(bundle.execution_id, "exec-01")
+        self.assertTrue(bool(SHA40_RE.fullmatch(bundle.accepted_revision)))
+        self.assertTrue(bool(SHA40_RE.fullmatch(bundle.claim_revision)))
+        self.assertNotEqual(bundle.accepted_revision, bundle.claim_revision)
+
+        record = parse_and_validate_record(bundle.canonical_record, "sep-prep-01")
+        self.assertEqual(record["state"], "executing")
+        self.assertEqual(record["execution_id"], "exec-01")
+
+        self.assertEqual(len(self.api.comments), 0)
+        ci_calls = [c for c in self.api.calls if "actions/workflows" in c[1]]
+        self.assertEqual(len(ci_calls), 0)
+
+    # 2. Control execute funciona sin journal/Publisher transport.
+    def test_02_control_execute_works_without_journal_or_publisher_transport(self) -> None:
+        event = make_event(request_id="sep-ctrl-01")
+        prep = self.publisher.prepare(event, "exec-02", ACCEPTED_AT, POLICY_REVISION)
+        assert prep.bundle is not None
+
+        ctrl_res = self.control.execute(prep.bundle)
+        self.assertFalse(ctrl_res.ambiguous)
+        self.assertEqual(ctrl_res.terminal_state, "succeeded")
+        self.assertEqual(ctrl_res.terminal_code, "found")
+        self.assertIsNotNone(ctrl_res.terminal_reference)
+        self.assertIn("issues/42#issuecomment-", ctrl_res.terminal_reference)
+        self.assertIsNotNone(ctrl_res.envelope)
+        self.assertEqual(ctrl_res.envelope["accepted_revision"], prep.bundle.accepted_revision)
+        self.assertEqual(ctrl_res.envelope["claim_revision"], prep.bundle.claim_revision)
+
+        comment_id = int(ctrl_res.terminal_reference.rsplit("-", 1)[-1])
+        self.assertIn(comment_id, self.api.comments)
+        comment = self.api.comments[comment_id]
+        self.assertIn(f"accepted_revision={prep.bundle.accepted_revision}", comment["body"])
+        self.assertIn(f"claim_revision={prep.bundle.claim_revision}", comment["body"])
+
+    # 3. Control execute no puede realizar mutaciones de journal.
+    def test_03_control_execute_cannot_perform_journal_mutations(self) -> None:
+        event = make_event(request_id="sep-nomut-01")
+        prep = self.publisher.prepare(event, "exec-03", ACCEPTED_AT, POLICY_REVISION)
+        assert prep.bundle is not None
+
+        self.assertFalse(hasattr(self.control, "_coordinator"))
+
+        journal_ref_before = self.api.refs[FIXED_REF]
+        patch_calls_before = [c for c in self.api.calls if c[0] == "PATCH"]
+
+        ctrl_res = self.control.execute(prep.bundle)
+        self.assertFalse(ctrl_res.ambiguous)
+
+        journal_ref_after = self.api.refs[FIXED_REF]
+        patch_calls_after = [c for c in self.api.calls if c[0] == "PATCH"]
+        self.assertEqual(journal_ref_before, journal_ref_after)
+        self.assertEqual(len(patch_calls_before), len(patch_calls_after))
+
+        _, record = self.coordinator.load_record("sep-nomut-01")
+        self.assertEqual(record["state"], "executing")
+
+    # 4. Publisher finalize funciona sin Control credential.
+    def test_04_publisher_finalize_works_without_control_credentials(self) -> None:
+        event = make_event(request_id="sep-fin-01")
+        prep = self.publisher.prepare(event, "exec-04", ACCEPTED_AT, POLICY_REVISION)
+        assert prep.bundle is not None
+        ctrl_res = self.control.execute(prep.bundle)
+
+        post_calls_before = len([c for c in self.api.calls if c[0] == "POST" and "comments" in c[1]])
+
+        receipt = self.publisher.finalize(prep.bundle, ctrl_res)
+
+        post_calls_after = len([c for c in self.api.calls if c[0] == "POST" and "comments" in c[1]])
+        self.assertEqual(post_calls_before, post_calls_after)
+
+        self.assertEqual(receipt.terminal_state, "succeeded")
+        self.assertEqual(receipt.terminal_code, "found")
+        self.assertEqual(receipt.terminal_reference, ctrl_res.terminal_reference)
+        self.assertFalse(receipt.replayed)
+        self.assertFalse(receipt.reconciled)
+
+        _, record = self.coordinator.load_record("sep-fin-01")
+        self.assertEqual(record["state"], "succeeded")
+        self.assertEqual(record["terminal_code"], "found")
+        self.assertEqual(record["terminal_reference"], ctrl_res.terminal_reference)
+
+    # 5. Receipt con App incorrecta es rechazado.
+    def test_05_receipt_with_wrong_app_is_rejected(self) -> None:
+        event = make_event(request_id="sep-badapp-01")
+        prep = self.publisher.prepare(event, "exec-05", ACCEPTED_AT, POLICY_REVISION)
+        assert prep.bundle is not None
+
+        self.api.bad_post_app_id = True
+        ctrl_res = self.control.execute(prep.bundle)
+        self.assertTrue(ctrl_res.ambiguous)
+        self.assertEqual(ctrl_res.ambiguous_code, "comment_app_id_mismatch")
+
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.publisher.finalize(prep.bundle, ctrl_res)
+        self.assertEqual(ctx.exception.code, "comment_app_id_mismatch")
+
+        _, record = self.coordinator.load_record("sep-badapp-01")
+        self.assertEqual(record["state"], "ambiguous")
+
+        bad_comment = {
+            "id": 101,
+            "issue_url": f"https://api.github.com/repos/{TRUSTED_POLICY.repository_full_name}/issues/42",
+            "html_url": f"https://github.com/{TRUSTED_POLICY.repository_full_name}/issues/42#issuecomment-101",
+            "user": {"id": TRUSTED_RECEIPT_POLICY.bot_user_id, "type": "Bot"},
+            "performed_via_github_app": {"id": 99999},
+        }
+        with self.assertRaises(ActionsHandlerError) as ctx2:
+            self.publisher.validate_comment_identity(
+                bad_comment, TRUSTED_POLICY.repository_full_name, 42
+            )
+        self.assertEqual(ctx2.exception.code, "comment_app_id_mismatch")
+
+    # 6. Receipt con bot incorrecto es rechazado.
+    def test_06_receipt_with_wrong_bot_is_rejected(self) -> None:
+        event = make_event(request_id="sep-badbot-01")
+        prep = self.publisher.prepare(event, "exec-06", ACCEPTED_AT, POLICY_REVISION)
+        assert prep.bundle is not None
+
+        self.api.bad_post_bot_id = True
+        ctrl_res = self.control.execute(prep.bundle)
+        self.assertTrue(ctrl_res.ambiguous)
+        self.assertEqual(ctrl_res.ambiguous_code, "comment_bot_id_mismatch")
+
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.publisher.finalize(prep.bundle, ctrl_res)
+        self.assertEqual(ctx.exception.code, "comment_bot_id_mismatch")
+
+        bad_comment = {
+            "id": 102,
+            "issue_url": f"https://api.github.com/repos/{TRUSTED_POLICY.repository_full_name}/issues/42",
+            "html_url": f"https://github.com/{TRUSTED_POLICY.repository_full_name}/issues/42#issuecomment-102",
+            "user": {"id": 88888, "type": "Bot"},
+            "performed_via_github_app": {"id": TRUSTED_RECEIPT_POLICY.app_id},
+        }
+        with self.assertRaises(ActionsHandlerError) as ctx2:
+            self.publisher.validate_comment_identity(
+                bad_comment, TRUSTED_POLICY.repository_full_name, 42
+            )
+        self.assertEqual(ctx2.exception.code, "comment_bot_id_mismatch")
+
+    # 7. Receipt forged por usuario es rechazado.
+    def test_07_receipt_forged_by_user_is_rejected(self) -> None:
+        event = make_event(request_id="sep-forged-01")
+        prep = self.publisher.prepare(event, "exec-07", ACCEPTED_AT, POLICY_REVISION)
+        assert prep.bundle is not None
+
+        repo = TRUSTED_POLICY.repository_full_name
+        envelope = {
+            "schema_version": 1,
+            "kind": "actions.request.receipt",
+            "request_id": "sep-forged-01",
+            "request_digest": prep.bundle.request_digest,
+            "operation": "github.ci.inspect",
+            "accepted_revision": prep.bundle.accepted_revision,
+            "claim_revision": prep.bundle.claim_revision,
+            "terminal_state": "succeeded",
+            "terminal_code": "found",
+            "result": {},
+        }
+        body = _format_receipt_comment(envelope)
+        self.api.comments[77] = {
+            "id": 77,
+            "body": body,
+            "issue_url": f"https://api.github.com/repos/{repo}/issues/42",
+            "html_url": f"https://github.com/{repo}/issues/42#issuecomment-77",
+            "user": {"id": 2001, "type": "User"},
+        }
+
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.publisher.finalize(prep.bundle)
+        self.assertEqual(ctx.exception.code, "comment_publication_ambiguous")
+
+        with self.assertRaises(ActionsHandlerError) as ctx2:
+            self.publisher.validate_comment_identity(
+                self.api.comments[77], repo, 42
+            )
+        self.assertEqual(ctx2.exception.code, "comment_bot_id_mismatch")
+
+    # 8. Receipt con accepted revision incorrecta es rechazado.
+    def test_08_receipt_with_wrong_accepted_revision_is_rejected(self) -> None:
+        event = make_event(request_id="sep-badaccrev-01")
+        prep = self.publisher.prepare(event, "exec-08", ACCEPTED_AT, POLICY_REVISION)
+        assert prep.bundle is not None
+
+        repo = TRUSTED_POLICY.repository_full_name
+        wrong_accepted_rev = "0" * 40
+        envelope = {
+            "schema_version": 1,
+            "kind": "actions.request.receipt",
+            "request_id": "sep-badaccrev-01",
+            "request_digest": prep.bundle.request_digest,
+            "operation": "github.ci.inspect",
+            "accepted_revision": wrong_accepted_rev,
+            "claim_revision": prep.bundle.claim_revision,
+            "terminal_state": "succeeded",
+            "terminal_code": "found",
+            "result": {},
+        }
+        body = _format_receipt_comment(envelope)
+        self.api.comments[88] = {
+            "id": 88,
+            "body": body,
+            "issue_url": f"https://api.github.com/repos/{repo}/issues/42",
+            "html_url": f"https://github.com/{repo}/issues/42#issuecomment-88",
+            "user": {"id": TRUSTED_RECEIPT_POLICY.bot_user_id, "type": "Bot"},
+            "performed_via_github_app": {"id": TRUSTED_RECEIPT_POLICY.app_id},
+        }
+
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.publisher.finalize(prep.bundle)
+        self.assertEqual(ctx.exception.code, "receipt_revision_mismatch")
+
+        with self.assertRaises(ActionsHandlerError) as ctx2:
+            _parse_receipt_comment(
+                body,
+                "sep-badaccrev-01",
+                prep.bundle.request_digest,
+                "github.ci.inspect",
+                expected_accepted_revision=prep.bundle.accepted_revision,
+                expected_claim_revision=prep.bundle.claim_revision,
+            )
+        self.assertEqual(ctx2.exception.code, "receipt_revision_mismatch")
+
+    # 9. Receipt con claim revision incorrecta es rechazado.
+    def test_09_receipt_with_wrong_claim_revision_is_rejected(self) -> None:
+        event = make_event(request_id="sep-badclaimrev-01")
+        prep = self.publisher.prepare(event, "exec-09", ACCEPTED_AT, POLICY_REVISION)
+        assert prep.bundle is not None
+
+        repo = TRUSTED_POLICY.repository_full_name
+        wrong_claim_rev = "0" * 40
+        envelope = {
+            "schema_version": 1,
+            "kind": "actions.request.receipt",
+            "request_id": "sep-badclaimrev-01",
+            "request_digest": prep.bundle.request_digest,
+            "operation": "github.ci.inspect",
+            "accepted_revision": prep.bundle.accepted_revision,
+            "claim_revision": wrong_claim_rev,
+            "terminal_state": "succeeded",
+            "terminal_code": "found",
+            "result": {},
+        }
+        body = _format_receipt_comment(envelope)
+        self.api.comments[89] = {
+            "id": 89,
+            "body": body,
+            "issue_url": f"https://api.github.com/repos/{repo}/issues/42",
+            "html_url": f"https://github.com/{repo}/issues/42#issuecomment-89",
+            "user": {"id": TRUSTED_RECEIPT_POLICY.bot_user_id, "type": "Bot"},
+            "performed_via_github_app": {"id": TRUSTED_RECEIPT_POLICY.app_id},
+        }
+
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.publisher.finalize(prep.bundle)
+        self.assertEqual(ctx.exception.code, "receipt_revision_mismatch")
+
+        with self.assertRaises(ActionsHandlerError) as ctx2:
+            _parse_receipt_comment(
+                body,
+                "sep-badclaimrev-01",
+                prep.bundle.request_digest,
+                "github.ci.inspect",
+                expected_accepted_revision=prep.bundle.accepted_revision,
+                expected_claim_revision=prep.bundle.claim_revision,
+            )
+        self.assertEqual(ctx2.exception.code, "receipt_revision_mismatch")
+
+    # 10. Duplicate receipts fallan cerrado.
+    def test_10_duplicate_receipts_fail_closed(self) -> None:
+        event = make_event(request_id="sep-duprec-01")
+        prep = self.publisher.prepare(event, "exec-10", ACCEPTED_AT, POLICY_REVISION)
+        assert prep.bundle is not None
+
+        repo = TRUSTED_POLICY.repository_full_name
+        envelope = {
+            "schema_version": 1,
+            "kind": "actions.request.receipt",
+            "request_id": "sep-duprec-01",
+            "request_digest": prep.bundle.request_digest,
+            "operation": "github.ci.inspect",
+            "accepted_revision": prep.bundle.accepted_revision,
+            "claim_revision": prep.bundle.claim_revision,
+            "terminal_state": "succeeded",
+            "terminal_code": "found",
+            "result": {},
+        }
+        body = _format_receipt_comment(envelope)
+        self.api.comments[1] = {
+            "id": 1,
+            "body": body,
+            "issue_url": f"https://api.github.com/repos/{repo}/issues/42",
+            "html_url": f"https://github.com/{repo}/issues/42#issuecomment-1",
+            "user": {"id": TRUSTED_RECEIPT_POLICY.bot_user_id, "type": "Bot"},
+            "performed_via_github_app": {"id": TRUSTED_RECEIPT_POLICY.app_id},
+        }
+        self.api.comments[2] = {
+            "id": 2,
+            "body": body,
+            "issue_url": f"https://api.github.com/repos/{repo}/issues/42",
+            "html_url": f"https://github.com/{repo}/issues/42#issuecomment-2",
+            "user": {"id": TRUSTED_RECEIPT_POLICY.bot_user_id, "type": "Bot"},
+            "performed_via_github_app": {"id": TRUSTED_RECEIPT_POLICY.app_id},
+        }
+
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.publisher.finalize(prep.bundle)
+        self.assertEqual(ctx.exception.code, "duplicate_receipts_found")
+
+    # 11. Unauthorized Issue es rechazado antes de otorgar ejecución.
+    def test_11_unauthorized_issue_rejected_before_granting_execution(self) -> None:
+        event = make_event(request_id="sep-unauth-01", sender_id=9999, author_id=9999)
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.publisher.prepare(event, "exec-11", ACCEPTED_AT, POLICY_REVISION)
+        self.assertEqual(ctx.exception.code, "cli_validation_failed")
+
+        patch_calls = [c for c in self.api.calls if c[0] == "PATCH"]
+        self.assertEqual(len(patch_calls), 0)
+        self.assertEqual(len(self.api.comments), 0)
+
+    # 12. Replay terminal conserva idempotencia.
+    def test_12_terminal_replay_preserves_idempotency(self) -> None:
+        event = make_event(request_id="sep-replay-01")
+        prep1 = self.publisher.prepare(event, "exec-12", ACCEPTED_AT, POLICY_REVISION)
+        assert prep1.bundle is not None
+        ctrl_res = self.control.execute(prep1.bundle)
+        receipt1 = self.publisher.finalize(prep1.bundle, ctrl_res)
+        self.assertEqual(receipt1.terminal_state, "succeeded")
+
+        ref_after_first = self.api.refs[FIXED_REF]
+        post_calls_after_first = len([c for c in self.api.calls if c[0] == "POST" and "comments" in c[1]])
+
+        prep2 = self.publisher.prepare(event, "exec-12-replay", ACCEPTED_AT, POLICY_REVISION)
+        self.assertEqual(prep2.disposition, ClaimDisposition.TERMINAL_REPLAY)
+        self.assertIsNone(prep2.bundle)
+        self.assertIsNotNone(prep2.receipt)
+        self.assertTrue(prep2.receipt.replayed)
+        self.assertEqual(prep2.receipt.terminal_state, "succeeded")
+        self.assertEqual(prep2.receipt.terminal_code, "found")
+
+        self.assertEqual(self.api.refs[FIXED_REF], ref_after_first)
+        self.assertEqual(
+            len([c for c in self.api.calls if c[0] == "POST" and "comments" in c[1]]),
+            post_calls_after_first,
+        )
+
+    # 13. Ambiguous publication no inventa terminal success/failure.
+    def test_13_ambiguous_publication_does_not_invent_terminal_success_or_failure(self) -> None:
+        event = make_event(request_id="sep-ambig-01")
+        prep = self.publisher.prepare(event, "exec-13", ACCEPTED_AT, POLICY_REVISION)
+        assert prep.bundle is not None
+
+        self.api.bad_post_comment = True
+        ctrl_res = self.control.execute(prep.bundle)
+        self.assertTrue(ctrl_res.ambiguous)
+        self.assertEqual(ctrl_res.ambiguous_code, "comment_publication_ambiguous")
+
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.publisher.finalize(prep.bundle, ctrl_res)
+        self.assertEqual(ctx.exception.code, "comment_publication_ambiguous")
+
+        _, record = self.coordinator.load_record("sep-ambig-01")
+        self.assertEqual(record["state"], "ambiguous")
+        self.assertIsNone(record.get("terminal_code"))
+
+        rec_receipt = self.publisher.reconcile_request("sep-ambig-01")
+        self.assertFalse(rec_receipt.reconciled)
+        self.assertEqual(rec_receipt.terminal_state, "ambiguous")
+        self.assertEqual(rec_receipt.terminal_code, "reconciliation_required")
+
+        _, record2 = self.coordinator.load_record("sep-ambig-01")
+        self.assertEqual(record2["state"], "ambiguous")
+
+    # 14. Existing "github.ci.inspect" behavior continúa funcionando.
+    def test_14_existing_github_ci_inspect_behavior_continues_to_work(self) -> None:
+        event = make_event(request_id="sep-inspect-01")
+        receipt = self.handler.handle_request(event, "exec-14", ACCEPTED_AT, POLICY_REVISION)
+
+        self.assertEqual(receipt.terminal_state, "succeeded")
+        self.assertEqual(receipt.terminal_code, "found")
+        self.assertFalse(receipt.replayed)
+        self.assertFalse(receipt.reconciled)
+
+        comment_id = int(receipt.terminal_reference.rsplit("-", 1)[-1])
+        comment = self.api.comments[comment_id]
+        self.assertIn("zach-actions:receipt:v1:request_id=sep-inspect-01", comment["body"])
+
+        _, record = self.coordinator.load_record("sep-inspect-01")
+        self.assertEqual(record["state"], "succeeded")
+        self.assertEqual(record["terminal_code"], "found")
+
+    # 15. ExecutionBundle serialization roundtrip and validation.
+    def test_15_bundle_serialization_roundtrip_and_validation(self) -> None:
+        event = make_event(request_id="sep-bundle-01")
+        prep = self.publisher.prepare(event, "exec-15", ACCEPTED_AT, POLICY_REVISION)
+        assert prep.bundle is not None
+        bundle = prep.bundle
+
+        bundle_json = bundle.to_json()
+        restored = ExecutionBundle.from_json(bundle_json)
+        self.assertEqual(bundle, restored)
+
+        tampered = ExecutionBundle(
+            request_id=bundle.request_id,
+            request_digest="f" * 64,
+            operation=bundle.operation,
+            repository_id=bundle.repository_id,
+            repository_full_name=bundle.repository_full_name,
+            issue_id=bundle.issue_id,
+            issue_number=bundle.issue_number,
+            execution_id=bundle.execution_id,
+            canonical_record=bundle.canonical_record,
+            accepted_revision=bundle.accepted_revision,
+            claim_revision=bundle.claim_revision,
+            parameters=bundle.parameters,
+        )
+        with self.assertRaises(ActionsHandlerError) as ctx:
+            self.control.execute(tampered)
+        self.assertEqual(ctx.exception.code, "invalid_execution_bundle")
+
+
 if __name__ == "__main__":
     unittest.main()
+
