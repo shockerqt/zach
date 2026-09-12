@@ -18,6 +18,7 @@ This module separates Publisher and Control authorities into distinct phases:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import json
 import re
 from typing import Any, Callable, Final, Mapping, Optional
@@ -53,6 +54,7 @@ MAX_RECONCILIATION_PAGES: Final[int] = 10
 RECONCILIATION_PER_PAGE: Final[int] = 100
 MAX_TERMINAL_CODE_BYTES: Final[int] = 128
 MAX_TERMINAL_REFERENCE_BYTES: Final[int] = 512
+MAX_PUBLISHER_CHECKPOINT_BYTES: Final[int] = 64 * 1024
 
 SHA40_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
@@ -61,6 +63,15 @@ EXECUTION_ID_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$"
 RECEIPT_MARKER_RE: Final[re.Pattern[str]] = re.compile(
     r"^<!-- zach-actions:receipt:v1:request_id=([A-Za-z0-9_.:-]{1,128}):"
     r"digest=([0-9a-f]{64}):op=([a-z0-9_.-]{1,64}):"
+    r"accepted_revision=([0-9a-f]{40}):claim_revision=([0-9a-f]{40}) -->$"
+)
+PUBLISHER_INTENT_MARKER_RE: Final[re.Pattern[str]] = re.compile(
+    r"^<!-- zach-actions:publisher-intent:v1:request_id=([A-Za-z0-9_-]{8,128}):"
+    r"digest=([0-9a-f]{64}):execution_digest=([0-9a-f]{64}) -->$"
+)
+PUBLISHER_PREPARE_MARKER_RE: Final[re.Pattern[str]] = re.compile(
+    r"^<!-- zach-actions:publisher-prepare:v1:request_id=([A-Za-z0-9_-]{8,128}):"
+    r"digest=([0-9a-f]{64}):execution_digest=([0-9a-f]{64}):"
     r"accepted_revision=([0-9a-f]{40}):claim_revision=([0-9a-f]{40}) -->$"
 )
 
@@ -183,7 +194,17 @@ class ExecutionBundle:
     def from_dict(cls, data: dict[str, Any]) -> ExecutionBundle:
         if not isinstance(data, dict):
             raise ActionsHandlerError("invalid_execution_bundle")
-        if data.get("schema_version") != 1 or data.get("kind") != "actions.execution.bundle":
+        expected_keys = {
+            "schema_version", "kind", "request_id", "request_digest", "operation",
+            "repository_id", "repository_full_name", "issue_id", "issue_number",
+            "execution_id", "canonical_record", "accepted_revision", "claim_revision",
+            "parameters",
+        }
+        if (
+            set(data) != expected_keys
+            or data.get("schema_version") != 1
+            or data.get("kind") != "actions.execution.bundle"
+        ):
             raise ActionsHandlerError("invalid_execution_bundle")
         try:
             return cls(
@@ -198,7 +219,7 @@ class ExecutionBundle:
                 canonical_record=data["canonical_record"],
                 accepted_revision=data["accepted_revision"],
                 claim_revision=data["claim_revision"],
-                parameters=data.get("parameters", {}),
+                parameters=data["parameters"],
             )
         except (KeyError, ValueError, TypeError):
             raise ActionsHandlerError("invalid_execution_bundle") from None
@@ -250,6 +271,16 @@ class ControlExecutionResult:
     envelope: Optional[dict[str, Any]] = None
     ambiguous: bool = False
     ambiguous_code: Optional[str] = None
+    replayed: bool = False
+
+
+@dataclass(frozen=True)
+class DurablePrepareCheckpoint:
+    """Authenticated Publisher handoff recovered from an Issue comment."""
+
+    disposition: ClaimDisposition
+    bundle: ExecutionBundle
+    comment_id: int
 
 
 def _format_receipt_comment(envelope: dict[str, Any]) -> str:
@@ -433,11 +464,203 @@ def _is_trusted_comment_author(
         return False
 
 
+def _execution_digest(execution_id: str) -> str:
+    if not isinstance(execution_id, str) or not EXECUTION_ID_RE.fullmatch(execution_id):
+        raise ActionsHandlerError("invalid_execution_id")
+    return hashlib.sha256(execution_id.encode("utf-8")).hexdigest()
+
+
+def _format_publisher_comment(kind: str, envelope: dict[str, Any]) -> str:
+    if kind == "intent":
+        marker = (
+            f"<!-- zach-actions:publisher-intent:v1:request_id={envelope['request_id']}:"
+            f"digest={envelope['request_digest']}:"
+            f"execution_digest={_execution_digest(envelope['execution_id'])} -->"
+        )
+    elif kind == "prepare":
+        bundle = envelope["bundle"]
+        marker = (
+            f"<!-- zach-actions:publisher-prepare:v1:request_id={bundle['request_id']}:"
+            f"digest={bundle['request_digest']}:"
+            f"execution_digest={_execution_digest(bundle['execution_id'])}:"
+            f"accepted_revision={bundle['accepted_revision']}:"
+            f"claim_revision={bundle['claim_revision']} -->"
+        )
+    else:
+        raise ActionsHandlerError("invalid_publisher_checkpoint")
+    encoded = json.dumps(envelope, indent=2, sort_keys=True, allow_nan=False)
+    body = f"{marker}\n```json\n{encoded}\n```\n"
+    if len(body.encode("utf-8")) > MAX_PUBLISHER_CHECKPOINT_BYTES:
+        raise ActionsHandlerError("publisher_checkpoint_too_large")
+    return body
+
+
+def _parse_publisher_comment(
+    body: Any,
+    kind: str,
+    execution_id: str,
+    request_id: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    if not isinstance(body, str):
+        return None
+    prefix = f"<!-- zach-actions:publisher-{kind}:v1:"
+    if prefix not in body:
+        return None
+    if body.count(prefix) != 1 or body.count("```json\n") != 1 or body.count("\n```\n") != 1:
+        raise ActionsHandlerError("publisher_checkpoint_canonical_mismatch")
+    lines = body.split("\n")
+    if len(lines) < 4 or lines[1] != "```json" or lines[-2] != "```" or lines[-1] != "":
+        raise ActionsHandlerError("publisher_checkpoint_canonical_mismatch")
+    marker_re = PUBLISHER_INTENT_MARKER_RE if kind == "intent" else PUBLISHER_PREPARE_MARKER_RE
+    match = marker_re.fullmatch(lines[0])
+    if match is None:
+        raise ActionsHandlerError("publisher_checkpoint_canonical_mismatch")
+    marker_request_id = match.group(1)
+    if request_id is not None and marker_request_id != request_id:
+        return None
+    if match.group(3) != _execution_digest(execution_id):
+        return None
+    try:
+        envelope = json.loads("\n".join(lines[2:-2]))
+    except (json.JSONDecodeError, RecursionError):
+        raise ActionsHandlerError("publisher_checkpoint_json_invalid") from None
+    if type(envelope) is not dict:
+        raise ActionsHandlerError("publisher_checkpoint_invalid")
+
+    if kind == "intent":
+        expected_keys = {
+            "schema_version", "kind", "request_id", "request_digest", "operation",
+            "repository_id", "repository_full_name", "issue_id", "issue_number",
+            "execution_id", "accepted_revision", "policy_revision",
+        }
+        if set(envelope) != expected_keys or envelope.get("kind") != "actions.publisher.intent":
+            raise ActionsHandlerError("publisher_checkpoint_invalid")
+        if (
+            envelope.get("schema_version") != 1
+            or envelope.get("request_id") != marker_request_id
+            or envelope.get("request_digest") != match.group(2)
+            or envelope.get("execution_id") != execution_id
+            or not isinstance(envelope.get("operation"), str)
+            or not SHA40_RE.fullmatch(envelope.get("accepted_revision", ""))
+            or not SHA40_RE.fullmatch(envelope.get("policy_revision", ""))
+        ):
+            raise ActionsHandlerError("publisher_checkpoint_binding_mismatch")
+    else:
+        expected_keys = {"schema_version", "kind", "disposition", "bundle"}
+        if set(envelope) != expected_keys or envelope.get("kind") != "actions.publisher.prepare":
+            raise ActionsHandlerError("publisher_checkpoint_invalid")
+        if envelope.get("schema_version") != 1 or envelope.get("disposition") not in {
+            ClaimDisposition.GRANTED.value,
+            ClaimDisposition.RECONCILIATION_REQUIRED.value,
+        }:
+            raise ActionsHandlerError("publisher_checkpoint_invalid")
+        bundle = ExecutionBundle.from_dict(envelope.get("bundle"))
+        try:
+            _validate_execution_bundle(bundle)
+        except ActionsHandlerError:
+            raise ActionsHandlerError("publisher_checkpoint_binding_mismatch") from None
+        if (
+            bundle.request_id != marker_request_id
+            or bundle.request_digest != match.group(2)
+            or bundle.execution_id != execution_id
+            or bundle.accepted_revision != match.group(4)
+            or bundle.claim_revision != match.group(5)
+        ):
+            raise ActionsHandlerError("publisher_checkpoint_binding_mismatch")
+
+    if body != _format_publisher_comment(kind, envelope):
+        raise ActionsHandlerError("publisher_checkpoint_canonical_mismatch")
+    return envelope
+
+
+def _scan_issue_comments(
+    api_transport: Callable[..., Any],
+    repo_full_name: str,
+    issue_number: int,
+) -> tuple[tuple[Any, ...], list[dict[str, Any]]]:
+    comments: list[dict[str, Any]] = []
+    snapshot: list[tuple[Any, ...]] = []
+    seen: set[int] = set()
+    for page in range(1, MAX_RECONCILIATION_PAGES + 1):
+        path = f"/repos/{repo_full_name}/issues/{issue_number}/comments?per_page={RECONCILIATION_PER_PAGE}&page={page}"
+        try:
+            items = api_transport("GET", path, body=None)
+        except Exception:
+            raise ActionsHandlerError("reconciliation_api_failed") from None
+        if type(items) is not list or len(items) > RECONCILIATION_PER_PAGE:
+            raise ActionsHandlerError("reconciliation_malformed_response")
+        for item in items:
+            if type(item) is not dict or type(item.get("id")) is not int or item["id"] <= 0:
+                raise ActionsHandlerError("reconciliation_malformed_response")
+            if item["id"] in seen:
+                raise ActionsHandlerError("reconciliation_duplicate_comment_ids")
+            seen.add(item["id"])
+            user = item.get("user")
+            app = item.get("performed_via_github_app")
+            snapshot.append((
+                item["id"], item.get("body"),
+                user.get("id") if type(user) is dict else None,
+                user.get("type") if type(user) is dict else None,
+                app.get("id") if type(app) is dict else None,
+                item.get("issue_url"), item.get("html_url"),
+            ))
+            comments.append(item)
+        if len(items) < RECONCILIATION_PER_PAGE:
+            return tuple(snapshot), comments
+    raise ActionsHandlerError("reconciliation_pagination_exceeded")
+
+
+def load_durable_prepare_checkpoint(
+    api_transport: Callable[..., Any],
+    trusted_publisher_policy: TrustedReceiptPolicy,
+    repository_full_name: str,
+    issue_number: int,
+    execution_id: str,
+    request_id: Optional[str] = None,
+) -> DurablePrepareCheckpoint:
+    """Load exactly one stable, authenticated Publisher prepare checkpoint."""
+    _execution_digest(execution_id)
+    if request_id is not None:
+        validate_request_id(request_id)
+    first, comments = _scan_issue_comments(api_transport, repository_full_name, issue_number)
+    second, _ = _scan_issue_comments(api_transport, repository_full_name, issue_number)
+    if first != second:
+        raise ActionsHandlerError("reconciliation_observation_unstable")
+    matches: list[tuple[dict[str, Any], int]] = []
+    for comment in comments:
+        if not _is_trusted_comment_author(
+            comment, trusted_publisher_policy, repository_full_name, issue_number
+        ):
+            continue
+        envelope = _parse_publisher_comment(
+            comment.get("body"), "prepare", execution_id, request_id
+        )
+        if envelope is not None:
+            matches.append((envelope, comment["id"]))
+    if not matches:
+        raise ActionsHandlerError("publisher_prepare_checkpoint_not_found")
+    if len(matches) > 1:
+        raise ActionsHandlerError("duplicate_publisher_prepare_checkpoints")
+    envelope, comment_id = matches[0]
+    bundle = ExecutionBundle.from_dict(envelope["bundle"])
+    if (
+        bundle.repository_full_name != repository_full_name
+        or bundle.issue_number != issue_number
+    ):
+        raise ActionsHandlerError("publisher_checkpoint_binding_mismatch")
+    return DurablePrepareCheckpoint(
+        disposition=ClaimDisposition(envelope["disposition"]),
+        bundle=bundle,
+        comment_id=comment_id,
+    )
+
+
 class PublisherPhase:
     """Phase A (prepare) and Phase C (finalize) executor with Publisher authority.
 
-    Operates strictly with Governance Contents / Journal authority.
-    Has NO Control App private key and does NOT post comments or run candidate effects.
+    Operates with Governance Contents / Journal authority and, when configured,
+    publishes authenticated durable handoff checkpoints on the control Issue.
+    It has no Control App private key and does not run candidate effects.
     """
 
     def __init__(
@@ -446,6 +669,7 @@ class PublisherPhase:
         trusted_issue_policy: TrustedIssuePolicy,
         trusted_receipt_policy: TrustedReceiptPolicy,
         read_api_transport: Optional[Callable[..., Any]] = None,
+        trusted_publisher_policy: Optional[TrustedReceiptPolicy] = None,
     ) -> None:
         if not isinstance(coordinator, ActionsJournalCoordinator):
             raise TypeError("coordinator must be an ActionsJournalCoordinator instance")
@@ -455,10 +679,15 @@ class PublisherPhase:
             raise TypeError("trusted_receipt_policy must be a TrustedReceiptPolicy instance")
         if read_api_transport is not None and not callable(read_api_transport):
             raise TypeError("read_api_transport must be callable")
+        if trusted_publisher_policy is not None and not isinstance(
+            trusted_publisher_policy, TrustedReceiptPolicy
+        ):
+            raise TypeError("trusted_publisher_policy must be a TrustedReceiptPolicy instance or None")
 
         self._coordinator = coordinator
         self._trusted_issue_policy = trusted_issue_policy
         self._trusted_receipt_policy = trusted_receipt_policy
+        self._trusted_publisher_policy = trusted_publisher_policy
         self._read_api_transport = read_api_transport or coordinator._api_transport
 
     def validate_comment_identity(
@@ -515,6 +744,9 @@ class PublisherPhase:
         except (CoordinatorError, AmbiguousPublication, ApiError) as e:
             code = getattr(e, "code", "acceptance_failed")
             raise ActionsHandlerError(code) from None
+
+        if self._trusted_publisher_policy is not None:
+            return self._prepare_durable(acceptance, execution_id)
 
         # 2. Durable execution claim
         try:
@@ -574,6 +806,315 @@ class PublisherPhase:
             request_id=acceptance.request_id,
             bundle=bundle,
         )
+
+    def _prepare_durable(self, acceptance: Any, execution_id: str) -> PrepareResult:
+        """Persist intent before claim and a complete Issue handoff after claim."""
+        accepted_or_later = parse_and_validate_record(
+            acceptance.record_json, acceptance.request_id
+        )
+        if accepted_or_later["state"] in ("succeeded", "rejected"):
+            return self._terminal_replay(
+                acceptance.request_id, acceptance.durable_revision, accepted_or_later
+            )
+
+        if accepted_or_later["state"] == "accepted":
+            intent = self._intent_envelope(
+                accepted_or_later, execution_id, acceptance.durable_revision
+            )
+            self._ensure_publisher_comment("intent", intent)
+        else:
+            intent = self._load_publisher_intent(
+                accepted_or_later, execution_id
+            )
+
+        try:
+            claim = self._coordinator.claim(acceptance.request_id, execution_id)
+        except (CoordinatorError, AmbiguousPublication, ApiError) as error:
+            raise ActionsHandlerError(getattr(error, "code", "claim_failed")) from None
+
+        if claim.disposition == ClaimDisposition.TERMINAL_REPLAY:
+            stored = parse_and_validate_record(claim.record_json, acceptance.request_id)
+            return self._terminal_replay(
+                acceptance.request_id, claim.durable_revision, stored
+            )
+
+        record = parse_and_validate_record(claim.record_json, acceptance.request_id)
+        if claim.disposition == ClaimDisposition.RECONCILIATION_REQUIRED:
+            if record.get("state") not in {"executing", "ambiguous"} or record.get(
+                "execution_id"
+            ) != execution_id:
+                raise ActionsHandlerError("publisher_prepare_resume_state_invalid")
+            try:
+                checkpoint = load_durable_prepare_checkpoint(
+                    self._read_api_transport,
+                    self._trusted_publisher_policy,
+                    record["repository_full_name"],
+                    record["issue_number"],
+                    execution_id,
+                    acceptance.request_id,
+                )
+            except ActionsHandlerError as error:
+                if error.code != "publisher_prepare_checkpoint_not_found":
+                    raise
+                if record["state"] == "ambiguous":
+                    raise ActionsHandlerError(
+                        "publisher_prepare_checkpoint_missing_after_effect"
+                    ) from None
+            else:
+                self._validate_recovered_bundle(checkpoint.bundle, record)
+                return PrepareResult(
+                    disposition=ClaimDisposition.RECONCILIATION_REQUIRED,
+                    request_id=acceptance.request_id,
+                    bundle=checkpoint.bundle,
+                )
+            disposition = ClaimDisposition.RECONCILIATION_REQUIRED
+        elif claim.disposition == ClaimDisposition.GRANTED:
+            disposition = ClaimDisposition.GRANTED
+        else:
+            raise ActionsHandlerError("unexpected_claim_disposition")
+
+        bundle = self._bundle_from_record(
+            record,
+            claim.record_json,
+            execution_id,
+            intent["accepted_revision"],
+            claim.durable_revision,
+        )
+        self._validate_intent_snapshot(intent, record)
+        envelope = {
+            "schema_version": 1,
+            "kind": "actions.publisher.prepare",
+            "disposition": disposition.value,
+            "bundle": bundle.to_dict(),
+        }
+        self._ensure_publisher_comment("prepare", envelope)
+        return PrepareResult(
+            disposition=disposition,
+            request_id=acceptance.request_id,
+            bundle=bundle,
+        )
+
+    @staticmethod
+    def _terminal_replay(
+        request_id: str, durable_revision: str, record: dict[str, Any]
+    ) -> PrepareResult:
+        return PrepareResult(
+            disposition=ClaimDisposition.TERMINAL_REPLAY,
+            request_id=request_id,
+            receipt=ExecutionReceipt(
+                request_id=request_id,
+                durable_revision=durable_revision,
+                terminal_state=record["state"],
+                terminal_code=record.get("terminal_code") or "",
+                terminal_reference=record.get("terminal_reference"),
+                envelope={},
+                replayed=True,
+            ),
+        )
+
+    @staticmethod
+    def _intent_envelope(
+        record: dict[str, Any], execution_id: str, accepted_revision: str
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "kind": "actions.publisher.intent",
+            "request_id": record["request_id"],
+            "request_digest": record["request_digest"],
+            "operation": record["operation"],
+            "repository_id": record["repository_id"],
+            "repository_full_name": record["repository_full_name"],
+            "issue_id": record["issue_id"],
+            "issue_number": record["issue_number"],
+            "execution_id": execution_id,
+            "accepted_revision": accepted_revision,
+            "policy_revision": record["policy_revision"],
+        }
+
+    @staticmethod
+    def _bundle_from_record(
+        record: dict[str, Any],
+        record_json: str,
+        execution_id: str,
+        accepted_revision: str,
+        claim_revision: str,
+    ) -> ExecutionBundle:
+        request = json.loads(record["canonical_request"])
+        return ExecutionBundle(
+            request_id=record["request_id"],
+            request_digest=record["request_digest"],
+            operation=record["operation"],
+            repository_id=record["repository_id"],
+            repository_full_name=record["repository_full_name"],
+            issue_id=record["issue_id"],
+            issue_number=record["issue_number"],
+            execution_id=execution_id,
+            canonical_record=record_json,
+            accepted_revision=accepted_revision,
+            claim_revision=claim_revision,
+            parameters=request["parameters"],
+        )
+
+    def _load_publisher_intent(
+        self, record: dict[str, Any], execution_id: str
+    ) -> dict[str, Any]:
+        first, comments = _scan_issue_comments(
+            self._read_api_transport,
+            record["repository_full_name"],
+            record["issue_number"],
+        )
+        second, _ = _scan_issue_comments(
+            self._read_api_transport,
+            record["repository_full_name"],
+            record["issue_number"],
+        )
+        if first != second:
+            raise ActionsHandlerError("reconciliation_observation_unstable")
+        matches: list[dict[str, Any]] = []
+        for comment in comments:
+            if not _is_trusted_comment_author(
+                comment,
+                self._trusted_publisher_policy,
+                record["repository_full_name"],
+                record["issue_number"],
+            ):
+                continue
+            envelope = _parse_publisher_comment(
+                comment.get("body"), "intent", execution_id, record["request_id"]
+            )
+            if envelope is not None:
+                matches.append(envelope)
+        if not matches:
+            raise ActionsHandlerError("publisher_intent_missing_after_claim")
+        if len(matches) > 1:
+            raise ActionsHandlerError("duplicate_publisher_intents")
+        self._validate_intent_snapshot(matches[0], record)
+        return matches[0]
+
+    def _validate_intent_snapshot(
+        self, intent: dict[str, Any], current: dict[str, Any]
+    ) -> None:
+        immutable = (
+            "request_id", "request_digest", "operation", "repository_id",
+            "repository_full_name", "issue_id", "issue_number", "policy_revision",
+        )
+        if any(intent.get(key) != current.get(key) for key in immutable):
+            raise ActionsHandlerError("publisher_intent_binding_mismatch")
+        journal = ActionsGitJournal(
+            request=self._read_api_transport,
+            validate_transition=lambda _old, _new: False,
+        )
+        try:
+            accepted = journal.load_at(current["request_id"], intent["accepted_revision"])
+            if accepted.record_json is None:
+                raise ValueError("missing accepted snapshot")
+            accepted_record = parse_and_validate_record(
+                accepted.record_json, current["request_id"]
+            )
+            expected = dict(
+                current,
+                state="accepted",
+                execution_id=None,
+                terminal_code=None,
+                terminal_reference=None,
+            )
+            if accepted_record != expected:
+                raise ValueError("accepted snapshot mismatch")
+        except Exception:
+            raise ActionsHandlerError("publisher_intent_revision_mismatch") from None
+
+    @staticmethod
+    def _validate_recovered_bundle(
+        bundle: ExecutionBundle, current: dict[str, Any]
+    ) -> None:
+        frozen = _validate_execution_bundle(bundle)
+        mutable = {"state", "terminal_code", "terminal_reference"}
+        if (
+            bundle.execution_id != current.get("execution_id")
+            or {key: value for key, value in frozen.items() if key not in mutable}
+            != {key: value for key, value in current.items() if key not in mutable}
+        ):
+            raise ActionsHandlerError("publisher_prepare_checkpoint_journal_mismatch")
+
+    def _ensure_publisher_comment(
+        self, kind: str, envelope: dict[str, Any]
+    ) -> int:
+        body = _format_publisher_comment(kind, envelope)
+        if kind == "intent":
+            request_id = envelope["request_id"]
+            execution_id = envelope["execution_id"]
+            repository = envelope["repository_full_name"]
+            issue_number = envelope["issue_number"]
+        else:
+            bundle = ExecutionBundle.from_dict(envelope["bundle"])
+            request_id = bundle.request_id
+            execution_id = bundle.execution_id
+            repository = bundle.repository_full_name
+            issue_number = bundle.issue_number
+
+        existing = self._matching_publisher_comments(
+            kind, repository, issue_number, execution_id, request_id
+        )
+        if len(existing) > 1:
+            raise ActionsHandlerError(f"duplicate_publisher_{kind}s")
+        if len(existing) == 1:
+            if existing[0].get("body") != body:
+                raise ActionsHandlerError("publisher_checkpoint_conflict")
+            return existing[0]["id"]
+
+        post_path = f"/repos/{repository}/issues/{issue_number}/comments"
+        try:
+            posted = self._read_api_transport("POST", post_path, body={"body": body})
+            comment_id = _validate_comment_identity(
+                posted, self._trusted_publisher_policy, repository, issue_number, body
+            )
+            readback = self._read_api_transport(
+                "GET", f"/repos/{repository}/issues/comments/{comment_id}", body=None
+            )
+            readback_id = _validate_comment_identity(
+                readback, self._trusted_publisher_policy, repository, issue_number, body
+            )
+            if readback_id != comment_id:
+                raise ActionsHandlerError("publisher_comment_readback_identity_mismatch")
+            return comment_id
+        except Exception:
+            recovered = self._matching_publisher_comments(
+                kind, repository, issue_number, execution_id, request_id
+            )
+            if len(recovered) == 1 and recovered[0].get("body") == body:
+                return recovered[0]["id"]
+            if len(recovered) > 1:
+                raise ActionsHandlerError(f"duplicate_publisher_{kind}s") from None
+            raise ActionsHandlerError("publisher_comment_publication_ambiguous") from None
+
+    def _matching_publisher_comments(
+        self,
+        kind: str,
+        repository: str,
+        issue_number: int,
+        execution_id: str,
+        request_id: str,
+    ) -> list[dict[str, Any]]:
+        first, comments = _scan_issue_comments(
+            self._read_api_transport, repository, issue_number
+        )
+        second, _ = _scan_issue_comments(
+            self._read_api_transport, repository, issue_number
+        )
+        if first != second:
+            raise ActionsHandlerError("reconciliation_observation_unstable")
+        matches: list[dict[str, Any]] = []
+        for comment in comments:
+            if not _is_trusted_comment_author(
+                comment, self._trusted_publisher_policy, repository, issue_number
+            ):
+                continue
+            envelope = _parse_publisher_comment(
+                comment.get("body"), kind, execution_id, request_id
+            )
+            if envelope is not None:
+                matches.append(comment)
+        return matches
 
     def finalize(
         self,
@@ -985,8 +1526,10 @@ class ControlPhase:
 
         operation = bundle.operation
 
-        if reconcile_recipe_only and operation != "workspace.recipe.dispatch":
-            raise ActionsHandlerError("recipe_reconciliation_operation_required")
+        if reconcile_recipe_only:
+            replay = self._existing_receipt(bundle)
+            if replay is not None:
+                return replay
 
         # Execute only the allowlisted, typed operations configured by trusted policy.
         if operation == "github.ci.inspect":
@@ -1053,6 +1596,13 @@ class ControlPhase:
 
         repo_full_name = bundle.repository_full_name
         issue_number = bundle.issue_number
+
+        # Reconciliation has no write effect before this point. Observe again so
+        # a receipt that appeared during destination reconciliation is replayed.
+        if reconcile_recipe_only:
+            replay = self._existing_receipt(bundle)
+            if replay is not None:
+                return replay
 
         if len(comment_body.encode("utf-8")) > MAX_COMMENT_BODY_BYTES:
             raise ActionsHandlerError("comment_body_too_large")
@@ -1137,6 +1687,55 @@ class ControlPhase:
             terminal_reference=canonical_reference,
             envelope=envelope,
             ambiguous=False,
+        )
+
+    def _existing_receipt(
+        self, bundle: ExecutionBundle
+    ) -> Optional[ControlExecutionResult]:
+        first, comments = _scan_issue_comments(
+            self._api_transport, bundle.repository_full_name, bundle.issue_number
+        )
+        second, _ = _scan_issue_comments(
+            self._api_transport, bundle.repository_full_name, bundle.issue_number
+        )
+        if first != second:
+            raise ActionsHandlerError("reconciliation_observation_unstable")
+        matches: list[tuple[dict[str, Any], int]] = []
+        for comment in comments:
+            if not _is_trusted_comment_author(
+                comment,
+                self._trusted_receipt_policy,
+                bundle.repository_full_name,
+                bundle.issue_number,
+            ):
+                continue
+            envelope = _parse_receipt_comment(
+                comment.get("body"),
+                bundle.request_id,
+                bundle.request_digest,
+                bundle.operation,
+                bundle.accepted_revision,
+                bundle.claim_revision,
+            )
+            if envelope is not None:
+                matches.append((envelope, comment["id"]))
+        if len(matches) > 1:
+            raise ActionsHandlerError("duplicate_receipts_found")
+        if not matches:
+            return None
+        envelope, comment_id = matches[0]
+        reference = (
+            f"https://github.com/{bundle.repository_full_name}/issues/"
+            f"{bundle.issue_number}#issuecomment-{comment_id}"
+        )
+        return ControlExecutionResult(
+            request_id=bundle.request_id,
+            execution_id=bundle.execution_id,
+            terminal_state=envelope["terminal_state"],
+            terminal_code=envelope["terminal_code"],
+            terminal_reference=reference,
+            envelope=envelope,
+            replayed=True,
         )
 
 
