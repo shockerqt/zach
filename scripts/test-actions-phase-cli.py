@@ -81,10 +81,18 @@ class FakePublisher:
 
 
 class FakeControl:
+    reconcile_values: list[bool] = []
+
     def __init__(self, **_kwargs: object) -> None:
         pass
 
-    def execute(self, value: ExecutionBundle) -> ControlExecutionResult:
+    def execute(
+        self,
+        value: ExecutionBundle,
+        *,
+        reconcile_recipe_only: bool = False,
+    ) -> ControlExecutionResult:
+        self.reconcile_values.append(reconcile_recipe_only)
         return ControlExecutionResult(
             request_id=value.request_id,
             execution_id=value.execution_id,
@@ -126,6 +134,7 @@ class PhaseCliTests(unittest.TestCase):
         FakeApi.constructed = []
         FakePublisher.prepare_error = None
         FakePublisher.finalize_calls = []
+        FakeControl.reconcile_values = []
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -226,6 +235,94 @@ class PhaseCliTests(unittest.TestCase):
                 )
             ],
         )
+
+    def test_recipe_control_uses_issue_and_recipe_namespaces_only(self) -> None:
+        policy_value = json.loads(self.policy.read_text(encoding="utf-8"))
+        policy_value["ci"].update(
+            {
+                "repository_alias": "infrastructure",
+                "repository_id": 1003,
+                "repository_full_name": "shockerqt/infrastructure",
+            }
+        )
+        policy_value["recipe"] = {
+            "recipe": "sandbox.delivery",
+            "repository_alias": "ui-design-sandbox",
+            "repository_id": 1324116785,
+            "repository_full_name": "shockerqt/ui-design-sandbox",
+            "workflow_id": 987654,
+            "workflow_path": ".github/workflows/sandbox-delivery.yml",
+            "ref": "main",
+            "actor_id": 54321,
+        }
+        self.policy.write_text(json.dumps(policy_value), encoding="utf-8")
+        prepare = json.loads(self._prepare_file().read_text(encoding="utf-8"))
+        prepare["bundle"]["operation"] = "workspace.recipe.dispatch"
+        prepare["bundle"]["parameters"] = {
+            "recipe": "sandbox.delivery",
+            "operation": "rollback",
+            "source_sha": "4" * 40,
+            "artifact_sha256": "5" * 64,
+            "expected_current": "6" * 40,
+        }
+        prepare_path = self.root / "recipe-prepare.json"
+        prepare_path.write_text(json.dumps(prepare), encoding="utf-8")
+        output = self.root / "recipe-control.json"
+        status = self._run(
+            [
+                "control",
+                "--policy-file", str(self.policy),
+                "--prepare-result", str(prepare_path),
+                "--output-file", str(output),
+            ]
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            FakeApi.constructed,
+            [("installation-token", frozenset({"shockerqt/zach", "shockerqt/ui-design-sandbox"}))],
+        )
+        self.assertEqual(FakeControl.reconcile_values, [False])
+
+        reconcile_output = self.root / "recipe-reconcile.json"
+        status = self._run(
+            [
+                "control-reconcile",
+                "--policy-file", str(self.policy),
+                "--prepare-result", str(prepare_path),
+                "--output-file", str(reconcile_output),
+            ]
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            json.loads(reconcile_output.read_text(encoding="utf-8"))["phase"],
+            "control-reconcile",
+        )
+        self.assertEqual(FakeControl.reconcile_values, [False, True])
+
+    def test_recipe_actor_must_match_receipt_bot(self) -> None:
+        policy_value = json.loads(self.policy.read_text(encoding="utf-8"))
+        policy_value["recipe"] = {
+            "recipe": "sandbox.delivery",
+            "repository_alias": "ui-design-sandbox",
+            "repository_id": 1324116785,
+            "repository_full_name": "shockerqt/ui-design-sandbox",
+            "workflow_id": 987654,
+            "workflow_path": ".github/workflows/sandbox-delivery.yml",
+            "ref": "main",
+            "actor_id": 99999,
+        }
+        self.policy.write_text(json.dumps(policy_value), encoding="utf-8")
+        output = self.root / "invalid-policy.json"
+        status = self._run(
+            [
+                "control",
+                "--policy-file", str(self.policy),
+                "--prepare-result", str(self._prepare_file()),
+                "--output-file", str(output),
+            ]
+        )
+        self.assertEqual(status, 2)
+        self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["code"], "invalid_policy")
 
     def test_finalize_observes_from_prepare_bundle_without_control_result(self) -> None:
         output = self.root / "finalize.json"

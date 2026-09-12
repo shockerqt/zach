@@ -162,9 +162,38 @@ Full Issue workflow wiring remains pending. A failed-step label identifies where
 CI failed; detailed compiler/test diagnostics will require a separately bounded
 reporting path before the complete Web debugging pilot can pass.
 
+## Typed recipe dispatch
+
+`scripts/actions_recipe_dispatch.py` implements only the recipe selected by the
+trusted Control policy. Issue JSON supplies `recipe`, `operation`, immutable
+source/artifact identities and expected current state; it cannot select a
+repository, workflow, ref, command or credential. Deploy requires the CI
+run/attempt, artifact ID and distinct outer transport digest. Rollback forbids
+those deploy-only fields and binds the exact retained source/digest pair.
+
+Before its single mutation, Control reads back the configured repository ID,
+default branch and active workflow ID/path. It POSTs one `workflow_dispatch`
+using policy-selected ref and exact string inputs. The API response must contain
+the new run ID and canonical URLs; an immediate readback must bind that run to
+the configured repository, workflow, ref, Control bot identity,
+`workflow_dispatch` event, request-bound run name and acceptance-time window.
+The authenticated receipt reports only `dispatched`
+and the observed run identity/status. Completion and production success come
+from the recipe's own bounded result, observed separately.
+
+A 4xx dispatch rejection is terminal and safe to report as rejected. A timeout,
+5xx, malformed successful response or failed/mismatched run readback after POST
+is ambiguous: Control publishes no terminal receipt and never repeats the POST.
+`control-reconcile` consumes the retained immutable prepare result and performs
+two complete, bounded workflow-run scans. It accepts exactly one stable run
+whose run name, acceptance-time window, actor, repository, workflow, ref and
+event match, verifies it again by immutable ID, and only then publishes the
+same `dispatched` receipt. Zero matches, multiple matches, unstable pagination
+or malformed observations remain ambiguous without another dispatch.
+
 ## Isolated phase CLI
 
-`scripts/actions_phase_cli.py` is the minimal machine entry point for three
+`scripts/actions_phase_cli.py` is the minimal machine entry point for separate
 separate trusted Actions jobs. It never fetches or synthesizes an Issue event.
 The sequential `ActionsRequestHandler` facade remains a compatibility/test
 composition and is not the credential-bearing Actions runtime.
@@ -190,12 +219,28 @@ policy is a checked-in or otherwise trusted workflow input with this exact shape
     "workflow_id": 339778910,
     "workflow_path": ".github/workflows/ci.yml"
   },
+  "recipe": {
+    "recipe": "sandbox.delivery",
+    "repository_alias": "ui-design-sandbox",
+    "repository_id": 1324116785,
+    "repository_full_name": "shockerqt/ui-design-sandbox",
+    "workflow_id": 123456,
+    "workflow_path": ".github/workflows/sandbox-delivery.yml",
+    "ref": "main",
+    "actor_id": 54321
+  },
   "policy_revision": "4ae216576b054f528c9edbcfed4a2711bccaa476"
 }
 ```
 
+The `recipe` object is optional only for the already deployed CI-inspection
+canary policy. A `workspace.recipe.dispatch` bundle fails closed when it is
+absent. Its `actor_id` must equal `control_identity.bot_user_id`. Control opens
+the Issue repository plus the repository required by the selected operation;
+recipe dispatch does not inherit the CI repository namespace.
+
 The workflow, rather than Issue JSON, selects this policy and the absolute path
-to the reviewed, integrated `zach-actions` executable. The three calls are:
+to the reviewed, integrated `zach-actions` executable. The normal calls are:
 
 ```text
 python3 scripts/actions_phase_cli.py prepare \
@@ -207,6 +252,11 @@ python3 scripts/actions_phase_cli.py control \
   --policy-file POLICY.json --prepare-result PREPARE.json \
   --output-file CONTROL.json
 
+# Only after an ambiguous Control result; this performs no workflow dispatch.
+python3 scripts/actions_phase_cli.py control-reconcile \
+  --policy-file POLICY.json --prepare-result PREPARE.json \
+  --output-file CONTROL-RECONCILE.json
+
 python3 scripts/actions_phase_cli.py finalize \
   --policy-file POLICY.json --prepare-result PREPARE.json \
   --rust-cli /absolute/path/to/zach-actions --output-file FINALIZE.json
@@ -215,7 +265,9 @@ python3 scripts/actions_phase_cli.py finalize \
 `prepare` returns `granted`, `reconciliation_required`, or `terminal_replay`.
 Only `granted` includes an immutable execution bundle and permits the Control
 job to run. `control` uses only the bundle and its Control installation token;
-it never receives the Publisher coordinator. `finalize` reloads the durable
+`control-reconcile` uses the same frozen bundle and Control namespace but is
+read-only until it publishes a uniquely reconciled receipt. Neither receives the
+Publisher coordinator. `finalize` reloads the durable
 journal and independently observes the authenticated receipt, without consuming
 the Control result file. Each job must expose only its own installation token.
 An ambiguous Control publication and every sanitized phase error return nonzero;

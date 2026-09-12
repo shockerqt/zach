@@ -13,6 +13,7 @@ import sys
 from typing import Any, Final, Optional, Sequence
 
 from actions_ci_inspect import CiInspectionPolicy
+from actions_recipe_dispatch import RecipeDispatchError, RecipeDispatchPolicy
 from actions_git_journal import FIXED_REPOSITORY
 from actions_github_api import GithubApi
 from actions_journal_coordinator import ActionsJournalCoordinator, ClaimDisposition, TrustedIssuePolicy
@@ -53,6 +54,7 @@ class PhasePolicy:
     issue: TrustedIssuePolicy
     receipt: TrustedReceiptPolicy
     ci: CiInspectionPolicy
+    recipe: RecipeDispatchPolicy | None
     policy_revision: str
 
 
@@ -109,9 +111,19 @@ def _exact_keys(value: Any, keys: set[str], code: str) -> dict[str, Any]:
 
 def _load_policy(path: str) -> PhasePolicy:
     value = _read_json(path, MAX_POLICY_BYTES, "invalid_policy")
+    expected_keys = {
+        "schema_version",
+        "repository",
+        "allowed_actor_ids",
+        "control_identity",
+        "ci",
+        "policy_revision",
+    }
+    if "recipe" in value:
+        expected_keys.add("recipe")
     _exact_keys(
         value,
-        {"schema_version", "repository", "allowed_actor_ids", "control_identity", "ci", "policy_revision"},
+        expected_keys,
         "invalid_policy",
     )
     repository = _exact_keys(value["repository"], {"id", "full_name"}, "invalid_policy")
@@ -123,6 +135,27 @@ def _load_policy(path: str) -> PhasePolicy:
     )
     actors = value["allowed_actor_ids"]
     revision = value["policy_revision"]
+    recipe_value = value.get("recipe")
+    recipe = None
+    if recipe_value is not None:
+        recipe_object = _exact_keys(
+            recipe_value,
+            {
+                "recipe",
+                "repository_alias",
+                "repository_id",
+                "repository_full_name",
+                "workflow_id",
+                "workflow_path",
+                "ref",
+                "actor_id",
+            },
+            "invalid_policy",
+        )
+        try:
+            recipe = RecipeDispatchPolicy(**recipe_object)
+        except (RecipeDispatchError, TypeError, ValueError):
+            raise PhaseCliError("invalid_policy") from None
     if (
         value["schema_version"] != 1
         or type(actors) is not list
@@ -132,6 +165,7 @@ def _load_policy(path: str) -> PhasePolicy:
         or len(set(actors)) != len(actors)
         or not isinstance(revision, str)
         or not SHA40_RE.fullmatch(revision)
+        or (recipe is not None and recipe.actor_id != control["bot_user_id"])
     ):
         raise PhaseCliError("invalid_policy")
     try:
@@ -152,6 +186,7 @@ def _load_policy(path: str) -> PhasePolicy:
                 workflow_id=ci["workflow_id"],
                 workflow_path=ci["workflow_path"],
             ),
+            recipe=recipe,
             policy_revision=revision,
         )
     except (KeyError, TypeError, ValueError):
@@ -259,20 +294,32 @@ def _run_prepare(args: argparse.Namespace, policy: PhasePolicy, token: str) -> d
     return output
 
 
-def _run_control(args: argparse.Namespace, policy: PhasePolicy, token: str) -> tuple[dict[str, Any], int]:
+def _run_control(
+    args: argparse.Namespace,
+    policy: PhasePolicy,
+    token: str,
+    *,
+    reconcile_recipe_only: bool = False,
+) -> tuple[dict[str, Any], int]:
     bundle = _prepare_bundle(args.prepare_result)
-    api = _transport(token, {policy.issue.repository_full_name, policy.ci.repository_full_name})
+    repositories = {policy.issue.repository_full_name}
+    if bundle.operation == "github.ci.inspect":
+        repositories.add(policy.ci.repository_full_name)
+    elif bundle.operation == "workspace.recipe.dispatch" and policy.recipe is not None:
+        repositories.add(policy.recipe.repository_full_name)
+    api = _transport(token, repositories)
     result = ControlPhase(
         api_transport=api,
         trusted_receipt_policy=policy.receipt,
         ci_policy=policy.ci,
-    ).execute(bundle)
+        recipe_policy=policy.recipe,
+    ).execute(bundle, reconcile_recipe_only=reconcile_recipe_only)
     if result.ambiguous:
         return (
             {
                 "schema_version": 1,
                 "kind": RESULT_KIND,
-                "phase": "control",
+                "phase": args.phase,
                 "state": "ambiguous",
                 "code": result.ambiguous_code or "comment_publication_ambiguous",
                 "request_id": result.request_id,
@@ -284,7 +331,7 @@ def _run_control(args: argparse.Namespace, policy: PhasePolicy, token: str) -> t
         {
             "schema_version": 1,
             "kind": RESULT_KIND,
-            "phase": "control",
+            "phase": args.phase,
             "state": result.terminal_state,
             "code": result.terminal_code,
             "reference": result.terminal_reference,
@@ -337,7 +384,7 @@ def _write_result(path: str, result: dict[str, Any]) -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = _Parser(prog="actions_phase_cli.py", add_help=True)
     subparsers = parser.add_subparsers(dest="phase", required=True)
-    for name in ("prepare", "control", "finalize"):
+    for name in ("prepare", "control", "control-reconcile", "finalize"):
         command = subparsers.add_parser(name)
         command.add_argument("--policy-file", required=True)
         command.add_argument("--output-file", required=True)
@@ -373,6 +420,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             output = _run_prepare(args, policy, token)
         elif phase == "control":
             output, exit_code = _run_control(args, policy, token)
+        elif phase == "control-reconcile":
+            output, exit_code = _run_control(
+                args,
+                policy,
+                token,
+                reconcile_recipe_only=True,
+            )
         else:
             output = _run_finalize(args, policy, token)
         _write_result(output_path, output)
