@@ -20,9 +20,11 @@ from actions_journal_coordinator import ActionsJournalCoordinator, ClaimDisposit
 from actions_request_handler import (
     ActionsHandlerError,
     ControlPhase,
+    DurablePrepareCheckpoint,
     ExecutionBundle,
     PublisherPhase,
     TrustedReceiptPolicy,
+    load_durable_prepare_checkpoint,
 )
 
 
@@ -53,6 +55,7 @@ class _Parser(argparse.ArgumentParser):
 class PhasePolicy:
     issue: TrustedIssuePolicy
     receipt: TrustedReceiptPolicy
+    publisher: TrustedReceiptPolicy | None
     ci: CiInspectionPolicy
     recipe: RecipeDispatchPolicy | None
     policy_revision: str
@@ -121,6 +124,8 @@ def _load_policy(path: str) -> PhasePolicy:
     }
     if "recipe" in value:
         expected_keys.add("recipe")
+    if "publisher_identity" in value:
+        expected_keys.add("publisher_identity")
     _exact_keys(
         value,
         expected_keys,
@@ -128,6 +133,16 @@ def _load_policy(path: str) -> PhasePolicy:
     )
     repository = _exact_keys(value["repository"], {"id", "full_name"}, "invalid_policy")
     control = _exact_keys(value["control_identity"], {"app_id", "bot_user_id"}, "invalid_policy")
+    publisher_value = value.get("publisher_identity")
+    publisher = None
+    if publisher_value is not None:
+        publisher_object = _exact_keys(
+            publisher_value, {"app_id", "bot_user_id"}, "invalid_policy"
+        )
+        try:
+            publisher = TrustedReceiptPolicy(**publisher_object)
+        except (TypeError, ValueError):
+            raise PhaseCliError("invalid_policy") from None
     ci = _exact_keys(
         value["ci"],
         {"repository_alias", "repository_id", "repository_full_name", "workflow_id", "workflow_path"},
@@ -166,6 +181,13 @@ def _load_policy(path: str) -> PhasePolicy:
         or not isinstance(revision, str)
         or not SHA40_RE.fullmatch(revision)
         or (recipe is not None and recipe.actor_id != control["bot_user_id"])
+        or (
+            publisher is not None
+            and (
+                publisher.app_id == control["app_id"]
+                or publisher.bot_user_id == control["bot_user_id"]
+            )
+        )
     ):
         raise PhaseCliError("invalid_policy")
     try:
@@ -179,6 +201,7 @@ def _load_policy(path: str) -> PhasePolicy:
                 app_id=control["app_id"],
                 bot_user_id=control["bot_user_id"],
             ),
+            publisher=publisher,
             ci=CiInspectionPolicy(
                 repository_alias=ci["repository_alias"],
                 repository_full_name=ci["repository_full_name"],
@@ -215,7 +238,10 @@ def _validate_cli_path(path: str) -> str:
     return resolved
 
 
-def _prepare_bundle(path: str) -> ExecutionBundle:
+def _prepare_bundle(
+    path: str,
+    allowed_dispositions: frozenset[ClaimDisposition] = frozenset({ClaimDisposition.GRANTED}),
+) -> DurablePrepareCheckpoint:
     value = _read_json(path, MAX_PREPARE_RESULT_BYTES, "invalid_prepare_result")
     _exact_keys(
         value,
@@ -227,7 +253,7 @@ def _prepare_bundle(path: str) -> ExecutionBundle:
         or value["kind"] != RESULT_KIND
         or value["phase"] != "prepare"
         or value["state"] != "ok"
-        or value["disposition"] != ClaimDisposition.GRANTED.value
+        or value["disposition"] not in {item.value for item in allowed_dispositions}
         or type(value["bundle"]) is not dict
     ):
         raise PhaseCliError("execution_not_granted")
@@ -237,7 +263,49 @@ def _prepare_bundle(path: str) -> ExecutionBundle:
         raise PhaseCliError("invalid_prepare_result") from None
     if value["request_id"] != bundle.request_id:
         raise PhaseCliError("invalid_prepare_result")
-    return bundle
+    return DurablePrepareCheckpoint(
+        disposition=ClaimDisposition(value["disposition"]),
+        bundle=bundle,
+        comment_id=0,
+    )
+
+
+def _load_checkpoint(
+    args: argparse.Namespace,
+    policy: PhasePolicy,
+    token: str,
+    allowed_dispositions: frozenset[ClaimDisposition],
+) -> DurablePrepareCheckpoint:
+    prepare_result = getattr(args, "prepare_result", None)
+    issue_number = getattr(args, "issue_number", None)
+    execution_id = getattr(args, "execution_id", None)
+    request_id = getattr(args, "request_id", None)
+    if prepare_result is not None:
+        if issue_number is not None or execution_id is not None or request_id is not None:
+            raise PhaseCliError("invalid_arguments")
+        return _prepare_bundle(prepare_result, allowed_dispositions)
+    if (
+        policy.publisher is None
+        or type(issue_number) is not int
+        or issue_number <= 0
+        or execution_id is None
+    ):
+        raise PhaseCliError("invalid_arguments")
+    api = _transport(token, {policy.issue.repository_full_name})
+    try:
+        checkpoint = load_durable_prepare_checkpoint(
+            api,
+            policy.publisher,
+            policy.issue.repository_full_name,
+            issue_number,
+            execution_id,
+            request_id,
+        )
+    except ActionsHandlerError as error:
+        raise PhaseCliError(error.code) from None
+    if checkpoint.disposition not in allowed_dispositions:
+        raise PhaseCliError("execution_not_granted")
+    return checkpoint
 
 
 def _transport(token: str, repositories: set[str]) -> GithubApi:
@@ -249,7 +317,7 @@ def _transport(token: str, repositories: set[str]) -> GithubApi:
 
 def _publisher(policy: PhasePolicy, token: str, cli_path: str, *, finalize: bool) -> PublisherPhase:
     repositories = {FIXED_REPOSITORY}
-    if finalize:
+    if finalize or policy.publisher is not None:
         repositories.add(policy.issue.repository_full_name)
     api = _transport(token, repositories)
     coordinator = ActionsJournalCoordinator(cli_executable=cli_path, api_transport=api)
@@ -258,6 +326,7 @@ def _publisher(policy: PhasePolicy, token: str, cli_path: str, *, finalize: bool
         trusted_issue_policy=policy.issue,
         trusted_receipt_policy=policy.receipt,
         read_api_transport=api,
+        trusted_publisher_policy=policy.publisher,
     )
 
 
@@ -278,9 +347,10 @@ def _run_prepare(args: argparse.Namespace, policy: PhasePolicy, token: str) -> d
         "disposition": result.disposition.value,
         "request_id": result.request_id,
     }
-    if result.disposition == ClaimDisposition.GRANTED:
-        if result.bundle is None:
-            raise PhaseCliError("invalid_prepare_result")
+    if result.disposition in (
+        ClaimDisposition.GRANTED,
+        ClaimDisposition.RECONCILIATION_REQUIRED,
+    ) and result.bundle is not None:
         output["bundle"] = result.bundle.to_dict()
     elif result.disposition == ClaimDisposition.TERMINAL_REPLAY:
         if result.receipt is None:
@@ -301,7 +371,13 @@ def _run_control(
     *,
     reconcile_recipe_only: bool = False,
 ) -> tuple[dict[str, Any], int]:
-    bundle = _prepare_bundle(args.prepare_result)
+    allowed = (
+        frozenset({ClaimDisposition.GRANTED, ClaimDisposition.RECONCILIATION_REQUIRED})
+        if reconcile_recipe_only
+        else frozenset({ClaimDisposition.GRANTED})
+    )
+    checkpoint = _load_checkpoint(args, policy, token, allowed)
+    bundle = checkpoint.bundle
     repositories = {policy.issue.repository_full_name}
     if bundle.operation == "github.ci.inspect":
         repositories.add(policy.ci.repository_full_name)
@@ -337,6 +413,7 @@ def _run_control(
             "reference": result.terminal_reference,
             "request_id": result.request_id,
             "execution_id": result.execution_id,
+            "replayed": result.replayed,
         },
         0,
     )
@@ -344,7 +421,13 @@ def _run_control(
 
 def _run_finalize(args: argparse.Namespace, policy: PhasePolicy, token: str) -> dict[str, Any]:
     cli_path = _validate_cli_path(args.rust_cli)
-    bundle = _prepare_bundle(args.prepare_result)
+    checkpoint = _load_checkpoint(
+        args,
+        policy,
+        token,
+        frozenset({ClaimDisposition.GRANTED, ClaimDisposition.RECONCILIATION_REQUIRED}),
+    )
+    bundle = checkpoint.bundle
     receipt = _publisher(policy, token, cli_path, finalize=True).finalize(bundle)
     return {
         "schema_version": 1,
@@ -395,7 +478,10 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument("--execution-id", required=True)
             command.add_argument("--accepted-at", required=True)
         else:
-            command.add_argument("--prepare-result", required=True)
+            command.add_argument("--prepare-result")
+            command.add_argument("--issue-number", type=int)
+            command.add_argument("--execution-id")
+            command.add_argument("--request-id")
     return parser
 
 

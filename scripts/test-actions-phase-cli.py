@@ -14,6 +14,7 @@ from actions_journal_coordinator import ClaimDisposition
 from actions_request_handler import (
     ActionsHandlerError,
     ControlExecutionResult,
+    DurablePrepareCheckpoint,
     ExecutionBundle,
     ExecutionReceipt,
     PrepareResult,
@@ -348,6 +349,103 @@ class PhaseCliTests(unittest.TestCase):
                 )
             ],
         )
+
+    def test_control_loads_durable_checkpoint_by_issue_and_execution(self) -> None:
+        policy = json.loads(self.policy.read_text(encoding="utf-8"))
+        policy["publisher_identity"] = {"app_id": 1234, "bot_user_id": 5678}
+        self.policy.write_text(json.dumps(policy), encoding="utf-8")
+        output = self.root / "control-locator.json"
+        checkpoint = DurablePrepareCheckpoint(
+            disposition=ClaimDisposition.GRANTED,
+            bundle=bundle(),
+            comment_id=77,
+        )
+        with patch.object(cli, "load_durable_prepare_checkpoint", return_value=checkpoint) as load:
+            status = self._run(
+                [
+                    "control",
+                    "--policy-file", str(self.policy),
+                    "--issue-number", "42",
+                    "--execution-id", "run-101",
+                    "--request-id", REQUEST_ID,
+                    "--output-file", str(output),
+                ]
+            )
+        self.assertEqual(status, 0)
+        load.assert_called_once()
+        self.assertEqual(
+            FakeApi.constructed,
+            [
+                ("installation-token", frozenset({"shockerqt/zach"})),
+                (
+                    "installation-token",
+                    frozenset({"shockerqt/zach", "shockerqt/ui-design-sandbox"}),
+                ),
+            ],
+        )
+
+    def test_prepare_with_publisher_identity_allows_only_issue_and_journal(self) -> None:
+        policy = json.loads(self.policy.read_text(encoding="utf-8"))
+        policy["publisher_identity"] = {"app_id": 1234, "bot_user_id": 5678}
+        self.policy.write_text(json.dumps(policy), encoding="utf-8")
+        output = self.root / "durable-prepare.json"
+        status = self._run(
+            [
+                "prepare",
+                "--policy-file", str(self.policy),
+                "--event-file", str(self.event),
+                "--execution-id", "run-101",
+                "--accepted-at", "2026-09-10T22:21:00Z",
+                "--rust-cli", str(self.rust_cli),
+                "--output-file", str(output),
+            ]
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            FakeApi.constructed,
+            [
+                (
+                    "installation-token",
+                    frozenset({"shockerqt/workspace-governance", "shockerqt/zach"}),
+                )
+            ],
+        )
+
+    def test_policy_rejects_collapsed_publisher_and_control_identity(self) -> None:
+        policy = json.loads(self.policy.read_text(encoding="utf-8"))
+        policy["publisher_identity"] = dict(policy["control_identity"])
+        self.policy.write_text(json.dumps(policy), encoding="utf-8")
+        output = self.root / "collapsed-identities.json"
+        status = self._run(
+            [
+                "prepare",
+                "--policy-file", str(self.policy),
+                "--event-file", str(self.event),
+                "--execution-id", "run-101",
+                "--accepted-at", "2026-09-10T22:21:00Z",
+                "--rust-cli", str(self.rust_cli),
+                "--output-file", str(output),
+            ]
+        )
+        self.assertEqual(status, 2)
+        self.assertEqual(
+            json.loads(output.read_text(encoding="utf-8"))["code"], "invalid_policy"
+        )
+
+    def test_locator_and_prepare_result_are_mutually_exclusive(self) -> None:
+        output = self.root / "invalid-sources.json"
+        status = self._run(
+            [
+                "control",
+                "--policy-file", str(self.policy),
+                "--prepare-result", str(self._prepare_file()),
+                "--issue-number", "42",
+                "--execution-id", "run-101",
+                "--output-file", str(output),
+            ]
+        )
+        self.assertEqual(status, 2)
+        self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["code"], "invalid_arguments")
 
     def test_control_rejects_non_granted_prepare_result_without_transport(self) -> None:
         prepare = self.root / "not-granted.json"

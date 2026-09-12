@@ -276,3 +276,18 @@ journal and independently observes the authenticated receipt, without consuming
 the Control result file. Each job must expose only its own installation token.
 An ambiguous Control publication and every sanitized phase error return nonzero;
 the CLI performs no automatic retry or second effect.
+
+When policy also configures a distinct `publisher_identity`, `prepare` persists
+two canonical, authenticated Issue comments. It reads back an intent before the
+durable claim and a complete execution-bundle checkpoint before Control may
+run. A later attempt with the same execution ID loads that checkpoint and
+returns `reconciliation_required`; it never grants a second execution. The
+Publisher App and bot IDs must both differ from Control.
+
+In this durable mode, `control`, `control-reconcile` and `finalize` may replace
+`--prepare-result` with `--issue-number`, `--execution-id` and an optional
+`--request-id`. They load exactly one stable Publisher-authored checkpoint and
+reject missing, conflicting, malformed or duplicate candidates.
+`control-reconcile` first replays an existing exact Control receipt without a
+new effect or comment. Only when no receipt exists may it observe the fixed
+recipe destination; it remains unable to dispatch a workflow.

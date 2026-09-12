@@ -11,9 +11,11 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 import unittest
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 from actions_ci_inspect import CiInspectionPolicy
+from actions_recipe_dispatch import RecipeDispatchPolicy
 from actions_git_journal import (
     AmbiguousPublication,
     ApiError,
@@ -45,7 +47,9 @@ from actions_request_handler import (
     PublisherPhase,
     SHA40_RE,
     TrustedReceiptPolicy,
+    _format_publisher_comment,
     _format_receipt_comment,
+    load_durable_prepare_checkpoint,
     _parse_receipt_comment,
 )
 
@@ -2325,6 +2329,236 @@ class SeparatedAuthorityPhasesTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "invalid_execution_bundle")
 
 
+class DurablePublisherCheckpointTests(unittest.TestCase):
+    """Adversarial coverage for cross-attempt Issue checkpoints."""
+
+    def setUp(self) -> None:
+        self.api = UnifiedFakeApi()
+        self.coordinator = ActionsJournalCoordinator(CLI, self.api.request)
+        self.publisher = PublisherPhase(
+            self.coordinator,
+            TRUSTED_POLICY,
+            TRUSTED_RECEIPT_POLICY,
+            self.api.request,
+            trusted_publisher_policy=TRUSTED_RECEIPT_POLICY,
+        )
+        self.control = ControlPhase(
+            self.api.request,
+            TRUSTED_RECEIPT_POLICY,
+            ci_policy=CI_POLICY,
+        )
+
+    def test_intent_is_read_back_before_claim_and_prepare_checkpoint(self) -> None:
+        result = self.publisher.prepare(
+            make_event(request_id="durable-order-01"),
+            "991-1",
+            ACCEPTED_AT,
+            POLICY_REVISION,
+        )
+        assert result.bundle is not None
+        mutations = [
+            (method, path, body)
+            for method, path, body in self.api.calls
+            if method == "PATCH"
+            or (method == "POST" and path.endswith("/comments"))
+        ]
+        self.assertEqual([entry[0] for entry in mutations], ["PATCH", "POST", "PATCH", "POST"])
+        self.assertIn("publisher-intent:v1", mutations[1][2]["body"])
+        self.assertIn("publisher-prepare:v1", mutations[3][2]["body"])
+        self.assertEqual(result.disposition, ClaimDisposition.GRANTED)
+
+    def test_rerun_reconstructs_prepare_from_intent_and_executing_journal(self) -> None:
+        event = make_event(request_id="durable-crash-01")
+        acceptance = self.coordinator.accept(event, TRUSTED_POLICY, ACCEPTED_AT, POLICY_REVISION)
+        accepted = parse_and_validate_record(acceptance.record_json, acceptance.request_id)
+        intent = self.publisher._intent_envelope(accepted, "992-1", acceptance.durable_revision)
+        self.publisher._ensure_publisher_comment("intent", intent)
+        claim = self.coordinator.claim(acceptance.request_id, "992-1")
+        self.assertEqual(claim.disposition, ClaimDisposition.GRANTED)
+
+        resumed = PublisherPhase(
+            self.coordinator,
+            TRUSTED_POLICY,
+            TRUSTED_RECEIPT_POLICY,
+            self.api.request,
+            trusted_publisher_policy=TRUSTED_RECEIPT_POLICY,
+        ).prepare(event, "992-1", ACCEPTED_AT, POLICY_REVISION)
+        assert resumed.bundle is not None
+        self.assertEqual(resumed.disposition, ClaimDisposition.RECONCILIATION_REQUIRED)
+        self.assertEqual(resumed.bundle.accepted_revision, acceptance.durable_revision)
+        self.assertEqual(resumed.bundle.claim_revision, self.api.refs[FIXED_REF])
+        checkpoint = load_durable_prepare_checkpoint(
+            self.api.request,
+            TRUSTED_RECEIPT_POLICY,
+            TRUSTED_POLICY.repository_full_name,
+            42,
+            "992-1",
+        )
+        self.assertEqual(checkpoint.bundle, resumed.bundle)
+
+    def test_executing_record_without_prior_intent_fails_closed(self) -> None:
+        event = make_event(request_id="missing-intent-01")
+        acceptance = self.coordinator.accept(event, TRUSTED_POLICY, ACCEPTED_AT, POLICY_REVISION)
+        self.coordinator.claim(acceptance.request_id, "993-1")
+        with self.assertRaisesRegex(ActionsHandlerError, "publisher_intent_missing_after_claim"):
+            self.publisher.prepare(event, "993-1", ACCEPTED_AT, POLICY_REVISION)
+        self.assertFalse(any("publisher-prepare:v1" in item["body"] for item in self.api.comments.values()))
+
+    def test_rerun_of_complete_prepare_requires_reconciliation(self) -> None:
+        event = make_event(request_id="durable-rerun-01")
+        first = self.publisher.prepare(event, "9922-1", ACCEPTED_AT, POLICY_REVISION)
+        self.assertEqual(first.disposition, ClaimDisposition.GRANTED)
+        resumed = self.publisher.prepare(event, "9922-1", ACCEPTED_AT, POLICY_REVISION)
+        self.assertEqual(resumed.disposition, ClaimDisposition.RECONCILIATION_REQUIRED)
+        self.assertEqual(resumed.bundle, first.bundle)
+
+    def test_ambiguous_rerun_recovers_the_durable_prepare_checkpoint(self) -> None:
+        event = make_event(request_id="durable-ambiguous-01")
+        first = self.publisher.prepare(event, "9923-1", ACCEPTED_AT, POLICY_REVISION)
+        assert first.bundle is not None
+        self.coordinator.mark_ambiguous(first.request_id, first.bundle.execution_id)
+        resumed = self.publisher.prepare(event, "9923-1", ACCEPTED_AT, POLICY_REVISION)
+        self.assertEqual(resumed.disposition, ClaimDisposition.RECONCILIATION_REQUIRED)
+        self.assertEqual(resumed.bundle, first.bundle)
+
+    def test_duplicate_prepare_checkpoints_fail_closed(self) -> None:
+        result = self.publisher.prepare(
+            make_event(request_id="duplicate-prep-01"), "994-1", ACCEPTED_AT, POLICY_REVISION
+        )
+        assert result.bundle is not None
+        prepare = next(
+            item for item in self.api.comments.values() if "publisher-prepare:v1" in item["body"]
+        )
+        duplicate = dict(prepare, id=self.api.next_comment_id)
+        duplicate["html_url"] = (
+            f"https://github.com/{TRUSTED_POLICY.repository_full_name}/issues/42"
+            f"#issuecomment-{self.api.next_comment_id}"
+        )
+        self.api.comments[self.api.next_comment_id] = duplicate
+        self.api.next_comment_id += 1
+        with self.assertRaisesRegex(
+            ActionsHandlerError, "duplicate_publisher_prepare_checkpoints"
+        ):
+            load_durable_prepare_checkpoint(
+                self.api.request,
+                TRUSTED_RECEIPT_POLICY,
+                TRUSTED_POLICY.repository_full_name,
+                42,
+                "994-1",
+            )
+
+    def test_tampered_prepare_checkpoint_is_rejected(self) -> None:
+        result = self.publisher.prepare(
+            make_event(request_id="tampered-prep-01"), "995-1", ACCEPTED_AT, POLICY_REVISION
+        )
+        assert result.bundle is not None
+        prepare = next(
+            item for item in self.api.comments.values() if "publisher-prepare:v1" in item["body"]
+        )
+        prepare["body"] = prepare["body"].replace('"issue_number": 42', '"issue_number": 43')
+        with self.assertRaisesRegex(ActionsHandlerError, "publisher_checkpoint_binding_mismatch"):
+            load_durable_prepare_checkpoint(
+                self.api.request,
+                TRUSTED_RECEIPT_POLICY,
+                TRUSTED_POLICY.repository_full_name,
+                42,
+                "995-1",
+            )
+
+    def test_control_reconcile_replays_existing_receipt_without_second_effect_or_post(self) -> None:
+        prepared = self.publisher.prepare(
+            make_event(request_id="receipt-replay-01"), "996-1", ACCEPTED_AT, POLICY_REVISION
+        )
+        assert prepared.bundle is not None
+        first = self.control.execute(prepared.bundle)
+        self.assertFalse(first.ambiguous)
+        calls_before = len(self.api.calls)
+        posts_before = len(
+            [call for call in self.api.calls if call[0] == "POST" and call[1].endswith("/comments")]
+        )
+        replay = self.control.execute(prepared.bundle, reconcile_recipe_only=True)
+        later_calls = self.api.calls[calls_before:]
+        self.assertTrue(replay.replayed)
+        self.assertFalse(any("actions/workflows" in path or "actions/runs" in path for _, path, _ in later_calls))
+        self.assertEqual(
+            len([call for call in self.api.calls if call[0] == "POST" and call[1].endswith("/comments")]),
+            posts_before,
+        )
+
+    def test_checkpoint_size_limit_is_enforced_before_post(self) -> None:
+        envelope = {
+            "schema_version": 1,
+            "kind": "actions.publisher.intent",
+            "request_id": "oversized-intent-01",
+            "request_digest": "1" * 64,
+            "operation": "github.ci.inspect",
+            "repository_id": 1001,
+            "repository_full_name": "shockerqt/zach",
+            "issue_id": 501,
+            "issue_number": 42,
+            "execution_id": "997-1",
+            "accepted_revision": "2" * 40,
+            "policy_revision": "3" * 40,
+            "extra": "x" * (64 * 1024),
+        }
+        with self.assertRaisesRegex(ActionsHandlerError, "publisher_checkpoint_too_large"):
+            _format_publisher_comment("intent", envelope)
+
+    def test_control_reconcile_without_receipt_reconciles_without_dispatch_and_posts_once(self) -> None:
+        parameters = {
+            "artifact_sha256": "6" * 64,
+            "expected_current": "7" * 40,
+            "operation": "rollback",
+            "recipe": "sandbox.delivery",
+            "source_sha": "5" * 40,
+        }
+        prepared = self.publisher.prepare(
+            make_event(
+                request_id="recipe-recover-01",
+                operation="workspace.recipe.dispatch",
+                parameters=parameters,
+            ),
+            "998-1",
+            ACCEPTED_AT,
+            POLICY_REVISION,
+        )
+        assert prepared.bundle is not None
+        recipe_policy = RecipeDispatchPolicy(
+            recipe="sandbox.delivery",
+            repository_alias="ui-design-sandbox",
+            repository_full_name="shockerqt/ui-design-sandbox",
+            repository_id=1002,
+            workflow_id=7654321,
+            workflow_path=".github/workflows/sandbox-delivery.yml",
+            ref="main",
+            actor_id=TRUSTED_RECEIPT_POLICY.bot_user_id,
+        )
+        control = ControlPhase(
+            self.api.request,
+            TRUSTED_RECEIPT_POLICY,
+            recipe_policy=recipe_policy,
+        )
+        reconciled = {
+            "schema_version": 1,
+            "kind": "workspace.recipe.dispatch.result",
+            "result": "dispatched",
+            "run_id": 12345,
+        }
+        posts_before = len(
+            [call for call in self.api.calls if call[0] == "POST" and call[1].endswith("/comments")]
+        )
+        with (
+            patch("actions_request_handler.reconcile_recipe", return_value=reconciled) as reconcile,
+            patch("actions_request_handler.dispatch_recipe", side_effect=AssertionError("dispatch forbidden")),
+        ):
+            result = control.execute(prepared.bundle, reconcile_recipe_only=True)
+        self.assertFalse(result.ambiguous)
+        reconcile.assert_called_once()
+        self.assertEqual(
+            len([call for call in self.api.calls if call[0] == "POST" and call[1].endswith("/comments")]),
+            posts_before + 1,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
-
