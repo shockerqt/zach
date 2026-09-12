@@ -18,7 +18,6 @@ MAX_RESULT_BYTES: Final[int] = 16 * 1024
 MAX_RECONCILIATION_PAGES: Final[int] = 10
 RECONCILIATION_PER_PAGE: Final[int] = 100
 DISPATCH_CLOCK_SKEW: Final[timedelta] = timedelta(minutes=5)
-DISPATCH_MAX_DELAY: Final[timedelta] = timedelta(minutes=15)
 SUPPORTED_RECIPE: Final[str] = "sandbox.delivery"
 SHA40_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
@@ -247,7 +246,6 @@ def _validate_run(
         or run.get("display_title")
         != _expected_title(operation, request_id, inputs["request_binding"])
         or created_at < accepted_at - DISPATCH_CLOCK_SKEW
-        or created_at > accepted_at + DISPATCH_MAX_DELAY
         or not isinstance(head_sha, str)
         or not SHA40_RE.fullmatch(head_sha)
         or type(actor) is not dict

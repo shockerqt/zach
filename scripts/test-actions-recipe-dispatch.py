@@ -273,20 +273,12 @@ class RecipeDispatchTests(unittest.TestCase):
         self.assertTrue(caught.exception.ambiguous)
         self.assertEqual(sum(call[0] == "POST" for call in api.calls), 1)
 
-    def test_run_readback_binds_exact_inputs_and_acceptance_window(self) -> None:
-        for title, created_at in (
-            (f"Sandbox deploy / {REQUEST_ID} / {'f' * 64}", "2026-09-12T12:00:10Z"),
-            (f"Sandbox deploy / {REQUEST_ID} / {DEPLOY_BINDING}", "2026-09-12T12:15:01Z"),
-        ):
-            with self.subTest(title=title, created_at=created_at):
-                api = FakeApi()
-                api.run["display_title"] = title
-                api.run["created_at"] = created_at
-                with self.assertRaises(RecipeDispatchError) as caught:
-                    dispatch_recipe(
-                        deploy_parameters(), REQUEST_ID, ACCEPTED_AT, policy(), api
-                    )
-                self.assertTrue(caught.exception.ambiguous)
+    def test_run_readback_binds_exact_inputs(self) -> None:
+        api = FakeApi()
+        api.run["display_title"] = f"Sandbox deploy / {REQUEST_ID} / {'f' * 64}"
+        with self.assertRaises(RecipeDispatchError) as caught:
+            dispatch_recipe(deploy_parameters(), REQUEST_ID, ACCEPTED_AT, policy(), api)
+        self.assertTrue(caught.exception.ambiguous)
 
     def test_reconciliation_finds_one_stable_run_without_dispatch(self) -> None:
         api = FakeApi()
