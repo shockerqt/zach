@@ -194,7 +194,7 @@ or malformed observations remain ambiguous without another dispatch.
 ## Isolated phase CLI
 
 `scripts/actions_phase_cli.py` is the minimal machine entry point for separate
-separate trusted Actions jobs. It never fetches or synthesizes an Issue event.
+trusted Actions jobs. It never fetches or synthesizes an Issue event.
 The sequential `ActionsRequestHandler` facade remains a compatibility/test
 composition and is not the credential-bearing Actions runtime.
 The Publisher workflow must fetch the actual Issue and construct a bounded event
