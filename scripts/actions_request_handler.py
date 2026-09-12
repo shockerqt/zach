@@ -6,7 +6,7 @@ This module separates Publisher and Control authorities into distinct phases:
     - produce bounded, immutable execution bundle
   Phase B: Control execute (with Control authority, WITHOUT Governance Contents authority)
     - consume and validate frozen execution bundle
-    - execute allowlisted effect (github.ci.inspect)
+    - execute an allowlisted typed effect
     - publish authenticated receipt comment with readback
     - return bounded execution outcome without mutating journal
   Phase C: Publisher finalize (with Publisher authority, WITHOUT Control private key)
@@ -23,6 +23,12 @@ import re
 from typing import Any, Callable, Final, Mapping, Optional
 
 from actions_ci_inspect import CiInspectError, CiInspectionPolicy, inspect_ci
+from actions_recipe_dispatch import (
+    RecipeDispatchError,
+    RecipeDispatchPolicy,
+    dispatch_recipe,
+    reconcile_recipe,
+)
 from actions_git_journal import (
     AmbiguousPublication,
     ActionsGitJournal,
@@ -58,12 +64,13 @@ RECEIPT_MARKER_RE: Final[re.Pattern[str]] = re.compile(
     r"accepted_revision=([0-9a-f]{40}):claim_revision=([0-9a-f]{40}) -->$"
 )
 
-EXECUTABLE_OPERATIONS: Final[frozenset[str]] = frozenset({"github.ci.inspect"})
+EXECUTABLE_OPERATIONS: Final[frozenset[str]] = frozenset(
+    {"github.ci.inspect", "workspace.recipe.dispatch"}
+)
 KNOWN_UNSUPPORTED_OPERATIONS: Final[frozenset[str]] = frozenset(
     {
         "governance.ledger",
         "governance.audit-task-integration",
-        "workspace.recipe.dispatch",
     }
 )
 
@@ -912,6 +919,7 @@ class ControlPhase:
         api_transport: Callable[..., Any],
         trusted_receipt_policy: TrustedReceiptPolicy,
         ci_policy: Optional[CiInspectionPolicy] = None,
+        recipe_policy: Optional[RecipeDispatchPolicy] = None,
     ) -> None:
         if not callable(api_transport):
             raise TypeError("api_transport must be callable")
@@ -919,10 +927,13 @@ class ControlPhase:
             raise TypeError("trusted_receipt_policy must be a TrustedReceiptPolicy instance")
         if ci_policy is not None and not isinstance(ci_policy, CiInspectionPolicy):
             raise TypeError("ci_policy must be a CiInspectionPolicy instance or None")
+        if recipe_policy is not None and not isinstance(recipe_policy, RecipeDispatchPolicy):
+            raise TypeError("recipe_policy must be a RecipeDispatchPolicy instance or None")
 
         self._api_transport = api_transport
         self._trusted_receipt_policy = trusted_receipt_policy
         self._ci_policy = ci_policy
+        self._recipe_policy = recipe_policy
 
     def validate_comment_identity(
         self,
@@ -952,8 +963,13 @@ class ControlPhase:
             expected_issue_number=expected_issue_number,
         )
 
-    def execute(self, bundle: ExecutionBundle) -> ControlExecutionResult:
-        """Phase B: consume frozen execution bundle, validate, execute allowlisted effect, publish receipt."""
+    def execute(
+        self,
+        bundle: ExecutionBundle,
+        *,
+        reconcile_recipe_only: bool = False,
+    ) -> ControlExecutionResult:
+        """Execute a typed effect, or reconcile a prior recipe dispatch, then publish its receipt."""
         if not isinstance(bundle, ExecutionBundle):
             try:
                 if isinstance(bundle, dict):
@@ -965,11 +981,14 @@ class ControlPhase:
             except Exception:
                 raise ActionsHandlerError("invalid_execution_bundle") from None
 
-        _validate_execution_bundle(bundle)
+        frozen_record = _validate_execution_bundle(bundle)
 
         operation = bundle.operation
 
-        # Execute only allowlisted operations (currently github.ci.inspect)
+        if reconcile_recipe_only and operation != "workspace.recipe.dispatch":
+            raise ActionsHandlerError("recipe_reconciliation_operation_required")
+
+        # Execute only the allowlisted, typed operations configured by trusted policy.
         if operation == "github.ci.inspect":
             if self._ci_policy is None:
                 raise ActionsHandlerError("ci_policy_missing")
@@ -982,6 +1001,31 @@ class ControlPhase:
                 terminal_state = "rejected"
                 terminal_code = e.code
                 result_payload = {"error": e.code, "retryable": e.retryable}
+        elif operation == "workspace.recipe.dispatch":
+            if self._recipe_policy is None:
+                raise ActionsHandlerError("recipe_policy_missing")
+            try:
+                dispatcher = reconcile_recipe if reconcile_recipe_only else dispatch_recipe
+                result_payload = dispatcher(
+                    bundle.parameters,
+                    bundle.request_id,
+                    frozen_record.get("accepted_at"),
+                    self._recipe_policy,
+                    self._api_transport,
+                )
+                terminal_state = "succeeded"
+                terminal_code = "dispatched"
+            except RecipeDispatchError as error:
+                if error.ambiguous or reconcile_recipe_only:
+                    return ControlExecutionResult(
+                        request_id=bundle.request_id,
+                        execution_id=bundle.execution_id,
+                        ambiguous=True,
+                        ambiguous_code=error.code,
+                    )
+                terminal_state = "rejected"
+                terminal_code = error.code
+                result_payload = {"error": error.code, "retryable": error.retryable}
         elif operation in KNOWN_UNSUPPORTED_OPERATIONS or operation not in EXECUTABLE_OPERATIONS:
             terminal_state = "rejected"
             terminal_code = "unsupported_operation"
@@ -1106,6 +1150,7 @@ class ActionsRequestHandler:
         trusted_issue_policy: TrustedIssuePolicy,
         trusted_receipt_policy: TrustedReceiptPolicy,
         ci_policy: Optional[CiInspectionPolicy] = None,
+        recipe_policy: Optional[RecipeDispatchPolicy] = None,
         *,
         publisher_api_transport: Optional[Callable[..., Any]] = None,
         control_api_transport: Optional[Callable[..., Any]] = None,
@@ -1123,6 +1168,7 @@ class ActionsRequestHandler:
             api_transport=ctrl_transport,
             trusted_receipt_policy=trusted_receipt_policy,
             ci_policy=ci_policy,
+            recipe_policy=recipe_policy,
         )
 
         self._coordinator = coordinator
@@ -1130,6 +1176,7 @@ class ActionsRequestHandler:
         self._trusted_issue_policy = trusted_issue_policy
         self._trusted_receipt_policy = trusted_receipt_policy
         self._ci_policy = ci_policy
+        self._recipe_policy = recipe_policy
 
     def validate_comment_identity(
         self,
