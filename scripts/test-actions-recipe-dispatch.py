@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import unittest
 
@@ -25,6 +26,26 @@ REPOSITORY = "shockerqt/ui-design-sandbox"
 REPOSITORY_ID = 1324116785
 WORKFLOW_ID = 987654
 ACTOR_ID = 325457439
+
+
+def request_binding(inputs: dict[str, str]) -> str:
+    return hashlib.sha256(
+        json.dumps(inputs, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+DEPLOY_INPUTS = {
+    "operation": "deploy",
+    "request_id": REQUEST_ID,
+    "source_sha": SOURCE,
+    "artifact_sha256": DIGEST,
+    "expected_current": CURRENT,
+    "artifact_run_id": "1234",
+    "artifact_run_attempt": "1",
+    "artifact_id": "5678",
+    "transport_digest": TRANSPORT,
+}
+DEPLOY_BINDING = request_binding(DEPLOY_INPUTS)
 
 
 def policy() -> RecipeDispatchPolicy:
@@ -70,7 +91,7 @@ class FakeApi:
             "event": "workflow_dispatch",
             "head_branch": "main",
             "head_sha": "e" * 40,
-            "display_title": f"Sandbox deploy / {REQUEST_ID}",
+            "display_title": f"Sandbox deploy / {REQUEST_ID} / {DEPLOY_BINDING}",
             "created_at": "2026-09-12T12:00:10Z",
             "actor": {"id": ACTOR_ID},
             "repository": {"id": REPOSITORY_ID, "full_name": REPOSITORY},
@@ -114,17 +135,7 @@ class RecipeDispatchTests(unittest.TestCase):
                 f"/repos/{REPOSITORY}/actions/workflows/{WORKFLOW_ID}/dispatches",
                 {
                     "ref": "main",
-                    "inputs": {
-                        "operation": "deploy",
-                        "request_id": REQUEST_ID,
-                        "source_sha": SOURCE,
-                        "artifact_sha256": DIGEST,
-                        "expected_current": CURRENT,
-                        "artifact_run_id": "1234",
-                        "artifact_run_attempt": "1",
-                        "artifact_id": "5678",
-                        "transport_digest": TRANSPORT,
-                    },
+                    "inputs": {**DEPLOY_INPUTS, "request_binding": DEPLOY_BINDING},
                 },
             ),
         )
@@ -138,8 +149,18 @@ class RecipeDispatchTests(unittest.TestCase):
             "artifact_sha256": DIGEST,
             "expected_current": CURRENT,
         }
+        rollback_inputs = {
+            "operation": "rollback",
+            "request_id": REQUEST_ID,
+            "source_sha": SOURCE,
+            "artifact_sha256": DIGEST,
+            "expected_current": CURRENT,
+        }
+        rollback_binding = request_binding(rollback_inputs)
         api_run = dict(api.run)
-        api_run["display_title"] = f"Sandbox rollback / {REQUEST_ID}"
+        api_run["display_title"] = (
+            f"Sandbox rollback / {REQUEST_ID} / {rollback_binding}"
+        )
 
         def transport(method: str, path: str, body: object = None) -> object:
             if method == "GET" and path.endswith("/actions/runs/2468"):
@@ -150,13 +171,7 @@ class RecipeDispatchTests(unittest.TestCase):
         dispatch_recipe(parameters, REQUEST_ID, ACCEPTED_AT, policy(), transport)
         self.assertEqual(
             next(call for call in api.calls if call[0] == "POST")[2]["inputs"],
-            {
-                "operation": "rollback",
-                "request_id": REQUEST_ID,
-                "source_sha": SOURCE,
-                "artifact_sha256": DIGEST,
-                "expected_current": CURRENT,
-            },
+            {**rollback_inputs, "request_binding": rollback_binding},
         )
 
     def test_rejects_unknown_recipe_operation_or_extra_inputs_before_api(self) -> None:
@@ -257,6 +272,21 @@ class RecipeDispatchTests(unittest.TestCase):
             dispatch_recipe(deploy_parameters(), REQUEST_ID, ACCEPTED_AT, policy(), transport)
         self.assertTrue(caught.exception.ambiguous)
         self.assertEqual(sum(call[0] == "POST" for call in api.calls), 1)
+
+    def test_run_readback_binds_exact_inputs_and_acceptance_window(self) -> None:
+        for title, created_at in (
+            (f"Sandbox deploy / {REQUEST_ID} / {'f' * 64}", "2026-09-12T12:00:10Z"),
+            (f"Sandbox deploy / {REQUEST_ID} / {DEPLOY_BINDING}", "2026-09-12T12:15:01Z"),
+        ):
+            with self.subTest(title=title, created_at=created_at):
+                api = FakeApi()
+                api.run["display_title"] = title
+                api.run["created_at"] = created_at
+                with self.assertRaises(RecipeDispatchError) as caught:
+                    dispatch_recipe(
+                        deploy_parameters(), REQUEST_ID, ACCEPTED_AT, policy(), api
+                    )
+                self.assertTrue(caught.exception.ambiguous)
 
     def test_reconciliation_finds_one_stable_run_without_dispatch(self) -> None:
         api = FakeApi()
@@ -374,6 +404,11 @@ class RecipeDispatchTests(unittest.TestCase):
                 self.comment = None
 
             def __call__(self, method: str, path: str, body: object = None) -> object:
+                if method == "GET" and path.startswith(
+                    f"/repos/shockerqt/workspace-governance/issues/42/comments?"
+                ):
+                    self.calls.append((method, path, body))
+                    return []
                 if method == "POST" and path.endswith("/issues/42/comments"):
                     self.calls.append((method, path, body))
                     self.comment = {

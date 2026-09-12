@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import re
 from typing import Any, Callable, Final, Mapping
@@ -17,6 +18,7 @@ MAX_RESULT_BYTES: Final[int] = 16 * 1024
 MAX_RECONCILIATION_PAGES: Final[int] = 10
 RECONCILIATION_PER_PAGE: Final[int] = 100
 DISPATCH_CLOCK_SKEW: Final[timedelta] = timedelta(minutes=5)
+DISPATCH_MAX_DELAY: Final[timedelta] = timedelta(minutes=15)
 SUPPORTED_RECIPE: Final[str] = "sandbox.delivery"
 SHA40_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
@@ -142,6 +144,11 @@ def _validate_parameters(
         ):
             raise RecipeDispatchError("invalid_recipe_transport_digest")
         inputs["transport_digest"] = transport_digest
+    inputs["request_binding"] = hashlib.sha256(
+        json.dumps(inputs, allow_nan=False, separators=(",", ":"), sort_keys=True).encode(
+            "utf-8"
+        )
+    ).hexdigest()
     return operation, inputs
 
 
@@ -203,8 +210,8 @@ def _preflight(
     return workflow_id
 
 
-def _expected_title(operation: str, request_id: str) -> str:
-    return f"Sandbox {operation} / {request_id}"
+def _expected_title(operation: str, request_id: str, request_binding: str) -> str:
+    return f"Sandbox {operation} / {request_id} / {request_binding}"
 
 
 def _validate_run(
@@ -237,8 +244,10 @@ def _validate_run(
         or run.get("path") != policy.workflow_path
         or run.get("event") != "workflow_dispatch"
         or run.get("head_branch") != policy.ref
-        or run.get("display_title") != _expected_title(operation, request_id)
+        or run.get("display_title")
+        != _expected_title(operation, request_id, inputs["request_binding"])
         or created_at < accepted_at - DISPATCH_CLOCK_SKEW
+        or created_at > accepted_at + DISPATCH_MAX_DELAY
         or not isinstance(head_sha, str)
         or not SHA40_RE.fullmatch(head_sha)
         or type(actor) is not dict
@@ -265,6 +274,7 @@ def _validate_run(
             "recipe": policy.recipe,
             "operation": operation,
             "request_id": request_id,
+            "request_binding": inputs["request_binding"],
             "repository": policy.repository_alias,
             "repository_full_name": policy.repository_full_name,
             "repository_id": policy.repository_id,
@@ -441,7 +451,7 @@ def reconcile_recipe(
         raise RecipeDispatchError("recipe_reconciliation_unstable", ambiguous=True)
 
     matches: list[int] = []
-    expected_title = _expected_title(operation, request_id)
+    expected_title = _expected_title(operation, request_id, inputs["request_binding"])
     for run in runs:
         if run.get("display_title") != expected_title:
             continue

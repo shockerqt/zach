@@ -177,6 +177,10 @@ using policy-selected ref and exact string inputs. The API response must contain
 the new run ID and canonical URLs; an immediate readback must bind that run to
 the configured repository, workflow, ref, Control bot identity,
 `workflow_dispatch` event, request-bound run name and acceptance-time window.
+The run name contains a SHA-256 binding of the canonical operation inputs; the
+destination recomputes that binding before any host access. This lets an
+ambiguous dispatch reconciliation distinguish the exact frozen request without
+trusting values copied from a later run.
 The authenticated receipt reports only `dispatched`
 and the observed run identity/status. Completion and production success come
 from the recipe's own bounded result, observed separately.
