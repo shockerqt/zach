@@ -488,6 +488,11 @@ pub fn decode_issue_event(
     let canonical_request =
         jcs(&request_json).map_err(|_| ActionsRequestError::new("canonicalization_failed"))?;
     let request_digest = sha256_hex(canonical_request.as_bytes());
+    let canonical_parameters = Json::parse(&canonical_request)
+        .map_err(|_| ActionsRequestError::new("canonicalization_failed"))?
+        .get("parameters")
+        .cloned()
+        .ok_or_else(|| ActionsRequestError::new("canonicalization_failed"))?;
 
     Ok(AcceptedIssue {
         repository_id: repo_id,
@@ -498,7 +503,7 @@ pub fn decode_issue_event(
         sender_id,
         request_id: request_id.to_string(),
         operation,
-        parameters: parameters_val.clone(),
+        parameters: canonical_parameters,
         canonical_request,
         request_digest,
     })
@@ -507,6 +512,7 @@ pub fn decode_issue_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ledger::actions_journal::JournalRecord;
 
     fn sample_policy() -> TrustedIssuePolicy {
         TrustedIssuePolicy::new(1001, "shockerqt/zach", vec![2001, 2002]).unwrap()
@@ -597,6 +603,33 @@ mod tests {
         assert_eq!(accepted_unfenced.request_id, "uds007-inspect-build-01");
         assert_eq!(accepted_unfenced.author_id, 2001);
         assert_eq!(accepted_unfenced.sender_id, 2001);
+    }
+
+    #[test]
+    fn unordered_parameters_survive_journal_acceptance_and_restart() {
+        let body = r#"{"parameters":{"source_sha":"4330f61359da78543b12bd3b71f79fdaef235a86","repository":"ui-design-sandbox"},"operation":"github.ci.inspect","request_id":"uds007-inspect-build-01","schema_version":1}"#;
+        let event = make_event(
+            "opened",
+            1001,
+            "shockerqt/zach",
+            2001,
+            2001,
+            501,
+            42,
+            body,
+            false,
+        );
+        let accepted = decode_issue_event("issues", &event, &sample_policy()).unwrap();
+        let record = JournalRecord::new(
+            accepted,
+            "2026-09-23T00:00:00Z",
+            "4ae216576b054f528c9edbcfed4a2711bccaa476",
+        )
+        .unwrap();
+        assert_eq!(
+            JournalRecord::from_json(&record.to_json().unwrap()).unwrap(),
+            record
+        );
     }
 
     #[test]
