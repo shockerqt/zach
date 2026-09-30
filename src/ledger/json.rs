@@ -25,7 +25,11 @@ impl std::error::Error for JsonError {}
 
 impl Json {
     pub(super) fn parse(input: &str) -> Result<Self, JsonError> {
-        let mut parser = Parser { input, pos: 0 };
+        let mut parser = Parser {
+            input,
+            pos: 0,
+            depth: 0,
+        };
         let value = parser.value()?;
         parser.ws();
         if parser.pos != input.len() {
@@ -187,6 +191,7 @@ fn integer_text(value: &str) -> bool {
 struct Parser<'a> {
     input: &'a str,
     pos: usize,
+    depth: usize,
 }
 
 impl Parser<'_> {
@@ -201,6 +206,16 @@ impl Parser<'_> {
     }
 
     fn value(&mut self) -> Result<Json, JsonError> {
+        if self.depth >= 64 {
+            return Err(JsonError("JSON nesting limit exceeded".into()));
+        }
+        self.depth += 1;
+        let result = self.value_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn value_inner(&mut self) -> Result<Json, JsonError> {
         self.ws();
         match self.peek_byte()? {
             b'n' => {

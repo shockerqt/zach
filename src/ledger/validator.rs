@@ -16,6 +16,28 @@ pub(super) const MAX_RECEIPT_UTF8_BYTES: usize = 60_000;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Debug, Clone, Copy)]
+enum ToolingPolicy {
+    Compatibility,
+    Candidate,
+}
+impl ToolingPolicy {
+    fn pins(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Self::Compatibility => (
+                TRUSTED_VALIDATOR_REVISION,
+                TRUSTED_CONTRACT_BLOB,
+                TRUSTED_MUTATOR_BLOB,
+            ),
+            Self::Candidate => (
+                super::candidate::CANDIDATE_REVISION,
+                "e7169ca5c539d2853438a02c2809f6657af68f39",
+                "e5542ba2621c8a98df646ccd2c5608a1dbde9f6e",
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LedgerRequest {
     pub request_id: String,
@@ -84,6 +106,7 @@ pub(crate) trait LedgerValidator: Send + Sync {
 #[derive(Debug, Clone)]
 pub(super) struct PinnedGovernanceValidator {
     mirror: PathBuf,
+    policy: ToolingPolicy,
 }
 
 impl PinnedGovernanceValidator {
@@ -94,13 +117,22 @@ impl PinnedGovernanceValidator {
                 "Governance mirror path must be absolute trusted configuration",
             ));
         }
-        Ok(Self { mirror })
+        Ok(Self {
+            mirror,
+            policy: ToolingPolicy::Compatibility,
+        })
+    }
+
+    pub(super) fn candidate(mirror: PathBuf) -> Result<Self, ValidationError> {
+        let mut validator = Self::new(mirror)?;
+        validator.policy = ToolingPolicy::Candidate;
+        Ok(validator)
     }
 }
 
 impl LedgerValidator for PinnedGovernanceValidator {
     fn validator_revision(&self) -> &str {
-        TRUSTED_VALIDATOR_REVISION
+        self.policy.pins().0
     }
 
     fn validate(
@@ -108,7 +140,23 @@ impl LedgerValidator for PinnedGovernanceValidator {
         request: &LedgerRequest,
         accepted_at: &str,
     ) -> Result<ValidatedLedgerResult, ValidationError> {
-        if request.contract_revision != TRUSTED_CONTRACT_REVISION {
+        self.validate_with_context(request, accepted_at, None)
+    }
+}
+
+impl PinnedGovernanceValidator {
+    pub(super) fn validate_with_context(
+        &self,
+        request: &LedgerRequest,
+        accepted_at: &str,
+        context: Option<&super::candidate::TrustedLedgerContext>,
+    ) -> Result<ValidatedLedgerResult, ValidationError> {
+        let revision = self.policy.pins().0;
+        let contract_revision = match self.policy {
+            ToolingPolicy::Compatibility => TRUSTED_CONTRACT_REVISION,
+            ToolingPolicy::Candidate => revision,
+        };
+        if request.contract_revision != contract_revision {
             return Err(ValidationError::new(
                 "contract-revision-mismatch",
                 "request contract revision does not match trusted integrated Governance contract",
@@ -124,11 +172,11 @@ impl LedgerValidator for PinnedGovernanceValidator {
         let workspace = TempDirectory::new("zach-ledger-validation")?;
         let validator_root = workspace.path.join("validator");
         let base_root = workspace.path.join("base");
-        materialize_revision(&self.mirror, TRUSTED_VALIDATOR_REVISION, &validator_root)?;
+        materialize_revision(&self.mirror, revision, &validator_root)?;
         materialize_revision(&self.mirror, &request.base_sha, &base_root)?;
-        verify_tooling_pin(&validator_root)?;
+        verify_tooling_pin(&validator_root, self.policy)?;
         let observed_base = command_text(
-            Command::new("git")
+            Command::new("/usr/bin/git")
                 .arg("-C")
                 .arg(&base_root)
                 .args(["rev-parse", "HEAD"]),
@@ -142,15 +190,18 @@ impl LedgerValidator for PinnedGovernanceValidator {
         }
 
         let request_path = workspace.path.join("request.json");
-        fs::write(&request_path, &request.canonical_json).map_err(|error| {
-            ValidationError::new(
-                "validator-io",
-                format!("could not materialize canonical request: {error}"),
-            )
-        })?;
+        super::candidate::write_private(&request_path, request.canonical_json.as_bytes()).map_err(
+            |error| {
+                ValidationError::new(
+                    "validator-io",
+                    format!("could not materialize canonical request: {error}"),
+                )
+            },
+        )?;
         let output_path = workspace.path.join("result.json");
-        let mut command = Command::new("python3");
+        let mut command = Command::new("/usr/bin/python3");
         command
+            .arg("-I")
             .arg(validator_root.join("bin/ws-ledger-mutate"))
             .arg("--root")
             .arg(&base_root)
@@ -159,11 +210,32 @@ impl LedgerValidator for PinnedGovernanceValidator {
             .arg("--expected-base-sha")
             .arg(&request.base_sha)
             .arg("--expected-contract-revision")
-            .arg(TRUSTED_CONTRACT_REVISION)
+            .arg(revision)
             .arg("--accepted-at")
             .arg(accepted_at)
             .arg("--output")
             .arg(&output_path);
+        if let Some(context) = context {
+            for (flag, value) in [
+                ("--trusted-remote-preflight", &context.remote_preflight),
+                ("--trusted-remote-evidence", &context.remote_evidence),
+            ] {
+                if let Some(value) = value {
+                    let path = workspace.path.join(flag.trim_start_matches("--"));
+                    super::candidate::write_private(
+                        &path,
+                        super::json::jcs(value)
+                            .map_err(|_| {
+                                ValidationError::new("invalid-trusted-context", "invalid context")
+                            })?
+                            .as_bytes(),
+                    )
+                    .map_err(|code| ValidationError::new(code, "context materialization failed"))?;
+                    command.arg(flag).arg(path);
+                }
+            }
+        }
+        isolate_command(&mut command);
         let output = command.output().map_err(|error| {
             ValidationError::new(
                 "trusted-validator-unavailable",
@@ -179,7 +251,7 @@ impl LedgerValidator for PinnedGovernanceValidator {
             ));
         }
 
-        let result_text = fs::read_to_string(&output_path).map_err(|error| {
+        let result_text = super::candidate::read_bounded(&output_path).map_err(|error| {
             ValidationError::new(
                 "validator-output-invalid",
                 format!("could not read trusted validator result: {error}"),
@@ -228,14 +300,14 @@ fn materialize_revision(
         ));
     }
     command_success(
-        Command::new("git")
+        Command::new("/usr/bin/git")
             .args(["clone", "--quiet", "--no-checkout", "--shared"])
             .arg(mirror)
             .arg(destination),
         "materialize configured Governance mirror",
     )?;
     command_success(
-        Command::new("git")
+        Command::new("/usr/bin/git")
             .arg("-C")
             .arg(destination)
             .args(["checkout", "--quiet", "--detach", revision]),
@@ -243,30 +315,28 @@ fn materialize_revision(
     )
 }
 
-fn verify_tooling_pin(root: &Path) -> Result<(), ValidationError> {
+fn verify_tooling_pin(root: &Path, policy: ToolingPolicy) -> Result<(), ValidationError> {
+    let (revision, contract_blob, mutator_blob) = policy.pins();
     let head = command_text(
-        Command::new("git")
+        Command::new("/usr/bin/git")
             .arg("-C")
             .arg(root)
             .args(["rev-parse", "HEAD"]),
         "read trusted validator HEAD",
     )?;
-    if head.trim() != TRUSTED_VALIDATOR_REVISION {
+    if head.trim() != revision {
         return Err(ValidationError::new(
             "validator-revision-mismatch",
             "trusted validator checkout HEAD does not match compiled revision",
         ));
     }
     for (path, expected) in [
-        (
-            "contracts/governance-ledger-fast-path.yaml",
-            TRUSTED_CONTRACT_BLOB,
-        ),
-        ("bin/ws-ledger-mutate", TRUSTED_MUTATOR_BLOB),
+        ("contracts/governance-ledger-fast-path.yaml", contract_blob),
+        ("bin/ws-ledger-mutate", mutator_blob),
     ] {
         let selector = format!("HEAD:{path}");
         let observed = command_text(
-            Command::new("git")
+            Command::new("/usr/bin/git")
                 .arg("-C")
                 .arg(root)
                 .args(["rev-parse", &selector]),
@@ -415,7 +485,7 @@ pub(super) fn materialize_and_verify_result(
     }
 
     if !expected_paths.is_empty() {
-        let mut command = Command::new("git");
+        let mut command = Command::new("/usr/bin/git");
         command.arg("-C").arg(root).args(["add", "-A", "--"]);
         for path in &expected_paths {
             command.arg(path);
@@ -423,10 +493,12 @@ pub(super) fn materialize_and_verify_result(
         command_success(&mut command, "stage exact validated Governance changes")?;
     }
     let staged = command_bytes(
-        Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(["diff", "--cached", "--name-only", "-z"]),
+        Command::new("/usr/bin/git").arg("-C").arg(root).args([
+            "diff",
+            "--cached",
+            "--name-only",
+            "-z",
+        ]),
         "read exact staged Governance paths",
     )?;
     let mut staged_paths = staged
@@ -453,7 +525,7 @@ pub(super) fn materialize_and_verify_result(
         match change.operation {
             ChangeOperation::Upsert => {
                 let output = command_text(
-                    Command::new("git")
+                    Command::new("/usr/bin/git")
                         .arg("-C")
                         .arg(root)
                         .args(["ls-files", "-s", "--"])
@@ -475,7 +547,7 @@ pub(super) fn materialize_and_verify_result(
             }
             ChangeOperation::Delete => {
                 let output = command_text(
-                    Command::new("git")
+                    Command::new("/usr/bin/git")
                         .arg("-C")
                         .arg(root)
                         .args(["ls-files", "-s", "--"])
@@ -493,7 +565,10 @@ pub(super) fn materialize_and_verify_result(
     }
 
     let tree = command_text(
-        Command::new("git").arg("-C").arg(root).arg("write-tree"),
+        Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(root)
+            .arg("write-tree"),
         "derive exact validated Governance result tree",
     )?;
     let tree = tree.trim().to_owned();
@@ -853,12 +928,32 @@ fn command_bytes(command: &mut Command, label: &str) -> Result<Vec<u8>, Validati
 }
 
 fn run_command(command: &mut Command, label: &str) -> Result<Output, ValidationError> {
+    isolate_command(command);
     command.output().map_err(|error| {
         ValidationError::new(
             "trusted-validator-unavailable",
             format!("could not execute fixed internal command for {label}: {error}"),
         )
     })
+}
+
+fn isolate_command(command: &mut Command) {
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_COUNT", "4")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", "/dev/null")
+        .env("GIT_CONFIG_KEY_1", "core.fsmonitor")
+        .env("GIT_CONFIG_VALUE_1", "false")
+        .env("GIT_CONFIG_KEY_2", "core.attributesFile")
+        .env("GIT_CONFIG_VALUE_2", "/dev/null")
+        .env("GIT_CONFIG_KEY_3", "init.templateDir")
+        .env("GIT_CONFIG_VALUE_3", "/dev/null")
+        .env("PYTHONNOUSERSITE", "1")
+        .env("GIT_TERMINAL_PROMPT", "0");
 }
 
 fn sha40(value: &str) -> bool {
@@ -876,7 +971,18 @@ impl TempDirectory {
     fn new(prefix: &str) -> Result<Self, ValidationError> {
         let id = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("{prefix}-{}-{id}", std::process::id()));
-        fs::create_dir(&path).map_err(|error| {
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        #[cfg(not(unix))]
+        return Err(ValidationError::new(
+            "unsupported-platform",
+            "private validator workspace unavailable",
+        ));
+        builder.create(&path).map_err(|error| {
             ValidationError::new(
                 "validator-io",
                 format!("could not create validation workspace: {error}"),

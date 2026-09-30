@@ -1,5 +1,6 @@
 pub mod actions;
 pub mod actions_journal;
+pub mod candidate;
 mod json;
 mod publisher;
 mod store;
@@ -468,6 +469,14 @@ fn parse_canonical_request(body: &str) -> Result<AcceptedRequest, &'static str> 
         return Err("request-digest-invalid");
     }
     let request = object_get(envelope_object, "request").ok_or("request-invalid")?;
+    let request = parse_request_object(request)?;
+    if request.request_digest != declared_digest {
+        return Err("request-digest-mismatch");
+    }
+    Ok(AcceptedRequest { request })
+}
+
+fn parse_request_object(request: &Json) -> Result<LedgerRequest, &'static str> {
     let request_object = request.as_object().ok_or("request-invalid")?;
     require_exact_keys(
         request_object,
@@ -507,21 +516,16 @@ fn parse_canonical_request(body: &str) -> Result<AcceptedRequest, &'static str> 
         .clone();
     let canonical_json = jcs(request).map_err(|_| "request-invalid")?;
     let digest = sha256_hex(canonical_json.as_bytes());
-    if digest != declared_digest {
-        return Err("request-digest-mismatch");
-    }
-    Ok(AcceptedRequest {
-        request: LedgerRequest {
-            request_id: request_id.to_owned(),
-            created_at: created_at.to_owned(),
-            expires_at: expires_at.to_owned(),
-            base_sha: base_sha.to_owned(),
-            operation: operation.to_owned(),
-            parameters,
-            contract_revision: contract_revision.to_owned(),
-            canonical_json,
-            request_digest: digest,
-        },
+    Ok(LedgerRequest {
+        request_id: request_id.to_owned(),
+        created_at: created_at.to_owned(),
+        expires_at: expires_at.to_owned(),
+        base_sha: base_sha.to_owned(),
+        operation: operation.to_owned(),
+        parameters,
+        contract_revision: contract_revision.to_owned(),
+        canonical_json,
+        request_digest: digest,
     })
 }
 
