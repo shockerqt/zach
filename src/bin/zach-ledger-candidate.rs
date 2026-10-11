@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use zach::ledger::candidate::{
-    TrustedLedgerContext, derive_candidate, read_bounded, write_private,
+    TrustedLedgerContext, derive_actions_candidate, derive_candidate, read_bounded, write_private,
 };
 
 fn run() -> Result<(), String> {
@@ -11,6 +11,9 @@ fn run() -> Result<(), String> {
             "--mirror",
             "--request",
             "--accepted-at",
+            "--journal-record",
+            "--accepted-revision",
+            "--claim-revision",
             "--trusted-context",
             "--output",
         ]
@@ -28,7 +31,27 @@ fn run() -> Result<(), String> {
             .get(key)
             .ok_or_else(|| "arguments-invalid".to_owned())
     };
-    let request = read_bounded(&PathBuf::from(required("--request")?)).map_err(str::to_owned)?;
+    let journal_mode = values.contains_key("--journal-record");
+    let mode_fields = if journal_mode {
+        [
+            "--journal-record",
+            "--accepted-revision",
+            "--claim-revision",
+        ]
+        .as_slice()
+    } else {
+        ["--request", "--accepted-at"].as_slice()
+    };
+    if mode_fields.iter().any(|key| !values.contains_key(*key))
+        || values.keys().any(|key| {
+            !["--mirror", "--trusted-context", "--output"].contains(&key.as_str())
+                && !mode_fields.contains(&key.as_str())
+        })
+    {
+        return Err("arguments-invalid".into());
+    }
+    required("--mirror")?;
+    required("--output")?;
     let context = match values.get("--trusted-context") {
         Some(path) => {
             TrustedLedgerContext::parse(&read_bounded(&PathBuf::from(path)).map_err(str::to_owned)?)
@@ -36,12 +59,26 @@ fn run() -> Result<(), String> {
         }
         None => TrustedLedgerContext::default(),
     };
-    let result = derive_candidate(
-        PathBuf::from(required("--mirror")?),
-        &request,
-        required("--accepted-at")?,
-        &context,
-    )?;
+    let result = if journal_mode {
+        let journal =
+            read_bounded(&PathBuf::from(required("--journal-record")?)).map_err(str::to_owned)?;
+        derive_actions_candidate(
+            PathBuf::from(required("--mirror")?),
+            &journal,
+            required("--accepted-revision")?,
+            required("--claim-revision")?,
+            &context,
+        )?
+    } else {
+        let request =
+            read_bounded(&PathBuf::from(required("--request")?)).map_err(str::to_owned)?;
+        derive_candidate(
+            PathBuf::from(required("--mirror")?),
+            &request,
+            required("--accepted-at")?,
+            &context,
+        )?
+    };
     write_private(&PathBuf::from(required("--output")?), result.as_bytes()).map_err(str::to_owned)
 }
 fn main() {

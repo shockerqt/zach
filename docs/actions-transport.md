@@ -4,6 +4,46 @@ Implementation target for ZACH-003 and Governance ADR-010. This transport is
 not activated until integrated contracts, provisioning and the Web-only pilot
 have passed. The existing v1 webhook remains a compatibility interface.
 
+## Frozen ledger candidate bridge
+
+The existing `zach-ledger-candidate` CLI supports an exclusive journal mode:
+
+```text
+zach-ledger-candidate --mirror GOVERNANCE_MIRROR \
+  --journal-record EXECUTING_RECORD.json \
+  --accepted-revision ACCEPTANCE_COMMIT --claim-revision CLAIM_COMMIT \
+  --trusted-context CONTEXT.json --output ARTIFACT.json
+```
+
+The original `--request REQUEST.json --accepted-at TIME` mode remains available.
+Journal mode implements the integrated transport profile at Governance
+`89b6c1751255090513e439f010153b8158d74cef`, reusing the existing journal parser,
+canonicalizer and candidate validator pinned to
+`7f7af5752ef2e016ffe7116f84648b3350fe507f`. It requires an executing
+`governance.ledger` record with an execution owner and exactly `base_sha`,
+`operation` and `parameters` in outer parameters. The existing candidate
+allowlist applies; closure and task transition to completed are forbidden.
+
+The inner request uses the frozen request ID and original acceptance timestamp,
+with expiry exactly 3600 seconds later. Fractions are retained verbatim across
+calendar rollover; invalid calendar times and overflow beyond year 9999 fail
+closed. Retry mapping is deterministic. Its distinct inner digest appears in
+the nested candidate; the artifact binds the frozen outer digest, acceptance
+and claim commit IDs, policy revision, acceptance time, inner request, separate
+context and exact candidate. JCS output is bounded to 262144 UTF-8 bytes; the
+nested candidate retains its 60000-byte limit. Inputs are bounded regular files
+opened without following symlinks; output is a newly created private file.
+
+This artifact is unauthenticated data, not a receipt or execution permission.
+Supplying a valid journal JSON and commit-shaped revision strings does not prove
+durable acceptance, claim ownership or trusted provenance. The runtime must
+independently establish those facts, collect operation-specific GitHub context,
+verify the integrated producer and artifact identity, recompute all bindings,
+and compose the existing isolated Publisher before any effect. Issue parameters
+cannot supply trusted context. No online handler or activation gate is enabled
+by this bridge. The next online composition starts with `run.record_evidence`
+and must verify replay, conflict, concurrent ref and interrupted publication.
+
 ## Request
 
 An Issue in the configured control repository contains ordinary JSON, optionally
