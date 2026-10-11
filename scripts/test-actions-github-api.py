@@ -86,6 +86,130 @@ class TestGithubApi(unittest.TestCase):
             opener=self.mock_opener,  # type: ignore[arg-type]
         )
 
+    def test_artifact_download_separates_credentials(self) -> None:
+        location = "https://productionresults1.blob.core.windows.net/artifact/zip?sig=PRIVATE"
+        redirect = MockResponse(status=302, headers={"Location": location})
+        download = MockResponse(body=b"zip-bytes", content_type="application/zip")
+        responses = iter([redirect, download])
+        self.mock_opener.handler = lambda _req, _timeout: next(responses)
+        self.assertEqual(self.api.download_artifact("shockerqt/workspace-governance", 123), b"zip-bytes")
+        first, second = [item[0] for item in self.mock_opener.calls]
+        self.assertEqual(first.get_header("Authorization"), f"Bearer {SYNTHETIC_TOKEN}")
+        self.assertIsNone(second.get_header("Authorization"))
+        self.assertEqual(second.full_url, location)
+        self.assertTrue(redirect.closed and download.closed)
+
+    def test_public_zach_observations_do_not_expand_authenticated_namespace(self) -> None:
+        api = GithubApi(SYNTHETIC_TOKEN, ["shockerqt/workspace-governance"], self.mock_opener)
+        paths = ["/repos/shockerqt/zach/git/ref/heads/main",
+                 "/repos/shockerqt/zach/compare/" + "a" * 40 + "..." + "b" * 40]
+        for path in paths:
+            self.assertEqual(api.public_zach_get(path), {})
+            request, timeout = self.mock_opener.calls[-1]
+            self.assertIsNone(request.get_header("Authorization"))
+            self.assertIsNone(request.data)
+            self.assertEqual(request.method, "GET")
+            self.assertEqual(request.full_url, "https://api.github.com" + path)
+            self.assertEqual(timeout, 20.0)
+            with self.assertRaises(RequestValidationError):
+                api("GET", path)
+        api("GET", "/repos/shockerqt/workspace-governance")
+        self.assertEqual(self.mock_opener.calls[-1][0].get_header("Authorization"), "Bearer " + SYNTHETIC_TOKEN)
+
+    def test_public_zach_other_paths_and_methods_never_touch_transport(self) -> None:
+        for path in [None, [], "/repos/shockerqt/zach", "/repos/shockerqt/zach/git/ref/heads/other",
+                     "/repos/shockerqt/zach/git/ref/heads/main?x=1",
+                     "/repos/shockerqt/zach/git/ref/heads/main#fragment",
+                     "/repos/shockerqt/zach/git/ref/heads/%6dain",
+                     "/repos/shockerqt/zach/compare/main...main",
+                     "/repos/shockerqt/zach/compare/" + "A" * 40 + "..." + "b" * 40,
+                     "/repos/shockerqt/zach/compare/" + "a" * 40 + "..." + "b" * 40 + "/extra",
+                     "https://api.github.com/repos/shockerqt/zach/git/ref/heads/main",
+                     "/repos/shockerqt/workspace-governance/git/ref/heads/master"]:
+            with self.subTest(path=path), self.assertRaises(RequestValidationError):
+                self.api.public_zach_get(path)
+        path = "/repos/shockerqt/zach/git/ref/heads/main"
+        for method in ["POST", "PATCH", "DELETE", "PUT"]:
+            with self.assertRaises(RequestValidationError):
+                self.api._request_json(method, path, public_zach=True)
+        with self.assertRaises(RequestValidationError):
+            self.api._request_json("GET", path, {}, public_zach=True)
+        self.assertEqual(self.mock_opener.calls, [])
+
+    def test_public_zach_uses_existing_strict_json_and_bounds(self) -> None:
+        for response in [MockResponse(body=b'{"x":1,"x":2}'), MockResponse(body=b'{"x":NaN}'),
+                         MockResponse(body=b'{"x":1e999}'), MockResponse(body=b'\xff'),
+                         MockResponse(body=b"x" * (2 * 1024 * 1024 + 1)),
+                         MockResponse(body=b"{}", content_type="text/html"),
+                         MockResponse(body=b"{}", status=201)]:
+            self.mock_opener.handler = lambda req, timeout: response
+            with self.assertRaises(ApiError):
+                self.api.public_zach_get("/repos/shockerqt/zach/git/ref/heads/main")
+            self.assertTrue(response.closed)
+            self.assertIsNone(self.mock_opener.calls[-1][0].get_header("Authorization"))
+
+    def test_public_zach_redirect_is_refused_without_retry_or_secret(self) -> None:
+        def redirect(req, timeout):
+            raise urllib.error.HTTPError(req.full_url, 302, "PRIVATE", {"Location": "https://evil.test/PRIVATE"}, io.BytesIO())
+        self.mock_opener.handler = redirect
+        with self.assertRaises(ApiError) as error:
+            self.api.public_zach_get("/repos/shockerqt/zach/git/ref/heads/main")
+        self.assertEqual(len(self.mock_opener.calls), 1)
+        self.assertNotIn("PRIVATE", str(error.exception))
+        self.assertNotIn(SYNTHETIC_TOKEN, str(error.exception))
+        self.assertIsNone(self.mock_opener.calls[0][0].get_header("Authorization"))
+
+    def test_artifact_download_handles_redirect_http_error_without_url_leak(self) -> None:
+        location = "https://results-receiver.actions.githubusercontent.com/artifact?sig=PRIVATE"
+        count = 0
+        def handler(req: urllib.request.Request, _timeout: float) -> MockResponse:
+            nonlocal count
+            count += 1
+            if count == 1:
+                raise urllib.error.HTTPError(req.full_url, 302, "Found", {"Location": location}, io.BytesIO())
+            raise urllib.error.HTTPError(location, 403, "PRIVATE", {}, io.BytesIO())
+        self.mock_opener.handler = handler
+        with self.assertRaises(ApiError) as error:
+            self.api.download_artifact("shockerqt/workspace-governance", 123)
+        self.assertNotIn("PRIVATE", str(error.exception))
+        self.assertNotIn(SYNTHETIC_TOKEN, str(error.exception))
+        self.assertEqual(count, 2)
+
+    def test_artifact_download_rejects_redirect_destinations(self) -> None:
+        for location in (
+            "http://a.blob.core.windows.net/artifact", "https://evil.test/artifact",
+            "https://productionresults1.blob.core.windows.net.evil.test/artifact",
+            "https://user@a.blob.core.windows.net/artifact", "https://a.blob.core.windows.net:444/artifact",
+            "https://a.blob.core.windows.net/artifact#secret", "https://127.0.0.1/artifact",
+            "https://a.blob.core.windows.net\\evil.test/artifact", "https://a.blob.core.windows.net/a b",
+        ):
+            with self.subTest(location=location):
+                self.mock_opener.calls.clear()
+                self.mock_opener.handler = lambda _req, _timeout: MockResponse(status=302, headers={"Location": location})
+                with self.assertRaises(ApiError):
+                    self.api.download_artifact("shockerqt/workspace-governance", 123)
+                self.assertEqual(len(self.mock_opener.calls), 1)
+
+    def test_artifact_download_bounds_and_no_redirect_retry(self) -> None:
+        for download in (
+            MockResponse(body=b"x" * 393217), MockResponse(body=b""),
+            MockResponse(body=b"x", headers={"Content-Length": "2"}),
+            MockResponse(body=b"x", headers={"Content-Encoding": "gzip"}),
+            MockResponse(status=302, headers={"Location": "https://a.blob.core.windows.net/next"}),
+        ):
+            self.mock_opener.calls.clear()
+            responses = iter([MockResponse(status=302, headers={"Location": "https://a.blob.core.windows.net/zip"}), download])
+            self.mock_opener.handler = lambda _req, _timeout: next(responses)
+            with self.assertRaises(ApiError):
+                self.api.download_artifact("shockerqt/workspace-governance", 123)
+            self.assertEqual(len(self.mock_opener.calls), 2)
+            self.assertTrue(download.closed)
+        for repo, identifier in (("shockerqt/unknown", 1), ([], 1), ("shockerqt/zach", True), ("shockerqt/zach", 0)):
+            self.mock_opener.calls.clear()
+            with self.assertRaises(ApiError):
+                self.api.download_artifact(repo, identifier)
+            self.assertEqual(self.mock_opener.calls, [])
+
     def test_constructor_allowlist_validation(self) -> None:
         # Non-empty subsets of trusted repositories are allowed
         api1 = GithubApi(SYNTHETIC_TOKEN, ["shockerqt/zach"])

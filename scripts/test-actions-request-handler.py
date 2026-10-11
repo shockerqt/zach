@@ -48,6 +48,7 @@ from actions_request_handler import (
     SHA40_RE,
     TrustedReceiptPolicy,
     _format_publisher_comment,
+    _parse_publisher_comment,
     _format_receipt_comment,
     load_durable_prepare_checkpoint,
     _parse_receipt_comment,
@@ -2558,6 +2559,391 @@ class DurablePublisherCheckpointTests(unittest.TestCase):
             len([call for call in self.api.calls if call[0] == "POST" and call[1].endswith("/comments")]),
             posts_before + 1,
         )
+
+
+class LedgerPublicationCheckpointTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.api = UnifiedFakeApi()
+        self.coordinator = ActionsJournalCoordinator(CLI, self.api.request)
+        self.publisher = PublisherPhase(
+            self.coordinator, TRUSTED_POLICY, TRUSTED_RECEIPT_POLICY,
+            self.api.request, trusted_publisher_policy=TRUSTED_RECEIPT_POLICY,
+        )
+        parameters = {"base_sha": SOURCE_SHA, "operation": "run.record_evidence", "parameters": {}}
+        acceptance = self.coordinator.accept(
+            make_event(request_id="ledger-checkpoint-01", operation="governance.ledger", parameters=parameters),
+            TRUSTED_POLICY, ACCEPTED_AT, POLICY_REVISION,
+        )
+        claim = self.coordinator.claim(acceptance.request_id, EXECUTION_ID)
+        self.bundle = ExecutionBundle(
+            request_id=acceptance.request_id, request_digest=json.loads(claim.record_json)["request_digest"],
+            operation="governance.ledger", repository_id=1001,
+            repository_full_name=TRUSTED_POLICY.repository_full_name,
+            issue_id=501, issue_number=42, execution_id=EXECUTION_ID,
+            canonical_record=claim.record_json, accepted_revision=acceptance.durable_revision,
+            claim_revision=claim.durable_revision, parameters=parameters,
+        )
+        self.publication = {
+            "repository_id": 1260920764, "repository_full_name": "shockerqt/workspace-governance",
+            "branch": "task/GOV-041-workspace-command-fast-path",
+            "base_sha": SOURCE_SHA, "tree_sha": "5" * 40, "commit_sha": "6" * 40,
+            "artifact_reference": {
+                "repository_id": 1001, "repository_full_name": "shockerqt/zach",
+                "run_id": 21, "run_attempt": 1, "artifact_id": 22,
+                "archive_sha256": "a" * 64, "content_sha256": "b" * 64,
+            },
+        }
+        self.calls_before = len(self.api.calls)
+
+    def envelope(self, publication=None):
+        return {"schema_version": 1, "kind": "actions.publisher.publication",
+                "bundle": self.bundle.to_dict(), "publication": publication or self.publication}
+
+    def test_stable_absence_and_exact_replay_only_post_one_comment(self):
+        self.assertIsNone(self.publisher.load_ledger_publication_checkpoint(self.bundle))
+        checkpoint = self.publisher.checkpoint_ledger_publication(self.bundle, self.publication)
+        self.assertEqual(checkpoint.publication, self.publication)
+        self.assertEqual(checkpoint.bundle, self.bundle)
+        self.assertEqual(self.publisher.load_ledger_publication_checkpoint(self.bundle), checkpoint)
+        replay = self.publisher.checkpoint_ledger_publication(self.bundle, self.publication)
+        self.assertEqual(replay, checkpoint)
+        mutations = [call for call in self.api.calls[self.calls_before:] if call[0] != "GET"]
+        self.assertEqual(len(mutations), 1)
+        self.assertTrue(mutations[0][1].endswith("/comments"))
+        self.assertEqual(self.coordinator.load_record(self.bundle.request_id)[1]["state"], "executing")
+        self.publication["artifact_reference"]["run_id"] = 999
+        self.assertEqual(checkpoint.publication["artifact_reference"]["run_id"], 21)
+
+    def test_lost_post_response_recovers_exact_authenticated_comment(self):
+        def lost_response(method, path, body=None):
+            result = self.api.request(method, path, body)
+            if method == "POST" and path.endswith("/comments"):
+                raise ApiError(500, "lost_response")
+            return result
+        self.publisher._read_api_transport = lost_response
+        result = self.publisher.checkpoint_ledger_publication(self.bundle, self.publication)
+        self.assertEqual(result.comment_id, 1)
+        self.assertEqual(len(self.api.comments), 1)
+
+    def test_duplicates_conflicts_and_unstable_scan_fail_closed(self):
+        checkpoint = self.publisher.checkpoint_ledger_publication(self.bundle, self.publication)
+        changed = dict(self.publication, commit_sha="7" * 40)
+        with self.assertRaisesRegex(ActionsHandlerError, "publisher_checkpoint_conflict"):
+            self.publisher.checkpoint_ledger_publication(self.bundle, changed)
+        original = self.api.comments[checkpoint.comment_id]
+        duplicate = dict(original, id=2, html_url=original["html_url"].replace("issuecomment-1", "issuecomment-2"))
+        self.api.comments[2] = duplicate
+        with self.assertRaisesRegex(ActionsHandlerError, "duplicate_publisher_publications"):
+            self.publisher.load_ledger_publication_checkpoint(self.bundle)
+        del self.api.comments[2]
+        count = 0
+        def change_between_scans(page, call_count):
+            nonlocal count
+            count += 1
+            if count == 2:
+                original["body"] += "changed"
+        self.api.on_comments_get = change_between_scans
+        with self.assertRaisesRegex(ActionsHandlerError, "reconciliation_observation_unstable"):
+            self.publisher.load_ledger_publication_checkpoint(self.bundle)
+
+    def test_spoofed_identity_never_recovers_checkpoint(self):
+        checkpoint = self.publisher.checkpoint_ledger_publication(self.bundle, self.publication)
+        original = self.api.comments[checkpoint.comment_id]
+        for field, value in [
+            ("user", {"id": 2001, "type": "User"}),
+            ("user", {"id": 54321, "type": "User"}),
+            ("performed_via_github_app", None),
+            ("performed_via_github_app", {"id": 1}),
+            ("issue_url", "https://api.github.com/repos/owner/foreign/issues/42"),
+            ("html_url", "https://github.com/owner/foreign/issues/42#issuecomment-1"),
+        ]:
+            with self.subTest(field=field, value=value):
+                self.api.comments[checkpoint.comment_id] = dict(original, **{field: value})
+                self.assertIsNone(self.publisher.load_ledger_publication_checkpoint(self.bundle))
+        self.api.comments[checkpoint.comment_id] = original
+
+    def test_untrusted_post_and_missing_publisher_identity_cannot_succeed(self):
+        self.api.bad_post_bot_id = True
+        with self.assertRaisesRegex(ActionsHandlerError, "publisher_comment_publication_ambiguous"):
+            self.publisher.checkpoint_ledger_publication(self.bundle, self.publication)
+        self.assertIsNone(self.publisher.load_ledger_publication_checkpoint(self.bundle))
+        self.publisher._trusted_publisher_policy = None
+        with self.assertRaisesRegex(ActionsHandlerError, "publisher_identity_required"):
+            self.publisher.checkpoint_ledger_publication(self.bundle, self.publication)
+        with self.assertRaisesRegex(ActionsHandlerError, "publisher_identity_required"):
+            self.publisher.load_ledger_publication_checkpoint(self.bundle)
+
+    def test_invalid_publication_fields_are_rejected_before_post(self):
+        variants = [dict(self.publication, extra=True)]
+        for key, value in [
+            ("repository_id", True), ("repository_id", 1), ("repository_full_name", "owner/foreign"),
+            ("branch", "master"), ("branch", "automation/requests"),
+            ("branch", "task/GOV-041-../escape"), ("branch", "refs/heads/task/GOV-041-valid"),
+            ("base_sha", "7" * 40), ("tree_sha", "G" * 40), ("commit_sha", None),
+        ]:
+            variants.append(dict(self.publication, **{key: value}))
+        for key, value in [
+            ("repository_id", True), ("run_id", 0), ("run_attempt", -1),
+            ("artifact_id", 1.0), ("repository_full_name", "owner/repo/extra"),
+            ("archive_sha256", "A" * 64), ("content_sha256", "short"), ("extra", 1),
+        ]:
+            variants.append(dict(self.publication, artifact_reference=dict(self.publication["artifact_reference"], **{key: value})))
+        for publication in variants:
+            with self.subTest(publication=publication), self.assertRaises(ActionsHandlerError):
+                self.publisher.checkpoint_ledger_publication(self.bundle, publication)
+        self.assertFalse(any(call[0] != "GET" for call in self.api.calls[self.calls_before:]))
+
+    def test_changed_bundle_bindings_and_noncanonical_comments_fail_closed(self):
+        checkpoint = self.publisher.checkpoint_ledger_publication(self.bundle, self.publication)
+        for bundle in [replace(self.bundle, accepted_revision="7" * 40),
+                       replace(self.bundle, claim_revision="8" * 40),
+                       replace(self.bundle, parameters=dict(self.bundle.parameters, extra=True))]:
+            with self.assertRaises(ActionsHandlerError):
+                self.publisher.load_ledger_publication_checkpoint(bundle)
+        changed_policy_record = json.loads(self.bundle.canonical_record)
+        changed_policy_record["policy_revision"] = "9" * 40
+        with self.assertRaisesRegex(ActionsHandlerError, "publisher_checkpoint_binding_mismatch"):
+            self.publisher.load_ledger_publication_checkpoint(replace(self.bundle, canonical_record=json.dumps(changed_policy_record)))
+        body = self.api.comments[checkpoint.comment_id]["body"]
+        for changed in [body + "extra", body.replace('"schema_version": 1', '"schema_version": true'),
+                        body.replace('"tree_sha":', '"extra": 1, "tree_sha":')]:
+            with self.assertRaises(ActionsHandlerError):
+                _parse_publisher_comment(changed, "publication", EXECUTION_ID, self.bundle.request_id)
+        original_record = json.loads(self.bundle.canonical_record)
+        original_record["operation"] = "github.ci.inspect"
+        request = json.loads(original_record["canonical_request"])
+        request["operation"] = "github.ci.inspect"
+        original_record["canonical_request"] = json.dumps(request, sort_keys=True, separators=(",", ":"))
+        original_record["request_digest"] = hashlib.sha256(original_record["canonical_request"].encode()).hexdigest()
+        foreign = replace(self.bundle, operation="github.ci.inspect", canonical_record=json.dumps(original_record), request_digest=original_record["request_digest"])
+        with self.assertRaisesRegex(ActionsHandlerError, "publisher_publication_operation_invalid"):
+            self.publisher.checkpoint_ledger_publication(foreign, self.publication)
+
+
+class LedgerRuntimePhaseTests(unittest.TestCase):
+    """Real Rust journal transitions; fake remote effect/producer observations."""
+
+    def setUp(self):
+        self.api = UnifiedFakeApi()
+        self.publisher_identity = TrustedReceiptPolicy(app_id=9877, bot_user_id=54322)
+        def publisher_api(method, path, body=None):
+            result = self.api.request(method, path, body)
+            if method == "POST" and path.endswith("/comments"):
+                result["user"] = {"id": self.publisher_identity.bot_user_id, "type": "Bot"}
+                result["performed_via_github_app"] = {"id": self.publisher_identity.app_id}
+            return result
+        self.publisher_api = publisher_api
+        self.coordinator = ActionsJournalCoordinator(CLI, publisher_api)
+        self.publisher = PublisherPhase(
+            self.coordinator, TRUSTED_POLICY, TRUSTED_RECEIPT_POLICY,
+            publisher_api, self.publisher_identity, ledger_publisher=self.publish,
+        )
+        self.event = make_event(request_id="ledger-runtime-01", operation="governance.ledger",
+            parameters={"base_sha": SOURCE_SHA, "operation": "run.record_evidence", "parameters": {}})
+        self.bundle = self.publisher.prepare(self.event, "100-1", ACCEPTED_AT, POLICY_REVISION).bundle
+        self.handoff = {"stage": "candidate-ready", "producer_run_id": 100,
+                        "producer_run_attempt": 1, "artifact_name": "workspace-ledger-candidate-100-1",
+                        "content_sha256": "b" * 64}
+        self.candidate_calls = 0
+        self.publish_calls = 0
+        self.effect_calls = 0
+        self.interrupt = False
+        self.no_change = False
+        self.control = ControlPhase(self.api.request, TRUSTED_RECEIPT_POLICY,
+                                    ledger_candidate=self.candidate)
+
+    def state(self):
+        return self.coordinator.load_record(self.bundle.request_id)[1]
+
+    def candidate(self, bundle):
+        self.assertEqual(bundle, self.bundle)
+        self.candidate_calls += 1
+        return dict(self.handoff)
+
+    def publish(self, publisher, bundle, handoff):
+        self.assertIn(self.state()["state"], ("executing", "ambiguous"))
+        self.assertEqual(handoff, self.handoff)
+        self.publish_calls += 1
+        existing = publisher.load_ledger_publication_checkpoint(bundle)
+        if existing:
+            self.assertEqual(self.effect_calls, 1)
+            return {"publication": existing.publication, "checkpoint_comment_id": existing.comment_id, "replayed": True}
+        publication = {"repository_id": 1260920764,
+            "repository_full_name": "shockerqt/workspace-governance",
+            "branch": "task/GOV-041-workspace-command-fast-path", "base_sha": SOURCE_SHA,
+            "tree_sha": "5" * 40, "commit_sha": SOURCE_SHA if self.no_change else "6" * 40,
+            "artifact_reference": {"repository_id": 1260920764,
+                "repository_full_name": "shockerqt/workspace-governance", "run_id": 100,
+                "run_attempt": 1, "artifact_id": 22, "archive_sha256": "a" * 64,
+                "content_sha256": "b" * 64}}
+        checkpoint = publisher.checkpoint_ledger_publication(bundle, publication)
+        self.effect_calls += 1
+        if self.interrupt:
+            raise ActionsHandlerError("ledger_publication_ambiguous")
+        return {"publication": publication, "checkpoint_comment_id": checkpoint.comment_id, "replayed": False}
+
+    def receipt_comment(self):
+        return next(item for item in self.api.comments.values() if "zach-actions:receipt:v1:" in item["body"])
+
+    def test_handoff_is_nonterminal_then_publisher_receipt_precedes_completion(self):
+        control = self.control.execute(self.bundle)
+        self.assertEqual(control.terminal_state, "candidate_ready")
+        self.assertEqual(self.state()["state"], "executing")
+        self.assertEqual(self.effect_calls, 0)
+        result = self.publisher.finalize(self.bundle)
+        self.assertEqual(result.terminal_code, "ledger_published")
+        self.assertEqual(result.envelope["kind"], "actions.publisher.published")
+        published = next(item for item in self.api.comments.values() if "publisher-published:v1:" in item["body"])
+        self.assertEqual(self.state()["terminal_reference"], published["html_url"])
+        self.assertEqual(self.state()["state"], "succeeded")
+        self.assertEqual(published["performed_via_github_app"]["id"], self.publisher_identity.app_id)
+        self.assertEqual(self.publisher.finalize(self.bundle).replayed, True)
+        self.assertEqual(self.publish_calls, 1)
+        self.assertEqual(self.effect_calls, 1)
+
+    def test_control_replays_handoff_without_candidate_or_new_comment(self):
+        first = self.control.execute(self.bundle)
+        count = len(self.api.comments)
+        second = self.control.execute(self.bundle)
+        self.assertTrue(second.replayed)
+        self.assertEqual(second.envelope, first.envelope)
+        self.assertEqual(self.candidate_calls, 1)
+        self.assertEqual(len(self.api.comments), count)
+
+    def test_existing_handoff_wrong_producer_is_rejected_before_candidate(self):
+        self.control.execute(self.bundle)
+        comment = self.receipt_comment()
+        envelope = _parse_receipt_comment(comment["body"], self.bundle.request_id, self.bundle.request_digest,
+                                         "governance.ledger", self.bundle.accepted_revision, self.bundle.claim_revision)
+        envelope["result"].update(producer_run_id=101, artifact_name="workspace-ledger-candidate-101-1")
+        comment["body"] = _format_receipt_comment(envelope)
+        with self.assertRaisesRegex(ActionsHandlerError, "invalid_ledger_handoff"):
+            self.control.execute(self.bundle)
+        with self.assertRaisesRegex(ActionsHandlerError, "invalid_ledger_handoff"):
+            self.publisher.finalize(self.bundle)
+        self.assertEqual(self.candidate_calls, 1)
+        self.assertEqual(self.publish_calls, 0)
+
+    def test_missing_publication_configuration_cannot_complete_candidate(self):
+        self.control.execute(self.bundle)
+        self.publisher._ledger_publisher = None
+        with self.assertRaisesRegex(ActionsHandlerError, "ledger_publication_unavailable"):
+            self.publisher.finalize(self.bundle)
+        self.assertEqual(self.state()["state"], "executing")
+        self.publisher._ledger_publisher = self.publish
+        self.publisher._trusted_publisher_policy = None
+        with self.assertRaisesRegex(ActionsHandlerError, "publisher_identity_required"):
+            self.publisher.finalize(self.bundle)
+        self.assertEqual(self.publish_calls, 0)
+
+    def test_legacy_ledger_success_and_forged_or_wrong_revision_handoff_cannot_publish(self):
+        self.control.execute(self.bundle)
+        comment = self.receipt_comment()
+        original = comment["body"]
+        invalid = _parse_receipt_comment(original, self.bundle.request_id, self.bundle.request_digest,
+                                       "governance.ledger", self.bundle.accepted_revision, self.bundle.claim_revision)
+        invalid["terminal_state"] = "succeeded"
+        comment["body"] = _format_receipt_comment(invalid)
+        with self.assertRaisesRegex(ActionsHandlerError, "invalid_ledger_handoff"):
+            self.publisher.finalize(self.bundle)
+        comment["body"] = original.replace(self.bundle.accepted_revision, "f" * 40)
+        with self.assertRaisesRegex(ActionsHandlerError, "receipt_revision_mismatch"):
+            self.publisher.finalize(self.bundle)
+        comment["body"] = original
+        comment["performed_via_github_app"] = {"id": self.publisher_identity.app_id}
+        with self.assertRaisesRegex(ActionsHandlerError, "comment_publication_ambiguous"):
+            self.publisher.finalize(self.bundle)
+        self.assertEqual(self.publish_calls, 0)
+        self.assertNotEqual(self.state()["state"], "succeeded")
+
+    def test_interrupted_effect_reconciles_existing_intent_without_second_effect(self):
+        self.control.execute(self.bundle)
+        self.interrupt = True
+        with self.assertRaisesRegex(ActionsHandlerError, "ledger_publication_ambiguous"):
+            self.publisher.finalize(self.bundle)
+        self.assertEqual(self.state()["state"], "ambiguous")
+        self.interrupt = False
+        result = self.publisher.reconcile_request(self.bundle.request_id)
+        self.assertEqual(result.terminal_state, "succeeded")
+        self.assertTrue(result.replayed)
+        self.assertTrue(result.reconciled)
+        self.assertEqual(self.effect_calls, 1)
+        self.assertEqual(self.publish_calls, 2)
+
+    def test_lost_published_comment_response_recovers_without_second_post(self):
+        self.control.execute(self.bundle)
+        def lost_response(method, path, body=None):
+            result = self.publisher_api(method, path, body)
+            if method == "POST" and "publisher-published:v1:" in body.get("body", ""):
+                raise ApiError(500, "lost_response")
+            return result
+        self.publisher._read_api_transport = lost_response
+        result = self.publisher.finalize(self.bundle)
+        self.assertEqual(result.terminal_state, "succeeded")
+        self.assertEqual(sum("publisher-published:v1:" in item["body"] for item in self.api.comments.values()), 1)
+
+    def test_failed_published_readback_stays_ambiguous_then_recovers_readonly_effect(self):
+        self.control.execute(self.bundle)
+        def failed_readback(method, path, body=None):
+            if method == "POST" and "publisher-published:v1:" in body.get("body", ""):
+                raise ApiError(500, "unavailable")
+            return self.publisher_api(method, path, body)
+        self.publisher._read_api_transport = failed_readback
+        with self.assertRaises(ActionsHandlerError):
+            self.publisher.finalize(self.bundle)
+        self.assertEqual(self.state()["state"], "ambiguous")
+        self.publisher._read_api_transport = self.publisher_api
+        self.assertEqual(self.publisher.finalize(self.bundle).terminal_code, "ledger_published")
+        self.assertEqual(self.effect_calls, 1)
+
+    def test_control_derivation_failure_sanitizes_and_terminalizes_only_rejection(self):
+        class Failure(Exception):
+            code = "SECRET token payload"
+        self.control._ledger_candidate = lambda bundle: (_ for _ in ()).throw(Failure())
+        outcome = self.control.execute(self.bundle)
+        self.assertEqual(outcome.terminal_state, "rejected")
+        self.assertEqual(outcome.terminal_code, "ledger_candidate_failed")
+        self.assertNotIn("SECRET", self.receipt_comment()["body"])
+        self.assertEqual(self.publisher.finalize(self.bundle).terminal_state, "rejected")
+        self.assertEqual(self.publish_calls, 0)
+
+    def test_no_change_and_bad_callback_result_are_not_confused(self):
+        self.no_change = True
+        self.control.execute(self.bundle)
+        self.assertEqual(self.publisher.finalize(self.bundle).terminal_code, "ledger_no_change")
+        self.setUp()
+        self.control.execute(self.bundle)
+        self.publisher._ledger_publisher = lambda publisher, bundle, handoff: {"success": True}
+        with self.assertRaisesRegex(ActionsHandlerError, "ledger_publication_result_invalid"):
+            self.publisher.finalize(self.bundle)
+        self.assertEqual(self.state()["state"], "ambiguous")
+
+    def test_publication_failure_never_exposes_exception_payload(self):
+        self.control.execute(self.bundle)
+        class Failure(Exception):
+            code = "SECRET token payload"
+        self.publisher._ledger_publisher = lambda *args: (_ for _ in ()).throw(Failure("PRIVATE"))
+        with self.assertRaisesRegex(ActionsHandlerError, "^ledger_publication_failed$"):
+            self.publisher.finalize(self.bundle)
+        self.assertEqual(self.state()["state"], "ambiguous")
+        self.assertFalse(any("SECRET" in item["body"] or "PRIVATE" in item["body"] for item in self.api.comments.values()))
+
+    def test_invalid_handoffs_and_differing_request_conflict(self):
+        for key, value in [("producer_run_id", True), ("producer_run_id", 101),
+                           ("producer_run_attempt", 2), ("artifact_name", "arbitrary"),
+                           ("content_sha256", "not-a-hash"), ("extra", True)]:
+            changed = dict(self.handoff, **{key: value})
+            control = ControlPhase(self.api.request, TRUSTED_RECEIPT_POLICY,
+                                   ledger_candidate=lambda bundle: changed)
+            self.api.comments = {id: item for id, item in self.api.comments.items() if "zach-actions:receipt:v1:" not in item["body"]}
+            with self.subTest(key=key):
+                result = control.execute(self.bundle)
+                self.assertEqual(result.terminal_state, "rejected")
+        altered = make_event(request_id=self.bundle.request_id, operation="governance.ledger",
+            parameters={"base_sha": "7" * 40, "operation": "run.record_evidence", "parameters": {}})
+        with self.assertRaises(ActionsHandlerError):
+            self.publisher.prepare(altered, "100-1", ACCEPTED_AT, POLICY_REVISION)
+        self.assertEqual(self.effect_calls, 0)
 
 
 if __name__ == "__main__":
