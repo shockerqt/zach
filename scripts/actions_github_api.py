@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from typing import Any, Final, Iterable, Optional
 import urllib.error
 import urllib.parse
@@ -41,6 +42,7 @@ MAX_PATH_BYTES: Final[int] = 8192
 MAX_REQUEST_BYTES: Final[int] = 256 * 1024  # 256 KiB
 MAX_RESPONSE_BYTES: Final[int] = 2 * 1024 * 1024  # 2 MiB
 TIMEOUT_SECONDS: Final[float] = 20.0
+MAX_ARTIFACT_ARCHIVE_BYTES: Final[int] = 393216
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -114,9 +116,28 @@ class GithubApi:
         return full_url
 
     def request(self, method: str, relative_path: str, body: Any = None) -> Any:
+        return self._request_json(method, relative_path, body)
+
+    def public_zach_get(self, relative_path: str) -> Any:
+        """Read only the public integrated Zach ref or exact commit ancestry.
+
+        This narrow capability never sends the installation token and does not
+        expand its authenticated repository namespace.
+        """
+        return self._request_json("GET", relative_path, public_zach=True)
+
+    def _request_json(
+        self, method: str, relative_path: str, body: Any = None, *, public_zach: bool = False
+    ) -> Any:
         if not isinstance(method, str) or method not in ALLOWED_METHODS:
             raise RequestValidationError(400, "HTTP method is not allowed")
-        full_url = self._validate_path(relative_path)
+        if public_zach:
+            if (method != "GET" or body is not None or type(relative_path) is not str
+                or re.fullmatch(r"/repos/shockerqt/zach/(?:git/ref/heads/main|compare/[0-9a-f]{40}\.\.\.[0-9a-f]{40})", relative_path) is None):
+                raise RequestValidationError(400, "Invalid public Zach observation")
+            full_url = FIXED_BASE_URL + relative_path
+        else:
+            full_url = self._validate_path(relative_path)
         encoded_body: Optional[bytes] = None
         if body is not None:
             # JSON encoding coerces integer keys and can create duplicate names.
@@ -149,8 +170,9 @@ class GithubApi:
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2026-03-10",
             "User-Agent": "zach-actions",
-            "Authorization": f"Bearer {self._token}",
         }
+        if not public_zach:
+            headers["Authorization"] = f"Bearer {self._token}"
         if encoded_body is not None:
             headers["Content-Type"] = "application/json"
 
@@ -161,6 +183,8 @@ class GithubApi:
             status = getattr(response, "status", None)
             if status is None and hasattr(response, "getcode"):
                 status = response.getcode()
+            if public_zach and status != 200:
+                raise ApiError(status, "Public observation unavailable")
             if status == 204:
                 if response.read(1):
                     raise ApiError(204, "HTTP 204 response must have empty body")
@@ -236,6 +260,81 @@ class GithubApi:
             raise ApiError(500, "Transport failure") from None
         finally:
             if response is not None and hasattr(response, "close"):
+                try:
+                    response.close()
+                except OSError:
+                    pass
+
+    def download_artifact(self, repository: str, artifact_id: int) -> bytes:
+        """Download one bounded artifact, without forwarding credentials to storage.
+
+        Only a redirect returned by the fixed authenticated GitHub endpoint is
+        accepted. The signed URL is never persisted, exposed in errors or retried.
+        This proves neither producer identity nor archive contents; callers must
+        independently verify metadata, hash, ZIP bounds and frozen bindings.
+        """
+        if (type(repository) is not str or repository not in self._allowed_repositories
+                or type(artifact_id) is not int or not 0 < artifact_id <= 2**53 - 1):
+            raise RequestValidationError(400, "Invalid artifact reference")
+        url = self._validate_path(f"/repos/{repository}/actions/artifacts/{artifact_id}/zip")
+        request = urllib.request.Request(url, method="GET", headers={
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2026-03-10",
+            "User-Agent": "zach-actions",
+            "Authorization": f"Bearer {self._token}",
+        })
+        response = None
+        try:
+            try:
+                response = self._opener.open(request, timeout=TIMEOUT_SECONDS)
+            except urllib.error.HTTPError as error:
+                response = error
+            if response.getcode() != 302:
+                raise ApiError(502, "Artifact redirect unavailable")
+            location = response.headers.get("Location", "")
+            if (type(location) is not str or not location.isascii()
+                    or len(location) > MAX_PATH_BYTES
+                    or any(ord(c) < 33 or ord(c) == 127 or c == "\\" for c in location)):
+                raise ApiError(502, "Artifact redirect rejected")
+            parsed = urllib.parse.urlsplit(location)
+            host = parsed.hostname or ""
+            allowed_host = (host == "results-receiver.actions.githubusercontent.com"
+                            or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}\.blob\.core\.windows\.net", host))
+            if (parsed.scheme != "https" or not allowed_host
+                    or parsed.username is not None or parsed.password is not None
+                    or parsed.port not in (None, 443) or parsed.fragment or not parsed.path):
+                raise ApiError(502, "Artifact redirect rejected")
+            response.close()
+            response = None
+            # Deliberately construct a new request, not a credential-bearing redirect.
+            storage_request = urllib.request.Request(location, method="GET", headers={
+                "Accept": "application/zip, application/octet-stream",
+                "User-Agent": "zach-actions",
+            })
+            response = self._opener.open(storage_request, timeout=TIMEOUT_SECONDS)
+            if response.getcode() != 200:
+                raise ApiError(502, "Artifact download failed")
+            if response.headers.get("Content-Encoding", "identity") != "identity":
+                raise ApiError(502, "Artifact encoding rejected")
+            length = response.headers.get("Content-Length")
+            if length is not None and (not length.isascii() or not length.isdigit()
+                                       or not 0 < int(length) <= MAX_ARTIFACT_ARCHIVE_BYTES):
+                raise ApiError(502, "Artifact download size rejected")
+            data = response.read(MAX_ARTIFACT_ARCHIVE_BYTES + 1)
+            if (not data or len(data) > MAX_ARTIFACT_ARCHIVE_BYTES
+                    or (length is not None and len(data) != int(length))):
+                raise ApiError(502, "Artifact download size rejected")
+            return data
+        except ApiError:
+            raise
+        except urllib.error.HTTPError as error:
+            response = error
+            raise ApiError(502, "Artifact download failed") from None
+        except Exception:
+            # HTTPError strings include signed URLs; never forward them.
+            raise ApiError(502, "Artifact download failed") from None
+        finally:
+            if response is not None:
                 try:
                     response.close()
                 except OSError:

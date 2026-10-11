@@ -7,6 +7,10 @@ test:
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-actions-ci-inspect.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-actions-recipe-dispatch.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-actions-github-api.py
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-actions-ledger-candidate.py
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-actions-ledger-producer.py
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-actions-ledger-publication.py
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-actions-ledger-runtime.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-actions-git-journal.py
 	cargo test
 	cargo build --locked --bin zach-actions

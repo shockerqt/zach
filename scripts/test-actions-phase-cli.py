@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 import os
 from pathlib import Path
 import tempfile
@@ -167,6 +168,96 @@ class PhaseCliTests(unittest.TestCase):
             patch.object(cli, "ControlPhase", FakeControl),
         ):
             return cli.main(arguments)
+
+    def _ledger_policy(self):
+        value = json.loads(self.policy.read_text())
+        value["ledger"] = {
+            "producer": {"workflow_id": 10, "workflow_revision": value["policy_revision"], "tool_revision": "a" * 40},
+            "publication": {"owner_task_id": "GOV-041", "owner_task_path": "tasks/GOV-041-workspace-command-fast-path.md", "branch": "task/GOV-041-workspace-command-fast-path"},
+        }
+        self.policy.write_text(json.dumps(value))
+        return value
+
+    def test_ledger_policy_typed_fixed_routing_and_fail_closed(self):
+        value = self._ledger_policy()
+        policy = cli._load_policy(str(self.policy))
+        self.assertEqual(policy.ledger_producer.repository_full_name, "shockerqt/workspace-governance")
+        self.assertEqual(policy.ledger_producer.workflow_revision, policy.policy_revision)
+        faults = [
+            ("producer", "workflow_id", True), ("producer", "workflow_id", 0),
+            ("producer", "workflow_revision", "b" * 40), ("producer", "tool_revision", "bad"),
+            ("producer", "repository_full_name", "client/repository"),
+            ("publication", "branch", "master"), ("publication", "owner_task_path", "tasks/../policy.md"),
+            ("publication", "repository", "client/repository"),
+        ]
+        for section, key, replacement in faults:
+            changed = json.loads(json.dumps(value))
+            changed["ledger"][section][key] = replacement
+            self.policy.write_text(json.dumps(changed))
+            with self.subTest(section=section, key=key), self.assertRaisesRegex(cli.PhaseCliError, "invalid_policy"):
+                cli._load_policy(str(self.policy))
+
+    def test_ledger_control_factory_and_missing_paths(self):
+        self._ledger_policy()
+        policy = cli._load_policy(str(self.policy))
+        checkpoint = DurablePrepareCheckpoint(ClaimDisposition.GRANTED, replace(bundle(), operation="governance.ledger"), 0)
+        args = cli._parser().parse_args(["control", "--policy-file", str(self.policy), "--output-file", str(self.root / "result"),
+            "--ledger-cli", str(self.rust_cli), "--governance-mirror", str(self.root),
+            "--ledger-candidate-output", str(self.root / "candidate.json")])
+        callback = lambda value: {}
+        with patch.object(cli, "_load_checkpoint", return_value=checkpoint), patch.object(cli, "GithubApi", FakeApi), \
+             patch.object(cli, "LedgerCandidateRuntime", return_value=callback) as factory, patch.object(cli, "ControlPhase") as phase:
+            phase.return_value.execute.return_value = ControlExecutionResult(REQUEST_ID, "run-101", terminal_state="succeeded", terminal_code="ledger_candidate_ready")
+            cli._run_control(args, policy, "installation-token")
+            factory.assert_called_once_with(str(self.rust_cli.resolve()), str(self.root), str(self.root / "candidate.json"))
+            self.assertIs(phase.call_args.kwargs["ledger_candidate"], callback)
+            self.assertEqual(FakeApi.constructed[-1][1], frozenset({policy.issue.repository_full_name}))
+            args.governance_mirror = str(self.root / "absent")
+            with self.assertRaisesRegex(cli.PhaseCliError, "invalid_governance_mirror"):
+                cli._run_control(args, policy, "installation-token")
+            args.governance_mirror = str(self.root)
+            args.ledger_candidate_output = None
+            with self.assertRaisesRegex(cli.PhaseCliError, "invalid_ledger_candidate_output"):
+                cli._run_control(args, policy, "installation-token")
+            args.ledger_cli = None
+            with self.assertRaisesRegex(cli.PhaseCliError, "invalid_rust_cli"):
+                cli._run_control(args, policy, "installation-token")
+
+    def test_ledger_publisher_uses_existing_api_and_policy_absent_stays_unwired(self):
+        self._ledger_policy()
+        policy = cli._load_policy(str(self.policy))
+        args = cli._parser().parse_args(["finalize", "--policy-file", str(self.policy), "--output-file", str(self.root / "result"),
+            "--rust-cli", str(self.rust_cli), "--ledger-cli", str(self.rust_cli), "--governance-mirror", str(self.root)])
+        callback = lambda *values: {}
+        with patch.object(cli, "GithubApi", FakeApi), patch.object(cli, "ActionsJournalCoordinator", FakeCoordinator), \
+             patch.object(cli, "LedgerPublisherRuntime", return_value=callback) as factory, patch.object(cli, "PublisherPhase") as phase:
+            cli._publisher(policy, "installation-token", str(self.rust_cli), finalize=True, ledger_args=args)
+            self.assertIs(factory.call_args.args[0], phase.call_args.kwargs["read_api_transport"])
+            self.assertIs(phase.call_args.kwargs["ledger_publisher"], callback)
+            self.assertEqual(factory.call_args.args[1:3], (policy.ledger_producer, policy.ledger_publication))
+            self.assertEqual(FakeApi.constructed[-1][1], frozenset({cli.FIXED_REPOSITORY, policy.issue.repository_full_name}))
+            cli._publisher(policy, "installation-token", str(self.rust_cli), finalize=False)
+            self.assertNotIn("ledger_publisher", phase.call_args.kwargs)
+        policy = replace(policy, ledger_producer=None, ledger_publication=None)
+        checkpoint = DurablePrepareCheckpoint(ClaimDisposition.GRANTED, replace(bundle(), operation="governance.ledger"), 0)
+        with patch.object(cli, "_load_checkpoint", return_value=checkpoint), patch.object(cli, "GithubApi", FakeApi), patch.object(cli, "ControlPhase") as phase:
+            phase.return_value.execute.return_value = ControlExecutionResult(REQUEST_ID, "run-101", terminal_state="rejected", terminal_code="operation_unsupported")
+            args.phase = "control"
+            cli._run_control(args, policy, "installation-token")
+            self.assertNotIn("ledger_candidate", phase.call_args.kwargs)
+
+    def test_finalize_selects_ledger_runtime_only_for_configured_ledger_bundle(self):
+        self._ledger_policy()
+        policy = cli._load_policy(str(self.policy))
+        args = cli._parser().parse_args(["finalize", "--policy-file", str(self.policy),
+            "--output-file", str(self.root / "result"), "--rust-cli", str(self.rust_cli)])
+        for operation, configured in (("governance.ledger", True), ("github.ci.inspect", True), ("governance.ledger", False)):
+            selected = policy if configured else replace(policy, ledger_producer=None, ledger_publication=None)
+            frozen = replace(bundle(), operation=operation)
+            checkpoint = DurablePrepareCheckpoint(ClaimDisposition.GRANTED, frozen, 0)
+            with patch.object(cli, "_load_checkpoint", return_value=checkpoint), patch.object(cli, "_publisher", return_value=FakePublisher()) as factory:
+                cli._run_finalize(args, selected, "installation-token")
+                self.assertIs(factory.call_args.kwargs["ledger_args"], args if operation == "governance.ledger" and configured else None)
 
     def test_prepare_writes_only_a_granted_result_file(self) -> None:
         output = self.root / "prepare-output.json"

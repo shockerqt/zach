@@ -17,6 +17,9 @@ from actions_recipe_dispatch import RecipeDispatchError, RecipeDispatchPolicy
 from actions_git_journal import FIXED_REPOSITORY
 from actions_github_api import GithubApi
 from actions_journal_coordinator import ActionsJournalCoordinator, ClaimDisposition, TrustedIssuePolicy
+from actions_ledger_producer import LedgerProducerPolicy
+from actions_ledger_publication import LedgerPublicationPolicy, LedgerPublicationError, _policy as _validate_ledger_policy
+from actions_ledger_runtime import LedgerCandidateRuntime, LedgerPublisherRuntime
 from actions_request_handler import (
     ActionsHandlerError,
     ControlPhase,
@@ -59,6 +62,8 @@ class PhasePolicy:
     ci: CiInspectionPolicy
     recipe: RecipeDispatchPolicy | None
     policy_revision: str
+    ledger_producer: LedgerProducerPolicy | None = None
+    ledger_publication: LedgerPublicationPolicy | None = None
 
 
 def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -126,6 +131,8 @@ def _load_policy(path: str) -> PhasePolicy:
         expected_keys.add("recipe")
     if "publisher_identity" in value:
         expected_keys.add("publisher_identity")
+    if "ledger" in value:
+        expected_keys.add("ledger")
     _exact_keys(
         value,
         expected_keys,
@@ -150,6 +157,21 @@ def _load_policy(path: str) -> PhasePolicy:
     )
     actors = value["allowed_actor_ids"]
     revision = value["policy_revision"]
+    ledger_producer, ledger_publication = None, None
+    if "ledger" in value:
+        ledger = _exact_keys(value["ledger"], {"producer", "publication"}, "invalid_policy")
+        producer = _exact_keys(ledger["producer"], {"workflow_id", "workflow_revision", "tool_revision"}, "invalid_policy")
+        publication = _exact_keys(ledger["publication"], {"owner_task_id", "owner_task_path", "branch"}, "invalid_policy")
+        if (type(producer["workflow_id"]) is not int or not 0 < producer["workflow_id"] <= 2**53 - 1
+            or any(type(producer[key]) is not str or not SHA40_RE.fullmatch(producer[key]) for key in ("workflow_revision", "tool_revision"))
+            or producer["workflow_revision"] != revision):
+            raise PhaseCliError("invalid_policy")
+        try:
+            ledger_producer = LedgerProducerPolicy(**producer)
+            ledger_publication = LedgerPublicationPolicy(**publication)
+            _validate_ledger_policy(ledger_publication)
+        except (LedgerPublicationError, TypeError, ValueError):
+            raise PhaseCliError("invalid_policy") from None
     recipe_value = value.get("recipe")
     recipe = None
     if recipe_value is not None:
@@ -211,6 +233,8 @@ def _load_policy(path: str) -> PhasePolicy:
             ),
             recipe=recipe,
             policy_revision=revision,
+            ledger_producer=ledger_producer,
+            ledger_publication=ledger_publication,
         )
     except (KeyError, TypeError, ValueError):
         raise PhaseCliError("invalid_policy") from None
@@ -315,18 +339,33 @@ def _transport(token: str, repositories: set[str]) -> GithubApi:
         raise PhaseCliError("invalid_policy") from None
 
 
-def _publisher(policy: PhasePolicy, token: str, cli_path: str, *, finalize: bool) -> PublisherPhase:
+def _ledger_paths(args: argparse.Namespace) -> tuple[str, str]:
+    cli_path = _validate_cli_path(getattr(args, "ledger_cli", None))
+    mirror = getattr(args, "governance_mirror", None)
+    if type(mirror) is not str or not os.path.isabs(mirror) or not os.path.isdir(mirror):
+        raise PhaseCliError("invalid_governance_mirror")
+    return cli_path, mirror
+
+
+def _publisher(policy: PhasePolicy, token: str, cli_path: str, *, finalize: bool,
+               ledger_args: argparse.Namespace | None = None) -> PublisherPhase:
     repositories = {FIXED_REPOSITORY}
     if finalize or policy.publisher is not None:
         repositories.add(policy.issue.repository_full_name)
     api = _transport(token, repositories)
     coordinator = ActionsJournalCoordinator(cli_executable=cli_path, api_transport=api)
+    ledger_kwargs = {}
+    if ledger_args is not None:
+        candidate_cli, mirror = _ledger_paths(ledger_args)
+        ledger_kwargs["ledger_publisher"] = LedgerPublisherRuntime(api, policy.ledger_producer,
+            policy.ledger_publication, candidate_cli, mirror)
     return PublisherPhase(
         coordinator=coordinator,
         trusted_issue_policy=policy.issue,
         trusted_receipt_policy=policy.receipt,
         read_api_transport=api,
         trusted_publisher_policy=policy.publisher,
+        **ledger_kwargs,
     )
 
 
@@ -384,11 +423,19 @@ def _run_control(
     elif bundle.operation == "workspace.recipe.dispatch" and policy.recipe is not None:
         repositories.add(policy.recipe.repository_full_name)
     api = _transport(token, repositories)
+    ledger_kwargs = {}
+    if bundle.operation == "governance.ledger" and policy.ledger_producer is not None:
+        candidate_cli, mirror = _ledger_paths(args)
+        output = getattr(args, "ledger_candidate_output", None)
+        if type(output) is not str or not os.path.isabs(output):
+            raise PhaseCliError("invalid_ledger_candidate_output")
+        ledger_kwargs["ledger_candidate"] = LedgerCandidateRuntime(candidate_cli, mirror, output)
     result = ControlPhase(
         api_transport=api,
         trusted_receipt_policy=policy.receipt,
         ci_policy=policy.ci,
         recipe_policy=policy.recipe,
+        **ledger_kwargs,
     ).execute(bundle, reconcile_recipe_only=reconcile_recipe_only)
     if result.ambiguous:
         return (
@@ -428,7 +475,8 @@ def _run_finalize(args: argparse.Namespace, policy: PhasePolicy, token: str) -> 
         frozenset({ClaimDisposition.GRANTED, ClaimDisposition.RECONCILIATION_REQUIRED}),
     )
     bundle = checkpoint.bundle
-    receipt = _publisher(policy, token, cli_path, finalize=True).finalize(bundle)
+    ledger_args = args if bundle.operation == "governance.ledger" and policy.ledger_producer is not None else None
+    receipt = _publisher(policy, token, cli_path, finalize=True, ledger_args=ledger_args).finalize(bundle)
     return {
         "schema_version": 1,
         "kind": RESULT_KIND,
@@ -471,6 +519,10 @@ def _parser() -> argparse.ArgumentParser:
         command = subparsers.add_parser(name)
         command.add_argument("--policy-file", required=True)
         command.add_argument("--output-file", required=True)
+        if name != "prepare":
+            command.add_argument("--ledger-cli")
+            command.add_argument("--governance-mirror")
+            command.add_argument("--ledger-candidate-output")
         if name in ("prepare", "finalize"):
             command.add_argument("--rust-cli", required=True)
         if name == "prepare":

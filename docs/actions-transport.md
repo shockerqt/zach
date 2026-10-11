@@ -17,7 +17,7 @@ zach-ledger-candidate --mirror GOVERNANCE_MIRROR \
 
 The original `--request REQUEST.json --accepted-at TIME` mode remains available.
 Journal mode implements the integrated transport profile at Governance
-`89b6c1751255090513e439f010153b8158d74cef`, reusing the existing journal parser,
+`071308dd515cfac100309f423d53c38c19a29d05`, reusing the existing journal parser,
 canonicalizer and candidate validator pinned to
 `7f7af5752ef2e016ffe7116f84648b3350fe507f`. It requires an executing
 `governance.ledger` record with an execution owner and exactly `base_sha`,
@@ -331,3 +331,71 @@ reject missing, conflicting, malformed or duplicate candidates.
 `control-reconcile` first replays an existing exact Control receipt without a
 new effect or comment. Only when no receipt exists may it observe the fixed
 recipe destination; it remains unable to dispatch a workflow.
+
+## Preparatory strict ledger publication
+
+This composition is opt-in trusted workflow configuration, not an enabled
+fast path. The initial operation is `run.record_evidence`; the other candidate
+operations are not yet wired. They must retain their full lifecycle checks and
+receive independently collected context where their operation requires it.
+Existing policies without `ledger` retain the unsupported-operation behavior.
+Do not treat this package's local tests as an authenticated online or Web pilot.
+
+An optional policy object has exactly this shape (placeholder revisions and
+workflow ID must be replaced by independently reviewed integrated identities):
+
+```json
+"ledger": {
+  "producer": {
+    "workflow_id": 123456,
+    "workflow_revision": "EXACT_GOVERNANCE_WORKFLOW_SHA",
+    "tool_revision": "EXACT_INTEGRATED_ZACH_SHA"
+  },
+  "publication": {
+    "owner_task_id": "GOV-041",
+    "owner_task_path": "tasks/GOV-041-workspace-command-fast-path.md",
+    "branch": "task/GOV-041-workspace-command-fast-path"
+  }
+}
+```
+
+The producer workflow revision equals the frozen `policy_revision`. Repository,
+workflow path, job name and artifact prefix are fixed by the integrated adapter.
+The Issue cannot select publication routing, executables, context or tooling.
+Configured ledger `control` adds `--ledger-cli /absolute/zach-ledger-candidate`,
+`--governance-mirror /absolute/trusted/mirror` and
+`--ledger-candidate-output /absolute/new/candidate.json`; configured ledger
+`finalize` needs the first two arguments plus its normal `--rust-cli`.
+Trusted automation prepares the mirror and binaries before exposing credentials.
+The candidate subprocess receives only LANG/LC_ALL, never the installation token,
+and neither executes candidate content nor writes Governance refs.
+
+Control persists a bounded authenticated `candidate_ready` handoff, not journal
+success. Trusted workflow automation must upload the sole `candidate.json` as
+`workspace-ledger-candidate-RUN_ID-1` and complete the producer `control` job
+successfully. Publisher subsequently observes the exact run attempt/job/artifact
+metadata and archive digest independently; the handoff supplies only the content
+digest and expected artifact name. Initial producer attempts must be attempt 1.
+
+Publisher rederives the exact candidate using the pinned credential-free CLI,
+checks registered owner/base/path/blob/tree and current request expiration, and
+records the existing authenticated publication intent before a nonforced task-ref
+update. It rechecks expiry immediately before that update. It never writes the
+default branch. Public integrated Zach ancestry is read only through the fixed
+main-ref/exact-SHA comparison endpoints without forwarding a Publisher token.
+The authenticated Publisher installation remains limited to Governance.
+
+Only exact ref/parent/tree readback allows the authenticated `published` result
+and journal completion. Interrupted effects first recover the immutable intent
+with read-only observation, including after artifact/request expiration; they do
+not create another commit or repeat PATCH. Missing evidence, changed refs or
+uncertain effects fail closed. Strict PR/exact-SHA CI remains required; workflow
+provisioning, online pilot, other operations and verified closure are separate
+pending gates. Full activation remains disabled.
+
+For local composition verification after building both binaries, run
+`python3 scripts/verify-actions-ledger-composition.py --governance-mirror /absolute/local/governance-mirror`.
+The mirror must contain the candidate tooling pin. The verifier uses real Rust
+and independently computed Git objects in a disposable clone, with synthetic
+remote metadata/comments and in-memory refs. It makes no network calls or source
+ref updates, and its results never count as an online or ChatGPT Web pilot.

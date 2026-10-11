@@ -74,6 +74,15 @@ PUBLISHER_PREPARE_MARKER_RE: Final[re.Pattern[str]] = re.compile(
     r"digest=([0-9a-f]{64}):execution_digest=([0-9a-f]{64}):"
     r"accepted_revision=([0-9a-f]{40}):claim_revision=([0-9a-f]{40}) -->$"
 )
+PUBLISHER_PUBLICATION_MARKER_RE: Final[re.Pattern[str]] = re.compile(
+    PUBLISHER_PREPARE_MARKER_RE.pattern.replace("publisher-prepare", "publisher-publication")
+)
+PUBLISHER_PUBLISHED_MARKER_RE: Final[re.Pattern[str]] = re.compile(
+    PUBLISHER_PREPARE_MARKER_RE.pattern.replace("publisher-prepare", "publisher-published")
+)
+LEDGER_TASK_BRANCH_RE: Final[re.Pattern[str]] = re.compile(
+    r"task/[A-Z][A-Z0-9]*-[0-9]{3}-[a-z0-9]+(?:-[a-z0-9]+)*"
+)
 
 EXECUTABLE_OPERATIONS: Final[frozenset[str]] = frozenset(
     {"github.ci.inspect", "workspace.recipe.dispatch"}
@@ -283,6 +292,19 @@ class DurablePrepareCheckpoint:
     comment_id: int
 
 
+@dataclass(frozen=True)
+class DurablePublicationCheckpoint:
+    """Authenticated recorded intent, not evidence that a ref was published.
+
+    Artifact trust, producer identity, canonical ownership and actual effect
+    observations remain the caller's responsibility.
+    """
+
+    bundle: ExecutionBundle
+    publication: dict[str, Any]
+    comment_id: int
+
+
 def _format_receipt_comment(envelope: dict[str, Any]) -> str:
     envelope_json = json.dumps(envelope, indent=2, sort_keys=True)
     if len(envelope_json.encode("utf-8")) > MAX_RESULT_ENVELOPE_BYTES:
@@ -355,7 +377,7 @@ def _parse_receipt_comment(
 
     if not isinstance(envelope, dict):
         raise ActionsHandlerError("receipt_envelope_invalid")
-    if envelope.get("schema_version") != 1:
+    if type(envelope.get("schema_version")) is not int or envelope.get("schema_version") != 1:
         raise ActionsHandlerError("receipt_version_unsupported")
     if envelope.get("kind") != "actions.request.receipt":
         raise ActionsHandlerError("receipt_kind_invalid")
@@ -375,8 +397,10 @@ def _parse_receipt_comment(
         raise ActionsHandlerError("receipt_revision_mismatch")
 
     state = envelope.get("terminal_state")
-    if state not in ("succeeded", "rejected"):
+    if state not in ("succeeded", "rejected", "candidate_ready"):
         raise ActionsHandlerError("receipt_state_invalid")
+    if expected_operation == "governance.ledger" and state == "succeeded":
+        raise ActionsHandlerError("invalid_ledger_handoff")
 
     code = envelope.get("terminal_code")
     if not isinstance(code, str) or not (1 <= len(code) <= MAX_TERMINAL_CODE_BYTES):
@@ -384,6 +408,10 @@ def _parse_receipt_comment(
 
     if not isinstance(envelope.get("result"), dict):
         raise ActionsHandlerError("receipt_result_invalid")
+    if state == "candidate_ready":
+        if expected_operation != "governance.ledger" or code != "ledger_candidate_ready":
+            raise ActionsHandlerError("invalid_ledger_handoff")
+        _validate_ledger_handoff(envelope["result"])
 
     # Exact canonical body check: regenerate from envelope and verify byte equality
     canonical = _format_receipt_comment(envelope)
@@ -470,6 +498,66 @@ def _execution_digest(execution_id: str) -> str:
     return hashlib.sha256(execution_id.encode("utf-8")).hexdigest()
 
 
+def _safe_ledger_code(error: Exception, fallback: str) -> str:
+    code = getattr(error, "code", fallback)
+    if type(code) is not str or not re.fullmatch(r"[a-z][a-z0-9_-]{0,127}", code):
+        return fallback
+    return code
+
+
+def _validate_ledger_handoff(result: Any, bundle: Optional[ExecutionBundle] = None) -> None:
+    if type(result) is not dict or set(result) != {
+        "stage", "producer_run_id", "producer_run_attempt", "artifact_name", "content_sha256",
+    }:
+        raise ActionsHandlerError("invalid_ledger_handoff")
+    run_id = result["producer_run_id"]
+    if (result["stage"] != "candidate-ready"
+        or type(run_id) is not int or not 0 < run_id <= 2**53 - 1
+        or type(result["producer_run_attempt"]) is not int or result["producer_run_attempt"] != 1
+        or result["artifact_name"] != f"workspace-ledger-candidate-{run_id}-1"
+        or type(result["content_sha256"]) is not str or not SHA256_RE.fullmatch(result["content_sha256"])
+        or (bundle is not None and bundle.execution_id != f"{run_id}-1")):
+        raise ActionsHandlerError("invalid_ledger_handoff")
+
+
+def _validate_ledger_publication(bundle: ExecutionBundle, publication: Any) -> None:
+    record = _validate_execution_bundle(bundle)
+    if bundle.operation != "governance.ledger":
+        raise ActionsHandlerError("publisher_publication_operation_invalid")
+    keys = {"repository_id", "repository_full_name", "branch", "base_sha",
+            "tree_sha", "commit_sha", "artifact_reference"}
+    if type(publication) is not dict or set(publication) != keys:
+        raise ActionsHandlerError("publisher_publication_invalid")
+    if (
+        type(publication["repository_id"]) is not int
+        or publication["repository_id"] != 1260920764
+        or publication["repository_full_name"] != "shockerqt/workspace-governance"
+        or type(publication["branch"]) is not str
+        or not LEDGER_TASK_BRANCH_RE.fullmatch(publication["branch"])
+        or any(type(publication[key]) is not str or not SHA40_RE.fullmatch(publication[key])
+               for key in ("base_sha", "tree_sha", "commit_sha"))
+    ):
+        raise ActionsHandlerError("publisher_publication_invalid")
+    request = json.loads(record["canonical_request"])
+    if publication["base_sha"] != request["parameters"].get("base_sha"):
+        raise ActionsHandlerError("publisher_publication_binding_mismatch")
+    reference = publication["artifact_reference"]
+    if type(reference) is not dict or set(reference) != {
+        "repository_id", "repository_full_name", "run_id", "run_attempt",
+        "artifact_id", "archive_sha256", "content_sha256",
+    }:
+        raise ActionsHandlerError("publisher_publication_invalid")
+    if (
+        any(type(reference[key]) is not int or reference[key] <= 0
+            for key in ("repository_id", "run_id", "run_attempt", "artifact_id"))
+        or type(reference["repository_full_name"]) is not str
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_][A-Za-z0-9_.-]*", reference["repository_full_name"])
+        or any(type(reference[key]) is not str or not SHA256_RE.fullmatch(reference[key])
+               for key in ("archive_sha256", "content_sha256"))
+    ):
+        raise ActionsHandlerError("publisher_publication_invalid")
+
+
 def _format_publisher_comment(kind: str, envelope: dict[str, Any]) -> str:
     if kind == "intent":
         marker = (
@@ -477,10 +565,20 @@ def _format_publisher_comment(kind: str, envelope: dict[str, Any]) -> str:
             f"digest={envelope['request_digest']}:"
             f"execution_digest={_execution_digest(envelope['execution_id'])} -->"
         )
-    elif kind == "prepare":
+    elif kind in {"prepare", "publication", "published"}:
+        if kind in {"publication", "published"}:
+            if (type(envelope) is not dict
+                or set(envelope) != {"schema_version", "kind", "bundle", "publication"}
+                or type(envelope.get("schema_version")) is not int
+                or envelope["schema_version"] != 1
+                or envelope["kind"] != f"actions.publisher.{kind}"
+                or type(envelope.get("bundle")) is not dict
+                or type(envelope["bundle"].get("schema_version")) is not int):
+                raise ActionsHandlerError("publisher_checkpoint_invalid")
+            _validate_ledger_publication(ExecutionBundle.from_dict(envelope.get("bundle")), envelope.get("publication"))
         bundle = envelope["bundle"]
         marker = (
-            f"<!-- zach-actions:publisher-prepare:v1:request_id={bundle['request_id']}:"
+            f"<!-- zach-actions:publisher-{kind}:v1:request_id={bundle['request_id']}:"
             f"digest={bundle['request_digest']}:"
             f"execution_digest={_execution_digest(bundle['execution_id'])}:"
             f"accepted_revision={bundle['accepted_revision']}:"
@@ -503,15 +601,22 @@ def _parse_publisher_comment(
 ) -> Optional[dict[str, Any]]:
     if not isinstance(body, str):
         return None
+    if kind not in {"intent", "prepare", "publication", "published"}:
+        raise ActionsHandlerError("invalid_publisher_checkpoint")
     prefix = f"<!-- zach-actions:publisher-{kind}:v1:"
     if prefix not in body:
         return None
+    if len(body.encode("utf-8")) > MAX_PUBLISHER_CHECKPOINT_BYTES:
+        raise ActionsHandlerError("publisher_checkpoint_too_large")
     if body.count(prefix) != 1 or body.count("```json\n") != 1 or body.count("\n```\n") != 1:
         raise ActionsHandlerError("publisher_checkpoint_canonical_mismatch")
     lines = body.split("\n")
     if len(lines) < 4 or lines[1] != "```json" or lines[-2] != "```" or lines[-1] != "":
         raise ActionsHandlerError("publisher_checkpoint_canonical_mismatch")
-    marker_re = PUBLISHER_INTENT_MARKER_RE if kind == "intent" else PUBLISHER_PREPARE_MARKER_RE
+    marker_re = {"intent": PUBLISHER_INTENT_MARKER_RE,
+                 "prepare": PUBLISHER_PREPARE_MARKER_RE,
+                 "publication": PUBLISHER_PUBLICATION_MARKER_RE,
+                 "published": PUBLISHER_PUBLISHED_MARKER_RE}[kind]
     match = marker_re.fullmatch(lines[0])
     if match is None:
         raise ActionsHandlerError("publisher_checkpoint_canonical_mismatch")
@@ -546,15 +651,20 @@ def _parse_publisher_comment(
         ):
             raise ActionsHandlerError("publisher_checkpoint_binding_mismatch")
     else:
-        expected_keys = {"schema_version", "kind", "disposition", "bundle"}
-        if set(envelope) != expected_keys or envelope.get("kind") != "actions.publisher.prepare":
+        expected_keys = {"schema_version", "kind", "bundle",
+                         "publication" if kind in {"publication", "published"} else "disposition"}
+        if set(envelope) != expected_keys or envelope.get("kind") != f"actions.publisher.{kind}":
             raise ActionsHandlerError("publisher_checkpoint_invalid")
-        if envelope.get("schema_version") != 1 or envelope.get("disposition") not in {
+        if type(envelope.get("schema_version")) is not int or envelope.get("schema_version") != 1:
+            raise ActionsHandlerError("publisher_checkpoint_invalid")
+        if kind == "prepare" and envelope.get("disposition") not in {
             ClaimDisposition.GRANTED.value,
             ClaimDisposition.RECONCILIATION_REQUIRED.value,
         }:
             raise ActionsHandlerError("publisher_checkpoint_invalid")
         bundle = ExecutionBundle.from_dict(envelope.get("bundle"))
+        if kind in {"publication", "published"}:
+            _validate_ledger_publication(bundle, envelope.get("publication"))
         try:
             _validate_execution_bundle(bundle)
         except ActionsHandlerError:
@@ -670,6 +780,7 @@ class PublisherPhase:
         trusted_receipt_policy: TrustedReceiptPolicy,
         read_api_transport: Optional[Callable[..., Any]] = None,
         trusted_publisher_policy: Optional[TrustedReceiptPolicy] = None,
+        ledger_publisher: Optional[Callable[..., Any]] = None,
     ) -> None:
         if not isinstance(coordinator, ActionsJournalCoordinator):
             raise TypeError("coordinator must be an ActionsJournalCoordinator instance")
@@ -683,11 +794,14 @@ class PublisherPhase:
             trusted_publisher_policy, TrustedReceiptPolicy
         ):
             raise TypeError("trusted_publisher_policy must be a TrustedReceiptPolicy instance or None")
+        if ledger_publisher is not None and not callable(ledger_publisher):
+            raise TypeError("ledger_publisher must be callable or None")
 
         self._coordinator = coordinator
         self._trusted_issue_policy = trusted_issue_policy
         self._trusted_receipt_policy = trusted_receipt_policy
         self._trusted_publisher_policy = trusted_publisher_policy
+        self._ledger_publisher = ledger_publisher
         self._read_api_transport = read_api_transport or coordinator._api_transport
 
     def validate_comment_identity(
@@ -1116,6 +1230,57 @@ class PublisherPhase:
                 matches.append(comment)
         return matches
 
+    def checkpoint_ledger_publication(
+        self, bundle: ExecutionBundle, publication: dict[str, Any]
+    ) -> DurablePublicationCheckpoint:
+        """Persist and authenticate one immutable intent before any ref mutation.
+
+        This only creates an Issue checkpoint. Caller must independently verify
+        artifact provenance and registered task ownership before invoking it.
+        It never creates a commit, updates a ref or terminalizes the journal.
+        """
+        if self._trusted_publisher_policy is None:
+            raise ActionsHandlerError("publisher_identity_required")
+        _validate_ledger_publication(bundle, publication)
+        # Detach mutable caller dictionaries using the existing canonical body.
+        envelope = {"schema_version": 1, "kind": "actions.publisher.publication",
+                    "bundle": bundle.to_dict(), "publication": publication}
+        body = _format_publisher_comment("publication", envelope)
+        detached = _parse_publisher_comment(body, "publication", bundle.execution_id, bundle.request_id)
+        comment_id = self._ensure_publisher_comment("publication", detached)
+        checkpoint = self.load_ledger_publication_checkpoint(bundle)
+        if checkpoint is None or checkpoint.comment_id != comment_id or checkpoint.publication != detached["publication"]:
+            raise ActionsHandlerError("publisher_comment_publication_ambiguous")
+        return checkpoint
+
+    def load_ledger_publication_checkpoint(
+        self, bundle: ExecutionBundle
+    ) -> Optional[DurablePublicationCheckpoint]:
+        """Recover a stable exact authenticated intent, or None when absent.
+
+        Zero matches authorize no effect; duplicate or conflicting records fail
+        closed. Actual publication must be independently observed by the caller.
+        """
+        if self._trusted_publisher_policy is None:
+            raise ActionsHandlerError("publisher_identity_required")
+        _validate_execution_bundle(bundle)
+        if bundle.operation != "governance.ledger":
+            raise ActionsHandlerError("publisher_publication_operation_invalid")
+        matches = self._matching_publisher_comments(
+            "publication", bundle.repository_full_name, bundle.issue_number,
+            bundle.execution_id, bundle.request_id,
+        )
+        if not matches:
+            return None
+        if len(matches) > 1:
+            raise ActionsHandlerError("duplicate_publisher_publications")
+        comment = matches[0]
+        envelope = _parse_publisher_comment(comment["body"], "publication", bundle.execution_id, bundle.request_id)
+        recovered = ExecutionBundle.from_dict(envelope["bundle"])
+        if recovered.to_dict() != bundle.to_dict():
+            raise ActionsHandlerError("publisher_checkpoint_binding_mismatch")
+        return DurablePublicationCheckpoint(recovered, envelope["publication"], comment["id"])
+
     def finalize(
         self,
         bundle: ExecutionBundle,
@@ -1232,6 +1397,51 @@ class PublisherPhase:
         envelope, canonical_reference = matching_receipts[0]
         terminal_state = envelope["terminal_state"]
         terminal_code = envelope["terminal_code"]
+        ledger_replayed = False
+
+        if bundle.operation == "governance.ledger":
+            if terminal_state == "succeeded":
+                raise ActionsHandlerError("invalid_ledger_handoff")
+            if terminal_state == "candidate_ready":
+                _validate_ledger_handoff(envelope["result"], bundle)
+                if self._ledger_publisher is None:
+                    raise ActionsHandlerError("ledger_publication_unavailable")
+                if self._trusted_publisher_policy is None:
+                    raise ActionsHandlerError("publisher_identity_required")
+                try:
+                    result = self._ledger_publisher(self, bundle, envelope["result"])
+                    if type(result) is not dict or set(result) != {"publication", "checkpoint_comment_id", "replayed"}:
+                        raise ActionsHandlerError("ledger_publication_result_invalid")
+                    publication = result["publication"]
+                    _validate_ledger_publication(bundle, publication)
+                    artifact_reference = publication["artifact_reference"]
+                    handoff = envelope["result"]
+                    if (type(result["checkpoint_comment_id"]) is not int or result["checkpoint_comment_id"] <= 0
+                        or type(result["replayed"]) is not bool
+                        or artifact_reference["run_id"] != handoff["producer_run_id"]
+                        or artifact_reference["run_attempt"] != handoff["producer_run_attempt"]
+                        or artifact_reference["content_sha256"] != handoff["content_sha256"]):
+                        raise ActionsHandlerError("ledger_publication_result_invalid")
+                    intent = self.load_ledger_publication_checkpoint(bundle)
+                    if (intent is None or intent.comment_id != result["checkpoint_comment_id"]
+                        or intent.publication != publication):
+                        raise ActionsHandlerError("ledger_publication_result_invalid")
+                    ledger_replayed = result["replayed"]
+                    envelope = {"schema_version": 1, "kind": "actions.publisher.published",
+                                "bundle": bundle.to_dict(), "publication": publication}
+                    published_id = self._ensure_publisher_comment("published", envelope)
+                    matches = self._matching_publisher_comments("published", repo_full_name, issue_number,
+                                                               bundle.execution_id, bundle.request_id)
+                    if (len(matches) != 1 or matches[0]["id"] != published_id
+                        or matches[0]["body"] != _format_publisher_comment("published", envelope)):
+                        raise ActionsHandlerError("publisher_comment_publication_ambiguous")
+                    canonical_reference = f"https://github.com/{repo_full_name}/issues/{issue_number}#issuecomment-{published_id}"
+                    terminal_state = "succeeded"
+                    terminal_code = "ledger_no_change" if publication["commit_sha"] == publication["base_sha"] else "ledger_published"
+                except Exception as error:
+                    if record["state"] == "executing":
+                        self._safe_mark_ambiguous(bundle.request_id, bundle.execution_id)
+                    raise ActionsHandlerError(_safe_ledger_code(error, "ledger_publication_failed")) from None
 
         # 4. Only after verification, terminalize the journal
         if record["state"] == "executing":
@@ -1263,7 +1473,7 @@ class PublisherPhase:
             terminal_code=terminal_code,
             terminal_reference=canonical_reference,
             envelope=envelope,
-            replayed=False,
+            replayed=ledger_replayed,
             reconciled=(record["state"] == "ambiguous"),
         )
 
@@ -1461,6 +1671,7 @@ class ControlPhase:
         trusted_receipt_policy: TrustedReceiptPolicy,
         ci_policy: Optional[CiInspectionPolicy] = None,
         recipe_policy: Optional[RecipeDispatchPolicy] = None,
+        ledger_candidate: Optional[Callable[..., Any]] = None,
     ) -> None:
         if not callable(api_transport):
             raise TypeError("api_transport must be callable")
@@ -1470,11 +1681,14 @@ class ControlPhase:
             raise TypeError("ci_policy must be a CiInspectionPolicy instance or None")
         if recipe_policy is not None and not isinstance(recipe_policy, RecipeDispatchPolicy):
             raise TypeError("recipe_policy must be a RecipeDispatchPolicy instance or None")
+        if ledger_candidate is not None and not callable(ledger_candidate):
+            raise TypeError("ledger_candidate must be callable or None")
 
         self._api_transport = api_transport
         self._trusted_receipt_policy = trusted_receipt_policy
         self._ci_policy = ci_policy
         self._recipe_policy = recipe_policy
+        self._ledger_candidate = ledger_candidate
 
     def validate_comment_identity(
         self,
@@ -1526,7 +1740,7 @@ class ControlPhase:
 
         operation = bundle.operation
 
-        if reconcile_recipe_only:
+        if reconcile_recipe_only or operation == "governance.ledger":
             replay = self._existing_receipt(bundle)
             if replay is not None:
                 return replay
@@ -1569,6 +1783,16 @@ class ControlPhase:
                 terminal_state = "rejected"
                 terminal_code = error.code
                 result_payload = {"error": error.code, "retryable": error.retryable}
+        elif operation == "governance.ledger" and self._ledger_candidate is not None:
+            try:
+                result_payload = self._ledger_candidate(bundle)
+                _validate_ledger_handoff(result_payload, bundle)
+                terminal_state = "candidate_ready"
+                terminal_code = "ledger_candidate_ready"
+            except Exception as error:
+                terminal_state = "rejected"
+                terminal_code = _safe_ledger_code(error, "ledger_candidate_failed")
+                result_payload = {"error": terminal_code}
         elif operation in KNOWN_UNSUPPORTED_OPERATIONS or operation not in EXECUTABLE_OPERATIONS:
             terminal_state = "rejected"
             terminal_code = "unsupported_operation"
@@ -1599,7 +1823,7 @@ class ControlPhase:
 
         # Reconciliation has no write effect before this point. Observe again so
         # a receipt that appeared during destination reconciliation is replayed.
-        if reconcile_recipe_only:
+        if reconcile_recipe_only or operation == "governance.ledger":
             replay = self._existing_receipt(bundle)
             if replay is not None:
                 return replay
@@ -1718,6 +1942,8 @@ class ControlPhase:
                 bundle.claim_revision,
             )
             if envelope is not None:
+                if envelope["terminal_state"] == "candidate_ready":
+                    _validate_ledger_handoff(envelope["result"], bundle)
                 matches.append((envelope, comment["id"]))
         if len(matches) > 1:
             raise ActionsHandlerError("duplicate_receipts_found")
