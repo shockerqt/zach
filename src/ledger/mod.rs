@@ -1145,13 +1145,13 @@ mod tests {
         }
     }
 
-    fn service<C: Clock>(
+    fn service<V: LedgerValidator, C: Clock>(
         db: &Path,
-        validator: FakeValidator,
+        validator: V,
         publisher: FakePublisher,
         clock: C,
         instance: &str,
-    ) -> WebhookService<FakeValidator, FakePublisher, C> {
+    ) -> WebhookService<V, FakePublisher, C> {
         WebhookService::new(ServiceConfig {
             webhook_secret: b"secret".to_vec(),
             repository: GOVERNANCE_REPOSITORY.into(),
@@ -1506,11 +1506,41 @@ mod tests {
 
     #[test]
     fn concurrent_duplicate_executes_validator_at_most_once() {
+        use std::sync::mpsc;
+
+        struct CoordinatedValidator {
+            delegate: FakeValidator,
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl LedgerValidator for CoordinatedValidator {
+            fn validator_revision(&self) -> &str {
+                self.delegate.validator_revision()
+            }
+
+            fn validate(
+                &self,
+                request: &LedgerRequest,
+                accepted_at: &str,
+            ) -> Result<validator::ValidatedLedgerResult, validator::ValidationError> {
+                self.entered.send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("test must release the claimed validation");
+                self.delegate.validate(request, accepted_at)
+            }
+        }
+
         let db = TestDb::new();
         let calls = Arc::new(AtomicUsize::new(0));
-        let validator = FakeValidator {
-            sleep_ms: 120,
-            ..default_validator(Arc::clone(&calls))
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let validator = CoordinatedValidator {
+            delegate: default_validator(Arc::clone(&calls)),
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
         };
         let service = Arc::new(service(
             &db.0,
@@ -1530,8 +1560,11 @@ mod tests {
         let first = thread::spawn(move || {
             first_service.handle(&headers(&first_body, "delivery-j"), &first_body)
         });
-        thread::sleep(Duration::from_millis(20));
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("first request must hold the durable execution claim");
         let second = service.handle(&headers(&body, "delivery-k"), &body);
+        release_tx.send(()).unwrap();
         let first = first.join().unwrap();
         assert_eq!(first.status_code, 200);
         assert_eq!(second.code, "transaction-in-flight");

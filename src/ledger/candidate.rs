@@ -1,4 +1,6 @@
 //! Preparatory candidate data; callers establish trusted context authority.
+use super::actions::ActionOperation;
+use super::actions_journal::{JournalRecord, JournalState};
 use super::json::{Json, jcs};
 use super::validator::{ChangeOperation, PinnedGovernanceValidator};
 #[cfg(target_os = "linux")]
@@ -10,6 +12,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 pub const CANDIDATE_REVISION: &str = "7f7af5752ef2e016ffe7116f84648b3350fe507f";
+/// Integrated transport profile; does not replace the candidate tooling pin.
+pub const ACTIONS_TRANSPORT_REVISION: &str = "89b6c1751255090513e439f010153b8158d74cef";
 pub const MAX_INPUT_BYTES: u64 = 256 * 1024;
 const OPERATIONS: &[&str] = &[
     "task.create",
@@ -28,6 +32,16 @@ pub struct TrustedLedgerContext {
     pub(super) remote_evidence: Option<Json>,
 }
 impl TrustedLedgerContext {
+    fn to_json(&self) -> Json {
+        let mut fields = Vec::new();
+        if let Some(value) = &self.remote_preflight {
+            fields.push(("remote_preflight".into(), value.clone()));
+        }
+        if let Some(value) = &self.remote_evidence {
+            fields.push(("remote_evidence".into(), value.clone()));
+        }
+        Json::Object(fields)
+    }
     pub fn parse(text: &str) -> Result<Self, &'static str> {
         if text.len() as u64 > MAX_INPUT_BYTES {
             return Err("input-too-large");
@@ -48,6 +62,162 @@ impl TrustedLedgerContext {
         jcs(&value).map_err(|_| "invalid-trusted-context")?;
         Ok(context)
     }
+}
+
+fn expiry(accepted_at: &str) -> Result<String, &'static str> {
+    if accepted_at.len() > 35 {
+        return Err("request-time-invalid");
+    }
+    let epoch =
+        super::actions_journal::parse_utc_epoch(accepted_at).ok_or("request-time-invalid")?;
+    let expires = epoch.checked_add(3600).ok_or("request-time-invalid")?;
+    let mut result = super::epoch_to_rfc3339(expires);
+    if result.len() != 20 {
+        return Err("request-time-invalid");
+    }
+    if let Some((_, fraction)) = accepted_at.strip_suffix('Z').unwrap().split_once('.') {
+        result.pop();
+        result.push('.');
+        result.push_str(fraction);
+        result.push('Z');
+    }
+    Ok(result)
+}
+
+fn inner_request(journal: &JournalRecord) -> Result<Json, &'static str> {
+    if journal.operation() != ActionOperation::GovernanceLedger
+        || journal.state() != JournalState::Executing
+        || journal.execution_id().is_none()
+    {
+        return Err("journal-binding-invalid");
+    }
+    let outer = Json::parse(journal.canonical_request()).map_err(|_| "journal-binding-invalid")?;
+    let parameters = outer.get("parameters").ok_or("request-invalid")?;
+    let fields = parameters.as_object().ok_or("request-invalid")?;
+    if fields.len() != 3
+        || fields
+            .iter()
+            .any(|(key, _)| !["base_sha", "operation", "parameters"].contains(&key.as_str()))
+    {
+        return Err("request-invalid");
+    }
+    let base = parameters
+        .get("base_sha")
+        .and_then(Json::as_str)
+        .ok_or("request-invalid")?;
+    let operation = parameters
+        .get("operation")
+        .and_then(Json::as_str)
+        .ok_or("request-invalid")?;
+    let inner_parameters = parameters.get("parameters").ok_or("request-invalid")?;
+    if !super::sha40(base) || inner_parameters.as_object().is_none() {
+        return Err("request-invalid");
+    }
+    if !OPERATIONS.contains(&operation)
+        || (operation == "task.transition_status"
+            && !matches!(
+                inner_parameters.get("target_status").and_then(Json::as_str),
+                Some("planned" | "active" | "blocked" | "cancelled")
+            ))
+    {
+        return Err("operation-not-allowed");
+    }
+    Ok(Json::Object(vec![
+        ("schema_version".into(), Json::Number("1".into())),
+        (
+            "request_id".into(),
+            Json::String(journal.request_id().into()),
+        ),
+        ("base_sha".into(), Json::String(base.into())),
+        ("operation".into(), Json::String(operation.into())),
+        ("parameters".into(), inner_parameters.clone()),
+        (
+            "created_at".into(),
+            Json::String(journal.accepted_at().into()),
+        ),
+        (
+            "expires_at".into(),
+            Json::String(expiry(journal.accepted_at())?),
+        ),
+        (
+            "contract_revision".into(),
+            Json::String(CANDIDATE_REVISION.into()),
+        ),
+    ]))
+}
+
+/// Derive bound candidate data from a frozen executing journal. The caller must
+/// independently authenticate the journal, revisions, context and producer.
+pub fn derive_actions_candidate(
+    mirror: PathBuf,
+    journal_json: &str,
+    accepted_revision: &str,
+    claim_revision: &str,
+    context: &TrustedLedgerContext,
+) -> Result<String, String> {
+    if !super::sha40(accepted_revision) || !super::sha40(claim_revision) {
+        return Err("journal-revision-invalid".into());
+    }
+    let journal =
+        JournalRecord::from_json(journal_json).map_err(|_| "journal-invalid".to_owned())?;
+    let inner = inner_request(&journal).map_err(str::to_owned)?;
+    let request = jcs(&inner).map_err(|_| "request-invalid".to_owned())?;
+    let candidate = derive_candidate(mirror, &request, journal.accepted_at(), context)?;
+    let candidate = Json::parse(&candidate).map_err(|_| "validator-output-invalid".to_owned())?;
+    bound_artifact(
+        &journal,
+        accepted_revision,
+        claim_revision,
+        inner,
+        context,
+        candidate,
+    )
+}
+
+fn bound_artifact(
+    journal: &JournalRecord,
+    accepted_revision: &str,
+    claim_revision: &str,
+    inner: Json,
+    context: &TrustedLedgerContext,
+    candidate: Json,
+) -> Result<String, String> {
+    let result = jcs(&Json::Object(vec![
+        (
+            "kind".into(),
+            Json::String("governance-actions-ledger-candidate".into()),
+        ),
+        ("schema_version".into(), Json::Number("1".into())),
+        (
+            "request_id".into(),
+            Json::String(journal.request_id().into()),
+        ),
+        (
+            "outer_request_digest".into(),
+            Json::String(journal.request_digest().into()),
+        ),
+        (
+            "accepted_revision".into(),
+            Json::String(accepted_revision.into()),
+        ),
+        ("claim_revision".into(), Json::String(claim_revision.into())),
+        (
+            "policy_revision".into(),
+            Json::String(journal.policy_revision().into()),
+        ),
+        (
+            "accepted_at".into(),
+            Json::String(journal.accepted_at().into()),
+        ),
+        ("inner_request".into(), inner),
+        ("trusted_context".into(), context.to_json()),
+        ("candidate".into(), candidate),
+    ]))
+    .map_err(|_| "candidate-invalid".to_owned())?;
+    if result.len() as u64 > MAX_INPUT_BYTES {
+        return Err("artifact-too-large".into());
+    }
+    Ok(result)
 }
 
 /// Returns exact candidate JSON, without receipt authentication or publication.
@@ -191,7 +361,282 @@ pub fn write_private(_path: &Path, _bytes: &[u8]) -> Result<(), &'static str> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::actions::AcceptedIssue;
+    use super::super::json::sha256_hex;
     use super::*;
+
+    fn journal(parameters: &str, time: &str, id: &str, policy: &str) -> JournalRecord {
+        let parameters = Json::parse(parameters).unwrap();
+        let canonical_request = jcs(&Json::Object(vec![
+            ("schema_version".into(), Json::Number("1".into())),
+            ("request_id".into(), Json::String(id.into())),
+            ("operation".into(), Json::String("governance.ledger".into())),
+            ("parameters".into(), parameters.clone()),
+        ]))
+        .unwrap();
+        let request_digest = sha256_hex(canonical_request.as_bytes());
+        let issue = AcceptedIssue {
+            repository_id: 1,
+            repository_full_name: "owner/repo".into(),
+            issue_id: 2,
+            issue_number: 3,
+            author_id: 4,
+            sender_id: 5,
+            request_id: id.into(),
+            operation: ActionOperation::GovernanceLedger,
+            parameters,
+            canonical_request,
+            request_digest,
+        };
+        let mut journal = JournalRecord::new(issue, time, policy).unwrap();
+        journal.claim_execution("execution-1").unwrap();
+        journal
+    }
+
+    fn outer_parameters() -> String {
+        format!(
+            r#"{{"base_sha":"{CANDIDATE_REVISION}","operation":"run.record_evidence","parameters":{{}}}}"#
+        )
+    }
+
+    #[test]
+    fn expiry_preserves_fractions_and_checks_calendar_boundaries() {
+        for (accepted, expected) in [
+            ("2026-12-31T23:30:01.001200Z", "2027-01-01T00:30:01.001200Z"),
+            ("2028-02-28T23:30:00Z", "2028-02-29T00:30:00Z"),
+            ("2028-02-29T23:30:00Z", "2028-03-01T00:30:00Z"),
+            ("1970-01-01T00:00:00Z", "1970-01-01T01:00:00Z"),
+            ("9999-12-31T22:59:59Z", "9999-12-31T23:59:59Z"),
+        ] {
+            assert_eq!(expiry(accepted), Ok(expected.into()));
+        }
+        for accepted in [
+            "9999-12-31T23:00:00Z",
+            "2026-02-29T00:00:00Z",
+            "2026-01-01T00:00:60Z",
+            "2026-01-01T00:00:00.Z",
+            "2026-01-01T00:00:00+00:00",
+            "9223372036854775807-01-01T00:00:00Z",
+            "2026-1-01T00:00:00Z",
+        ] {
+            assert!(expiry(accepted).is_err(), "{accepted}");
+        }
+    }
+
+    #[test]
+    fn frozen_mapping_and_artifact_are_deterministic_and_bound() {
+        let record = journal(
+            &outer_parameters(),
+            "2026-10-11T00:00:00.123Z",
+            "journal-test",
+            CANDIDATE_REVISION,
+        );
+        let accepted = record
+            .to_json()
+            .unwrap()
+            .replace("\"executing\"", "\"accepted\"")
+            .replace("\"execution-1\"", "null");
+        assert_eq!(
+            derive_actions_candidate(
+                "/missing".into(),
+                &accepted,
+                CANDIDATE_REVISION,
+                CANDIDATE_REVISION,
+                &TrustedLedgerContext::default()
+            ),
+            Err("journal-binding-invalid".into())
+        );
+        let inner = inner_request(&record).unwrap();
+        let digest = super::super::parse_request_object(&inner)
+            .unwrap()
+            .request_digest;
+        assert_ne!(digest, record.request_digest());
+        assert_eq!(
+            inner.get("created_at").unwrap().as_str(),
+            Some(record.accepted_at())
+        );
+        assert_eq!(
+            inner.get("expires_at").unwrap().as_str(),
+            Some("2026-10-11T01:00:00.123Z")
+        );
+        let artifact = |record: &JournalRecord, accepted: &str, claim: &str| {
+            bound_artifact(
+                record,
+                accepted,
+                claim,
+                inner_request(record).unwrap(),
+                &TrustedLedgerContext::default(),
+                Json::Object(vec![]),
+            )
+            .unwrap()
+        };
+        let original = artifact(&record, CANDIDATE_REVISION, CANDIDATE_REVISION);
+        let mut reordered = Json::parse(&record.to_json().unwrap()).unwrap();
+        if let Json::Object(fields) = &mut reordered {
+            fields.reverse();
+        }
+        let reordered = format!(
+            "{{{}}}",
+            reordered
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(key, value)| format!(
+                    "{}:{}",
+                    jcs(&Json::String(key.clone())).unwrap(),
+                    jcs(value).unwrap()
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let replay = JournalRecord::from_json(&reordered).unwrap();
+        assert_eq!(
+            original,
+            artifact(&replay, CANDIDATE_REVISION, CANDIDATE_REVISION)
+        );
+        let other_revision = "a".repeat(40);
+        for changed in [
+            artifact(&record, &other_revision, CANDIDATE_REVISION),
+            artifact(&record, CANDIDATE_REVISION, &other_revision),
+            artifact(
+                &journal(
+                    &outer_parameters(),
+                    "2026-10-11T00:00:00.124Z",
+                    "journal-test",
+                    CANDIDATE_REVISION,
+                ),
+                CANDIDATE_REVISION,
+                CANDIDATE_REVISION,
+            ),
+            artifact(
+                &journal(
+                    &outer_parameters(),
+                    record.accepted_at(),
+                    "journal-other",
+                    CANDIDATE_REVISION,
+                ),
+                CANDIDATE_REVISION,
+                CANDIDATE_REVISION,
+            ),
+            artifact(
+                &journal(
+                    &outer_parameters(),
+                    record.accepted_at(),
+                    "journal-test",
+                    &other_revision,
+                ),
+                CANDIDATE_REVISION,
+                CANDIDATE_REVISION,
+            ),
+        ] {
+            assert_ne!(original, changed);
+        }
+        let output = Json::parse(&original).unwrap();
+        assert_eq!(output.as_object().unwrap().len(), 11);
+        assert_eq!(
+            jcs(output.get("inner_request").unwrap()).unwrap(),
+            jcs(&inner).unwrap()
+        );
+        assert!(
+            bound_artifact(
+                &record,
+                CANDIDATE_REVISION,
+                CANDIDATE_REVISION,
+                inner,
+                &TrustedLedgerContext::parse(&format!(
+                    r#"{{"remote_evidence":{{"large":"{}"}}}}"#,
+                    "x".repeat(262_000)
+                ))
+                .unwrap(),
+                Json::String("x".repeat(1000))
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn journal_bridge_rejects_unclaimed_foreign_and_hostile_inputs() {
+        let record = journal(
+            &outer_parameters(),
+            "2026-10-11T00:00:00Z",
+            "journal-test",
+            CANDIDATE_REVISION,
+        );
+        for parameters in [
+            "{}".into(),
+            outer_parameters().replace("run.record_evidence", "task.complete"),
+            outer_parameters()
+                .replace("run.record_evidence", "task.transition_status")
+                .replace(
+                    "\"parameters\":{}",
+                    "\"parameters\":{\"target_status\":\"completed\"}",
+                ),
+            outer_parameters().replace(
+                "\"parameters\":{}",
+                "\"parameters\":{},\"remote_evidence\":{}",
+            ),
+            outer_parameters().replace(CANDIDATE_REVISION, "main"),
+            outer_parameters().replace("\"parameters\":{}", "\"parameters\":null"),
+        ] {
+            let record = journal(
+                &parameters,
+                record.accepted_at(),
+                "journal-test",
+                CANDIDATE_REVISION,
+            );
+            assert!(inner_request(&record).is_err());
+        }
+        for state in ["accepted", "ambiguous", "succeeded", "rejected"] {
+            let text = record
+                .to_json()
+                .unwrap()
+                .replace("\"executing\"", &format!("\"{state}\""));
+            assert!(
+                derive_actions_candidate(
+                    "/missing".into(),
+                    &text,
+                    CANDIDATE_REVISION,
+                    CANDIDATE_REVISION,
+                    &TrustedLedgerContext::default()
+                )
+                .is_err()
+            );
+        }
+        for text in [
+            "{}".into(),
+            "x".repeat(65_537),
+            record
+                .to_json()
+                .unwrap()
+                .replace(record.request_digest(), &"a".repeat(64)),
+            record.to_json().unwrap().replace("\"execution-1\"", "null"),
+            record
+                .to_json()
+                .unwrap()
+                .replace("governance.ledger", "github.ci.inspect"),
+        ] {
+            assert_eq!(
+                derive_actions_candidate(
+                    "/missing".into(),
+                    &text,
+                    CANDIDATE_REVISION,
+                    CANDIDATE_REVISION,
+                    &TrustedLedgerContext::default()
+                ),
+                Err("journal-invalid".into())
+            );
+        }
+        assert_eq!(
+            derive_actions_candidate(
+                "/missing".into(),
+                &record.to_json().unwrap(),
+                "main",
+                CANDIDATE_REVISION,
+                &TrustedLedgerContext::default()
+            ),
+            Err("journal-revision-invalid".into())
+        );
+    }
     #[test]
     fn context_is_separate_and_bounded() {
         assert!(TrustedLedgerContext::parse("{}").is_ok());

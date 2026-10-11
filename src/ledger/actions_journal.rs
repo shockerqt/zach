@@ -1199,7 +1199,7 @@ fn validate_utc_timestamp(value: &str) -> bool {
     parse_utc_epoch(value).is_some()
 }
 
-fn parse_utc_epoch(value: &str) -> Option<i64> {
+pub(super) fn parse_utc_epoch(value: &str) -> Option<i64> {
     // Bound calendar fields before arithmetic, including malicious huge years.
     let bytes = value.as_bytes();
     if bytes.len() < 20
@@ -1209,6 +1209,11 @@ fn parse_utc_epoch(value: &str) -> Option<i64> {
         || bytes[13] != b':'
         || bytes[16] != b':'
         || !bytes[..4].iter().all(u8::is_ascii_digit)
+        || ![5, 6, 8, 9, 11, 12, 14, 15, 17, 18]
+            .iter()
+            .all(|index| bytes[*index].is_ascii_digit())
+        || (bytes.len() == 20 && bytes[19] != b'Z')
+        || (bytes.len() > 20 && bytes[19] != b'.')
     {
         return None;
     }

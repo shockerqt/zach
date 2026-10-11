@@ -6,6 +6,37 @@ fn invalid_arguments_expose_only_codes() {
         vec![],
         vec!["--unknown", "secret-value"],
         vec!["--request", "a", "--request", "b"],
+        vec!["--journal-record", "secret", "--accepted-revision", "a"],
+        vec![
+            "--journal-record",
+            "secret",
+            "--accepted-revision",
+            "a",
+            "--claim-revision",
+            "b",
+            "--request",
+            "secret",
+            "--accepted-at",
+            "now",
+        ],
+        vec![
+            "--request",
+            "secret",
+            "--accepted-at",
+            "now",
+            "--claim-revision",
+            "a",
+        ],
+        vec![
+            "--journal-record",
+            "secret",
+            "--accepted-revision",
+            "a",
+            "--claim-revision",
+            "b",
+            "--accepted-at",
+            "now",
+        ],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_zach-ledger-candidate"))
             .args(args)
