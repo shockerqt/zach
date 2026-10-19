@@ -95,13 +95,57 @@ class Tests(unittest.TestCase):
             {"path": "runs/GOV-041/active.md", "operation": "upsert", "content": content,
              "blob_sha": hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest()}]}}
 
-    def invoke(self):
+    def invoke(self, *, derive_error=None):
         with patch.object(module, "_validate_execution_bundle", return_value={"policy_revision": REVISION}), \
              patch.object(module, "observe_ledger_producer", return_value={"stable": "observation"}), \
-             patch.object(module, "derive_bound_candidate", return_value=b"candidate"), \
+             patch.object(module, "derive_bound_candidate", return_value=b"candidate", side_effect=derive_error) as derive, \
              patch.object(module, "validate_bound_candidate", return_value=self.candidate):
+            self.derive = derive
             return module.publish_ledger_candidate(self.api, self.api, self.bundle, self.reference,
                 self.producer, POLICY, "/trusted/cli", "/trusted/mirror", self.now, clock=self.clock)
+
+    def test_shared_profile_rederives_empty_context_and_recovers_read_only(self):
+        # Synthetic remote facts and candidate seams prove mechanics, not
+        # operation semantics, authenticated online authority or real Git trees.
+        for operation in ("run.record_evidence", "run.transition_status", "task.append_run", "task.transition_status"):
+            with self.subTest(operation=operation):
+                self.setUp()
+                self.bundle.parameters["operation"] = operation
+                result = self.invoke()
+                self.assertFalse(result["replayed"])
+                self.derive.assert_called_once_with(self.bundle, "/trusted/cli", "/trusted/mirror", {})
+                self.api.calls.clear()
+                self.assertTrue(self.invoke()["replayed"])
+                self.derive.assert_not_called()
+                self.assertTrue(all(method == "GET" for method, _, _ in self.api.calls))
+
+    def test_unavailable_profiles_reject_before_checkpoint_observation_or_effect(self):
+        for operation in ("run.create", "task.start_run", "run.record_remote_evidence", "task.create", "task.complete", "task.complete_verified", "unknown", None):
+            with self.subTest(operation=operation):
+                self.setUp()
+                self.bundle.parameters["operation"] = operation
+                with patch.object(self.api, "load_ledger_publication_checkpoint") as load, \
+                     patch.object(module, "observe_ledger_producer") as observe, \
+                     self.assertRaisesRegex(module.LedgerPublicationError, "ledger_context_profile_unavailable"):
+                    self.invoke()
+                load.assert_not_called()
+                observe.assert_not_called()
+                self.derive.assert_not_called()
+                self.assertEqual(self.api.calls, [])
+
+    def test_candidate_lifecycle_rejection_prevents_checkpoint_and_git_effects(self):
+        # Candidate errors are injected: this checks propagation rather than
+        # independently asserting terminal-evidence or completion validation.
+        for operation, parameters in (("run.transition_status", {"target_status": "completed"}),
+                                      ("task.transition_status", {"target_status": "completed"})):
+            with self.subTest(operation=operation):
+                self.setUp()
+                self.bundle.parameters.update(operation=operation, parameters=parameters)
+                with self.assertRaisesRegex(module.LedgerPublicationError, "candidate_rejected"):
+                    self.invoke(derive_error=module.LedgerPublicationError("candidate_rejected"))
+                self.derive.assert_called_once_with(self.bundle, "/trusted/cli", "/trusted/mirror", {})
+                self.assertIsNone(self.api.checkpoint)
+                self.assertFalse(any(method in ("POST", "PATCH", "checkpoint") for method, _, _ in self.api.calls))
 
     def test_published_checkpoint_precedes_nonforced_patch_and_replay_is_read_only(self):
         result = self.invoke()

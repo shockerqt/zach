@@ -16,6 +16,14 @@ from actions_ledger_producer import REPOSITORY, REPOSITORY_ID, observe_ledger_pr
 from actions_request_handler import _validate_execution_bundle
 
 
+# Shared composition gate only. Parameter and lifecycle decisions belong to
+# the compiled pinned candidate, including task completion/terminal evidence.
+EMPTY_CONTEXT_LEDGER_OPERATIONS = frozenset({
+    "run.record_evidence", "run.transition_status", "task.append_run",
+    "task.transition_status",
+})
+
+
 class LedgerPublicationError(Exception):
     def __init__(self, code):
         self.code = code
@@ -149,8 +157,8 @@ def publish_ledger_candidate(api, publisher, bundle, reference, producer_policy,
                              policy, cli_path, mirror, now, *, clock):
     """Return a proven publication, or fail closed without terminalizing.
 
-    Initial rollout composes run.record_evidence only, whose trusted context is
-    empty. Other operations need the independently collected context profile.
+    Compose the shared empty-context operation profile. The pinned candidate
+    decides parameter and lifecycle validity; other profiles remain unavailable.
     Recovery loads the authenticated effect first and makes no new write.
     """
     try:
@@ -158,7 +166,7 @@ def publish_ledger_candidate(api, publisher, bundle, reference, producer_policy,
         record = _validate_execution_bundle(bundle)
         _require(bundle.operation == "governance.ledger" and record["policy_revision"] == producer_policy.workflow_revision,
                  "ledger_bundle_mismatch")
-        _require(bundle.parameters.get("operation") == "run.record_evidence", "ledger_context_profile_unavailable")
+        _require(bundle.parameters.get("operation") in EMPTY_CONTEXT_LEDGER_OPERATIONS, "ledger_context_profile_unavailable")
         checkpoint = publisher.load_ledger_publication_checkpoint(bundle)
         if checkpoint is not None:
             publication = checkpoint.publication

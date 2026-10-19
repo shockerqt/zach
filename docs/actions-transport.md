@@ -41,8 +41,9 @@ independently establish those facts, collect operation-specific GitHub context,
 verify the integrated producer and artifact identity, recompute all bindings,
 and compose the existing isolated Publisher before any effect. Issue parameters
 cannot supply trusted context. No online handler or activation gate is enabled
-by this bridge. The next online composition starts with `run.record_evidence`
-and must verify replay, conflict, concurrent ref and interrupted publication.
+by this bridge. The preparatory composition supports the empty-context
+operations listed below and must verify replay, conflict, concurrent ref and
+interrupted publication before any online activation.
 
 ## Request
 
@@ -335,11 +336,22 @@ recipe destination; it remains unable to dispatch a workflow.
 ## Preparatory strict ledger publication
 
 This composition is opt-in trusted workflow configuration, not an enabled
-fast path. The initial operation is `run.record_evidence`; the other candidate
-operations are not yet wired. They must retain their full lifecycle checks and
-receive independently collected context where their operation requires it.
+fast path. Control and Publisher share one immutable empty-context operation
+allowlist: `run.record_evidence`, `run.transition_status`, `task.append_run` and
+`task.transition_status`. Both pass `{}` as trusted context to the existing
+pinned candidate. The compiled candidate and Governance mutator decide all
+parameters, transitions, linking and lifecycle validity; these guards add no
+alternate lifecycle rules. Task transitions to `completed` remain forbidden,
+and run completion still requires the terminal evidence enforced by the mutator.
+`run.create`, `task.start_run`, `run.record_remote_evidence`, `task.create`,
+`task.complete` and `task.complete_verified` remain unsupported by this
+composition. Startup, independently collected remote context and verified
+closure require separate reviewed increments.
 Existing policies without `ledger` retain the unsupported-operation behavior.
 Do not treat this package's local tests as an authenticated online or Web pilot.
+The disabled Governance pilot still admits only `run.record_evidence` and keeps
+its integrated Zach pin `93e7f53db55f5ceee55c6a3e074d72c6988421ca`; this software
+increment does not broaden workflow admission or update that pin.
 
 An optional policy object has exactly this shape (placeholder revisions and
 workflow ID must be replaced by independently reviewed integrated identities):
@@ -390,7 +402,7 @@ and journal completion. Interrupted effects first recover the immutable intent
 with read-only observation, including after artifact/request expiration; they do
 not create another commit or repeat PATCH. Missing evidence, changed refs or
 uncertain effects fail closed. Strict PR/exact-SHA CI remains required; workflow
-provisioning, online pilot, other operations and verified closure are separate
+provisioning, online pilot, context-dependent operations and verified closure are separate
 pending gates. Full activation remains disabled.
 
 For local composition verification after building both binaries, run

@@ -263,7 +263,7 @@ def run(args):
         producer_policy = LedgerProducerPolicy(30001, WORKFLOW_REVISION, TOOL_REVISION)
         publication_policy = LedgerPublicationPolicy("GOV-041", "tasks/GOV-041-workspace-command-fast-path.md", BRANCH)
 
-        def scenario(label, number, base=BASE):
+        def scenario(label, number, base=BASE, *, operation="run.record_evidence", arguments=None, ready=True):
             case = work / label
             case.mkdir()
             api = SyntheticApi(fixtures, store, case / "index", number, base, publisher_identity)
@@ -284,7 +284,7 @@ def run(args):
             publisher = PublisherPhase(coordinator, fixtures.TRUSTED_POLICY, control_identity, api,
                 publisher_identity, ledger_publisher=publish)
             control = ControlPhase(api.control, control_identity, ledger_candidate=candidate)
-            parameters = {"base_sha": base, "operation": "run.record_evidence", "parameters": {
+            parameters = {"base_sha": base, "operation": operation, "parameters": arguments if arguments is not None else {
                 "run_id": RUN_ID, "evidence_id": "actions-ledger-composition-synthetic",
                 "kind": "validation", "summary": "Synthetic local composition verification; no online or production effect.",
                 "reference": None}}
@@ -293,7 +293,7 @@ def run(args):
             bundle = publisher.prepare(event, f"{number}-1", ACCEPTED_AT, WORKFLOW_REVISION).bundle
             require(bundle is not None, "real journal claim missing")
             handoff = control.execute(bundle)
-            require(handoff.terminal_state == "candidate_ready", "real candidate derivation did not produce handoff")
+            require(handoff.terminal_state == ("candidate_ready" if ready else "rejected"), "real candidate derivation unexpected state")
             require(coordinator.load_record(bundle.request_id)[1]["state"] == "executing", "candidate terminalized before publication")
             return api, clock, counts, coordinator, publisher, control, bundle, handoff, parameters
 
@@ -379,6 +379,87 @@ def run(args):
             require(error.code == "ledger_request_expired", "unexpected expiry failure")
         require(api.task_patches == 0 and api.object_writes == 0 and api.pending_publication() is None, "expired candidate created intent/effect")
         checks.append("expired-new-effect-rejected")
+
+        # These are real candidate/lifecycle decisions on synthetic local data,
+        # not a new online admission profile or a claim about connector reads.
+        failed_args = {"run_id": RUN_ID, "target_status": "failed"}
+        api, clock, counts, journal, publisher, control, bundle, handoff, _ = scenario(
+            "run-failed", 107, operation="run.transition_status", arguments=failed_args)
+        require(publisher.finalize(bundle).terminal_code == "ledger_published", "run transition did not publish")
+        failed_commit = api.branch_head
+        raw = git(store, "show", failed_commit + ":runs/GOV-041/20260905-030554-actions-ledger-lifecycle.md")
+        require(b"status: failed\n" in raw and api.task_patches == 1, "run failed state missing")
+        require(publisher.finalize(bundle).replayed and api.task_patches == 1, "run transition replay duplicated effect")
+        api, clock, counts, journal, publisher, control, bundle, handoff, _ = scenario(
+            "run-failed-noop", 108, failed_commit, operation="run.transition_status", arguments=failed_args)
+        require(publisher.finalize(bundle).terminal_code == "ledger_no_change" and api.task_patches == 0,
+                "same terminal run transition was not no-op")
+        api, clock, counts, journal, publisher, control, bundle, handoff, _ = scenario(
+            "run-conflict", 109, failed_commit, operation="run.transition_status",
+            arguments={"run_id": RUN_ID, "target_status": "cancelled"}, ready=False)
+        require(publisher.finalize(bundle).terminal_state == "rejected" and api.task_patches == 0,
+                "conflicting terminal transition produced effect")
+        checks.extend(("real-run-terminal-transition-and-replay", "real-run-terminal-no-op", "real-run-terminal-conflict-rejected"))
+
+        api, clock, counts, journal, publisher, control, bundle, handoff, _ = scenario(
+            "task-blocked", 110, operation="task.transition_status",
+            arguments={"task_id": "GOV-041", "target_status": "blocked"})
+        require(publisher.finalize(bundle).terminal_code == "ledger_published" and api.task_patches == 1,
+                "noncompletion task transition failed")
+        raw = git(store, "show", api.branch_head + ":tasks/GOV-041-workspace-command-fast-path.md")
+        require(b"status: blocked\n" in raw and publisher.finalize(bundle).replayed,
+                "blocked task state or replay missing")
+        api, clock, counts, journal, publisher, control, bundle, handoff, _ = scenario(
+            "task-closure", 111, operation="task.transition_status",
+            arguments={"task_id": "GOV-041", "target_status": "completed"}, ready=False)
+        require(publisher.finalize(bundle).terminal_state == "rejected" and api.task_patches == 0,
+                "unverified task closure produced effect")
+        checks.extend(("real-task-noncompletion-transition", "real-task-completion-rejected"))
+
+        # Build a valid active remote-run fixture in disposable Git objects only.
+        # This deliberately has no publication/terminal evidence. The synthetic
+        # startup declarations confer no real remote or agent-read authority.
+        remote_id = "GOV-041-20261011-020000-synthetic-startup"
+        remote_path = "runs/GOV-041/20261011-020000-synthetic-startup.md"
+        startup = {"schema_version": 2, "run_id": remote_id, "execution_profile": "github-connector",
+            "stage": "startup", "repository": {"name": "governance", "default_branch": "master", "base_sha": BASE},
+            "branch": {"name": BRANCH, "starting_sha": BASE},
+            "reads": ["AGENTS.md", "STACK.md", "contracts/governance-lifecycle.yaml",
+                ".agents/skills/governance-task/SKILL.md", ".agents/skills/governance-run/SKILL.md",
+                "tasks/GOV-041-workspace-command-fast-path.md"],
+            "capabilities": {"available": ["github_repository_read", "github_git_write", "github_nonforced_ref_update",
+                "github_pull_request", "github_actions_via_operations"],
+                "unavailable": ["clone", "shell", "worktree", "hooks", "local_tests"]},
+            "reuse": {"branch": True, "run": False, "pull_request": False}}
+        remote = (f"---\nkind: run\nschema_version: 1\nid: {remote_id}\ntask: GOV-041\nstatus: active\n"
+            f"status_history: [active]\nstarted: {ACCEPTED_AT}\nrun_type: execution\nexecution_profile: github-connector\n"
+            f"preflight: remote\nrepository: governance\nbranch: {BRANCH}\nworktree: none\n"
+            "provenance: {operator: shockerqt, actor: chatgpt, environment: web}\n---\n\n"
+            "# Synthetic local fixture only\n\n## Remote preflight\n\n```yaml\n" + json.dumps(startup) + "\n```\n").encode()
+        fixture_index = work / "remote-fixture-index"
+        git(store, "read-tree", BASE, index=fixture_index)
+        blob = git(store, "hash-object", "-w", "--stdin", data=remote).decode().strip()
+        git(store, "update-index", "--add", "--cacheinfo", f"100644,{blob},{remote_path}", index=fixture_index)
+        fixture_tree = git(store, "write-tree", index=fixture_index).decode().strip()
+        fixture_base = git(store, "commit-tree", fixture_tree, "-p", BASE, data=b"Synthetic remote startup fixture\n").decode().strip()
+        link_args = {"task_id": "GOV-041", "run_id": remote_id}
+        api, clock, counts, journal, publisher, control, bundle, handoff, _ = scenario(
+            "append-run", 112, fixture_base, operation="task.append_run", arguments=link_args)
+        require(publisher.finalize(bundle).terminal_code == "ledger_published" and api.task_patches == 1,
+                "run linking did not publish")
+        linked_commit = api.branch_head
+        require(("../" + remote_path).encode() in git(store, "show", linked_commit + ":tasks/GOV-041-workspace-command-fast-path.md"),
+                "exact run link absent")
+        api, clock, counts, journal, publisher, control, bundle, handoff, _ = scenario(
+            "append-run-noop", 113, linked_commit, operation="task.append_run", arguments=link_args)
+        require(publisher.finalize(bundle).terminal_code == "ledger_no_change" and api.task_patches == 0,
+                "run link replay was not no-op")
+        api, clock, counts, journal, publisher, control, bundle, handoff, _ = scenario(
+            "remote-terminal-missing", 114, linked_commit, operation="run.transition_status",
+            arguments={"run_id": remote_id, "target_status": "completed"}, ready=False)
+        require(publisher.finalize(bundle).terminal_state == "rejected" and api.task_patches == 0,
+                "remote completion without terminal evidence produced effect")
+        checks.extend(("real-task-run-link", "real-task-run-link-no-op", "real-missing-remote-terminal-evidence-rejected"))
         require(git(mirror, "show-ref") == source_refs, "source mirror refs changed")
     return {"kind": "synthetic-local-ledger-composition-verification", "checks": checks,
             "real_rust_and_git_objects": True, "remote_metadata": "synthetic", "online_proof": False}
