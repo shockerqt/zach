@@ -102,6 +102,44 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(api.calls, [])
         self.publisher.load_ledger_publication_checkpoint.assert_not_called()
 
+    def test_control_shared_profile_passes_empty_context_to_candidate(self):
+        # Guard/wiring test only: authentication and Rust derivation are seams.
+        self.assertIs(runtime.EMPTY_CONTEXT_LEDGER_OPERATIONS, publication.EMPTY_CONTEXT_LEDGER_OPERATIONS)
+        self.assertIsInstance(runtime.EMPTY_CONTEXT_LEDGER_OPERATIONS, frozenset)
+        for operation in ("run.record_evidence", "run.transition_status", "task.append_run", "task.transition_status"):
+            bundle = SimpleNamespace(operation="governance.ledger", parameters={"operation": operation}, execution_id="123-1")
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory, \
+                 patch.object(runtime, "_validate_execution_bundle") as validate, \
+                 patch.object(runtime, "derive_bound_candidate", return_value=self.content) as derive:
+                callback = runtime.LedgerCandidateRuntime("/trusted/cli", "/trusted/mirror", directory + "/candidate.json")
+                self.assertEqual(callback(bundle), self.handoff)
+                validate.assert_called_once_with(bundle)
+                derive.assert_called_once_with(bundle, "/trusted/cli", "/trusted/mirror", {})
+
+    def test_control_unavailable_profiles_never_derive_or_write(self):
+        # A synthetic validated bundle isolates the composition gate itself.
+        for operation in ("run.create", "task.start_run", "run.record_remote_evidence", "task.create", "task.complete", "task.complete_verified", "unknown", None):
+            bundle = SimpleNamespace(operation="governance.ledger", parameters={"operation": operation}, execution_id="123-1")
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory, \
+                 patch.object(runtime, "_validate_execution_bundle"), \
+                 patch.object(runtime, "derive_bound_candidate") as derive:
+                output = directory + "/candidate.json"
+                with self.assertRaisesRegex(publication.LedgerPublicationError, "ledger_context_profile_unavailable"):
+                    runtime.LedgerCandidateRuntime("/trusted/cli", "/trusted/mirror", output)(bundle)
+                derive.assert_not_called()
+                self.assertFalse(Path(output).exists())
+
+    def test_control_propagates_candidate_lifecycle_rejection_without_output(self):
+        # The rejection is injected here; actual lifecycle proof is Rust/Git.
+        bundle = SimpleNamespace(operation="governance.ledger", parameters={"operation": "task.transition_status", "parameters": {"target_status": "completed"}}, execution_id="123-1")
+        with tempfile.TemporaryDirectory() as directory, patch.object(runtime, "_validate_execution_bundle"), \
+             patch.object(runtime, "derive_bound_candidate", side_effect=publication.LedgerPublicationError("candidate_rejected")) as derive:
+            output = directory + "/candidate.json"
+            with self.assertRaisesRegex(publication.LedgerPublicationError, "candidate_rejected"):
+                runtime.LedgerCandidateRuntime("/trusted/cli", "/trusted/mirror", output)(bundle)
+            derive.assert_called_once_with(bundle, "/trusted/cli", "/trusted/mirror", {})
+            self.assertFalse(Path(output).exists())
+
     def test_unique_lookup_binds_exact_reference_and_clock(self):
         api = Api([{"total_count": 1, "artifacts": [self.artifact]}])
         with patch.object(runtime, "publish_ledger_candidate", return_value={"synthetic": True}) as publish:

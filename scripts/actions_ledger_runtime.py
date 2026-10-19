@@ -2,8 +2,8 @@
 
 Configuration is reviewed workflow policy. No Issue supplies an executable,
 mirror, output path, publication branch, producer policy or current clock.
-This initial composition implements run.record_evidence; it does not activate
-the workflow or stand in for the remaining context and closure collectors.
+This composition supports the shared empty-context operation profile; it does
+not activate the workflow or replace required context and closure collectors.
 """
 from datetime import datetime, timezone
 import hashlib
@@ -12,7 +12,7 @@ import re
 
 from actions_ledger_candidate import derive_bound_candidate
 from actions_ledger_producer import ArtifactReference, LedgerProducerPolicy, REPOSITORY
-from actions_ledger_publication import LedgerPublicationPolicy, LedgerPublicationError, publish_ledger_candidate
+from actions_ledger_publication import EMPTY_CONTEXT_LEDGER_OPERATIONS, LedgerPublicationPolicy, LedgerPublicationError, publish_ledger_candidate
 from actions_request_handler import _validate_execution_bundle
 
 
@@ -42,7 +42,7 @@ class LedgerCandidateRuntime:
 
     def __call__(self, bundle):
         _validate_execution_bundle(bundle)
-        _require(bundle.operation == "governance.ledger" and bundle.parameters.get("operation") == "run.record_evidence", "ledger_context_profile_unavailable")
+        _require(bundle.operation == "governance.ledger" and bundle.parameters.get("operation") in EMPTY_CONTEXT_LEDGER_OPERATIONS, "ledger_context_profile_unavailable")
         match = re.fullmatch(r"([1-9][0-9]{0,15})-1", bundle.execution_id)
         _require(match is not None and int(match[1]) <= 2**53 - 1, "ledger_execution_invalid")
         run = int(match[1])
