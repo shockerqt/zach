@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import hashlib
 import importlib.util
 import io
@@ -259,6 +260,8 @@ def run(args):
     from actions_ledger_publication import LedgerPublicationPolicy
     from actions_ledger_evidence import _normal, validate_evidence_context
     from actions_request_handler import load_durable_published_receipt
+    from actions_ledger_producer import IntegrationProducerPolicy
+    from actions_integration_runtime import IntegrationPublisherRuntime
     journal_cli = root / "target/debug/zach-actions"
     candidate_cli = root / "target/debug/zach-ledger-candidate"
     require(all(path.is_file() and os.access(path, os.X_OK) for path in (journal_cli, candidate_cli)), "build Zach binaries before verification")
@@ -612,6 +615,151 @@ def run(args):
         require(publisher.finalize(bundle).terminal_code == "ledger_no_change" and api.task_patches == 0,
                 "remote completed run exact terminal no-op failed")
         checks.extend(("real-remote-run-completion-after-evidence", "real-remote-completed-run-no-op"))
+
+        # A dedicated disposable task avoids the unrelated active runs of the
+        # real owning GOV-041 task. These facts are synthetic, not remote proof.
+        closure_task, closure_run = "GOV-999", "GOV-999-20261011-020000-synthetic-implementation"
+        closure_branch = "task/GOV-999-synthetic-closure"
+        closure_task_path = "tasks/GOV-999-synthetic-closure.md"
+        closure_run_path = "runs/GOV-999/20261011-020000-synthetic-implementation.md"
+        closure_fixture = work / "closure-fixture"
+        git(work, "clone", "--quiet", "--no-checkout", "--shared", str(store), str(closure_fixture))
+        git(closure_fixture, "checkout", "--quiet", "--detach", BASE)
+        # Run only the compiled reviewed Governance pin's generator, not any
+        # newly constructed candidate tooling or executable content.
+        trusted_tools = work / "closure-trusted-tools"
+        git(work, "clone", "--quiet", "--no-checkout", "--shared", str(store), str(trusted_tools))
+        git(trusted_tools, "checkout", "--quiet", "--detach", BASE)
+        normalized_startup = copy.deepcopy(original_context["remote_preflight"])
+        normalized_startup.pop("source_binding")
+        normalized_startup["run_id"] = closure_run
+        normalized_startup["branch"]["name"] = closure_branch
+        normalized_startup["reads"] = [closure_task_path if path.startswith("tasks/") else path for path in normalized_startup["reads"]]
+        normalized_publication = copy.deepcopy(normalized_startup)
+        normalized_publication.update(stage="publication", publication={
+            "method": "non-forced-single-parent-readback", "observed_before_sha": BASE,
+            "published_after_sha": original_commit, "parent_sha": BASE,
+            "validated_tree_sha": original_publication["tree_sha"], "readback_tree_sha": original_publication["tree_sha"],
+            "readback_ref_sha": original_commit, "forced": False, "default_branch_updated": False,
+            "logical_commit_count": 1, "conventional_commit": True, "concurrent_head_handling": "unchanged"})
+        normalized_terminal = copy.deepcopy(normalized_publication)
+        normalized_terminal.update(stage="terminal", terminal={"implementation_sha": original_commit,
+            "ci_sha": original_commit, "ci_conclusion": "success", "pull_request_head_sha": original_commit,
+            "ci_run_url": f"https://github.com/{REPOSITORY}/actions/runs/80001",
+            "pull_request_url": f"https://github.com/{REPOSITORY}/pull/99", "unavailable_validations": ["local_tests"]})
+        task_text = ("---\nkind: task\nschema_version: 1\nid: GOV-999\nproject: governance\nstatus: active\n"
+            "status_history: [planned, active]\ncreated: 2026-10-11\nsummary: Synthetic disposable verified closure.\n"
+            f"target_repository: governance\nbranch: {closure_branch}\nworktree: /home/ubuntu/workspace/governance--GOV-999-synthetic-closure\n"
+            "provenance: {operator: shockerqt, actor: chatgpt, environment: web}\ndepends_on: []\n---\n\n"
+            "# Synthetic closure fixture\n\n## Objective\n\nVerify local composition only.\n\n## Runs\n\n"
+            f"- [{closure_run}](../{closure_run_path})\n")
+        run_text = (f"---\nkind: run\nschema_version: 1\nid: {closure_run}\ntask: GOV-999\nstatus: completed\n"
+            f"status_history: [active, completed]\nstarted: {ACCEPTED_AT}\nrun_type: execution\nexecution_profile: github-connector\n"
+            f"preflight: remote\nrepository: governance\nbranch: {closure_branch}\nworktree: none\n"
+            "provenance: {operator: shockerqt, actor: chatgpt, environment: web}\n---\n\n# Synthetic completed implementation\n\n")
+        for heading, value in (("Remote preflight", normalized_startup), ("Remote publication evidence", normalized_publication), ("Remote terminal evidence", normalized_terminal)):
+            run_text += f"## {heading}\n\n```yaml\n" + json.dumps(value) + "\n```\n\n"
+        (closure_fixture / closure_task_path).write_text(task_text, encoding="utf-8")
+        (closure_fixture / closure_run_path).parent.mkdir()
+        (closure_fixture / closure_run_path).write_text(run_text, encoding="utf-8")
+        generated = subprocess.run(("/usr/bin/python3", "-I", str(trusted_tools / "bin/ws-generate-task-indexes"), "--root", str(closure_fixture)),
+            env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=False)
+        require(generated.returncode == 0, "trusted fixture index generation failed")
+        git(closure_fixture, "add", "--", closure_task_path, closure_run_path, "indexes")
+        fixture_index = work / "closure-fixture-index"
+        git(store, "read-tree", BASE, index=fixture_index)
+        # Clone alternates are read-only fallback: write constructed fixture
+        # objects explicitly into the disposable shared store, never source refs.
+        fixture_paths = git(closure_fixture, "diff", "--cached", "--name-only", "-z").split(b"\0")
+        for raw_path in fixture_paths:
+            if raw_path:
+                path = raw_path.decode()
+                blob = git(store, "hash-object", "-w", "--stdin", data=(closure_fixture / path).read_bytes()).decode().strip()
+                git(store, "update-index", "--add", "--cacheinfo", f"100644,{blob},{path}", index=fixture_index)
+        closure_tree = git(store, "write-tree", index=fixture_index).decode().strip()
+        closure_base = git(store, "commit-tree", closure_tree, "-p", BASE, data=b"Synthetic local closure fixture\n").decode().strip()
+        active_index = work / "active-closure-index"
+        git(store, "read-tree", closure_base, index=active_index)
+        active_raw = run_text.replace("status: completed\n", "status: active\n").replace("status_history: [active, completed]", "status_history: [active]").encode()
+        active_blob = git(store, "hash-object", "-w", "--stdin", data=active_raw).decode().strip()
+        git(store, "update-index", "--cacheinfo", f"100644,{active_blob},{closure_run_path}", index=active_index)
+        active_tree = git(store, "write-tree", index=active_index).decode().strip()
+        active_base = git(store, "commit-tree", active_tree, "-p", closure_base, data=b"Synthetic active target negative fixture\n").decode().strip()
+        integration_policy = IntegrationProducerPolicy(30003, WORKFLOW_REVISION, TOOL_REVISION)
+
+        def closure_case(label, number, base, fault=None):
+            case = work / label
+            case.mkdir()
+            api = SyntheticApi(fixtures, store, case / "index", number, base, publisher_identity)
+            clock = ["2026-10-11T02:10:00Z"]
+            runtime = IntegrationPublisherRuntime(api, integration_policy, publication_policy,
+                str(candidate_cli), str(store), clock=lambda: clock[0])
+            journal = ActionsJournalCoordinator(str(journal_cli), api)
+            publisher = PublisherPhase(journal, fixtures.TRUSTED_POLICY, control_identity, api,
+                publisher_identity, ledger_publisher=runtime)
+            parameters = {"base_sha": base, "operation": "task.complete_verified", "parameters": {"task_id": closure_task, "run_id": closure_run}}
+            event = fixtures.make_event(request_id=f"local-ledger-{label}-01", operation="governance.ledger", parameters=parameters,
+                repo_id=REPOSITORY_ID, repo_full_name=REPOSITORY)
+            bundle = publisher.prepare(event, f"{number}-1", ACCEPTED_AT, WORKFLOW_REVISION).bundle
+            require(bundle is not None, "closure claim missing")
+            observation = {"schema_version": 1, "task_id": closure_task, "run_id": closure_run,
+                "repository": "governance", "branch": closure_branch, "request_id": bundle.request_id,
+                "request_digest": bundle.request_digest, "accepted_journal_sha": bundle.accepted_revision,
+                "policy_revision": WORKFLOW_REVISION, "tool_revision": TOOL_REVISION, "verified_at": "2026-10-11T02:01:00Z",
+                "implementation": {"sha": original_commit, "ci_sha": original_commit,
+                    "ci_run_url": normalized_terminal["terminal"]["ci_run_url"], "pr_url": normalized_terminal["terminal"]["pull_request_url"], "pr_head_sha": original_commit},
+                "integration": {"merge_commit_sha": "5" * 40, "merged_at": "2026-10-11T02:00:30Z", "post_merge_ci_sha": "5" * 40,
+                    "post_merge_ci_run_url": f"https://github.com/{REPOSITORY}/actions/runs/80003", "post_merge_ci_conclusion": "success",
+                    "pull_request_merged": True, "implementation_represented": True,
+                    "cleanup": {"remote_branch": "retained", "local_worktree": "not-applicable", "local_branch": "not-applicable"}}}
+            if fault == "request": observation["request_digest"] = "9" * 64
+            if fault == "terminal": observation["implementation"].update(sha="8" * 40, ci_sha="8" * 40, pr_head_sha="8" * 40)
+            raw = json.dumps(observation, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+            stream = io.BytesIO()
+            with zipfile.ZipFile(stream, "w") as archive: archive.writestr("integration-observation.json", raw)
+            api.archive = stream.getvalue()
+            api.artifact = {"id": number * 10 + 1, "name": f"workspace-integration-observation-{number}-1", "digest": "sha256:" + hashlib.sha256(api.archive).hexdigest()}
+            handoff = {"stage": "integration-observed", "producer_run_id": number, "producer_run_attempt": 1,
+                "artifact_name": api.artifact["name"], "content_sha256": hashlib.sha256(raw).hexdigest()}
+            observed = {"producer_started_at": "2026-10-11T02:00:10Z", "producer_completed_at": "2026-10-11T02:01:10Z", "producer_job_id": number * 100}
+            control = ControlPhase(api.control, control_identity, ledger_candidate=lambda _bundle: handoff)
+            control_result = control.execute(bundle)
+            require(control_result.terminal_state == "candidate_ready", "synthetic observer handoff rejected")
+            return api, clock, journal, publisher, control, bundle, handoff, observed
+
+        for label, number, base, fault in (("closure-active", 122, active_base, None),
+                ("closure-terminal", 123, closure_base, "terminal"), ("closure-request", 124, closure_base, "request")):
+            api, clock, journal, publisher, control, bundle, handoff, observed = closure_case(label, number, base, fault)
+            with patch("actions_integration_runtime.observe_integration_producer", return_value=observed):
+                try:
+                    publisher.finalize(bundle)
+                    raise VerificationError("invalid closure source unexpectedly published")
+                except ActionsHandlerError:
+                    pass
+            require(api.task_patches == 0 and api.object_writes == 0 and api.pending_publication() is None,
+                    "invalid closure created intent or Git effect")
+            checks.append("real-verified-" + label + "-rejected")
+
+        api, clock, journal, publisher, control, bundle, handoff, observed = closure_case("closure-success", 125, closure_base)
+        with patch("actions_integration_runtime.observe_integration_producer", return_value=observed) as observe:
+            receipt = publisher.finalize(bundle)
+            require(receipt.terminal_code == "ledger_published", "verified closure did not publish")
+            require(observe.call_count == 2, "closure producer was not rechecked")
+        closed = api.branch_head
+        require(b"status: completed\n" in git(store, "show", closed + ":" + closure_task_path), "closure task not completed")
+        require(b"## Automated integration verification" in git(store, "show", closed + ":" + closure_run_path), "closure attestation missing")
+        paths = set(git(store, "diff-tree", "--no-commit-id", "--name-only", "-r", closure_base, closed).decode().splitlines())
+        require(paths == {closure_task_path, closure_run_path, "indexes/tasks/governance.yaml"}, "closure atomic changed paths differ")
+        require(git(store, "rev-parse", closed + "^{tree}").decode().strip() == receipt.envelope["publication"]["tree_sha"], "closure published tree differs")
+        require(control.execute(bundle).replayed and publisher.finalize(bundle).replayed and api.task_patches == 1, "closure replay duplicated effect")
+        clock[0] = "2026-10-11T03:10:00Z"
+        before = (api.object_writes, api.task_patches, api.downloads)
+        with patch("actions_integration_runtime.observe_integration_producer") as observe:
+            recovered = publisher._ledger_publisher(publisher, bundle, handoff)
+        require(recovered["replayed"] and before == (api.object_writes, api.task_patches, api.downloads)
+                and observe.call_count == 0, "closure expired recovery refreshed source or effect")
+        checks.extend(("real-explicit-verified-task-closure-atomic-tree", "real-verified-closure-replay-expired-no-recollection"))
         require(git(mirror, "show-ref") == source_refs, "source mirror refs changed")
     return {"kind": "synthetic-local-ledger-composition-verification", "checks": checks,
             "real_rust_and_git_objects": True, "remote_metadata": "synthetic", "online_proof": False}

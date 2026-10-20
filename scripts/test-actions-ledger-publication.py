@@ -5,7 +5,7 @@ import hashlib
 import io
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import zipfile
 
 from actions_ledger_producer import ArtifactReference
@@ -200,6 +200,51 @@ class Tests(unittest.TestCase):
         self.assertEqual(self.api.head, COMMIT)
         self.api.calls.clear()
         self.assertTrue(self.invoke()["replayed"])
+        self.assertTrue(all(method == "GET" for method, _, _ in self.api.calls))
+
+    def test_shared_recovery_returns_none_without_source_or_git_observation(self):
+        with patch.object(self.api, "load_ledger_publication_checkpoint", wraps=self.api.load_ledger_publication_checkpoint) as load:
+            self.assertIsNone(module._recover_publication(self.api, self.api, self.bundle, self.reference, POLICY))
+        load.assert_called_once_with(self.bundle)
+        self.assertEqual(self.api.calls, [])
+
+    def test_shared_publication_trusted_recheck_precedes_any_new_effect(self):
+        # Only mechanics on an already trusted synthetic candidate. This
+        # internal callback is policy supplied by callers, never Issue input.
+        def reject():
+            self.assertTrue(self.api.calls)
+            self.assertTrue(all(method == "GET" for method, _, _ in self.api.calls))
+            self.assertTrue(any("/git/blobs/" in path for _, path, _ in self.api.calls))
+            raise module.LedgerPublicationError("source_changed")
+        with self.assertRaisesRegex(module.LedgerPublicationError, "source_changed"):
+            module._publish_validated_candidate(self.api, self.api, self.bundle, self.reference,
+                POLICY, self.candidate, self.clock, reject)
+        self.assertIsNone(self.api.checkpoint)
+        self.assertTrue(all(method == "GET" for method, _, _ in self.api.calls))
+        self.api.calls.clear()
+        self.now = "2026-10-11T00:30:00Z"
+        recheck = Mock()
+        with self.assertRaisesRegex(module.LedgerPublicationError, "ledger_request_expired"):
+            module._publish_validated_candidate(self.api, self.api, self.bundle, self.reference,
+                POLICY, self.candidate, self.clock, recheck)
+        recheck.assert_not_called()
+        self.assertEqual(self.api.calls, [])
+
+    def test_shared_effect_recovery_is_checkpoint_first_without_source_refresh(self):
+        recheck = Mock()
+        result = module._publish_validated_candidate(self.api, self.api, self.bundle, self.reference,
+            POLICY, self.candidate, self.clock, recheck)
+        self.assertFalse(result["replayed"])
+        recheck.assert_called_once_with()
+        self.now = "2026-10-11T00:30:00Z"
+        self.api.calls.clear()
+        with patch.object(module, "observe_ledger_producer") as observe, \
+             patch.object(module, "derive_bound_candidate") as derive:
+            recovered = module._recover_publication(self.api, self.api, self.bundle, self.reference, POLICY)
+        self.assertTrue(recovered["replayed"])
+        observe.assert_not_called()
+        derive.assert_not_called()
+        recheck.assert_called_once_with()
         self.assertTrue(all(method == "GET" for method, _, _ in self.api.calls))
 
     def test_lost_patch_response_is_reconciled_without_repeat(self):
