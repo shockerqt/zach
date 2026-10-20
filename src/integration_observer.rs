@@ -160,6 +160,151 @@ pub struct IntegrationObservationBindings {
     pub verified_at: String,
 }
 
+fn validate_observation_bindings(
+    bindings: &IntegrationObservationBindings,
+) -> Result<(), AuditError> {
+    require(
+        sha(&bindings.accepted_journal_sha)
+            && sha(&bindings.policy_revision)
+            && sha(&bindings.tool_revision)
+            && bindings.request_digest.len() == 64
+            && bindings
+                .request_digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "invalid trusted observation bindings",
+    )?;
+    observation_time(&bindings.verified_at)?;
+    Ok(())
+}
+
+fn parse_observer_input(
+    raw: &str,
+) -> Result<(FrozenIntegrationRequest, IntegrationObservationBindings), &'static str> {
+    let invalid = "observer-input-invalid";
+    if raw.is_empty() || raw.len() > 16_384 {
+        return Err(invalid);
+    }
+    bounded_json_depth(raw).map_err(|_| invalid)?;
+    // The legacy GitHub JSON parser tolerates trailing commas. This trusted
+    // executable's input is strict JSON and must reject them before parsing.
+    let (mut quoted, mut escaped, mut previous) = (false, false, 0u8);
+    for byte in raw.bytes() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+                previous = b'"';
+            }
+        } else if byte == b'"' {
+            quoted = true;
+        } else if byte.is_ascii_whitespace() {
+            if !matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
+                return Err(invalid);
+            }
+        } else {
+            if previous == b',' && matches!(byte, b'}' | b']') {
+                return Err(invalid);
+            }
+            previous = byte;
+        }
+    }
+    let json = JsonValue::parse(raw).map_err(|_| invalid)?;
+    let root = json.as_object().ok_or(invalid)?;
+    if root.len() != 2 || !root.contains_key("request") || !root.contains_key("bindings") {
+        return Err(invalid);
+    }
+    let request = json.get_object("request").ok_or(invalid)?;
+    let bindings = json.get_object("bindings").ok_or(invalid)?;
+    let fields = |object: &BTreeMap<String, JsonValue>, expected: &[&str]| {
+        object.len() == expected.len()
+            && expected
+                .iter()
+                .all(|key| object_string(object, key).is_some())
+    };
+    if !fields(
+        request,
+        &["governance_sha", "task_id", "run_id", "request_id"],
+    ) || !fields(
+        bindings,
+        &[
+            "accepted_journal_sha",
+            "request_digest",
+            "policy_revision",
+            "tool_revision",
+            "verified_at",
+        ],
+    ) {
+        return Err(invalid);
+    }
+    let field = |object: &BTreeMap<String, JsonValue>, key| {
+        object_string(object, key).unwrap_or_default().to_owned()
+    };
+    let request = FrozenIntegrationRequest {
+        governance_sha: field(request, "governance_sha"),
+        task_id: field(request, "task_id"),
+        run_id: field(request, "run_id"),
+        request_id: field(request, "request_id"),
+    };
+    let bindings = IntegrationObservationBindings {
+        accepted_journal_sha: field(bindings, "accepted_journal_sha"),
+        request_digest: field(bindings, "request_digest"),
+        policy_revision: field(bindings, "policy_revision"),
+        tool_revision: field(bindings, "tool_revision"),
+        verified_at: field(bindings, "verified_at"),
+    };
+    validate_request(
+        &request,
+        &IntegrationObserverPolicy {
+            ci_workflow_path: ".github/workflows/ci.yml".into(),
+        },
+    )
+    .map_err(|_| invalid)?;
+    if request.run_id.len() > 160
+        || !request.run_id.starts_with(&format!("{}-", request.task_id))
+        || request.request_id.len() < 8
+        || !request
+            .request_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(invalid);
+    }
+    validate_observation_bindings(&bindings).map_err(|_| invalid)?;
+    Ok((request, bindings))
+}
+
+/// Trusted read-only executable bridge. No endpoint, workflow or credential is
+/// accepted in the input JSON; the existing runtime supplies its read token.
+pub fn execute_integration_observer_input(
+    raw: &str,
+    installation_token: &str,
+) -> Result<Vec<u8>, &'static str> {
+    let (request, bindings) = parse_observer_input(raw)?;
+    if installation_token.is_empty()
+        || installation_token.len() > 4096
+        || !installation_token.bytes().all(|b| b.is_ascii_graphic())
+    {
+        return Err("observer-token-unavailable");
+    }
+    let config = GithubConfig {
+        api_url: "https://api.github.com".into(),
+        token: installation_token.into(),
+        governance_repository: "shockerqt/workspace-governance".into(),
+        governance_default_branch: "master".into(),
+    };
+    let policy = IntegrationObserverPolicy {
+        ci_workflow_path: ".github/workflows/ci.yml".into(),
+    };
+    let facts = collect_frozen_integration(&config, &request, &policy)
+        .map_err(|_| "observer-collection-failed")?;
+    serialize_integration_observations(&facts, &bindings)
+        .map_err(|_| "observer-serialization-failed")
+}
+
 type UtcParts = [u32; 7];
 
 fn observation_time(value: &str) -> Result<UtcParts, AuditError> {
