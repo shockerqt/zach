@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 pub const CANDIDATE_REVISION: &str = "7f7af5752ef2e016ffe7116f84648b3350fe507f";
 /// Integrated transport profile; does not replace the candidate tooling pin.
-pub const ACTIONS_TRANSPORT_REVISION: &str = "071308dd515cfac100309f423d53c38c19a29d05";
+pub const ACTIONS_TRANSPORT_REVISION: &str = "4eec2150563db6b32907797080b305cb9f443d40";
 pub const MAX_INPUT_BYTES: u64 = 256 * 1024;
 const OPERATIONS: &[&str] = &[
     "task.create",
@@ -94,10 +94,10 @@ fn inner_request(journal: &JournalRecord) -> Result<Json, &'static str> {
     let outer = Json::parse(journal.canonical_request()).map_err(|_| "journal-binding-invalid")?;
     let parameters = outer.get("parameters").ok_or("request-invalid")?;
     let fields = parameters.as_object().ok_or("request-invalid")?;
-    if fields.len() != 3
-        || fields
-            .iter()
-            .any(|(key, _)| !["base_sha", "operation", "parameters"].contains(&key.as_str()))
+    if !matches!(fields.len(), 3 | 4)
+        || fields.iter().any(|(key, _)| {
+            !["base_sha", "operation", "parameters", "agent_declaration"].contains(&key.as_str())
+        })
     {
         return Err("request-invalid");
     }
@@ -110,6 +110,15 @@ fn inner_request(journal: &JournalRecord) -> Result<Json, &'static str> {
         .and_then(Json::as_str)
         .ok_or("request-invalid")?;
     let inner_parameters = parameters.get("parameters").ok_or("request-invalid")?;
+    if let Some(declaration) = parameters.get("agent_declaration") {
+        if !matches!(operation, "run.create" | "task.start_run")
+            || declaration.as_object().is_none()
+        {
+            return Err("request-invalid");
+        }
+    } else if fields.len() != 3 {
+        return Err("request-invalid");
+    }
     if !super::sha40(base) || inner_parameters.as_object().is_none() {
         return Err("request-invalid");
     }
@@ -397,6 +406,48 @@ mod tests {
         format!(
             r#"{{"base_sha":"{CANDIDATE_REVISION}","operation":"run.record_evidence","parameters":{{}}}}"#
         )
+    }
+
+    #[test]
+    fn startup_declaration_is_outer_bound_not_a_mutator_parameter() {
+        let parameters = format!(
+            r#"{{"agent_declaration":{{"schema_version":1}},"base_sha":"{CANDIDATE_REVISION}","operation":"task.start_run","parameters":{{}}}}"#
+        );
+        let record = journal(
+            &parameters,
+            "2026-10-20T00:00:00Z",
+            "startup-test",
+            CANDIDATE_REVISION,
+        );
+        let inner = inner_request(&record).unwrap();
+        assert!(inner.get("agent_declaration").is_none());
+        assert_eq!(
+            inner.get("operation").and_then(Json::as_str),
+            Some("task.start_run")
+        );
+        let wrong = parameters.replace("task.start_run", "run.record_evidence");
+        assert!(
+            inner_request(&journal(
+                &wrong,
+                "2026-10-20T00:00:00Z",
+                "startup-test",
+                CANDIDATE_REVISION
+            ))
+            .is_err()
+        );
+        let wrong = parameters.replace(
+            "\"agent_declaration\":{\"schema_version\":1}",
+            "\"agent_declaration\":true",
+        );
+        assert!(
+            inner_request(&journal(
+                &wrong,
+                "2026-10-20T00:00:00Z",
+                "startup-test",
+                CANDIDATE_REVISION
+            ))
+            .is_err()
+        );
     }
 
     #[test]

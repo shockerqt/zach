@@ -81,6 +81,7 @@ class SyntheticApi:
         self.artifact = None
         self.candidate_bytes = None
         self.calls = []
+        self.startup_reads = 0
 
     def install_artifact(self, path):
         raw = Path(path).read_bytes()
@@ -115,6 +116,13 @@ class SyntheticApi:
         require(path.startswith(f"/repos/{REPOSITORY}/issues/"), "Control attempted Git/journal access")
         return self._request(method, path, body, publisher=False)
 
+    def startup(self, method, path, body=None):
+        # Separate synthetic GET-only transport; no Publisher credential or
+        # write authority is supplied to the startup collector.
+        require(method == "GET" and body is None, "startup attempted a write")
+        self.startup_reads += 1
+        return self._request(method, path, body, publisher=True)
+
     def __call__(self, method, path, body=None):
         return self._request(method, path, body, publisher=True)
 
@@ -137,6 +145,8 @@ class SyntheticApi:
             return {"id": 30001, "path": ".github/workflows/workspace-ledger-pilot.yml", "state": "active"}
         if method == "GET" and tail == "git/ref/heads/master":
             return {"ref": "refs/heads/master", "object": {"type": "commit", "sha": WORKFLOW_REVISION}}
+        if method == "GET" and tail.startswith("pulls?state=open&head=shockerqt%3Atask%2FGOV-041-workspace-command-fast-path&per_page=100&page="):
+            return []
         if method == "GET" and tail == f"actions/runs/{self.run_id}/attempts/1":
             repository = {"id": REPOSITORY_ID, "full_name": REPOSITORY}
             return {"id": self.run_id, "run_attempt": 1, "workflow_id": 30001,
@@ -208,16 +218,18 @@ class SyntheticApi:
             return {"sha": sha, "tree": {"sha": next(line[5:] for line in headers if line.startswith("tree "))},
                     "parents": [{"sha": line[7:]} for line in headers if line.startswith("parent ")]}
         if method == "GET" and tail.startswith("git/trees/"):
-            sha = tail.rsplit("/", 1)[1]
+            sha = tail.rsplit("/", 1)[1].split("?", 1)[0]
             if sha in self.journal.trees:
                 return self.journal.request(method, path, body)
             entries = []
-            for raw in git(self.store, "ls-tree", "-z", sha).split(b"\0"):
+            recursive = tail.endswith("?recursive=1")
+            for raw in git(self.store, "ls-tree", *( ["-r"] if recursive else []), "-z", sha).split(b"\0"):
                 if raw:
                     header, name = raw.decode().split("\t", 1)
                     mode, kind, oid = header.split()
                     entries.append({"path": name, "mode": mode, "type": kind, "sha": oid})
-            return {"sha": sha, "tree": entries, "truncated": False}
+            tree_sha = git(self.store, "rev-parse", sha + "^{tree}").decode().strip() if recursive else sha
+            return {"sha": tree_sha, "tree": entries, "truncated": False}
         if method == "GET" and tail.startswith("git/blobs/"):
             sha = tail.rsplit("/", 1)[1]
             raw = git(self.store, "cat-file", "blob", sha)
@@ -268,7 +280,7 @@ def run(args):
             case.mkdir()
             api = SyntheticApi(fixtures, store, case / "index", number, base, publisher_identity)
             clock = ["2026-10-11T02:10:00Z"]
-            candidate_runtime = LedgerCandidateRuntime(str(candidate_cli), str(store), str(case / "candidate.json"))
+            candidate_runtime = LedgerCandidateRuntime(str(candidate_cli), str(store), str(case / "candidate.json"), api=api.startup)
             publisher_runtime = LedgerPublisherRuntime(api, producer_policy, publication_policy,
                 str(candidate_cli), str(store), clock=lambda: clock[0])
             counts = {"candidate": 0, "publisher": 0}
@@ -288,6 +300,16 @@ def run(args):
                 "run_id": RUN_ID, "evidence_id": "actions-ledger-composition-synthetic",
                 "kind": "validation", "summary": "Synthetic local composition verification; no online or production effect.",
                 "reference": None}}
+            if operation in {"run.create", "task.start_run"}:
+                reads = ["AGENTS.md", "STACK.md", "contracts/governance-lifecycle.yaml",
+                    ".agents/skills/governance-task/SKILL.md", ".agents/skills/governance-run/SKILL.md",
+                    "tasks/GOV-041-workspace-command-fast-path.md"]
+                parameters["agent_declaration"] = {"schema_version": 1,
+                    "reads": [{"path": path, "commit_sha": base,
+                        "blob_sha": git(store, "rev-parse", base + ":" + path).decode().strip()} for path in reads],
+                    "capabilities": {"available": ["github_repository_read", "github_git_write", "github_nonforced_ref_update",
+                        "github_pull_request", "github_actions_via_operations"],
+                        "unavailable": ["clone", "shell", "worktree", "hooks", "local_tests"]}}
             event = fixtures.make_event(request_id=f"local-ledger-{label}-01", operation="governance.ledger",
                 parameters=parameters, repo_id=REPOSITORY_ID, repo_full_name=REPOSITORY)
             bundle = publisher.prepare(event, f"{number}-1", ACCEPTED_AT, WORKFLOW_REVISION).bundle
@@ -460,6 +482,39 @@ def run(args):
         require(publisher.finalize(bundle).terminal_state == "rejected" and api.task_patches == 0,
                 "remote completion without terminal evidence produced effect")
         checks.extend(("real-task-run-link", "real-task-run-link-no-op", "real-missing-remote-terminal-evidence-rejected"))
+
+        for number, operation, slug in ((115, "run.create", "synthetic-created-run"), (116, "task.start_run", "synthetic-started-run")):
+            arguments = {"task_id": "GOV-041", "slug": slug, "title": "Synthetic startup composition",
+                "scope": "Synthetic local source declarations and observations; no actual agent capability or online proof.",
+                "provenance": {"operator": "shockerqt", "actor": "chatgpt", "environment": "web"}}
+            if operation == "run.create":
+                arguments.update(run_type="execution", execution_profile="github-connector")
+            api, clock, counts, journal, publisher, control, bundle, handoff, _ = scenario(
+                slug, number, operation=operation, arguments=arguments)
+            source = json.loads(api.candidate_bytes)["trusted_context"]["remote_preflight"]
+            require(source["source_binding"]["declaration"] == bundle.parameters["agent_declaration"]
+                    and source["source_binding"]["actor_id"] == 2001,
+                    "startup source declaration was not bound")
+            observed = api.startup_reads
+            require(observed > 0 and publisher.finalize(bundle).terminal_code == "ledger_published",
+                    "startup did not publish actual validated run")
+            path = f"runs/GOV-041/20261011-020000-{slug}.md"
+            published = git(store, "show", api.branch_head + ":" + path)
+            require(b"execution_profile: github-connector" in published and b"source_binding:" in published
+                    and b"worktree: none" in published and b"preflight: remote" in published,
+                    "startup canonical profile/source missing")
+            if operation == "task.start_run":
+                require(("../" + path).encode() in git(store, "show", api.branch_head + ":tasks/GOV-041-workspace-command-fast-path.md"),
+                        "start_run did not atomically link its run")
+            require(control.execute(bundle).replayed and publisher.finalize(bundle).replayed
+                    and api.task_patches == 1 and api.startup_reads == observed and counts["candidate"] == 1,
+                    "startup replay recollected context or repeated publication")
+            clock[0] = "2026-10-11T03:10:00Z"
+            before = (api.object_writes, api.task_patches, api.downloads, api.startup_reads)
+            recovered = publisher._ledger_publisher(publisher, bundle, handoff.envelope["result"])
+            require(recovered["replayed"] and before == (api.object_writes, api.task_patches, api.downloads, api.startup_reads),
+                    "startup expired effect recovery refreshed its source")
+            checks.append("real-" + operation.replace(".", "-") + "-frozen-context-and-replay")
         require(git(mirror, "show-ref") == source_refs, "source mirror refs changed")
     return {"kind": "synthetic-local-ledger-composition-verification", "checks": checks,
             "real_rust_and_git_objects": True, "remote_metadata": "synthetic", "online_proof": False}

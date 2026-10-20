@@ -14,6 +14,7 @@ test:
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-actions-ledger-producer.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-actions-ledger-publication.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-actions-ledger-runtime.py
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-actions-ledger-startup.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-actions-journal-coordinator.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-actions-request-handler.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-actions-phase-cli.py

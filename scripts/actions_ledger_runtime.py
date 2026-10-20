@@ -12,7 +12,8 @@ import re
 
 from actions_ledger_candidate import derive_bound_candidate
 from actions_ledger_producer import ArtifactReference, LedgerProducerPolicy, REPOSITORY
-from actions_ledger_publication import EMPTY_CONTEXT_LEDGER_OPERATIONS, LedgerPublicationPolicy, LedgerPublicationError, publish_ledger_candidate
+from actions_ledger_publication import EMPTY_CONTEXT_LEDGER_OPERATIONS, STARTUP_LEDGER_OPERATIONS, LedgerPublicationPolicy, LedgerPublicationError, publish_ledger_candidate
+from actions_ledger_startup import collect_startup_context
 from actions_request_handler import _validate_execution_bundle
 
 
@@ -36,17 +37,26 @@ def _handoff(bundle, value):
 
 
 class LedgerCandidateRuntime:
-    def __init__(self, cli_path, mirror, output_path):
+    def __init__(self, cli_path, mirror, output_path, *, api=None):
         _require(all(type(path) is str and os.path.isabs(path) for path in (cli_path, mirror, output_path)), "ledger_configuration_invalid")
         self.cli_path, self.mirror, self.output_path = cli_path, mirror, output_path
+        _require(api is None or callable(api), "ledger_configuration_invalid")
+        self.api = api
 
     def __call__(self, bundle):
         _validate_execution_bundle(bundle)
-        _require(bundle.operation == "governance.ledger" and bundle.parameters.get("operation") in EMPTY_CONTEXT_LEDGER_OPERATIONS, "ledger_context_profile_unavailable")
+        operation = bundle.parameters.get("operation")
+        _require(bundle.operation == "governance.ledger" and operation in EMPTY_CONTEXT_LEDGER_OPERATIONS | STARTUP_LEDGER_OPERATIONS, "ledger_context_profile_unavailable")
         match = re.fullmatch(r"([1-9][0-9]{0,15})-1", bundle.execution_id)
         _require(match is not None and int(match[1]) <= 2**53 - 1, "ledger_execution_invalid")
         run = int(match[1])
-        raw = derive_bound_candidate(bundle, self.cli_path, self.mirror, {})
+        context = {}
+        if operation in STARTUP_LEDGER_OPERATIONS:
+            _require(self.api is not None, "ledger_context_profile_unavailable")
+            context = collect_startup_context(self.api, bundle)
+        else:
+            _require("agent_declaration" not in bundle.parameters, "ledger_context_profile_unavailable")
+        raw = derive_bound_candidate(bundle, self.cli_path, self.mirror, context)
         descriptor = -1
         try:
             descriptor = os.open(self.output_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)

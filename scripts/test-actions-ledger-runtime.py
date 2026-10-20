@@ -14,6 +14,7 @@ import zipfile
 
 import actions_ledger_runtime as runtime
 import actions_ledger_publication as publication
+import actions_ledger_startup as startup
 from actions_ledger_producer import ArtifactReference, LedgerProducerPolicy, REPOSITORY
 from actions_request_handler import _validate_execution_bundle
 
@@ -101,6 +102,55 @@ class RuntimeTests(unittest.TestCase):
                 self.invoke(api, handoff)
             self.assertEqual(api.calls, [])
         self.publisher.load_ledger_publication_checkpoint.assert_not_called()
+
+    def test_startup_collects_before_deriving_same_context(self):
+        # Wiring seams only; neither collection nor candidate success here is
+        # evidence of authenticated sources or a valid ledger mutation.
+        for operation in ("run.create", "task.start_run"):
+            bundle = SimpleNamespace(operation="governance.ledger", parameters={"operation": operation, "agent_declaration": {}}, execution_id="123-1")
+            context, events = {"remote_preflight": {"synthetic": True}}, []
+            api = Mock()
+            def collect(observed_api, observed_bundle):
+                self.assertIs(observed_api, api)
+                self.assertIs(observed_bundle, bundle)
+                events.append("collect")
+                return context
+            def derive(observed_bundle, cli, mirror, observed_context):
+                self.assertIs(observed_bundle, bundle)
+                self.assertEqual((cli, mirror), ("/trusted/cli", "/trusted/mirror"))
+                self.assertIs(observed_context, context)
+                events.append("derive")
+                return self.content
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory, \
+                 patch.object(runtime, "_validate_execution_bundle"), \
+                 patch.object(runtime, "collect_startup_context", side_effect=collect), \
+                 patch.object(runtime, "derive_bound_candidate", side_effect=derive), \
+                 patch.dict(os.environ, {"GITHUB_TOKEN": "synthetic-secret"}):
+                output = directory + "/candidate.json"
+                self.assertEqual(runtime.LedgerCandidateRuntime("/trusted/cli", "/trusted/mirror", output, api=api)(bundle), self.handoff)
+                self.assertEqual(events, ["collect", "derive"])
+                self.assertEqual(Path(output).read_bytes(), self.content)
+                api.assert_not_called()
+
+    def test_startup_missing_api_declaration_or_operation_never_derives_or_writes(self):
+        for fault in ("api", "declaration", "operation"):
+            bundle = SimpleNamespace(operation="governance.ledger", execution_id="123-1", accepted_revision="a" * 40,
+                claim_revision="b" * 40, request_digest="c" * 64,
+                repository_full_name="shockerqt/workspace-governance", repository_id=1260920764,
+                parameters={"operation": "task.start_run", "base_sha": "d" * 40, "parameters": {}, "agent_declaration": {}})
+            api = Mock()
+            if fault == "declaration": del bundle.parameters["agent_declaration"]
+            if fault == "operation": bundle.parameters["operation"] = "task.complete"
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory, \
+                 patch.object(runtime, "_validate_execution_bundle"), \
+                 patch.object(startup, "_validate_execution_bundle", return_value={"policy_revision": "e" * 40}), \
+                 patch.object(runtime, "derive_bound_candidate") as derive:
+                output = directory + "/candidate.json"
+                with self.assertRaises((publication.LedgerPublicationError, startup.StartupContextError)):
+                    runtime.LedgerCandidateRuntime("/trusted/cli", "/trusted/mirror", output, api=None if fault == "api" else api)(bundle)
+                derive.assert_not_called()
+                api.assert_not_called()
+                self.assertFalse(Path(output).exists())
 
     def test_control_shared_profile_passes_empty_context_to_candidate(self):
         # Guard/wiring test only: authentication and Rust derivation are seams.
