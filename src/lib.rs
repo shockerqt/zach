@@ -1,3 +1,4 @@
+pub mod integration_observer;
 pub mod ledger;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -1252,11 +1253,15 @@ fn parse_pr_url(url: &str) -> Result<PrLocation, AuditError> {
 
 struct GithubHttp<'a> {
     config: &'a GithubConfig,
+    bounded_observer: bool,
 }
 
 impl<'a> GithubHttp<'a> {
     fn new(config: &'a GithubConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            bounded_observer: false,
+        }
     }
 
     fn commit_sha(&self, repo: &str, reference: &str) -> Result<String, AuditError> {
@@ -1410,12 +1415,18 @@ impl<'a> GithubHttp<'a> {
 
     fn request(&self, endpoint: &str, fail: bool, raw: bool) -> Result<(u16, String), AuditError> {
         let url = format!("{}{}", self.config.api_url.trim_end_matches('/'), endpoint);
-        let output = Command::new("curl")
+        let mut command = Command::new("curl");
+        if self.bounded_observer {
+            integration_observer::configure_observer_command(&mut command);
+        } else {
+            command
+                .arg("--header")
+                .arg(format!("Authorization: Bearer {}", self.config.token));
+        }
+        command
             .args(["--silent", "--show-error", "--location", "--request", "GET"])
             .arg("--header")
             .arg("X-GitHub-Api-Version: 2022-11-28")
-            .arg("--header")
-            .arg(format!("Authorization: Bearer {}", self.config.token))
             .arg("--header")
             .arg(if raw {
                 "Accept: application/vnd.github.raw+json"
@@ -1423,17 +1434,23 @@ impl<'a> GithubHttp<'a> {
                 "Accept: application/vnd.github+json"
             })
             .args(["--write-out", "\n%{http_code}"])
-            .arg(url)
-            .output()
-            .map_err(|error| {
+            .arg(url);
+        let output = if self.bounded_observer {
+            integration_observer::bounded_http_output(&mut command, &self.config.token)?
+        } else {
+            command.output().map_err(|error| {
                 AuditError::Github(format!(
                     "failed to execute bounded GitHub HTTP client: {error}"
                 ))
-            })?;
+            })?
+        };
         if !output.status.success() {
             return Err(AuditError::Github(
                 "bounded GitHub HTTP client failed".into(),
             ));
+        }
+        if self.bounded_observer && output.stdout.len() > 1_048_580 {
+            return Err(AuditError::Github("observer response exceeds bound".into()));
         }
         let stdout = String::from_utf8(output.stdout)
             .map_err(|_| AuditError::Github("GitHub response was not UTF-8".into()))?;
@@ -1447,6 +1464,9 @@ impl<'a> GithubHttp<'a> {
             return Err(AuditError::Github(format!(
                 "GitHub request returned HTTP {status}"
             )));
+        }
+        if self.bounded_observer && (!raw || body.trim_start().starts_with(['{', '['])) {
+            integration_observer::bounded_json_depth(body)?;
         }
         Ok((status, body.to_owned()))
     }
