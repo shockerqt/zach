@@ -51,6 +51,7 @@ from actions_request_handler import (
     _parse_publisher_comment,
     _format_receipt_comment,
     load_durable_prepare_checkpoint,
+    load_durable_published_receipt,
     _parse_receipt_comment,
 )
 
@@ -2944,6 +2945,142 @@ class LedgerRuntimePhaseTests(unittest.TestCase):
         with self.assertRaises(ActionsHandlerError):
             self.publisher.prepare(altered, "100-1", ACCEPTED_AT, POLICY_REVISION)
         self.assertEqual(self.effect_calls, 0)
+
+
+class DurablePublishedReceiptTests(unittest.TestCase):
+    """Real journal state transitions, synthetic remote comment identities."""
+
+    def setUp(self):
+        policy = TrustedIssuePolicy(1260920764, FIXED_REPOSITORY, (2001,))
+        original = make_event
+        def event(**kwargs):
+            kwargs.setdefault("repo_id", policy.repository_id)
+            kwargs.setdefault("repo_full_name", policy.repository_full_name)
+            return original(**kwargs)
+        for name, value in (("TRUSTED_POLICY", policy), ("make_event", event)):
+            replacement = patch.dict(globals(), {name: value})
+            replacement.start()
+            self.addCleanup(replacement.stop)
+        self.f = LedgerRuntimePhaseTests()
+        self.f.setUp()
+
+    def load(self, api=None):
+        f = self.f
+        before = len(f.api.calls)
+        try:
+            return load_durable_published_receipt(
+                api or f.publisher_api, f.publisher_identity, 42,
+                f.bundle.execution_id, f.bundle.request_id)
+        finally:
+            self.assertTrue(all(method == "GET" for method, _, _ in f.api.calls[before:]))
+
+    def finish(self):
+        self.f.control.execute(self.f.bundle)
+        self.f.publisher.finalize(self.f.bundle)
+
+    def test_exact_success_loads_without_mutations(self):
+        self.finish()
+        receipt = self.load()
+        self.assertEqual(receipt.bundle, self.f.bundle)
+        self.assertEqual(receipt.publication["commit_sha"], "6" * 40)
+        self.assertEqual(receipt.terminal_journal_sha,
+                         self.f.coordinator.load_record(self.f.bundle.request_id)[0])
+        self.assertEqual(self.load(), receipt)
+
+    def test_intent_alone_and_nonterminal_journal_are_not_success(self):
+        self.f.control.execute(self.f.bundle)
+        self.f.interrupt = True
+        with self.assertRaises(ActionsHandlerError):
+            self.f.publisher.finalize(self.f.bundle)
+        with self.assertRaises(ActionsHandlerError):
+            self.load()
+
+    def test_fake_duplicate_and_unstable_comments_reject(self):
+        self.finish()
+        comment = next(item for item in self.f.api.comments.values()
+                       if "publisher-published:v1:" in item["body"])
+        author = comment["user"]
+        comment["user"] = {"id": 2001, "type": "User"}
+        with self.assertRaises(ActionsHandlerError):
+            self.load()
+        comment["user"] = author
+        duplicate = dict(comment, id=999, html_url=comment["html_url"].split("#")[0] + "#issuecomment-999")
+        self.f.api.comments[999] = duplicate
+        with self.assertRaises(ActionsHandlerError):
+            self.load()
+        del self.f.api.comments[999]
+        scans = 0
+        def mutate(page, count):
+            nonlocal scans
+            scans += 1
+            if scans == 2:
+                comment["body"] += "changed"
+        self.f.api.on_comments_get = mutate
+        with self.assertRaisesRegex(ActionsHandlerError, "observation_unstable"):
+            self.load()
+
+    def test_current_terminal_and_historical_bindings_are_required(self):
+        self.finish()
+        snapshot_sha, record = self.f.coordinator.load_record(self.f.bundle.request_id)
+        original_request = self.f.publisher_api
+        from actions_request_handler import ActionsGitJournal
+        real = ActionsGitJournal.load
+        for field, value in (("state", "executing"), ("terminal_code", "ledger_no_change"),
+                             ("terminal_reference", "https://github.com/wrong"),
+                             ("execution_id", "other-owner")):
+            with self.subTest(field=field):
+                changed = dict(record, **{field: value})
+                snapshot = real(ActionsGitJournal(original_request, lambda _a, _b: False), self.f.bundle.request_id)
+                with patch.object(ActionsGitJournal, "load", return_value=replace(snapshot, record_json=json.dumps(changed))):
+                    with self.assertRaises(ActionsHandlerError):
+                        self.load()
+        def bad_compare(method, path, body=None):
+            if "/compare/" in path:
+                return {"status": "diverged"}
+            return original_request(method, path, body)
+        with self.assertRaisesRegex(ActionsHandlerError, "bundle_revision_mismatch"):
+            self.load(bad_compare)
+
+    def test_identifiers_fail_before_observation(self):
+        for issue in (True, 0, -1, 2**53):
+            with self.assertRaises(ActionsHandlerError):
+                load_durable_published_receipt(lambda *_a, **_k: self.fail("unexpected API"),
+                    self.f.publisher_identity, issue, "100-1", self.f.bundle.request_id)
+
+    def test_conflicting_intent_and_no_change_do_not_qualify(self):
+        self.finish()
+        intent = next(item for item in self.f.api.comments.values()
+                      if "publisher-publication:v1:" in item["body"])
+        body = intent["body"]
+        envelope = _parse_publisher_comment(body, "publication", self.f.bundle.execution_id,
+                                            self.f.bundle.request_id)
+        envelope["publication"]["commit_sha"] = "7" * 40
+        intent["body"] = _format_publisher_comment("publication", envelope)
+        with self.assertRaisesRegex(ActionsHandlerError, "publisher_checkpoint_binding_mismatch"):
+            self.load()
+        intent["body"] = body
+        published = next(item for item in self.f.api.comments.values()
+                         if "publisher-published:v1:" in item["body"])
+        for kind, comment in (("publication", intent), ("published", published)):
+            value = _parse_publisher_comment(comment["body"], kind, self.f.bundle.execution_id,
+                                             self.f.bundle.request_id)
+            value["publication"]["commit_sha"] = value["publication"]["base_sha"]
+            comment["body"] = _format_publisher_comment(kind, value)
+        with self.assertRaisesRegex(ActionsHandlerError, "publisher_checkpoint_binding_mismatch"):
+            self.load()
+
+    def test_historical_claim_bytes_are_independently_loaded(self):
+        self.finish()
+        from actions_request_handler import ActionsGitJournal
+        original = ActionsGitJournal.load_at
+        def altered(journal, request_id, head_sha):
+            snapshot = original(journal, request_id, head_sha)
+            if head_sha == self.f.bundle.claim_revision:
+                return replace(snapshot, record_json=self.f.bundle.canonical_record + " ")
+            return snapshot
+        with patch.object(ActionsGitJournal, "load_at", altered):
+            with self.assertRaisesRegex(ActionsHandlerError, "bundle_revision_mismatch"):
+                self.load()
 
 
 if __name__ == "__main__":

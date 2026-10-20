@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 pub const CANDIDATE_REVISION: &str = "7f7af5752ef2e016ffe7116f84648b3350fe507f";
 /// Integrated transport profile; does not replace the candidate tooling pin.
-pub const ACTIONS_TRANSPORT_REVISION: &str = "4eec2150563db6b32907797080b305cb9f443d40";
+pub const ACTIONS_TRANSPORT_REVISION: &str = "0cd08835a0dc778d687fd71f9f00c5499172bec4";
 pub const MAX_INPUT_BYTES: u64 = 256 * 1024;
 const OPERATIONS: &[&str] = &[
     "task.create",
@@ -96,7 +96,14 @@ fn inner_request(journal: &JournalRecord) -> Result<Json, &'static str> {
     let fields = parameters.as_object().ok_or("request-invalid")?;
     if !matches!(fields.len(), 3 | 4)
         || fields.iter().any(|(key, _)| {
-            !["base_sha", "operation", "parameters", "agent_declaration"].contains(&key.as_str())
+            ![
+                "base_sha",
+                "operation",
+                "parameters",
+                "agent_declaration",
+                "publication_source",
+            ]
+            .contains(&key.as_str())
         })
     {
         return Err("request-invalid");
@@ -110,13 +117,15 @@ fn inner_request(journal: &JournalRecord) -> Result<Json, &'static str> {
         .and_then(Json::as_str)
         .ok_or("request-invalid")?;
     let inner_parameters = parameters.get("parameters").ok_or("request-invalid")?;
-    if let Some(declaration) = parameters.get("agent_declaration") {
-        if !matches!(operation, "run.create" | "task.start_run")
-            || declaration.as_object().is_none()
-        {
-            return Err("request-invalid");
-        }
-    } else if fields.len() != 3 {
+    if let Some(declaration) = parameters.get("agent_declaration")
+        && (!matches!(operation, "run.create" | "task.start_run")
+            || declaration.as_object().is_none())
+    {
+        return Err("request-invalid");
+    }
+    if let Some(source) = parameters.get("publication_source")
+        && (operation != "run.record_remote_evidence" || source.as_object().is_none())
+    {
         return Err("request-invalid");
     }
     if !super::sha40(base) || inner_parameters.as_object().is_none() {
@@ -448,6 +457,30 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn publication_source_is_outer_bound_and_operation_specific() {
+        let parameters = format!(
+            r#"{{"base_sha":"{CANDIDATE_REVISION}","operation":"run.record_remote_evidence","parameters":{{}},"publication_source":{{"issue_number":1}}}}"#
+        );
+        let make = |value: &str| {
+            journal(
+                value,
+                "2026-10-20T00:00:00Z",
+                "source-test",
+                CANDIDATE_REVISION,
+            )
+        };
+        let inner = inner_request(&make(&parameters)).unwrap();
+        assert!(inner.get("publication_source").is_none());
+        assert!(
+            inner_request(&make(
+                &parameters.replace("run.record_remote_evidence", "run.record_evidence")
+            ))
+            .is_err()
+        );
+        assert!(inner_request(&make(&parameters.replace("{\"issue_number\":1}", "true"))).is_err());
     }
 
     #[test]

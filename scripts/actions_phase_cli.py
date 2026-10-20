@@ -435,8 +435,13 @@ def _run_control(
         if type(output) is not str or not os.path.isabs(output):
             raise PhaseCliError("invalid_ledger_candidate_output")
         startup = bundle.parameters.get("operation") in {"run.create", "task.start_run"}
+        evidence = bundle.parameters.get("operation") == "run.record_remote_evidence"
+        context_kwargs = {"api": api} if startup or evidence else {}
+        if evidence:
+            context_kwargs.update(publisher_policy=policy.publisher,
+                producer_policy=policy.ledger_producer, ci_policy=policy.ci)
         ledger_kwargs["ledger_candidate"] = LedgerCandidateRuntime(
-            candidate_cli, mirror, output, **({"api": api} if startup else {}))
+            candidate_cli, mirror, output, **context_kwargs)
     result = ControlPhase(
         api_transport=api,
         trusted_receipt_policy=policy.receipt,

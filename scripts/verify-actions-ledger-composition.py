@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from unittest.mock import patch
 
 
 BASE = "7f7af5752ef2e016ffe7116f84648b3350fe507f"
@@ -256,6 +257,8 @@ def run(args):
     from actions_ledger_runtime import LedgerCandidateRuntime, LedgerPublisherRuntime
     from actions_ledger_producer import LedgerProducerPolicy
     from actions_ledger_publication import LedgerPublicationPolicy
+    from actions_ledger_evidence import _normal, validate_evidence_context
+    from actions_request_handler import load_durable_published_receipt
     journal_cli = root / "target/debug/zach-actions"
     candidate_cli = root / "target/debug/zach-ledger-candidate"
     require(all(path.is_file() and os.access(path, os.X_OK) for path in (journal_cli, candidate_cli)), "build Zach binaries before verification")
@@ -275,12 +278,14 @@ def run(args):
         producer_policy = LedgerProducerPolicy(30001, WORKFLOW_REVISION, TOOL_REVISION)
         publication_policy = LedgerPublicationPolicy("GOV-041", "tasks/GOV-041-workspace-command-fast-path.md", BRANCH)
 
-        def scenario(label, number, base=BASE, *, operation="run.record_evidence", arguments=None, ready=True):
+        def scenario(label, number, base=BASE, *, operation="run.record_evidence", arguments=None, ready=True,
+                     publication_source=None, context_factory=None):
             case = work / label
             case.mkdir()
             api = SyntheticApi(fixtures, store, case / "index", number, base, publisher_identity)
             clock = ["2026-10-11T02:10:00Z"]
-            candidate_runtime = LedgerCandidateRuntime(str(candidate_cli), str(store), str(case / "candidate.json"), api=api.startup)
+            candidate_runtime = LedgerCandidateRuntime(str(candidate_cli), str(store), str(case / "candidate.json"), api=api.startup,
+                publisher_policy=publisher_identity, producer_policy=producer_policy)
             publisher_runtime = LedgerPublisherRuntime(api, producer_policy, publication_policy,
                 str(candidate_cli), str(store), clock=lambda: clock[0])
             counts = {"candidate": 0, "publisher": 0}
@@ -310,11 +315,22 @@ def run(args):
                     "capabilities": {"available": ["github_repository_read", "github_git_write", "github_nonforced_ref_update",
                         "github_pull_request", "github_actions_via_operations"],
                         "unavailable": ["clone", "shell", "worktree", "hooks", "local_tests"]}}
+            if publication_source is not None:
+                parameters["publication_source"] = publication_source
             event = fixtures.make_event(request_id=f"local-ledger-{label}-01", operation="governance.ledger",
                 parameters=parameters, repo_id=REPOSITORY_ID, repo_full_name=REPOSITORY)
             bundle = publisher.prepare(event, f"{number}-1", ACCEPTED_AT, WORKFLOW_REVISION).bundle
             require(bundle is not None, "real journal claim missing")
-            handoff = control.execute(bundle)
+            if context_factory is None:
+                handoff = control.execute(bundle)
+            else:
+                # Collection/authentication has separate unit coverage. Inject
+                # only synthetic frozen source facts; Rust candidate derivation,
+                # journal, isolated publication and Git materialization stay real.
+                context = context_factory(bundle)
+                with patch("actions_ledger_runtime.collect_evidence_context", return_value=context) as collect:
+                    handoff = control.execute(bundle)
+                require(collect.call_count == 1, "remote source seam not consumed once")
             require(handoff.terminal_state == ("candidate_ready" if ready else "rejected"), "real candidate derivation unexpected state")
             require(coordinator.load_record(bundle.request_id)[1]["state"] == "executing", "candidate terminalized before publication")
             return api, clock, counts, coordinator, publisher, control, bundle, handoff, parameters
@@ -483,6 +499,7 @@ def run(args):
                 "remote completion without terminal evidence produced effect")
         checks.extend(("real-task-run-link", "real-task-run-link-no-op", "real-missing-remote-terminal-evidence-rejected"))
 
+        original_source = None
         for number, operation, slug in ((115, "run.create", "synthetic-created-run"), (116, "task.start_run", "synthetic-started-run")):
             arguments = {"task_id": "GOV-041", "slug": slug, "title": "Synthetic startup composition",
                 "scope": "Synthetic local source declarations and observations; no actual agent capability or online proof.",
@@ -498,6 +515,10 @@ def run(args):
             observed = api.startup_reads
             require(observed > 0 and publisher.finalize(bundle).terminal_code == "ledger_published",
                     "startup did not publish actual validated run")
+            if operation == "task.start_run":
+                original_source = (load_durable_published_receipt(api, publisher_identity,
+                    issue_number=bundle.issue_number, execution_id=bundle.execution_id, request_id=bundle.request_id),
+                    json.loads(api.candidate_bytes)["trusted_context"])
             path = f"runs/GOV-041/20261011-020000-{slug}.md"
             published = git(store, "show", api.branch_head + ":" + path)
             require(b"execution_profile: github-connector" in published and b"source_binding:" in published
@@ -515,6 +536,82 @@ def run(args):
             require(recovered["replayed"] and before == (api.object_writes, api.task_patches, api.downloads, api.startup_reads),
                     "startup expired effect recovery refreshed its source")
             checks.append("real-" + operation.replace(".", "-") + "-frozen-context-and-replay")
+
+        require(original_source is not None, "original linked startup source missing")
+        original_receipt, original_context = original_source
+        original_bundle, original_publication = original_receipt.bundle, original_receipt.publication
+        source_run = original_context["remote_preflight"]["run_id"]
+        source_path = original_context["remote_preflight"]["source_binding"]["run"]["path"]
+        locator = {"issue_number": original_bundle.issue_number, "execution_id": original_bundle.execution_id,
+                   "request_id": original_bundle.request_id}
+        original_commit = original_publication["commit_sha"]
+
+        def evidence_context(current):
+            record = json.loads(current.canonical_record)
+            stage = current.parameters["parameters"]["stage"]
+            binding = {"kind": "actions.remote-evidence.context", "schema_version": 1,
+                "request_id": current.request_id, "outer_request_digest": current.request_digest,
+                "accepted_revision": current.accepted_revision, "claim_revision": current.claim_revision,
+                "policy_revision": record["policy_revision"], "governance_sha": current.parameters["base_sha"],
+                "run_id": source_run, "stage": stage, "original_bundle": original_bundle.to_dict(),
+                "published_comment_id": original_receipt.comment_id, "terminal_journal_sha": original_receipt.terminal_journal_sha,
+                "publication": original_publication, "startup_context": original_context,
+                "commit": {"sha": original_commit, "parent_sha": original_publication["base_sha"],
+                    "tree_sha": git(store, "rev-parse", original_commit + "^{tree}").decode().strip(),
+                    "message": git(store, "show", "-s", "--format=%B", original_commit).decode().rstrip("\n")},
+                "ci": None, "pull_request": None}
+            if stage == "terminal":
+                binding["ci"] = {"id": 80001, "attempt": 1, "sha": original_commit, "workflow_id": 30002,
+                    "workflow_path": ".github/workflows/ci.yml", "status": "completed", "conclusion": "success",
+                    "html_url": f"https://github.com/{REPOSITORY}/actions/runs/80001"}
+                binding["pull_request"] = {"id": 80002, "number": 99, "head_sha": original_commit,
+                    "head_branch": BRANCH, "base_branch": "master", "repository_id": REPOSITORY_ID,
+                    "html_url": f"https://github.com/{REPOSITORY}/pull/99", "state": "closed"}
+            return validate_evidence_context(_normal(binding, current), current)
+
+        api, clock, counts, journal, publisher, control, bundle, handoff, _ = scenario(
+            "remote-publication", 117, original_commit, operation="run.record_remote_evidence",
+            arguments={"run_id": source_run, "stage": "publication"}, publication_source=locator, context_factory=evidence_context)
+        require(publisher.finalize(bundle).terminal_code == "ledger_published", "remote publication evidence failed")
+        publication_base = api.branch_head
+        require(b"## Remote publication evidence" in git(store, "show", publication_base + ":" + source_path),
+                "publication evidence absent from actual canonical run")
+        require(control.execute(bundle).replayed and publisher.finalize(bundle).replayed
+                and api.task_patches == 1 and counts["candidate"] == 1, "remote evidence replay repeated effect")
+        checks.append("real-source-bound-publication-evidence-and-replay")
+
+        api, clock, counts, journal, publisher, control, bundle, handoff, _ = scenario(
+            "remote-evidence-conflict", 118, publication_base, operation="run.record_remote_evidence",
+            arguments={"run_id": source_run, "stage": "publication"}, publication_source=locator,
+            context_factory=evidence_context, ready=False)
+        require(publisher.finalize(bundle).terminal_state == "rejected" and api.task_patches == 0,
+                "different frozen evidence snapshot overwrote existing evidence")
+        checks.append("real-source-bound-evidence-conflict-rejected")
+
+        api, clock, counts, journal, publisher, control, bundle, handoff, _ = scenario(
+            "remote-terminal", 119, publication_base, operation="run.record_remote_evidence",
+            arguments={"run_id": source_run, "stage": "terminal"}, publication_source=locator, context_factory=evidence_context)
+        require(publisher.finalize(bundle).terminal_code == "ledger_published", "exact CI PR terminal evidence failed")
+        terminal_base = api.branch_head
+        require(b"## Remote terminal evidence" in git(store, "show", terminal_base + ":" + source_path),
+                "terminal evidence absent from actual canonical run")
+        require(control.execute(bundle).replayed and publisher.finalize(bundle).replayed and api.task_patches == 1,
+                "terminal evidence replay repeated effect")
+        checks.append("real-source-bound-exact-ci-pr-terminal-evidence")
+
+        completed_args = {"run_id": source_run, "target_status": "completed"}
+        api, clock, counts, journal, publisher, control, bundle, handoff, _ = scenario(
+            "remote-completed", 120, terminal_base, operation="run.transition_status", arguments=completed_args)
+        require(publisher.finalize(bundle).terminal_code == "ledger_published", "remote run completion after evidence failed")
+        completed_base = api.branch_head
+        require(b"status: completed\n" in git(store, "show", completed_base + ":" + source_path),
+                "completed canonical run missing")
+        require(publisher.finalize(bundle).replayed and api.task_patches == 1, "completed run replay repeated effect")
+        api, clock, counts, journal, publisher, control, bundle, handoff, _ = scenario(
+            "remote-completed-noop", 121, completed_base, operation="run.transition_status", arguments=completed_args)
+        require(publisher.finalize(bundle).terminal_code == "ledger_no_change" and api.task_patches == 0,
+                "remote completed run exact terminal no-op failed")
+        checks.extend(("real-remote-run-completion-after-evidence", "real-remote-completed-run-no-op"))
         require(git(mirror, "show-ref") == source_refs, "source mirror refs changed")
     return {"kind": "synthetic-local-ledger-composition-verification", "checks": checks,
             "real_rust_and_git_objects": True, "remote_metadata": "synthetic", "online_proof": False}
