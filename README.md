@@ -54,3 +54,38 @@ pinned validators execute, in a private temporary workspace with sanitized
 Git/Python environments. Input files must be regular, at most 256 KiB and
 not symlinks. Output uses exclusive creation with mode 0600 and at most
 60,000 UTF-8 bytes. Failures print a bounded code only.
+
+## Preparatory frozen integration collector
+
+`integration_observer::collect_frozen_integration` is a Rust library API for
+trusted Actions composition. Its typed request fixes the Governance commit,
+task ID, explicitly linked implementation run ID and accepted request ID.
+Reviewed runtime policy supplies the CI workflow path (`.github/workflows/ci.yml`),
+never Issue parameters. It reads canonical records at that single SHA, requires
+a completed standard v1 GitHub connector run with owned evidence, independently
+checks implementation CI, merged representation and exact merge-SHA CI from
+the same workflow, and reports canonical branch/open-PR observations even when
+the branch is absent. The API host is fixed to `https://api.github.com` and
+canonical Governance source to `shockerqt/workspace-governance`; configuration
+overrides fail before HTTP. The frozen Governance revision must be an ancestor
+of the independently observed integrated `master` head before any canonical
+records are read. Merge CI must be a push on the target repository's observed
+default branch. Present branch SHAs and repeated open-PR observations must agree;
+unstable or truncated cleanup evidence fails closed.
+The observer sends its bounded Authorization header
+through stdin, never process arguments. It hard-caps stdout (1 MiB plus status)
+and stderr (8 KiB), kills/reaps on excess or failure, and also sets curl request
+timeouts and rejects redirects. Repository, workflow and verified CI run IDs
+must fit the safe integer range.
+Requests use bounded GETs; up to 100
+linked runs and the first 100 merge-CI candidates are supported. Missing evidence
+fails closed. Attempt-specific implementation CI URLs are currently unsupported
+and rejected instead of substituting the latest attempt.
+
+The output is plain observations, not an authenticated receipt or closure
+attestation. There is no CLI, new authentication path, durable store or writer.
+The existing Actions journal must own acceptance, claims and replay. A separate
+Publisher must still authenticate the verification job and immutable artifact,
+bind their bytes to that accepted request, and apply the Governance closure
+gates. This API does not activate closure or replace the required Web pilot.
+The legacy audit API retains its existing unavailable-store behavior.
