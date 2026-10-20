@@ -305,6 +305,99 @@ class DurablePublicationCheckpoint:
     comment_id: int
 
 
+@dataclass(frozen=True)
+class DurablePublishedReceipt:
+    """Authenticated original success; not an owning-run or producer verdict."""
+
+    bundle: ExecutionBundle
+    publication: dict[str, Any]
+    comment_id: int
+    terminal_journal_sha: str
+
+
+def _verify_bundle_journal(
+    api: Callable[..., Any], bundle: ExecutionBundle,
+    head_sha: str, record: dict[str, Any],
+) -> None:
+    """Read-only acceptance/claim/current binding shared with finalization."""
+    frozen = _validate_execution_bundle(bundle)
+    mutable = {"state", "terminal_code", "terminal_reference"}
+    if ({k: v for k, v in frozen.items() if k not in mutable}
+            != {k: v for k, v in record.items() if k not in mutable}):
+        raise ActionsHandlerError("bundle_journal_mismatch")
+    journal = ActionsGitJournal(request=api, validate_transition=lambda _old, _new: False)
+    try:
+        for base, head in ((bundle.accepted_revision, bundle.claim_revision),
+                           (bundle.claim_revision, head_sha)):
+            if base == head:
+                continue
+            comparison = api("GET", f"/repos/{journal.REPOSITORY}/compare/{base}...{head}", body=None)
+            if (comparison.get("status") != "ahead"
+                    or comparison.get("base_commit", {}).get("sha") != base
+                    or comparison.get("merge_base_commit", {}).get("sha") != base):
+                raise ValueError("not journal ancestry")
+        accepted = journal.load_at(bundle.request_id, bundle.accepted_revision)
+        claimed = journal.load_at(bundle.request_id, bundle.claim_revision)
+        if claimed.record_json != bundle.canonical_record or accepted.record_json is None:
+            raise ValueError("snapshot mismatch")
+        expected = dict(frozen, state="accepted", execution_id=None,
+                        terminal_code=None, terminal_reference=None)
+        if parse_and_validate_record(accepted.record_json, bundle.request_id) != expected:
+            raise ValueError("acceptance mismatch")
+    except Exception:
+        raise ActionsHandlerError("bundle_revision_mismatch") from None
+
+
+def load_durable_published_receipt(
+    api_transport: Callable[..., Any], trusted_publisher_policy: TrustedReceiptPolicy,
+    issue_number: int, execution_id: str, request_id: str,
+) -> DurablePublishedReceipt:
+    """Load original authenticated Publisher success using GETs only.
+
+    The caller still establishes owning-run and integrated-producer authority.
+    Intent comments and an unterminalized publication do not qualify.
+    """
+    repository = "shockerqt/workspace-governance"
+    if type(issue_number) is not int or not 0 < issue_number <= 2**53 - 1:
+        raise ActionsHandlerError("invalid_issue_number")
+    _execution_digest(execution_id)
+    validate_request_id(request_id)
+    first, comments = _scan_issue_comments(api_transport, repository, issue_number)
+    second, _ = _scan_issue_comments(api_transport, repository, issue_number)
+    if first != second:
+        raise ActionsHandlerError("reconciliation_observation_unstable")
+    found = {kind: [] for kind in ("prepare", "publication", "published")}
+    for comment in comments:
+        if not _is_trusted_comment_author(comment, trusted_publisher_policy, repository, issue_number):
+            continue
+        for kind in found:
+            envelope = _parse_publisher_comment(comment.get("body"), kind, execution_id, request_id)
+            if envelope is not None:
+                found[kind].append((envelope, comment["id"]))
+    if any(len(matches) != 1 for matches in found.values()):
+        raise ActionsHandlerError("publisher_published_receipt_missing_or_conflicting")
+    published, comment_id = found["published"][0]
+    bundle = ExecutionBundle.from_dict(published["bundle"])
+    if (bundle.repository_full_name != repository or bundle.repository_id != 1260920764
+            or bundle.issue_number != issue_number
+            or any(matches[0][0]["bundle"] != bundle.to_dict() for matches in found.values())
+            or found["publication"][0][0]["publication"] != published["publication"]
+            or published["publication"]["commit_sha"] == published["publication"]["base_sha"]):
+        raise ActionsHandlerError("publisher_checkpoint_binding_mismatch")
+    journal = ActionsGitJournal(request=api_transport, validate_transition=lambda _old, _new: False)
+    try:
+        snapshot = journal.load(request_id)
+        record = parse_and_validate_record(snapshot.record_json, request_id)
+    except Exception:
+        raise ActionsHandlerError("publisher_terminal_journal_invalid") from None
+    _verify_bundle_journal(api_transport, bundle, snapshot.head_sha, record)
+    reference = f"https://github.com/{repository}/issues/{issue_number}#issuecomment-{comment_id}"
+    if (record["state"] != "succeeded" or record.get("terminal_code") != "ledger_published"
+            or record.get("terminal_reference") != reference):
+        raise ActionsHandlerError("publisher_terminal_journal_mismatch")
+    return DurablePublishedReceipt(bundle, published["publication"], comment_id, snapshot.head_sha)
+
+
 def _format_receipt_comment(envelope: dict[str, Any]) -> str:
     envelope_json = json.dumps(envelope, indent=2, sort_keys=True)
     if len(envelope_json.encode("utf-8")) > MAX_RESULT_ENVELOPE_BYTES:
@@ -1291,39 +1384,8 @@ class PublisherPhase:
             raise TypeError("bundle must be an ExecutionBundle instance")
 
         # Bind the original bundle to the independently loaded durable request.
-        frozen = _validate_execution_bundle(bundle)
         head_sha, record = self._coordinator.load_record(bundle.request_id)
-        mutable_fields = {"state", "terminal_code", "terminal_reference"}
-        if ({k: v for k, v in frozen.items() if k not in mutable_fields}
-                != {k: v for k, v in record.items() if k not in mutable_fields}):
-            raise ActionsHandlerError("bundle_journal_mismatch")
-
-        # Caller-supplied SHA strings are not proof: independently read both
-        # immutable journal snapshots and bind them to the accepted request/claim.
-        journal = ActionsGitJournal(request=self._read_api_transport,
-                                    validate_transition=lambda _old, _new: False)
-        try:
-            for base, head in ((bundle.accepted_revision, bundle.claim_revision),
-                               (bundle.claim_revision, head_sha)):
-                if base == head:
-                    continue
-                comparison = self._read_api_transport(
-                    "GET", f"/repos/{journal.REPOSITORY}/compare/{base}...{head}", body=None)
-                if (comparison.get("status") != "ahead"
-                        or comparison.get("base_commit", {}).get("sha") != base
-                        or comparison.get("merge_base_commit", {}).get("sha") != base):
-                    raise ValueError("not journal ancestry")
-            accepted = journal.load_at(bundle.request_id, bundle.accepted_revision)
-            claimed = journal.load_at(bundle.request_id, bundle.claim_revision)
-            if claimed.record_json != bundle.canonical_record or accepted.record_json is None:
-                raise ValueError("snapshot mismatch")
-            accepted_record = parse_and_validate_record(accepted.record_json, bundle.request_id)
-            expected_accepted = dict(frozen, state="accepted", execution_id=None,
-                                     terminal_code=None, terminal_reference=None)
-            if accepted_record != expected_accepted:
-                raise ValueError("acceptance mismatch")
-        except Exception:
-            raise ActionsHandlerError("bundle_revision_mismatch") from None
+        _verify_bundle_journal(self._read_api_transport, bundle, head_sha, record)
 
         if record["state"] in ("succeeded", "rejected"):
             return ExecutionReceipt(

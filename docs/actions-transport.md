@@ -346,8 +346,8 @@ and run completion still requires the terminal evidence enforced by the mutator.
 Startup additionally supports `run.create` and `task.start_run` with frozen
 source-bound context, as described below. `run.record_remote_evidence`,
 `task.create`, `task.complete` and `task.complete_verified` remain unsupported
-by this composition. Remote publication evidence and verified closure require
-separate reviewed increments.
+by the initial composition. The separate initial Governance-only remote-evidence
+profile is described below; verified closure still requires its own composition.
 Existing policies without `ledger` retain the unsupported-operation behavior.
 Do not treat this package's local tests as an authenticated online or Web pilot.
 The disabled Governance pilot still admits only `run.record_evidence` and keeps
@@ -376,6 +376,26 @@ Recovery reuses the original artifact or existing publication checkpoint; it
 cannot collect a replacement snapshot or regenerate missing Control output.
 Local Rust/Git composition tests use synthetic remote metadata and are not
 authenticated online or fresh-chat Web acceptance.
+
+`run.record_remote_evidence` uses an outer `publication_source` locator with
+`issue_number`, `execution_id` and `request_id`, never caller evidence or result
+flags. It is excluded from mutator parameters and covered by the outer digest.
+Control loads one original isolated-Governance-Publisher success, verifies the
+existing acceptance/claim/success journal bindings, and authenticates/rederives
+the original startup artifact before using its same-run preflight. Intent-only,
+no-change, reused-run and foreign/project sources fail closed. The initial
+source must share the current reviewed producer policy and describe a newly
+created Governance run. Its exact commit parent/tree/message are independently
+read; only that trusted original protocol supplies historical no-force and
+before-ref/readback guarantees. Ancestry alone cannot establish those facts.
+
+Terminal collection independently observes the configured Governance CI on the
+original publication SHA and a unique PR with that exact historical head,
+including closed PRs. Obtain that original exact-head PR before advancing the
+branch with later bookkeeping. Current producer authentication seals this
+snapshot; Publisher reconstructs it without refreshing history or gaining any
+project credentials. Native project connector publication history remains
+unsupported by this source profile; preparatory software does not enable it.
 
 An optional policy object has exactly this shape (placeholder revisions and
 workflow ID must be replaced by independently reviewed integrated identities):

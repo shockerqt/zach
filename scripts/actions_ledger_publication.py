@@ -13,6 +13,7 @@ import re
 
 from actions_ledger_candidate import derive_bound_candidate, read_candidate_archive, validate_bound_candidate, _json
 from actions_ledger_startup import validate_startup_context
+from actions_ledger_evidence import validate_evidence_context
 from actions_ledger_producer import REPOSITORY, REPOSITORY_ID, observe_ledger_producer
 from actions_request_handler import _validate_execution_bundle
 
@@ -24,6 +25,7 @@ EMPTY_CONTEXT_LEDGER_OPERATIONS = frozenset({
     "task.transition_status",
 })
 STARTUP_LEDGER_OPERATIONS = frozenset({"run.create", "task.start_run"})
+EVIDENCE_LEDGER_OPERATIONS = frozenset({"run.record_remote_evidence"})
 
 
 class LedgerPublicationError(Exception):
@@ -169,12 +171,16 @@ def publish_ledger_candidate(api, publisher, bundle, reference, producer_policy,
         _require(bundle.operation == "governance.ledger" and record["policy_revision"] == producer_policy.workflow_revision,
                  "ledger_bundle_mismatch")
         operation = bundle.parameters.get("operation")
-        _require(operation in EMPTY_CONTEXT_LEDGER_OPERATIONS | STARTUP_LEDGER_OPERATIONS, "ledger_context_profile_unavailable")
+        _require(operation in EMPTY_CONTEXT_LEDGER_OPERATIONS | STARTUP_LEDGER_OPERATIONS | EVIDENCE_LEDGER_OPERATIONS, "ledger_context_profile_unavailable")
         if operation in STARTUP_LEDGER_OPERATIONS:
             _require(type(bundle.parameters.get("agent_declaration")) is dict,
                      "ledger_context_profile_unavailable")
         else:
             _require("agent_declaration" not in bundle.parameters, "ledger_context_profile_unavailable")
+        if operation in EVIDENCE_LEDGER_OPERATIONS:
+            _require(type(bundle.parameters.get("publication_source")) is dict, "ledger_context_profile_unavailable")
+        else:
+            _require("publication_source" not in bundle.parameters, "ledger_context_profile_unavailable")
         checkpoint = publisher.load_ledger_publication_checkpoint(bundle)
         if checkpoint is not None:
             publication = checkpoint.publication
@@ -190,10 +196,11 @@ def publish_ledger_candidate(api, publisher, bundle, reference, producer_policy,
         # Context bytes alone are never evidence. Reuse that exact trusted
         # producer snapshot; do not recollect mutable project refs with Publisher.
         context = {}
-        if operation in STARTUP_LEDGER_OPERATIONS:
+        if operation in STARTUP_LEDGER_OPERATIONS | EVIDENCE_LEDGER_OPERATIONS:
             encoded = _json(raw)
             _require(type(encoded) is dict, "ledger_startup_context_invalid")
-            context = validate_startup_context(encoded.get("trusted_context"), bundle)
+            validate_context = validate_startup_context if operation in STARTUP_LEDGER_OPERATIONS else validate_evidence_context
+            context = validate_context(encoded.get("trusted_context"), bundle)
         independent = derive_bound_candidate(bundle, cli_path, mirror, context)
         artifact = validate_bound_candidate(raw, independent, bundle, context)
         _fresh_request(artifact, clock)
