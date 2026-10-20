@@ -149,6 +149,452 @@ pub struct FrozenIntegrationObservations {
     pub open_pr_urls: Vec<String>,
 }
 
+/// Supplied by the existing accepted Actions execution, never Issue parameters.
+/// This does not authenticate a job/artifact or authorize task closure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntegrationObservationBindings {
+    pub accepted_journal_sha: String,
+    pub request_digest: String,
+    pub policy_revision: String,
+    pub tool_revision: String,
+    pub verified_at: String,
+}
+
+fn validate_observation_bindings(
+    bindings: &IntegrationObservationBindings,
+) -> Result<(), AuditError> {
+    require(
+        sha(&bindings.accepted_journal_sha)
+            && sha(&bindings.policy_revision)
+            && sha(&bindings.tool_revision)
+            && bindings.request_digest.len() == 64
+            && bindings
+                .request_digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "invalid trusted observation bindings",
+    )?;
+    observation_time(&bindings.verified_at)?;
+    Ok(())
+}
+
+fn parse_observer_input(
+    raw: &str,
+) -> Result<(FrozenIntegrationRequest, IntegrationObservationBindings), &'static str> {
+    let invalid = "observer-input-invalid";
+    if raw.is_empty() || raw.len() > 16_384 {
+        return Err(invalid);
+    }
+    bounded_json_depth(raw).map_err(|_| invalid)?;
+    // The legacy GitHub JSON parser tolerates trailing commas. This trusted
+    // executable's input is strict JSON and must reject them before parsing.
+    let (mut quoted, mut escaped, mut previous) = (false, false, 0u8);
+    for byte in raw.bytes() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+                previous = b'"';
+            }
+        } else if byte == b'"' {
+            quoted = true;
+        } else if byte.is_ascii_whitespace() {
+            if !matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
+                return Err(invalid);
+            }
+        } else {
+            if previous == b',' && matches!(byte, b'}' | b']') {
+                return Err(invalid);
+            }
+            previous = byte;
+        }
+    }
+    let json = JsonValue::parse(raw).map_err(|_| invalid)?;
+    let root = json.as_object().ok_or(invalid)?;
+    if root.len() != 2 || !root.contains_key("request") || !root.contains_key("bindings") {
+        return Err(invalid);
+    }
+    let request = json.get_object("request").ok_or(invalid)?;
+    let bindings = json.get_object("bindings").ok_or(invalid)?;
+    let fields = |object: &BTreeMap<String, JsonValue>, expected: &[&str]| {
+        object.len() == expected.len()
+            && expected
+                .iter()
+                .all(|key| object_string(object, key).is_some())
+    };
+    if !fields(
+        request,
+        &["governance_sha", "task_id", "run_id", "request_id"],
+    ) || !fields(
+        bindings,
+        &[
+            "accepted_journal_sha",
+            "request_digest",
+            "policy_revision",
+            "tool_revision",
+            "verified_at",
+        ],
+    ) {
+        return Err(invalid);
+    }
+    let field = |object: &BTreeMap<String, JsonValue>, key| {
+        object_string(object, key).unwrap_or_default().to_owned()
+    };
+    let request = FrozenIntegrationRequest {
+        governance_sha: field(request, "governance_sha"),
+        task_id: field(request, "task_id"),
+        run_id: field(request, "run_id"),
+        request_id: field(request, "request_id"),
+    };
+    let bindings = IntegrationObservationBindings {
+        accepted_journal_sha: field(bindings, "accepted_journal_sha"),
+        request_digest: field(bindings, "request_digest"),
+        policy_revision: field(bindings, "policy_revision"),
+        tool_revision: field(bindings, "tool_revision"),
+        verified_at: field(bindings, "verified_at"),
+    };
+    validate_request(
+        &request,
+        &IntegrationObserverPolicy {
+            ci_workflow_path: ".github/workflows/ci.yml".into(),
+        },
+    )
+    .map_err(|_| invalid)?;
+    if request.run_id.len() > 160
+        || !request.run_id.starts_with(&format!("{}-", request.task_id))
+        || request.request_id.len() < 8
+        || !request
+            .request_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(invalid);
+    }
+    validate_observation_bindings(&bindings).map_err(|_| invalid)?;
+    Ok((request, bindings))
+}
+
+/// Trusted read-only executable bridge. No endpoint, workflow or credential is
+/// accepted in the input JSON; the existing runtime supplies its read token.
+pub fn execute_integration_observer_input(
+    raw: &str,
+    installation_token: &str,
+) -> Result<Vec<u8>, &'static str> {
+    let (request, bindings) = parse_observer_input(raw)?;
+    if installation_token.is_empty()
+        || installation_token.len() > 4096
+        || !installation_token.bytes().all(|b| b.is_ascii_graphic())
+    {
+        return Err("observer-token-unavailable");
+    }
+    let config = GithubConfig {
+        api_url: "https://api.github.com".into(),
+        token: installation_token.into(),
+        governance_repository: "shockerqt/workspace-governance".into(),
+        governance_default_branch: "master".into(),
+    };
+    let policy = IntegrationObserverPolicy {
+        ci_workflow_path: ".github/workflows/ci.yml".into(),
+    };
+    let facts = collect_frozen_integration(&config, &request, &policy)
+        .map_err(|_| "observer-collection-failed")?;
+    serialize_integration_observations(&facts, &bindings)
+        .map_err(|_| "observer-serialization-failed")
+}
+
+type UtcParts = [u32; 7];
+
+fn observation_time(value: &str) -> Result<UtcParts, AuditError> {
+    let invalid = || AuditError::Verification("invalid observation UTC timestamp".into());
+    let bytes = value.as_bytes();
+    if !(value.len() == 20 || (22..=27).contains(&value.len()))
+        || !value.is_ascii()
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+        || bytes.last() != Some(&b'Z')
+    {
+        return Err(invalid());
+    }
+    let number = |start: usize, end: usize| -> Result<u32, AuditError> {
+        let part = &value[start..end];
+        if !part.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(invalid());
+        }
+        part.parse().map_err(|_| invalid())
+    };
+    let (year, month, day, hour, minute, second) = (
+        number(0, 4)?,
+        number(5, 7)?,
+        number(8, 10)?,
+        number(11, 13)?,
+        number(14, 16)?,
+        number(17, 19)?,
+    );
+    let mut micros = 0;
+    if value.len() > 20 {
+        if bytes[19] != b'.' {
+            return Err(invalid());
+        }
+        let end = value.len() - 1;
+        micros = number(20, end)? * 10u32.pow((6 - (end - 20)) as u32);
+    }
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => 0,
+    };
+    require(
+        year > 0 && day > 0 && day <= days && hour < 24 && minute < 60 && second < 60,
+        "invalid observation UTC calendar value",
+    )?;
+    Ok([year, month, day, hour, minute, second, micros])
+}
+
+fn ascii_json_string(value: &str) -> String {
+    let mut result = String::from("\"");
+    for character in value.chars() {
+        match character {
+            '"' => result.push_str("\\\""),
+            '\\' => result.push_str("\\\\"),
+            '\u{8}' => result.push_str("\\b"),
+            '\u{c}' => result.push_str("\\f"),
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\t' => result.push_str("\\t"),
+            ch if !(' '..'\u{7f}').contains(&ch) => {
+                for unit in ch.encode_utf16(&mut [0; 2]) {
+                    result.push_str(&format!("\\u{unit:04x}"));
+                }
+            }
+            ch => result.push(ch),
+        }
+    }
+    result.push('"');
+    result
+}
+
+fn observation_json(value: &JsonValue) -> String {
+    match value {
+        JsonValue::String(value) => ascii_json_string(value),
+        JsonValue::Bool(value) => value.to_string(),
+        JsonValue::Number(value) => value.clone(),
+        JsonValue::Object(values) => format!(
+            "{{{}}}",
+            values
+                .iter()
+                .map(|(key, value)| format!(
+                    "{}:{}",
+                    ascii_json_string(key),
+                    observation_json(value)
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        _ => unreachable!("observation serializer constructs only mappings and scalar fields"),
+    }
+}
+
+fn observation_object<const N: usize>(values: [(&str, JsonValue); N]) -> JsonValue {
+    JsonValue::Object(
+        values
+            .into_iter()
+            .map(|(key, value)| (key.into(), value))
+            .collect(),
+    )
+}
+
+/// Return json-ascii-sorted-compact-v1 observation bytes, not an envelope.
+/// Bindings require independent runtime provenance; serialization cannot prove it.
+pub fn serialize_integration_observations(
+    facts: &FrozenIntegrationObservations,
+    bindings: &IntegrationObservationBindings,
+) -> Result<Vec<u8>, AuditError> {
+    let text = |value: &str| JsonValue::String(value.into());
+    let bounded = |value: &str, limit| !value.is_empty() && value.len() <= limit;
+    let request = &facts.request;
+    super::validate_request(&AuditRequest {
+        task_id: request.task_id.clone(),
+        request_id: request.request_id.clone(),
+    })?;
+    require(
+        sha(&request.governance_sha)
+            && bounded(&request.run_id, 160)
+            && request
+                .run_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && (8..=128).contains(&request.request_id.len())
+            && request
+                .request_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+        "invalid observation request identity",
+    )?;
+    require(
+        sha(&bindings.accepted_journal_sha)
+            && sha(&bindings.policy_revision)
+            && sha(&bindings.tool_revision)
+            && bindings.request_digest.len() == 64
+            && bindings
+                .request_digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "invalid trusted observation bindings",
+    )?;
+    let verified = observation_time(&bindings.verified_at)?;
+    require(
+        bounded(&facts.repository, 200)
+            && bounded(&facts.repository_alias, 200)
+            && bounded(&facts.branch, 200)
+            && facts
+                .branch
+                .starts_with(&format!("task/{}-", request.task_id))
+            && safe_id(facts.ci_workflow_id),
+        "invalid observation repository or branch",
+    )?;
+    let implementation = &facts.implementation;
+    let run_suffix = request
+        .run_id
+        .strip_prefix(&format!("{}-", request.task_id))
+        .ok_or_else(|| AuditError::Verification("run identity does not belong to task".into()))?;
+    require(
+        !run_suffix.is_empty()
+            && implementation.run_path == format!("runs/{}/{}.md", request.task_id, run_suffix)
+            && matches!(implementation.role, RunEvidenceRole::Implementation)
+            && coherent_terminal(implementation)
+            && sha(&implementation.implementation_sha),
+        "inconsistent observation implementation",
+    )?;
+    let pr = &facts.pull_request;
+    let pr_location = parse_pr_url(&pr.url)?;
+    require(
+        bounded(&pr.url, 1024)
+            && pr.url == implementation.pull_request_url
+            && pr_location.repository == facts.repository
+            && safe_id(pr_location.number)
+            && pr.url
+                == format!(
+                    "https://github.com/{}/pull/{}",
+                    facts.repository, pr_location.number
+                )
+            && pr.merged
+            && sha(&pr.head_sha)
+            && facts
+                .representation
+                .implementation_is_ancestor_or_equal_of_pr_head
+            && facts.representation.pr_head_is_ancestor_or_equal_of_merge,
+        "unverified observation integration",
+    )?;
+    let merge = pr
+        .merge_commit_sha
+        .as_deref()
+        .ok_or_else(|| AuditError::Verification("observation merge SHA missing".into()))?;
+    let merged_at = pr
+        .merged_at
+        .as_deref()
+        .ok_or_else(|| AuditError::Verification("observation merge time missing".into()))?;
+    require(
+        sha(merge) && observation_time(merged_at)? <= verified,
+        "invalid observation merge time or SHA",
+    )?;
+    for (ci, expected_sha) in [
+        (
+            &facts.implementation_ci,
+            implementation.implementation_sha.as_str(),
+        ),
+        (&facts.post_merge_ci, merge),
+    ] {
+        require(
+            bounded(&ci.url, 1024)
+                && safe_id(ci.id)
+                && ci_id(&ci.url, &facts.repository)? == ci.id
+                && ci.url
+                    == format!(
+                        "https://github.com/{}/actions/runs/{}",
+                        facts.repository, ci.id
+                    )
+                && ci.head_sha == expected_sha
+                && ci.conclusion == "success",
+            "inconsistent observation CI",
+        )?;
+    }
+    verify_cleanup_stability(&facts.remote_branch, &facts.open_pr_urls)?;
+    require(
+        facts.open_pr_urls.is_empty(),
+        "outstanding open PRs prevent closure observations",
+    )?;
+    let remote_cleanup = match &facts.remote_branch {
+        BranchObservation::Absent => "deleted",
+        BranchObservation::Present { .. } => "retained",
+    };
+    let value = observation_object([
+        ("schema_version", JsonValue::Number("1".into())),
+        ("task_id", text(&request.task_id)),
+        ("run_id", text(&request.run_id)),
+        ("repository", text(&facts.repository_alias)),
+        ("branch", text(&facts.branch)),
+        ("request_id", text(&request.request_id)),
+        ("request_digest", text(&bindings.request_digest)),
+        ("accepted_journal_sha", text(&bindings.accepted_journal_sha)),
+        ("policy_revision", text(&bindings.policy_revision)),
+        ("tool_revision", text(&bindings.tool_revision)),
+        ("verified_at", text(&bindings.verified_at)),
+        (
+            "implementation",
+            observation_object([
+                ("sha", text(&implementation.implementation_sha)),
+                ("ci_sha", text(&facts.implementation_ci.head_sha)),
+                ("ci_run_url", text(&facts.implementation_ci.url)),
+                ("pr_url", text(&pr.url)),
+                ("pr_head_sha", text(&pr.head_sha)),
+            ]),
+        ),
+        (
+            "integration",
+            observation_object([
+                ("merge_commit_sha", text(merge)),
+                ("merged_at", text(merged_at)),
+                ("post_merge_ci_sha", text(&facts.post_merge_ci.head_sha)),
+                ("post_merge_ci_run_url", text(&facts.post_merge_ci.url)),
+                (
+                    "post_merge_ci_conclusion",
+                    text(&facts.post_merge_ci.conclusion),
+                ),
+                ("pull_request_merged", JsonValue::Bool(pr.merged)),
+                (
+                    "implementation_represented",
+                    JsonValue::Bool(
+                        facts
+                            .representation
+                            .implementation_is_ancestor_or_equal_of_pr_head
+                            && facts.representation.pr_head_is_ancestor_or_equal_of_merge,
+                    ),
+                ),
+                (
+                    "cleanup",
+                    observation_object([
+                        ("remote_branch", text(remote_cleanup)),
+                        ("local_worktree", text("not-applicable")),
+                        ("local_branch", text("not-applicable")),
+                    ]),
+                ),
+            ]),
+        ),
+    ]);
+    let bytes = observation_json(&value).into_bytes();
+    require(bytes.len() <= 32768, "observation bytes exceed bound")?;
+    Ok(bytes)
+}
+
 fn require(ok: bool, message: &str) -> Result<(), AuditError> {
     if ok {
         Ok(())
@@ -715,6 +1161,146 @@ mod tests {
             task_id: "ZACH-002".into(),
             run_id: RUN.into(),
             request_id: "request-0001".into(),
+        }
+    }
+
+    fn observation_fixture() -> (
+        FrozenIntegrationObservations,
+        IntegrationObservationBindings,
+    ) {
+        let (repository, repository_alias, branch, implementation, _) =
+            canonical_run(&mut fixture(), &request()).unwrap();
+        let implementation_ci = WorkflowEvidence {
+            id: 12,
+            head_sha: "b".repeat(40),
+            conclusion: "success".into(),
+            url: "https://github.com/shockerqt/zach/actions/runs/12".into(),
+        };
+        let facts = FrozenIntegrationObservations {
+            request: request(),
+            repository,
+            repository_alias,
+            branch,
+            implementation,
+            implementation_ci,
+            ci_workflow_id: 7,
+            pull_request: PullRequestEvidence {
+                url: "https://github.com/shockerqt/zach/pull/2".into(),
+                merged: true,
+                merge_commit_sha: Some("c".repeat(40)),
+                merged_at: Some("2026-10-20T01:02:03.000001Z".into()),
+                head_sha: "b".repeat(40),
+            },
+            representation: RepresentationEvidence {
+                implementation_is_ancestor_or_equal_of_pr_head: true,
+                pr_head_is_ancestor_or_equal_of_merge: true,
+            },
+            post_merge_ci: WorkflowEvidence {
+                id: 13,
+                head_sha: "c".repeat(40),
+                conclusion: "success".into(),
+                url: "https://github.com/shockerqt/zach/actions/runs/13".into(),
+            },
+            remote_branch: BranchObservation::Absent,
+            open_pr_urls: vec![],
+        };
+        let bindings = IntegrationObservationBindings {
+            accepted_journal_sha: "d".repeat(40),
+            request_digest: "e".repeat(64),
+            policy_revision: "f".repeat(40),
+            tool_revision: "1".repeat(40),
+            verified_at: "2026-10-20T01:02:03.000002Z".into(),
+        };
+        (facts, bindings)
+    }
+
+    #[test]
+    fn serialized_observations_are_sorted_ascii_deterministic_and_use_alias() {
+        let (mut facts, bindings) = observation_fixture();
+        facts.branch = "task/ZACH-002-café😀".into();
+        let bytes = serialize_integration_observations(&facts, &bindings).unwrap();
+        assert!(bytes.is_ascii());
+        assert_eq!(
+            bytes,
+            serialize_integration_observations(&facts, &bindings).unwrap()
+        );
+        let raw = String::from_utf8(bytes).unwrap();
+        assert!(raw.starts_with("{\"accepted_journal_sha\":"));
+        assert!(raw.contains("task/ZACH-002-caf\\u00e9\\ud83d\\ude00"));
+        assert!(raw.contains("\"repository\":\"zach\""));
+        assert!(raw.contains("\"local_branch\":\"not-applicable\",\"local_worktree\":\"not-applicable\",\"remote_branch\":\"deleted\""));
+        let parsed = JsonValue::parse(&raw).unwrap();
+        assert_eq!(parsed.as_object().unwrap().len(), 13);
+        assert_eq!(
+            ascii_json_string("\u{7f}\u{8}\u{c}\n\r\t\\\"😀"),
+            "\"\\u007f\\b\\f\\n\\r\\t\\\\\\\"\\ud83d\\ude00\""
+        );
+        facts.remote_branch = BranchObservation::Present {
+            sha: "2".repeat(40),
+            open_pr_urls: vec![],
+        };
+        assert!(
+            String::from_utf8(serialize_integration_observations(&facts, &bindings).unwrap())
+                .unwrap()
+                .contains("\"remote_branch\":\"retained\"")
+        );
+    }
+
+    #[test]
+    fn serializer_rejects_inconsistent_public_facts_and_bad_bindings() {
+        let (facts, bindings) = observation_fixture();
+        for mutation in 0..12 {
+            let mut changed = facts.clone();
+            match mutation {
+                0 => changed
+                    .open_pr_urls
+                    .push("https://github.com/shockerqt/zach/pull/3".into()),
+                1 => changed.implementation_ci.head_sha = "3".repeat(40),
+                2 => changed.post_merge_ci.head_sha = "3".repeat(40),
+                3 => changed.representation.pr_head_is_ancestor_or_equal_of_merge = false,
+                4 => changed.pull_request.merged = false,
+                5 => changed.pull_request.url = "https://github.com/attacker/zach/pull/2".into(),
+                6 => changed.request.run_id = "ZACH-002-other-run".into(),
+                7 => changed.pull_request.merged_at = Some("2026-10-20T01:02:03.000003Z".into()),
+                8 => changed.branch = "task/OTHER-001-other".into(),
+                9 => {
+                    changed.implementation.role = RunEvidenceRole::IntegrationAudit {
+                        audited_implementation_sha: "b".repeat(40),
+                        audited_pull_request_url: changed.pull_request.url.clone(),
+                    }
+                }
+                10 => changed.implementation_ci.id = 999,
+                _ => {
+                    changed.remote_branch = BranchObservation::Present {
+                        sha: "bad".into(),
+                        open_pr_urls: vec![],
+                    }
+                }
+            }
+            assert!(
+                serialize_integration_observations(&changed, &bindings).is_err(),
+                "mutation {mutation}"
+            );
+        }
+        for mutation in 0..5 {
+            let mut changed = bindings.clone();
+            match mutation {
+                0 => changed.request_digest = "bad".into(),
+                1 => changed.accepted_journal_sha = "bad".into(),
+                2 => changed.policy_revision = "bad".into(),
+                3 => changed.tool_revision = "bad".into(),
+                _ => changed.verified_at = "2026-02-30T01:02:03Z".into(),
+            }
+            assert!(serialize_integration_observations(&facts, &changed).is_err());
+        }
+        assert!(observation_time("2024-02-29T00:00:00Z").is_ok());
+        for value in [
+            "2026-02-29T00:00:00Z",
+            "2026-10-20T01:02:03.1234567Z",
+            "2026-10-20T01:02:03+00:00",
+            "0000-01-01T00:00:00Z",
+        ] {
+            assert!(observation_time(value).is_err());
         }
     }
     fn fixture() -> Reader {
