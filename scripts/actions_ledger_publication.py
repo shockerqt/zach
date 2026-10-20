@@ -11,7 +11,8 @@ import base64
 import hashlib
 import re
 
-from actions_ledger_candidate import derive_bound_candidate, read_candidate_archive, validate_bound_candidate
+from actions_ledger_candidate import derive_bound_candidate, read_candidate_archive, validate_bound_candidate, _json
+from actions_ledger_startup import validate_startup_context
 from actions_ledger_producer import REPOSITORY, REPOSITORY_ID, observe_ledger_producer
 from actions_request_handler import _validate_execution_bundle
 
@@ -22,6 +23,7 @@ EMPTY_CONTEXT_LEDGER_OPERATIONS = frozenset({
     "run.record_evidence", "run.transition_status", "task.append_run",
     "task.transition_status",
 })
+STARTUP_LEDGER_OPERATIONS = frozenset({"run.create", "task.start_run"})
 
 
 class LedgerPublicationError(Exception):
@@ -166,7 +168,13 @@ def publish_ledger_candidate(api, publisher, bundle, reference, producer_policy,
         record = _validate_execution_bundle(bundle)
         _require(bundle.operation == "governance.ledger" and record["policy_revision"] == producer_policy.workflow_revision,
                  "ledger_bundle_mismatch")
-        _require(bundle.parameters.get("operation") in EMPTY_CONTEXT_LEDGER_OPERATIONS, "ledger_context_profile_unavailable")
+        operation = bundle.parameters.get("operation")
+        _require(operation in EMPTY_CONTEXT_LEDGER_OPERATIONS | STARTUP_LEDGER_OPERATIONS, "ledger_context_profile_unavailable")
+        if operation in STARTUP_LEDGER_OPERATIONS:
+            _require(type(bundle.parameters.get("agent_declaration")) is dict,
+                     "ledger_context_profile_unavailable")
+        else:
+            _require("agent_declaration" not in bundle.parameters, "ledger_context_profile_unavailable")
         checkpoint = publisher.load_ledger_publication_checkpoint(bundle)
         if checkpoint is not None:
             publication = checkpoint.publication
@@ -178,8 +186,16 @@ def publish_ledger_candidate(api, publisher, bundle, reference, producer_policy,
         archive = api.download_artifact(REPOSITORY, reference.artifact_id)
         raw = read_candidate_archive(archive, reference.archive_sha256)
         _require(hashlib.sha256(raw).hexdigest() == reference.content_sha256, "ledger_content_digest_mismatch")
-        independent = derive_bound_candidate(bundle, cli_path, mirror, {})
-        artifact = validate_bound_candidate(raw, independent, bundle, {})
+        # Producer/job and archive/content identity are authenticated above.
+        # Context bytes alone are never evidence. Reuse that exact trusted
+        # producer snapshot; do not recollect mutable project refs with Publisher.
+        context = {}
+        if operation in STARTUP_LEDGER_OPERATIONS:
+            encoded = _json(raw)
+            _require(type(encoded) is dict, "ledger_startup_context_invalid")
+            context = validate_startup_context(encoded.get("trusted_context"), bundle)
+        independent = derive_bound_candidate(bundle, cli_path, mirror, context)
+        artifact = validate_bound_candidate(raw, independent, bundle, context)
         _fresh_request(artifact, clock)
         candidate = artifact["candidate"]
         base = candidate["base_sha"]

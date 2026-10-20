@@ -15,7 +15,7 @@ from typing import Any, Final, Optional, Sequence
 from actions_ci_inspect import CiInspectionPolicy
 from actions_recipe_dispatch import RecipeDispatchError, RecipeDispatchPolicy
 from actions_git_journal import FIXED_REPOSITORY
-from actions_github_api import GithubApi
+from actions_github_api import GithubApi, TRUSTED_REPOSITORIES
 from actions_journal_coordinator import ActionsJournalCoordinator, ClaimDisposition, TrustedIssuePolicy
 from actions_ledger_producer import LedgerProducerPolicy
 from actions_ledger_publication import LedgerPublicationPolicy, LedgerPublicationError, _policy as _validate_ledger_policy
@@ -422,6 +422,11 @@ def _run_control(
         repositories.add(policy.ci.repository_full_name)
     elif bundle.operation == "workspace.recipe.dispatch" and policy.recipe is not None:
         repositories.add(policy.recipe.repository_full_name)
+    elif (bundle.operation == "governance.ledger" and policy.ledger_producer is not None
+          and bundle.parameters.get("operation") in {"run.create", "task.start_run"}):
+        # Existing reviewed Control allowlist only; the actual short-lived token
+        # still determines available read scope. Publisher is never widened.
+        repositories.update(TRUSTED_REPOSITORIES)
     api = _transport(token, repositories)
     ledger_kwargs = {}
     if bundle.operation == "governance.ledger" and policy.ledger_producer is not None:
@@ -429,7 +434,9 @@ def _run_control(
         output = getattr(args, "ledger_candidate_output", None)
         if type(output) is not str or not os.path.isabs(output):
             raise PhaseCliError("invalid_ledger_candidate_output")
-        ledger_kwargs["ledger_candidate"] = LedgerCandidateRuntime(candidate_cli, mirror, output)
+        startup = bundle.parameters.get("operation") in {"run.create", "task.start_run"}
+        ledger_kwargs["ledger_candidate"] = LedgerCandidateRuntime(
+            candidate_cli, mirror, output, **({"api": api} if startup else {}))
     result = ControlPhase(
         api_transport=api,
         trusted_receipt_policy=policy.receipt,

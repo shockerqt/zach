@@ -343,15 +343,39 @@ pinned candidate. The compiled candidate and Governance mutator decide all
 parameters, transitions, linking and lifecycle validity; these guards add no
 alternate lifecycle rules. Task transitions to `completed` remain forbidden,
 and run completion still requires the terminal evidence enforced by the mutator.
-`run.create`, `task.start_run`, `run.record_remote_evidence`, `task.create`,
-`task.complete` and `task.complete_verified` remain unsupported by this
-composition. Startup, independently collected remote context and verified
-closure require separate reviewed increments.
+Startup additionally supports `run.create` and `task.start_run` with frozen
+source-bound context, as described below. `run.record_remote_evidence`,
+`task.create`, `task.complete` and `task.complete_verified` remain unsupported
+by this composition. Remote publication evidence and verified closure require
+separate reviewed increments.
 Existing policies without `ledger` retain the unsupported-operation behavior.
 Do not treat this package's local tests as an authenticated online or Web pilot.
 The disabled Governance pilot still admits only `run.record_evidence` and keeps
 its integrated Zach pin `93e7f53db55f5ceee55c6a3e074d72c6988421ca`; this software
 increment does not broaden workflow admission or update that pin.
+
+For startup only, the outer parameters also require `agent_declaration`, with
+exact `schema_version`, `reads` and `capabilities` fields as defined by the
+integrated Governance contract. Reads identify regular Governance blobs at the
+frozen outer `base_sha`; capabilities are explicitly labelled sender claims,
+not probes of the agent's tools or proof that it understood those files. The
+declaration remains covered by the outer request digest and is never passed as
+an inner mutator parameter. Other operations reject it.
+
+Control uses its existing repository allowlist and short-lived installation
+token to read canonical task routing and bounded repository/ref/open-PR facts.
+Missing branches or unavailable token scope fail closed; this collector never
+creates a branch. Its normalized context binds the accepted request, sender,
+policy, exact canonical task blob, declaration and observed resource identities.
+The existing candidate artifact and authenticated Control handoff seal these
+bytes. Publisher authenticates the original producer job and archive/content
+identity before parsing and validating the snapshot, reconstructs the normalized
+fields, then independently rederives the candidate against that exact context.
+It receives no project credentials and does not refresh mutable source refs.
+Recovery reuses the original artifact or existing publication checkpoint; it
+cannot collect a replacement snapshot or regenerate missing Control output.
+Local Rust/Git composition tests use synthetic remote metadata and are not
+authenticated online or fresh-chat Web acceptance.
 
 An optional policy object has exactly this shape (placeholder revisions and
 workflow ID must be replaced by independently reviewed integrated identities):

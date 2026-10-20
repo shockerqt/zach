@@ -10,6 +10,7 @@ import zipfile
 
 from actions_ledger_producer import ArtifactReference
 import actions_ledger_publication as module
+from actions_ledger_startup import StartupContextError
 
 
 BASE, TREE, RESULT, COMMIT, REVISION = (character * 40 for character in "abcde")
@@ -118,6 +119,52 @@ class Tests(unittest.TestCase):
                 self.assertTrue(self.invoke()["replayed"])
                 self.derive.assert_not_called()
                 self.assertTrue(all(method == "GET" for method, _, _ in self.api.calls))
+
+    def test_startup_producer_failure_prevents_context_parse_validation_and_derivation(self):
+        self.bundle.parameters.update(operation="task.start_run", agent_declaration={})
+        with patch.object(module, "_validate_execution_bundle", return_value={"policy_revision": REVISION}), \
+             patch.object(module, "observe_ledger_producer", side_effect=module.LedgerPublicationError("producer_rejected")), \
+             patch.object(self.api, "download_artifact") as download, \
+             patch.object(module, "_json") as parse, \
+             patch.object(module, "validate_startup_context") as validate, \
+             patch.object(module, "derive_bound_candidate") as derive, \
+             self.assertRaisesRegex(module.LedgerPublicationError, "producer_rejected"):
+            module.publish_ledger_candidate(self.api, self.api, self.bundle, self.reference,
+                self.producer, POLICY, "/trusted/cli", "/trusted/mirror", self.now, clock=self.clock)
+        for seam in (download, parse, validate, derive): seam.assert_not_called()
+        self.assertIsNone(self.api.checkpoint)
+        self.assertEqual(self.api.calls, [])
+
+    def test_authenticated_archive_context_rejection_prevents_derivation_and_effects(self):
+        # Producer observation and context parsing/validation are explicit seams.
+        # ZIP/archive/content digests are checked by the real existing reader.
+        self.bundle.parameters.update(operation="task.start_run", agent_declaration={})
+        context, events = {"remote_preflight": {"synthetic": True}}, []
+        def parse(raw):
+            self.assertEqual(raw, b"candidate")
+            events.append("parse")
+            return {"trusted_context": context}
+        def validate(value, bundle):
+            self.assertIs(value, context)
+            self.assertIs(bundle, self.bundle)
+            events.append("validate")
+            raise StartupContextError("startup_context_invalid")
+        with patch.object(module, "_validate_execution_bundle", return_value={"policy_revision": REVISION}), \
+             patch.object(module, "observe_ledger_producer", side_effect=lambda *args: events.append("observe") or {}), \
+             patch.object(self.api, "download_artifact", wraps=self.api.download_artifact) as download, \
+             patch.object(module, "_json", side_effect=parse), \
+             patch.object(module, "validate_startup_context", side_effect=validate), \
+             patch.object(module, "derive_bound_candidate") as derive, \
+             patch.object(module, "validate_bound_candidate") as bind, \
+             self.assertRaisesRegex(module.LedgerPublicationError, "startup_context_invalid"):
+            module.publish_ledger_candidate(self.api, self.api, self.bundle, self.reference,
+                self.producer, POLICY, "/trusted/cli", "/trusted/mirror", self.now, clock=self.clock)
+        self.assertEqual(events, ["observe", "parse", "validate"])
+        download.assert_called_once_with(module.REPOSITORY, self.reference.artifact_id)
+        derive.assert_not_called()
+        bind.assert_not_called()
+        self.assertIsNone(self.api.checkpoint)
+        self.assertFalse(any(method in ("POST", "PATCH", "checkpoint") for method, _, _ in self.api.calls))
 
     def test_unavailable_profiles_reject_before_checkpoint_observation_or_effect(self):
         for operation in ("run.create", "task.start_run", "run.record_remote_evidence", "task.create", "task.complete", "task.complete_verified", "unknown", None):
