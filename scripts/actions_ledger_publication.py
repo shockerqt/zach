@@ -157,6 +157,65 @@ def _readback(api, publication):
     _require(_head(api, publication["branch"]) == publication["commit_sha"], "ledger_publication_ambiguous")
 
 
+def _recover_publication(api, publisher, bundle, reference, policy):
+    """Recover an authenticated recorded effect without refreshing sources."""
+    checkpoint = publisher.load_ledger_publication_checkpoint(bundle)
+    if checkpoint is not None:
+        publication = checkpoint.publication
+        _require(publication["branch"] == policy.branch and publication["artifact_reference"] == asdict(reference), "ledger_checkpoint_conflict")
+        _readback(api, publication)
+        return {"publication": publication, "checkpoint_comment_id": checkpoint.comment_id, "replayed": True}
+
+    return None
+
+
+def _publish_validated_candidate(api, publisher, bundle, reference, policy, artifact, clock, recheck):
+    """Publish trusted rederived data; recheck is internal policy, never input."""
+    _fresh_request(artifact, clock)
+    candidate = artifact["candidate"]
+    base = candidate["base_sha"]
+    _require(_head(api, policy.branch) == base, "ledger_ref_conflict")
+    base_commit = _commit(api, base)
+    _owner(api, base_commit["tree"]["sha"], policy)
+    recheck()
+    tree_entries = []
+    for change in candidate["changes"]:
+        sha = None
+        if change["operation"] == "upsert":
+            content = base64.b64encode(change["content"].encode("utf-8")).decode("ascii")
+            blob = api("POST", f"/repos/{REPOSITORY}/git/blobs", body={"content": content, "encoding": "base64"})
+            _require(type(blob) is dict and blob.get("sha") == change["blob_sha"], "ledger_blob_mismatch")
+            sha = change["blob_sha"]
+        tree_entries.append({"path": change["path"], "mode": "100644", "type": "blob", "sha": sha})
+    commit_sha = base
+    if tree_entries:
+        tree = api("POST", f"/repos/{REPOSITORY}/git/trees", body={"base_tree": base_commit["tree"]["sha"], "tree": tree_entries})
+        _require(type(tree) is dict and tree.get("sha") == candidate["validated_tree_sha"], "ledger_tree_mismatch")
+        commit = api("POST", f"/repos/{REPOSITORY}/git/commits", body={"message": f"chore(ledger): apply {bundle.request_id}",
+                     "tree": candidate["validated_tree_sha"], "parents": [base]})
+        _require(type(commit) is dict and _sha(commit.get("sha")), "ledger_commit_invalid")
+        commit_sha = commit["sha"]
+        checked = _commit(api, commit_sha)
+        _require(checked["tree"]["sha"] == candidate["validated_tree_sha"] and [item["sha"] for item in checked["parents"]] == [base], "ledger_commit_mismatch")
+    else:
+        _require(candidate["validated_tree_sha"] == base_commit["tree"]["sha"], "ledger_tree_mismatch")
+    publication = {"repository_id": REPOSITORY_ID, "repository_full_name": REPOSITORY,
+                   "branch": policy.branch, "base_sha": base, "tree_sha": candidate["validated_tree_sha"],
+                   "commit_sha": commit_sha, "artifact_reference": asdict(reference)}
+    checkpoint = publisher.checkpoint_ledger_publication(bundle, publication)
+    recovered = publisher.load_ledger_publication_checkpoint(bundle)
+    _require(recovered is not None and recovered.publication == publication, "ledger_checkpoint_conflict")
+    _require(_head(api, policy.branch) == base, "ledger_ref_conflict")
+    _fresh_request(artifact, clock)
+    if commit_sha != base:
+        try:
+            api("PATCH", f"/repos/{REPOSITORY}/git/refs/heads/{policy.branch}", body={"sha": commit_sha, "force": False})
+        except Exception:
+            pass  # Reconcile exactly the recorded effect, never retry PATCH.
+    _readback(api, publication)
+    return {"publication": publication, "checkpoint_comment_id": checkpoint.comment_id, "replayed": False}
+
+
 def publish_ledger_candidate(api, publisher, bundle, reference, producer_policy,
                              policy, cli_path, mirror, now, *, clock):
     """Return a proven publication, or fail closed without terminalizing.
@@ -181,12 +240,9 @@ def publish_ledger_candidate(api, publisher, bundle, reference, producer_policy,
             _require(type(bundle.parameters.get("publication_source")) is dict, "ledger_context_profile_unavailable")
         else:
             _require("publication_source" not in bundle.parameters, "ledger_context_profile_unavailable")
-        checkpoint = publisher.load_ledger_publication_checkpoint(bundle)
-        if checkpoint is not None:
-            publication = checkpoint.publication
-            _require(publication["branch"] == policy.branch and publication["artifact_reference"] == asdict(reference), "ledger_checkpoint_conflict")
-            _readback(api, publication)
-            return {"publication": publication, "checkpoint_comment_id": checkpoint.comment_id, "replayed": True}
+        recovered = _recover_publication(api, publisher, bundle, reference, policy)
+        if recovered is not None:
+            return recovered
 
         first = observe_ledger_producer(api, bundle, reference, producer_policy, now)
         archive = api.download_artifact(REPOSITORY, reference.artifact_id)
@@ -203,49 +259,10 @@ def publish_ledger_candidate(api, publisher, bundle, reference, producer_policy,
             context = validate_context(encoded.get("trusted_context"), bundle)
         independent = derive_bound_candidate(bundle, cli_path, mirror, context)
         artifact = validate_bound_candidate(raw, independent, bundle, context)
-        _fresh_request(artifact, clock)
-        candidate = artifact["candidate"]
-        base = candidate["base_sha"]
-        _require(_head(api, policy.branch) == base, "ledger_ref_conflict")
-        base_commit = _commit(api, base)
-        _owner(api, base_commit["tree"]["sha"], policy)
-        _require(first == observe_ledger_producer(api, bundle, reference, producer_policy, now), "ledger_producer_observation_unstable")
-        tree_entries = []
-        for change in candidate["changes"]:
-            sha = None
-            if change["operation"] == "upsert":
-                content = base64.b64encode(change["content"].encode("utf-8")).decode("ascii")
-                blob = api("POST", f"/repos/{REPOSITORY}/git/blobs", body={"content": content, "encoding": "base64"})
-                _require(type(blob) is dict and blob.get("sha") == change["blob_sha"], "ledger_blob_mismatch")
-                sha = change["blob_sha"]
-            tree_entries.append({"path": change["path"], "mode": "100644", "type": "blob", "sha": sha})
-        commit_sha = base
-        if tree_entries:
-            tree = api("POST", f"/repos/{REPOSITORY}/git/trees", body={"base_tree": base_commit["tree"]["sha"], "tree": tree_entries})
-            _require(type(tree) is dict and tree.get("sha") == candidate["validated_tree_sha"], "ledger_tree_mismatch")
-            commit = api("POST", f"/repos/{REPOSITORY}/git/commits", body={"message": f"chore(ledger): apply {bundle.request_id}",
-                         "tree": candidate["validated_tree_sha"], "parents": [base]})
-            _require(type(commit) is dict and _sha(commit.get("sha")), "ledger_commit_invalid")
-            commit_sha = commit["sha"]
-            checked = _commit(api, commit_sha)
-            _require(checked["tree"]["sha"] == candidate["validated_tree_sha"] and [item["sha"] for item in checked["parents"]] == [base], "ledger_commit_mismatch")
-        else:
-            _require(candidate["validated_tree_sha"] == base_commit["tree"]["sha"], "ledger_tree_mismatch")
-        publication = {"repository_id": REPOSITORY_ID, "repository_full_name": REPOSITORY,
-                       "branch": policy.branch, "base_sha": base, "tree_sha": candidate["validated_tree_sha"],
-                       "commit_sha": commit_sha, "artifact_reference": asdict(reference)}
-        checkpoint = publisher.checkpoint_ledger_publication(bundle, publication)
-        recovered = publisher.load_ledger_publication_checkpoint(bundle)
-        _require(recovered is not None and recovered.publication == publication, "ledger_checkpoint_conflict")
-        _require(_head(api, policy.branch) == base, "ledger_ref_conflict")
-        _fresh_request(artifact, clock)
-        if commit_sha != base:
-            try:
-                api("PATCH", f"/repos/{REPOSITORY}/git/refs/heads/{policy.branch}", body={"sha": commit_sha, "force": False})
-            except Exception:
-                pass  # Reconcile exactly the recorded effect, never retry PATCH.
-        _readback(api, publication)
-        return {"publication": publication, "checkpoint_comment_id": checkpoint.comment_id, "replayed": False}
+        def recheck():
+            _require(first == observe_ledger_producer(api, bundle, reference, producer_policy, now), "ledger_producer_observation_unstable")
+        return _publish_validated_candidate(api, publisher, bundle, reference, policy, artifact, clock, recheck)
+
     except LedgerPublicationError:
         raise
     except Exception as error:

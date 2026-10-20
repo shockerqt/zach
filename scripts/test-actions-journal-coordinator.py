@@ -310,6 +310,19 @@ class TestActionsJournalCoordinator(unittest.TestCase):
             self.coordinator.load_record("req-non-existent")
         self.assertEqual(error.exception.code, "request_not_found")
 
+    def test_observer_token_is_separate_from_candidate_environment(self) -> None:
+        from unittest.mock import patch
+        argv = ("/usr/bin/python3", "-c", "import os;print('present' if 'ZACH_INSTALLATION_TOKEN' in os.environ else 'absent');print('clean' if 'GITHUB_TOKEN' not in os.environ else 'dirty')")
+        with patch.dict(os.environ, {"ZACH_INSTALLATION_TOKEN": "synthetic-reader", "GITHUB_TOKEN": "synthetic-ambient"}):
+            candidate = ActionsJournalCoordinator._run_subprocess(argv, 5.0)
+            observer = ActionsJournalCoordinator._run_observer_subprocess(argv, "synthetic-reader")
+        self.assertEqual(candidate.stdout, b"absent\nclean\n")
+        self.assertEqual(observer.stdout, b"present\nclean\n")
+        self.assertEqual(candidate.returncode, 0)
+        self.assertEqual(observer.returncode, 0)
+        with self.assertRaises(CoordinatorError):
+            ActionsJournalCoordinator._run_observer_subprocess(argv, "invalid\nvalue")
+
 
 if __name__ == "__main__":
     unittest.main()

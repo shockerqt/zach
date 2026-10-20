@@ -52,6 +52,7 @@ from actions_request_handler import (
     _format_receipt_comment,
     load_durable_prepare_checkpoint,
     load_durable_published_receipt,
+    _validate_ledger_handoff,
     _parse_receipt_comment,
 )
 
@@ -3081,6 +3082,27 @@ class DurablePublishedReceiptTests(unittest.TestCase):
         with patch.object(ActionsGitJournal, "load_at", altered):
             with self.assertRaisesRegex(ActionsHandlerError, "bundle_revision_mismatch"):
                 self.load()
+
+
+class LedgerHandoffProfileTests(unittest.TestCase):
+    def test_fixed_material_profiles_must_match_bound_operation(self):
+        # Shape/binding test only; no authentication or integration proof.
+        from types import SimpleNamespace
+        profiles = (("candidate-ready", "workspace-ledger-candidate", "run.record_evidence"),
+                    ("integration-observed", "workspace-integration-observation", "task.complete_verified"))
+        for stage, prefix, operation in profiles:
+            result = {"stage": stage, "producer_run_id": 100, "producer_run_attempt": 1,
+                      "artifact_name": f"{prefix}-100-1", "content_sha256": "b" * 64}
+            bundle = SimpleNamespace(operation="governance.ledger", parameters={"operation": operation}, execution_id="100-1")
+            _validate_ledger_handoff(result)
+            _validate_ledger_handoff(result, bundle)
+            bundle.parameters["operation"] = "task.complete_verified" if operation != "task.complete_verified" else "run.record_evidence"
+            with self.assertRaises(ActionsHandlerError):
+                _validate_ledger_handoff(result, bundle)
+            for changed in (dict(result, artifact_name="wrong-100-1"),
+                            dict(result, stage="other"), dict(result, producer_run_attempt=2)):
+                with self.assertRaises(ActionsHandlerError):
+                    _validate_ledger_handoff(changed)
 
 
 if __name__ == "__main__":

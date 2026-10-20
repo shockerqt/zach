@@ -604,13 +604,20 @@ def _validate_ledger_handoff(result: Any, bundle: Optional[ExecutionBundle] = No
     }:
         raise ActionsHandlerError("invalid_ledger_handoff")
     run_id = result["producer_run_id"]
-    if (result["stage"] != "candidate-ready"
+    profiles = {"candidate-ready": "workspace-ledger-candidate",
+                "integration-observed": "workspace-integration-observation"}
+    stage = result["stage"]
+    if (type(stage) is not str or stage not in profiles
         or type(run_id) is not int or not 0 < run_id <= 2**53 - 1
         or type(result["producer_run_attempt"]) is not int or result["producer_run_attempt"] != 1
-        or result["artifact_name"] != f"workspace-ledger-candidate-{run_id}-1"
+        or result["artifact_name"] != f"{profiles[stage]}-{run_id}-1"
         or type(result["content_sha256"]) is not str or not SHA256_RE.fullmatch(result["content_sha256"])
         or (bundle is not None and bundle.execution_id != f"{run_id}-1")):
         raise ActionsHandlerError("invalid_ledger_handoff")
+    if bundle is not None:
+        closure = bundle.parameters.get("operation") == "task.complete_verified"
+        if bundle.operation != "governance.ledger" or closure != (stage == "integration-observed"):
+            raise ActionsHandlerError("invalid_ledger_handoff")
 
 
 def _validate_ledger_publication(bundle: ExecutionBundle, publication: Any) -> None:

@@ -223,6 +223,63 @@ class PhaseCliTests(unittest.TestCase):
             with self.assertRaisesRegex(cli.PhaseCliError, "invalid_rust_cli"):
                 cli._run_control(args, policy, "installation-token")
 
+    def _integration_policy(self):
+        value = self._ledger_policy()
+        value["publisher_identity"] = {"app_id": 9877, "bot_user_id": 54322}
+        value["ledger"]["integration_producer"] = dict(value["ledger"]["producer"], workflow_id=11)
+        self.policy.write_text(json.dumps(value))
+        return value
+
+    def test_integration_policy_fixed_fields_revisions_and_publisher_required(self):
+        value = self._integration_policy()
+        policy = cli._load_policy(str(self.policy))
+        self.assertEqual(policy.integration_producer.workflow_path, ".github/workflows/workspace-operations.yml")
+        self.assertEqual(policy.integration_producer.producer_job_name, "verify")
+        self.assertEqual(policy.integration_producer.tool_revision, policy.ledger_producer.tool_revision)
+        for key, replacement in (("workflow_id", True), ("workflow_id", 0),
+                                 ("workflow_revision", "b" * 40), ("tool_revision", "b" * 40),
+                                 ("repository_full_name", "untrusted/repository"), ("workflow_path", "other.yml")):
+            changed = json.loads(json.dumps(value))
+            changed["ledger"]["integration_producer"][key] = replacement
+            self.policy.write_text(json.dumps(changed))
+            with self.subTest(key=key), self.assertRaisesRegex(cli.PhaseCliError, "invalid_policy"):
+                cli._load_policy(str(self.policy))
+        del value["publisher_identity"]
+        self.policy.write_text(json.dumps(value))
+        with self.assertRaisesRegex(cli.PhaseCliError, "invalid_policy"):
+            cli._load_policy(str(self.policy))
+
+    def test_closure_control_and_publisher_select_distinct_runtimes(self):
+        self._integration_policy()
+        policy = cli._load_policy(str(self.policy))
+        closure = replace(bundle(), operation="governance.ledger", parameters={"operation": "task.complete_verified"})
+        checkpoint = DurablePrepareCheckpoint(ClaimDisposition.GRANTED, closure, 0)
+        args = cli._parser().parse_args(["control", "--policy-file", str(self.policy), "--output-file", str(self.root / "result"),
+            "--ledger-cli", str(self.rust_cli), "--governance-mirror", str(self.root), "--observer-cli", str(self.rust_cli),
+            "--ledger-candidate-output", str(self.root / "observation.json")])
+        callback = lambda *values: {}
+        with patch.object(cli, "_load_checkpoint", return_value=checkpoint), patch.object(cli, "GithubApi", FakeApi), \
+             patch.object(cli, "IntegrationObservationRuntime", return_value=callback) as factory, \
+             patch.object(cli, "LedgerCandidateRuntime") as candidate, patch.object(cli, "ControlPhase") as phase:
+            phase.return_value.execute.return_value = ControlExecutionResult(REQUEST_ID, "run-101", terminal_state="candidate_ready", terminal_code="ledger_candidate_ready")
+            cli._run_control(args, policy, "installation-token")
+            factory.assert_called_once_with(str(self.rust_cli.resolve()), str(self.root / "observation.json"), "installation-token", policy.integration_producer)
+            candidate.assert_not_called()
+            self.assertIs(phase.call_args.kwargs["ledger_candidate"], callback)
+        with patch.object(cli, "GithubApi", FakeApi), patch.object(cli, "ActionsJournalCoordinator", FakeCoordinator), \
+             patch.object(cli, "IntegrationPublisherRuntime", return_value=callback) as factory, \
+             patch.object(cli, "LedgerPublisherRuntime") as candidate, patch.object(cli, "PublisherPhase") as phase:
+            cli._publisher(policy, "installation-token", str(self.rust_cli), finalize=True, ledger_args=args, integration_closure=True)
+            self.assertEqual(factory.call_args.args[1:3], (policy.integration_producer, policy.ledger_publication))
+            candidate.assert_not_called()
+        args.rust_cli = str(self.rust_cli)
+        with patch.object(cli, "_load_checkpoint", return_value=checkpoint), patch.object(cli, "_publisher", return_value=FakePublisher()) as factory:
+            cli._run_finalize(args, policy, "installation-token")
+            self.assertIs(factory.call_args.kwargs["integration_closure"], True)
+        with patch.object(cli, "_load_checkpoint", return_value=checkpoint), patch.object(cli, "GithubApi", FakeApi), \
+             self.assertRaisesRegex(cli.PhaseCliError, "integration_profile_unavailable"):
+            cli._run_control(args, replace(policy, integration_producer=None), "installation-token")
+
     def test_ledger_publisher_uses_existing_api_and_policy_absent_stays_unwired(self):
         self._ledger_policy()
         policy = cli._load_policy(str(self.policy))

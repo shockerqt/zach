@@ -80,6 +80,42 @@ class LedgerCandidateRuntime:
                 "artifact_name": f"workspace-ledger-candidate-{run}-1", "content_sha256": hashlib.sha256(raw).hexdigest()}
 
 
+def _artifact_reference(api, publisher, bundle, handoff):
+    """Resolve an already validated handoff through existing checkpoint/lookup."""
+    checkpoint = publisher.load_ledger_publication_checkpoint(bundle)
+    if checkpoint is not None:
+        # Authenticate the recorded artifact before trying a fresh lookup or
+        # download. Expiration cannot authorize replacing a prior effect.
+        reference = ArtifactReference(**checkpoint.publication["artifact_reference"])
+        _require(reference.repository_full_name == REPOSITORY and reference.repository_id == 1260920764
+                 and reference.run_id == handoff["producer_run_id"] and reference.run_attempt == 1
+                 and reference.content_sha256 == handoff["content_sha256"], "ledger_checkpoint_conflict")
+    else:
+        matches, seen, total = [], set(), None
+        for page in range(1, 11):
+            response = api("GET", f"/repos/{REPOSITORY}/actions/runs/{handoff['producer_run_id']}/artifacts?per_page=100&page={page}", body=None)
+            _require(type(response) is dict and type(response.get("total_count")) is int
+                     and 0 <= response["total_count"] <= 1000 and type(response.get("artifacts")) is list
+                     and len(response["artifacts"]) <= 100
+                     and (total is None or total == response["total_count"]), "ledger_artifact_lookup_invalid")
+            total = response["total_count"]
+            for artifact in response["artifacts"]:
+                _require(type(artifact) is dict and type(artifact.get("id")) is int
+                         and 0 < artifact["id"] <= 2**53 - 1 and artifact["id"] not in seen, "ledger_artifact_lookup_invalid")
+                seen.add(artifact["id"])
+                if artifact.get("name") == handoff["artifact_name"]:
+                    matches.append(artifact)
+            _require(len(seen) <= total, "ledger_artifact_lookup_invalid")
+            if len(seen) == total:
+                break
+            _require(len(response["artifacts"]) == 100 and page < 10, "ledger_artifact_lookup_incomplete")
+        _require(len(matches) == 1 and type(matches[0].get("digest")) is str
+                 and re.fullmatch(r"sha256:[0-9a-f]{64}", matches[0]["digest"]), "ledger_artifact_lookup_ambiguous")
+        reference = ArtifactReference(1260920764, REPOSITORY, handoff["producer_run_id"], 1,
+                    matches[0]["id"], matches[0]["digest"][7:], handoff["content_sha256"])
+    return reference
+
+
 class LedgerPublisherRuntime:
     def __init__(self, api, producer_policy, publication_policy, cli_path, mirror, *, clock=None):
         _require(isinstance(producer_policy, LedgerProducerPolicy)
@@ -94,37 +130,7 @@ class LedgerPublisherRuntime:
     def __call__(self, publisher, bundle, value):
         _validate_execution_bundle(bundle)
         handoff = _handoff(bundle, value)
-        checkpoint = publisher.load_ledger_publication_checkpoint(bundle)
-        if checkpoint is not None:
-            # Authenticate the recorded artifact before trying a fresh lookup or
-            # download. Expiration cannot authorize replacing a prior effect.
-            reference = ArtifactReference(**checkpoint.publication["artifact_reference"])
-            _require(reference.repository_full_name == REPOSITORY and reference.repository_id == 1260920764
-                     and reference.run_id == handoff["producer_run_id"] and reference.run_attempt == 1
-                     and reference.content_sha256 == handoff["content_sha256"], "ledger_checkpoint_conflict")
-        else:
-            matches, seen, total = [], set(), None
-            for page in range(1, 11):
-                response = self.api("GET", f"/repos/{REPOSITORY}/actions/runs/{handoff['producer_run_id']}/artifacts?per_page=100&page={page}", body=None)
-                _require(type(response) is dict and type(response.get("total_count")) is int
-                         and 0 <= response["total_count"] <= 1000 and type(response.get("artifacts")) is list
-                         and len(response["artifacts"]) <= 100
-                         and (total is None or total == response["total_count"]), "ledger_artifact_lookup_invalid")
-                total = response["total_count"]
-                for artifact in response["artifacts"]:
-                    _require(type(artifact) is dict and type(artifact.get("id")) is int
-                             and 0 < artifact["id"] <= 2**53 - 1 and artifact["id"] not in seen, "ledger_artifact_lookup_invalid")
-                    seen.add(artifact["id"])
-                    if artifact.get("name") == handoff["artifact_name"]:
-                        matches.append(artifact)
-                _require(len(seen) <= total, "ledger_artifact_lookup_invalid")
-                if len(seen) == total:
-                    break
-                _require(len(response["artifacts"]) == 100 and page < 10, "ledger_artifact_lookup_incomplete")
-            _require(len(matches) == 1 and type(matches[0].get("digest")) is str
-                     and re.fullmatch(r"sha256:[0-9a-f]{64}", matches[0]["digest"]), "ledger_artifact_lookup_ambiguous")
-            reference = ArtifactReference(1260920764, REPOSITORY, handoff["producer_run_id"], 1,
-                        matches[0]["id"], matches[0]["digest"][7:], handoff["content_sha256"])
+        reference = _artifact_reference(self.api, publisher, bundle, handoff)
         return publish_ledger_candidate(self.api, publisher, bundle, reference,
                     self.producer_policy, self.publication_policy, self.cli_path, self.mirror,
                     self.clock(), clock=self.clock)

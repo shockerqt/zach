@@ -219,6 +219,10 @@ impl PinnedGovernanceValidator {
             for (flag, value) in [
                 ("--trusted-remote-preflight", &context.remote_preflight),
                 ("--trusted-remote-evidence", &context.remote_evidence),
+                (
+                    "--trusted-integration-attestation",
+                    &context.integration_attestation,
+                ),
             ] {
                 if let Some(value) = value {
                     let path = workspace.path.join(flag.trim_start_matches("--"));

@@ -347,7 +347,8 @@ Startup additionally supports `run.create` and `task.start_run` with frozen
 source-bound context, as described below. `run.record_remote_evidence`,
 `task.create`, `task.complete` and `task.complete_verified` remain unsupported
 by the initial composition. The separate initial Governance-only remote-evidence
-profile is described below; verified closure still requires its own composition.
+profile is described below; verified closure uses the separate explicit profile
+described below, never the initial candidate profile.
 Existing policies without `ledger` retain the unsupported-operation behavior.
 Do not treat this package's local tests as an authenticated online or Web pilot.
 The disabled Governance pilot still admits only `run.record_evidence` and keeps
@@ -396,6 +397,43 @@ branch with later bookkeeping. Current producer authentication seals this
 snapshot; Publisher reconstructs it without refreshing history or gaining any
 project credentials. Native project connector publication history remains
 unsupported by this source profile; preparatory software does not enable it.
+
+Verified closure is an additional opt-in policy field
+`ledger.integration_producer`, with the same three trusted revision/ID fields
+as `ledger.producer`. It fixes `.github/workflows/workspace-operations.yml`,
+job `verify` and artifact `workspace-integration-observation-RUN_ID-1` rather
+than admitting caller-selected producer routes. Its only operation is
+`task.complete_verified` with inner `task_id` and `run_id`; outer parameters
+remain exactly `base_sha`, `operation` and `parameters`. The default candidate
+profile and initial producer still reject closure.
+
+Control invokes the reviewed `zach-integration-observe` executable with its
+bounded read token, accepted journal/request bindings and fixed source policy.
+It emits canonical `integration-observation.json`, not candidate data or its own
+authentication metadata. The existing nonterminal receipt retains its legacy
+state/code but uses the explicit `integration-observed` stage and fixed artifact
+name. Candidate handoffs for closure and observation handoffs for other ledger
+operations reject. Observation input/output are private regular bounded files.
+
+Publisher authenticates the exact original integrated workflow/tool revisions,
+successful verification job/run/attempt and immutable archive/content identity.
+Only then does it bind the canonical observation to the current accepted request,
+add job/artifact metadata and call the separate credential-free candidate profile.
+The Rust CLI requires explicit `--profile integration-closure` in journal mode;
+its context contains only `integration_attestation`. The existing pinned mutator
+checks exact canonical completed implementation/terminal evidence, all integration
+and cleanup gates, no active task runs, atomic original-run attestation/task/index
+changes and full candidate validity. Publisher receives no project credentials.
+
+Publication reuses the existing task policy, fresh base checks, authenticated
+intent, non-forced ref update, exact parent/tree/ref readback and terminal journal.
+An existing intent is reconciled before any artifact refresh or new effect;
+recovery does not rerun verification or replace the original observation bytes.
+The workflow remains disabled until concrete approval and compatible integrated
+pins. First-attempt approval binds request/task/run/base through validated guard
+outputs; recovery after the window closes uses only the original checkpoint.
+Source/fixture tests and an active registered workflow are not Web acceptance
+or authorization to enable either this pilot or the full fast path.
 
 An optional policy object has exactly this shape (placeholder revisions and
 workflow ID must be replaced by independently reviewed integrated identities):

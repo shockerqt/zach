@@ -98,7 +98,7 @@ def _regular_read(path):
             os.close(fd)
 
 
-def derive_bound_candidate(bundle, cli_path, mirror, trusted_context, *, timeout_seconds=30.0):
+def derive_bound_candidate(bundle, cli_path, mirror, trusted_context, *, timeout_seconds=30.0, integration_closure=False):
     """Invoke configured trusted absolute paths, never paths from Issue data."""
     try:
         bundle = ExecutionBundle.from_dict(bundle.to_dict())
@@ -114,16 +114,24 @@ def derive_bound_candidate(bundle, cli_path, mirror, trusted_context, *, timeout
             _reject("candidate_configuration_invalid")
         context = json.dumps(trusted_context, ensure_ascii=False, allow_nan=False).encode("utf-8")
         parsed_context = _json(context)
-        if not isinstance(parsed_context, dict) or set(parsed_context) - {"remote_preflight", "remote_evidence"} or any(type(v) is not dict for v in parsed_context.values()):
+        if type(integration_closure) is not bool:
+            _reject()
+        fields = {"integration_attestation"} if integration_closure else {"remote_preflight", "remote_evidence"}
+        if not isinstance(parsed_context, dict) or set(parsed_context) - fields or any(type(v) is not dict for v in parsed_context.values()):
+            _reject()
+        if integration_closure and (set(parsed_context) != fields or bundle.parameters.get("operation") != "task.complete_verified"):
             _reject()
         with tempfile.TemporaryDirectory(prefix="zach-ledger-candidate-") as directory:
             record_path = ActionsJournalCoordinator._write_private(directory, "journal.json", bundle.canonical_record.encode("utf-8"))
             context_path = ActionsJournalCoordinator._write_private(directory, "context.json", context)
             output = os.path.join(directory, "candidate.json")
-            result = ActionsJournalCoordinator._run_subprocess((cli_path,
+            argv = (cli_path,
                 "--journal-record", record_path, "--accepted-revision", bundle.accepted_revision,
                 "--claim-revision", bundle.claim_revision, "--mirror", mirror,
-                "--trusted-context", context_path, "--output", output), timeout_seconds)
+                "--trusted-context", context_path, "--output", output)
+            if integration_closure:
+                argv += ("--profile", "integration-closure")
+            result = ActionsJournalCoordinator._run_subprocess(argv, timeout_seconds)
             if result.returncode != 0 or result.stdout:
                 _reject("candidate_derivation_failed")
             raw = _regular_read(output)
@@ -202,6 +210,15 @@ def validate_bound_candidate(raw, rederived_bytes, bundle, trusted_context):
 
 def read_candidate_archive(zip_bytes, expected_archive_sha256):
     """Verify archive digest and return its sole regular candidate.json in memory."""
+    return _read_archive(zip_bytes, expected_archive_sha256, "candidate.json", MAX_ARTIFACT_BYTES)
+
+
+def read_integration_archive(zip_bytes, expected_archive_sha256):
+    """Same bounded archive checks, with a distinct fixed observation file."""
+    return _read_archive(zip_bytes, expected_archive_sha256, "integration-observation.json", 32768)
+
+
+def _read_archive(zip_bytes, expected_archive_sha256, filename, maximum):
     if type(zip_bytes) is not bytes or not 0 < len(zip_bytes) <= MAX_ARCHIVE_BYTES or not isinstance(expected_archive_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_archive_sha256) or hashlib.sha256(zip_bytes).hexdigest() != expected_archive_sha256:
         _reject("candidate_archive_invalid")
     try:
@@ -212,11 +229,11 @@ def read_candidate_archive(zip_bytes, expected_archive_sha256):
             entry = entries[0]
             mode = entry.external_attr >> 16
             kind = stat.S_IFMT(mode)
-            if entry.filename != "candidate.json" or entry.is_dir() or kind not in (0, stat.S_IFREG) or entry.external_attr & 0x10 or entry.flag_bits & 1 or entry.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED) or not 0 < entry.file_size <= MAX_ARTIFACT_BYTES:
+            if entry.filename != filename or entry.is_dir() or kind not in (0, stat.S_IFREG) or entry.external_attr & 0x10 or entry.flag_bits & 1 or entry.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED) or not 0 < entry.file_size <= maximum:
                 _reject("candidate_archive_invalid")
             with archive.open(entry) as handle:
-                raw = handle.read(MAX_ARTIFACT_BYTES + 1)
-            if len(raw) != entry.file_size or len(raw) > MAX_ARTIFACT_BYTES:
+                raw = handle.read(maximum + 1)
+            if len(raw) != entry.file_size or len(raw) > maximum:
                 _reject("candidate_archive_invalid")
             return raw
     except CandidateError:

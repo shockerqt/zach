@@ -157,6 +157,20 @@ class ActionsJournalCoordinator:
     @staticmethod
     def _run_subprocess(argv: tuple[str, ...], timeout_seconds: float) -> CliProcessResult:
         """Run the pinned binary with a minimal environment and bounded pipes."""
+        return ActionsJournalCoordinator._run_bounded_process(argv, timeout_seconds,
+            {"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"})
+
+    @staticmethod
+    def _run_observer_subprocess(argv: tuple[str, ...], token: str) -> CliProcessResult:
+        """Trusted read-only observer only. Never used for candidate execution."""
+        if type(token) is not str or not 0 < len(token) <= 4096 or not all(33 <= ord(ch) <= 126 for ch in token):
+            raise CoordinatorError("observer_token_invalid")
+        return ActionsJournalCoordinator._run_bounded_process(argv, 120.0,
+            {"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PATH": "/usr/bin:/bin",
+             "ZACH_INSTALLATION_TOKEN": token})
+
+    @staticmethod
+    def _run_bounded_process(argv: tuple[str, ...], timeout_seconds: float, environment: dict[str, str]) -> CliProcessResult:
         try:
             process = subprocess.Popen(
                 argv,
@@ -165,7 +179,7 @@ class ActionsJournalCoordinator:
                 stderr=subprocess.PIPE,
                 shell=False,
                 cwd="/",
-                env={"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+                env=environment,
                 close_fds=True,
             )
         except (OSError, ValueError):

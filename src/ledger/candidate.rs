@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 pub const CANDIDATE_REVISION: &str = "7f7af5752ef2e016ffe7116f84648b3350fe507f";
 /// Integrated transport profile; does not replace the candidate tooling pin.
-pub const ACTIONS_TRANSPORT_REVISION: &str = "0cd08835a0dc778d687fd71f9f00c5499172bec4";
+pub const ACTIONS_TRANSPORT_REVISION: &str = "9cd4ca6a8457ee1a575f14bbf7afb914927c06be";
 pub const MAX_INPUT_BYTES: u64 = 256 * 1024;
 const OPERATIONS: &[&str] = &[
     "task.create",
@@ -30,6 +30,33 @@ const OPERATIONS: &[&str] = &[
 pub struct TrustedLedgerContext {
     pub(super) remote_preflight: Option<Json>,
     pub(super) remote_evidence: Option<Json>,
+    pub(super) integration_attestation: Option<Json>,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CandidateProfile {
+    Initial,
+    IntegrationClosure,
+}
+impl CandidateProfile {
+    fn allows(self, operation: &str) -> bool {
+        match self {
+            Self::Initial => OPERATIONS.contains(&operation),
+            Self::IntegrationClosure => operation == "task.complete_verified",
+        }
+    }
+    fn check_context(self, context: &TrustedLedgerContext) -> Result<(), &'static str> {
+        match self {
+            Self::Initial if context.integration_attestation.is_none() => Ok(()),
+            Self::IntegrationClosure
+                if context.integration_attestation.is_some()
+                    && context.remote_preflight.is_none()
+                    && context.remote_evidence.is_none() =>
+            {
+                Ok(())
+            }
+            _ => Err("invalid-trusted-context"),
+        }
+    }
 }
 impl TrustedLedgerContext {
     fn to_json(&self) -> Json {
@@ -40,9 +67,19 @@ impl TrustedLedgerContext {
         if let Some(value) = &self.remote_evidence {
             fields.push(("remote_evidence".into(), value.clone()));
         }
+        if let Some(value) = &self.integration_attestation {
+            fields.push(("integration_attestation".into(), value.clone()));
+        }
         Json::Object(fields)
     }
     pub fn parse(text: &str) -> Result<Self, &'static str> {
+        Self::parse_profile(text, CandidateProfile::Initial)
+    }
+    /// Envelope bytes are not authentication; the caller verifies provenance.
+    pub fn parse_closure(text: &str) -> Result<Self, &'static str> {
+        Self::parse_profile(text, CandidateProfile::IntegrationClosure)
+    }
+    fn parse_profile(text: &str, profile: CandidateProfile) -> Result<Self, &'static str> {
         if text.len() as u64 > MAX_INPUT_BYTES {
             return Err("input-too-large");
         }
@@ -56,10 +93,12 @@ impl TrustedLedgerContext {
             match key.as_str() {
                 "remote_preflight" => context.remote_preflight = Some(value.clone()),
                 "remote_evidence" => context.remote_evidence = Some(value.clone()),
+                "integration_attestation" => context.integration_attestation = Some(value.clone()),
                 _ => return Err("invalid-trusted-context"),
             }
         }
         jcs(&value).map_err(|_| "invalid-trusted-context")?;
+        profile.check_context(&context)?;
         Ok(context)
     }
 }
@@ -84,7 +123,14 @@ fn expiry(accepted_at: &str) -> Result<String, &'static str> {
     Ok(result)
 }
 
+#[cfg(test)]
 fn inner_request(journal: &JournalRecord) -> Result<Json, &'static str> {
+    inner_request_profile(journal, CandidateProfile::Initial)
+}
+fn inner_request_profile(
+    journal: &JournalRecord,
+    profile: CandidateProfile,
+) -> Result<Json, &'static str> {
     if journal.operation() != ActionOperation::GovernanceLedger
         || journal.state() != JournalState::Executing
         || journal.execution_id().is_none()
@@ -131,7 +177,7 @@ fn inner_request(journal: &JournalRecord) -> Result<Json, &'static str> {
     if !super::sha40(base) || inner_parameters.as_object().is_none() {
         return Err("request-invalid");
     }
-    if !OPERATIONS.contains(&operation)
+    if !profile.allows(operation)
         || (operation == "task.transition_status"
             && !matches!(
                 inner_parameters.get("target_status").and_then(Json::as_str),
@@ -139,6 +185,17 @@ fn inner_request(journal: &JournalRecord) -> Result<Json, &'static str> {
             ))
     {
         return Err("operation-not-allowed");
+    }
+    if profile == CandidateProfile::IntegrationClosure
+        && (fields.len() != 3
+            || inner_parameters.as_object().is_none_or(|fields| {
+                fields.len() != 2
+                    || fields
+                        .iter()
+                        .any(|(key, _)| !["task_id", "run_id"].contains(&key.as_str()))
+            }))
+    {
+        return Err("request-invalid");
     }
     Ok(Json::Object(vec![
         ("schema_version".into(), Json::Number("1".into())),
@@ -173,14 +230,51 @@ pub fn derive_actions_candidate(
     claim_revision: &str,
     context: &TrustedLedgerContext,
 ) -> Result<String, String> {
+    derive_actions_profile(
+        mirror,
+        journal_json,
+        accepted_revision,
+        claim_revision,
+        context,
+        CandidateProfile::Initial,
+    )
+}
+
+/// Opt-in closure candidate. Authentication belongs to the trusted Publisher.
+pub fn derive_actions_closure_candidate(
+    mirror: PathBuf,
+    journal_json: &str,
+    accepted_revision: &str,
+    claim_revision: &str,
+    context: &TrustedLedgerContext,
+) -> Result<String, String> {
+    derive_actions_profile(
+        mirror,
+        journal_json,
+        accepted_revision,
+        claim_revision,
+        context,
+        CandidateProfile::IntegrationClosure,
+    )
+}
+
+fn derive_actions_profile(
+    mirror: PathBuf,
+    journal_json: &str,
+    accepted_revision: &str,
+    claim_revision: &str,
+    context: &TrustedLedgerContext,
+    profile: CandidateProfile,
+) -> Result<String, String> {
     if !super::sha40(accepted_revision) || !super::sha40(claim_revision) {
         return Err("journal-revision-invalid".into());
     }
     let journal =
         JournalRecord::from_json(journal_json).map_err(|_| "journal-invalid".to_owned())?;
-    let inner = inner_request(&journal).map_err(str::to_owned)?;
+    let inner = inner_request_profile(&journal, profile).map_err(str::to_owned)?;
     let request = jcs(&inner).map_err(|_| "request-invalid".to_owned())?;
-    let candidate = derive_candidate(mirror, &request, journal.accepted_at(), context)?;
+    let candidate =
+        derive_candidate_profile(mirror, &request, journal.accepted_at(), context, profile)?;
     let candidate = Json::parse(&candidate).map_err(|_| "validator-output-invalid".to_owned())?;
     bound_artifact(
         &journal,
@@ -245,14 +339,30 @@ pub fn derive_candidate(
     accepted_at: &str,
     context: &TrustedLedgerContext,
 ) -> Result<String, String> {
+    derive_candidate_profile(
+        mirror,
+        request_json,
+        accepted_at,
+        context,
+        CandidateProfile::Initial,
+    )
+}
+fn derive_candidate_profile(
+    mirror: PathBuf,
+    request_json: &str,
+    accepted_at: &str,
+    context: &TrustedLedgerContext,
+    profile: CandidateProfile,
+) -> Result<String, String> {
     if request_json.len() as u64 > MAX_INPUT_BYTES {
         return Err("input-too-large".into());
     }
     let value = Json::parse(request_json).map_err(|_| "request-invalid".to_owned())?;
     let request = super::parse_request_object(&value).map_err(str::to_owned)?;
-    if !OPERATIONS.contains(&request.operation.as_str()) {
+    if !profile.allows(&request.operation) {
         return Err("operation-not-allowed".into());
     }
+    profile.check_context(context).map_err(str::to_owned)?;
     if request.operation == "task.transition_status"
         && !matches!(
             request
@@ -721,6 +831,77 @@ mod tests {
             Err("journal-revision-invalid".into())
         );
     }
+    #[test]
+    fn closure_context_is_explicit_and_cannot_mix_profiles() {
+        let text = r#"{"integration_attestation":{}}"#;
+        assert!(TrustedLedgerContext::parse(text).is_err());
+        let context = TrustedLedgerContext::parse_closure(text).unwrap();
+        assert_eq!(jcs(&context.to_json()).unwrap(), text);
+        for value in [
+            "{}",
+            r#"{"integration_attestation":null}"#,
+            r#"{"integration_attestation":{},"remote_preflight":{}}"#,
+            r#"{"integration_attestation":{},"remote_evidence":{}}"#,
+            r#"{"integration_attestation":{},"unknown":{}}"#,
+        ] {
+            assert!(TrustedLedgerContext::parse_closure(value).is_err());
+        }
+    }
+
+    #[test]
+    fn closure_profile_requires_envelope_and_exact_operation() {
+        let parameters = format!(
+            r#"{{"base_sha":"{CANDIDATE_REVISION}","operation":"task.complete_verified","parameters":{{"run_id":"owned-run","task_id":"GOV-041"}}}}"#
+        );
+        let record = journal(
+            &parameters,
+            "2026-10-20T00:00:00Z",
+            "closure-profile",
+            CANDIDATE_REVISION,
+        );
+        assert!(inner_request(&record).is_err());
+        assert!(inner_request_profile(&record, CandidateProfile::IntegrationClosure).is_ok());
+        assert_eq!(
+            derive_actions_closure_candidate(
+                "/missing".into(),
+                &record.to_json().unwrap(),
+                CANDIDATE_REVISION,
+                CANDIDATE_REVISION,
+                &TrustedLedgerContext::default()
+            ),
+            Err("invalid-trusted-context".into())
+        );
+        let wrong = parameters.replace("task.complete_verified", "run.record_evidence");
+        assert!(
+            inner_request_profile(
+                &journal(
+                    &wrong,
+                    "2026-10-20T00:00:00Z",
+                    "closure-wrongop",
+                    CANDIDATE_REVISION
+                ),
+                CandidateProfile::IntegrationClosure
+            )
+            .is_err()
+        );
+        let extra = parameters.replace(
+            "\"task_id\":\"GOV-041\"",
+            "\"task_id\":\"GOV-041\",\"verified\":true",
+        );
+        assert!(
+            inner_request_profile(
+                &journal(
+                    &extra,
+                    "2026-10-20T00:00:00Z",
+                    "closure-extra",
+                    CANDIDATE_REVISION
+                ),
+                CandidateProfile::IntegrationClosure
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn context_is_separate_and_bounded() {
         assert!(TrustedLedgerContext::parse("{}").is_ok());

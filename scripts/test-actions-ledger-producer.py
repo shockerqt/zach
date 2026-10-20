@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from actions_ledger_producer import (ArtifactReference, LedgerProducerPolicy,
+                                    IntegrationProducerPolicy, observe_integration_producer,
                                     LedgerProducerError, observe_ledger_producer,
                                     REPOSITORY, REPOSITORY_ID)
 
@@ -41,7 +42,7 @@ class ProducerTests(unittest.TestCase):
             root + "/actions/runs/51/artifacts?per_page=100&page=1": {"total_count": 1, "artifacts": [self.artifact]},
         }
 
-    def observe(self, ref=None, *, public_available=True):
+    def observe(self, ref=None, *, public_available=True, observer=observe_ledger_producer):
         def api(method, path, body=None):
             self.assertEqual(method, "GET")
             self.assertIsNone(body)
@@ -53,7 +54,7 @@ class ProducerTests(unittest.TestCase):
         if public_available:
             api.public_zach_get = public_zach_get
         with patch("actions_ledger_producer._validate_execution_bundle", return_value={"policy_revision": self.sha, "author_id": 80, "sender_id": 81}):
-            return observe_ledger_producer(api, self.bundle, ref or self.ref, self.policy, "2026-10-11T03:00:00Z")
+            return observer(api, self.bundle, ref or self.ref, self.policy, "2026-10-11T03:00:00Z")
 
     def test_success_and_observation_changes(self):
         original = self.observe()
@@ -140,6 +141,57 @@ class ProducerTests(unittest.TestCase):
         self.responses[compare]["status"] = "diverged"
         with self.assertRaises(LedgerProducerError):
             self.observe()
+
+
+class IntegrationProducerTests(ProducerTests):
+    """Same mock HTTP proofs applied to the distinct fixed verification profile."""
+    def setUp(self):
+        super().setUp()
+        self.policy = IntegrationProducerPolicy(41, self.sha, "b" * 40)
+        self.bundle.parameters = {"operation": "task.complete_verified"}
+        self.job["name"] = "verify"
+        self.artifact["name"] = "workspace-integration-observation-51-1"
+        self.responses[self.root + "/actions/workflows/41"]["path"] = self.policy.workflow_path
+        self.responses[self.root + "/actions/runs/51/attempts/1"]["path"] = self.policy.workflow_path
+
+    def observe(self, ref=None, *, public_available=True, observer=observe_integration_producer):
+        return super().observe(ref, public_available=public_available, observer=observer)
+
+    def test_cross_profile_and_operation_rejected(self):
+        from dataclasses import replace
+        self.observe()
+        with self.assertRaisesRegex(LedgerProducerError, "producer_policy_invalid"):
+            self.observe(observer=observe_ledger_producer)
+        integration_policy = self.policy
+        self.policy = LedgerProducerPolicy(41, self.sha, "b" * 40)
+        with self.assertRaisesRegex(LedgerProducerError, "producer_policy_invalid"):
+            self.observe()
+        with self.assertRaisesRegex(LedgerProducerError, "producer_operation_invalid"):
+            self.observe(observer=observe_ledger_producer)
+        self.policy = integration_policy
+        for operation in ("run.record_evidence", "run.record_remote_evidence", None):
+            self.bundle.parameters = {"operation": operation}
+            with self.subTest(operation=operation), self.assertRaisesRegex(LedgerProducerError, "producer_operation_invalid"):
+                self.observe()
+        self.bundle.parameters = {"operation": "task.complete_verified"}
+        for key, value in (("workflow_path", ".github/workflows/workspace-ledger-pilot.yml"),
+                           ("producer_job_name", "control"), ("artifact_prefix", "workspace-ledger-candidate")):
+            self.policy = replace(integration_policy, **{key: value})
+            with self.subTest(key=key), self.assertRaisesRegex(LedgerProducerError, "producer_policy_invalid"):
+                self.observe()
+
+    def test_wrong_profile_observations_rejected(self):
+        workflow = self.responses[self.root + "/actions/workflows/41"]
+        run = self.responses[self.root + "/actions/runs/51/attempts/1"]
+        for target, key, value in ((workflow, "path", ".github/workflows/workspace-ledger-pilot.yml"),
+                                   (run, "path", ".github/workflows/workspace-ledger-pilot.yml"),
+                                   (self.job, "name", "control"),
+                                   (self.artifact, "name", "workspace-ledger-candidate-51-1")):
+            old = target[key]
+            target[key] = value
+            with self.subTest(key=key), self.assertRaises(LedgerProducerError):
+                self.observe()
+            target[key] = old
 
 
 if __name__ == "__main__":

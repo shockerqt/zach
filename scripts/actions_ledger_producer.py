@@ -31,6 +31,19 @@ class LedgerProducerPolicy:
 
 
 @dataclass(frozen=True)
+class IntegrationProducerPolicy:
+    workflow_id: int
+    workflow_revision: str
+    tool_revision: str
+    repository_id: int = REPOSITORY_ID
+    repository_full_name: str = REPOSITORY
+    default_branch: str = "master"
+    workflow_path: str = ".github/workflows/workspace-operations.yml"
+    producer_job_name: str = "verify"
+    artifact_prefix: str = "workspace-integration-observation"
+
+
+@dataclass(frozen=True)
 class ArtifactReference:
     repository_id: int
     repository_full_name: str
@@ -97,17 +110,35 @@ def observe_ledger_producer(api, bundle, reference, policy, now):
         raise LedgerProducerError("producer_observation_invalid") from None
 
 
-def _observe(api, bundle, reference, policy, now):
-    _require(isinstance(policy, LedgerProducerPolicy) and isinstance(reference, ArtifactReference), "producer_policy_invalid")
+def observe_integration_producer(api, bundle, reference, policy, now):
+    """Observe the separate fixed verification producer; not closure authority."""
+    try:
+        return _observe(api, bundle, reference, policy, now, integration=True)
+    except LedgerProducerError:
+        raise
+    except Exception:
+        raise LedgerProducerError("producer_observation_invalid") from None
+
+
+def _observe(api, bundle, reference, policy, now, *, integration=False):
+    policy_type = IntegrationProducerPolicy if integration else LedgerProducerPolicy
+    workflow_path = (".github/workflows/workspace-operations.yml" if integration
+                     else ".github/workflows/workspace-ledger-pilot.yml")
+    job_name = "verify" if integration else "control"
+    artifact_prefix = "workspace-integration-observation" if integration else "workspace-ledger-candidate"
+    _require(isinstance(policy, policy_type) and isinstance(reference, ArtifactReference), "producer_policy_invalid")
     _require(policy.repository_id == REPOSITORY_ID and policy.repository_full_name == REPOSITORY
-             and policy.default_branch == "master" and policy.workflow_path == ".github/workflows/workspace-ledger-pilot.yml"
-             and policy.producer_job_name == "control" and policy.artifact_prefix == "workspace-ledger-candidate"
+             and policy.default_branch == "master" and policy.workflow_path == workflow_path
+             and policy.producer_job_name == job_name and policy.artifact_prefix == artifact_prefix
              and _id(policy.workflow_id) and _hash(policy.workflow_revision, 40) and _hash(policy.tool_revision, 40), "producer_policy_invalid")
     _require(reference.repository_id == REPOSITORY_ID and reference.repository_full_name == REPOSITORY
              and all(_id(getattr(reference, key)) for key in ("run_id", "run_attempt", "artifact_id"))
              and reference.run_attempt == 1 and _hash(reference.archive_sha256, 64)
              and _hash(reference.content_sha256, 64), "producer_reference_invalid")
     record = _validate_execution_bundle(bundle)
+    parameters = getattr(bundle, "parameters", None)
+    closure = isinstance(parameters, dict) and parameters.get("operation") == "task.complete_verified"
+    _require(closure if integration else not closure, "producer_operation_invalid")
     _require(bundle.operation == "governance.ledger" and record["policy_revision"] == policy.workflow_revision
              and bundle.execution_id == f"{reference.run_id}-1", "producer_bundle_mismatch")
     now = _time(now) if isinstance(now, str) else now
@@ -148,7 +179,7 @@ def _observe(api, bundle, reference, policy, now):
              and all(_same_id(run.get(key, {}).get("id"), REPOSITORY_ID) and run.get(key, {}).get("full_name") == REPOSITORY
                      for key in ("repository", "head_repository")), "producer_run_mismatch")
     jobs = _pages(get, f"{root}/actions/runs/{reference.run_id}/attempts/1/jobs", "jobs")
-    matches = [job for job in jobs if job.get("name") == "control"]
+    matches = [job for job in jobs if job.get("name") == job_name]
     _require(len(matches) == 1, "producer_job_ambiguous")
     job = matches[0]
     _require(_same_id(job.get("run_id"), reference.run_id) and _same_id(job.get("run_attempt"), 1)

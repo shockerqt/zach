@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use zach::ledger::candidate::{
-    TrustedLedgerContext, derive_actions_candidate, derive_candidate, read_bounded, write_private,
+    TrustedLedgerContext, derive_actions_candidate, derive_actions_closure_candidate,
+    derive_candidate, read_bounded, write_private,
 };
 
 fn run() -> Result<(), String> {
@@ -16,6 +17,7 @@ fn run() -> Result<(), String> {
             "--claim-revision",
             "--trusted-context",
             "--output",
+            "--profile",
         ]
         .contains(&flag.as_str())
         {
@@ -32,6 +34,11 @@ fn run() -> Result<(), String> {
             .ok_or_else(|| "arguments-invalid".to_owned())
     };
     let journal_mode = values.contains_key("--journal-record");
+    let closure = match values.get("--profile").map(String::as_str) {
+        None => false,
+        Some("integration-closure") if journal_mode => true,
+        _ => return Err("arguments-invalid".into()),
+    };
     let mode_fields = if journal_mode {
         [
             "--journal-record",
@@ -44,7 +51,7 @@ fn run() -> Result<(), String> {
     };
     if mode_fields.iter().any(|key| !values.contains_key(*key))
         || values.keys().any(|key| {
-            !["--mirror", "--trusted-context", "--output"].contains(&key.as_str())
+            !["--mirror", "--trusted-context", "--output", "--profile"].contains(&key.as_str())
                 && !mode_fields.contains(&key.as_str())
         })
     {
@@ -54,15 +61,25 @@ fn run() -> Result<(), String> {
     required("--output")?;
     let context = match values.get("--trusted-context") {
         Some(path) => {
-            TrustedLedgerContext::parse(&read_bounded(&PathBuf::from(path)).map_err(str::to_owned)?)
-                .map_err(str::to_owned)?
+            let text = read_bounded(&PathBuf::from(path)).map_err(str::to_owned)?;
+            (if closure {
+                TrustedLedgerContext::parse_closure(&text)
+            } else {
+                TrustedLedgerContext::parse(&text)
+            })
+            .map_err(str::to_owned)?
         }
+        None if closure => return Err("invalid-trusted-context".into()),
         None => TrustedLedgerContext::default(),
     };
     let result = if journal_mode {
         let journal =
             read_bounded(&PathBuf::from(required("--journal-record")?)).map_err(str::to_owned)?;
-        derive_actions_candidate(
+        (if closure {
+            derive_actions_closure_candidate
+        } else {
+            derive_actions_candidate
+        })(
             PathBuf::from(required("--mirror")?),
             &journal,
             required("--accepted-revision")?,

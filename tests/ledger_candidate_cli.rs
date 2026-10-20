@@ -1,6 +1,43 @@
 use std::process::Command;
 
 #[test]
+fn closure_profile_is_explicit_journal_only_and_requires_context() {
+    for (mode, expected) in [
+        (
+            vec!["--request", "/missing", "--accepted-at", "invalid"],
+            b"arguments-invalid\n".as_slice(),
+        ),
+        (
+            vec![
+                "--journal-record",
+                "/missing",
+                "--accepted-revision",
+                "invalid",
+                "--claim-revision",
+                "invalid",
+            ],
+            b"invalid-trusted-context\n".as_slice(),
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_zach-ledger-candidate"))
+            .args([
+                "--profile",
+                "integration-closure",
+                "--mirror",
+                "/missing",
+                "--output",
+                "/unused",
+            ])
+            .args(mode)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert_eq!(output.stderr, expected);
+    }
+}
+
+#[test]
 fn invalid_arguments_expose_only_codes() {
     for args in [
         vec![],
