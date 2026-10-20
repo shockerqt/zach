@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 pub const CANDIDATE_REVISION: &str = "7f7af5752ef2e016ffe7116f84648b3350fe507f";
 /// Integrated transport profile; does not replace the candidate tooling pin.
-pub const ACTIONS_TRANSPORT_REVISION: &str = "0cd08835a0dc778d687fd71f9f00c5499172bec4";
+pub const ACTIONS_TRANSPORT_REVISION: &str = "9cd4ca6a8457ee1a575f14bbf7afb914927c06be";
 pub const MAX_INPUT_BYTES: u64 = 256 * 1024;
 const OPERATIONS: &[&str] = &[
     "task.create",
