@@ -83,7 +83,7 @@ fails closed. Attempt-specific implementation CI URLs are currently unsupported
 and rejected instead of substituting the latest attempt.
 
 The output is plain observations, not an authenticated receipt or closure
-attestation. There is no CLI, new authentication path, durable store or writer.
+attestation. There is no new authentication path, durable store or lifecycle writer.
 The existing Actions journal must own acceptance, claims and replay. A separate
 Publisher must still authenticate the verification job and immutable artifact,
 bind their bytes to that accepted request, and apply the Governance closure
@@ -100,3 +100,13 @@ The serializer rejects inconsistent identities, unsuccessful CI, unrepresented
 merges, invalid timestamps and outstanding open PRs. Remote-only local cleanup
 is `not-applicable`. These deterministic bytes remain unauthenticated observations;
 they contain no verification envelope or job/artifact proof.
+
+The trusted read-only executable `zach-integration-observe --input /absolute/input.json
+--output /absolute/new-observation.json` accepts exactly `request` (Governance
+SHA, task/run/request IDs) and `bindings` (accepted journal SHA, request digest,
+policy/tool revisions, verified UTC time). Input is strict JSON capped at 16 KiB
+from a regular non-symlink file. The output uses exclusive creation with mode
+0600. It uses only `ZACH_INSTALLATION_TOKEN`, fixed GitHub/Governance routing and
+`.github/workflows/ci.yml` policy. It emits static failure codes and no success
+metadata on stdout. This executable is trusted tooling for the existing Actions
+owner, not a service, candidate-code runner, authenticator or publisher.
