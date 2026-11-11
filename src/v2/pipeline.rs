@@ -173,14 +173,34 @@ pub fn verify_worktree_diff(
     DiffCheckOutcome::Clean
 }
 
+pub fn unwrap_json_markdown(text: &str) -> String {
+    let mut current = text.trim().to_owned();
+    while current.starts_with('{') && current.ends_with('}') {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&current) {
+            let found = val
+                .get("review_markdown")
+                .or_else(|| val.get("summary"))
+                .or_else(|| val.get("response"))
+                .and_then(|v| v.as_str());
+            if let Some(inner) = found {
+                current = inner.trim().to_owned();
+                continue;
+            }
+        }
+        break;
+    }
+    current
+}
+
 /// Validates that a `pr-review` markdown output contains a 5-column AC verification
 /// table (`| AC | Criterion | Code (file:line) | Test | Status |`) with `PASS` and
 /// a `file:line` reference for every expected AC.
 pub fn validate_pr_review_table(markdown: &str, expected_ac_ids: &[String]) -> Result<(), String> {
-    let normalized = if markdown.contains("\\n") {
-        markdown.replace("\\n", "\n")
+    let unwrapped = unwrap_json_markdown(markdown);
+    let normalized = if unwrapped.contains("\\n") {
+        unwrapped.replace("\\n", "\n")
     } else {
-        markdown.to_owned()
+        unwrapped
     };
     let mut verified_acs = std::collections::BTreeMap::new();
 
@@ -520,8 +540,20 @@ pub fn parse_agy_cli_response(
         }
     }
 
+    if let Some(ref md) = review_markdown {
+        let unwrapped = unwrap_json_markdown(md);
+        if !unwrapped.is_empty() {
+            review_markdown = Some(unwrapped);
+        }
+    }
+
     if review_markdown.is_none() && summary.contains('|') {
-        review_markdown = Some(summary.clone());
+        let unwrapped = unwrap_json_markdown(&summary);
+        review_markdown = Some(if unwrapped.is_empty() {
+            summary.clone()
+        } else {
+            unwrapped
+        });
     }
 
     let invocation_id = json
@@ -2414,5 +2446,12 @@ mod tests {
         let escaped = "Summary\\n\\n| AC | Criterion | Code (file:line) | Test | Status |\\n|---|---|---|---|---|\\n| AC-1 | Feature works | src/lib.rs:10 | cargo test | PASS |\\n";
         let expected = vec!["AC-1".to_owned()];
         assert!(validate_pr_review_table(escaped, &expected).is_ok());
+    }
+
+    #[test]
+    fn validate_pr_review_table_unwraps_nested_json() {
+        let nested_json = r#"{"run_id":"test-123","review_markdown":"{\"status\":\"completed\",\"summary\":\"| AC | Criterion | Code (file:line) | Test | Status |\\n|---|---|---|---|---|\\n| AC-1 | Works | src/main.rs:1 | test_main | PASS |\\n\"}"}"#;
+        let expected = vec!["AC-1".to_owned()];
+        assert!(validate_pr_review_table(nested_json, &expected).is_ok());
     }
 }
