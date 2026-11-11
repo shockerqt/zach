@@ -380,6 +380,18 @@ impl StageExecutor for SystemdStageExecutor {
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let sha_after = git_head_sha(&spec.worktree_path);
+        let diff_files = collect_worktree_diff_entries(&spec.worktree_path);
+
+        if let Ok(mut parsed) =
+            crate::v2::pipeline::parse_agy_cli_response(&stdout, &stderr, output.status.code())
+        {
+            parsed.sha_before = sha_before;
+            parsed.sha_after = sha_after;
+            parsed.diff_files = diff_files;
+            return Ok(parsed);
+        }
+
         let status = if output.status.success() {
             "PASSED".to_owned()
         } else {
@@ -390,8 +402,6 @@ impl StageExecutor for SystemdStageExecutor {
         } else {
             stdout.lines().take(10).collect::<Vec<_>>().join("\n")
         };
-        let sha_after = git_head_sha(&spec.worktree_path);
-        let diff_files = collect_worktree_diff_entries(&spec.worktree_path);
 
         Ok(StageExecutionResult {
             status,
