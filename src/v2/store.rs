@@ -160,6 +160,24 @@ pub struct PendingDecisionRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PathLockRecord {
+    pub repo: String,
+    pub path: String,
+    pub task_id: String,
+    pub acquired_epoch: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MergeQueueRecord {
+    pub repo: String,
+    pub task_id: String,
+    pub pr_number: i64,
+    pub reviewed_sha: String,
+    pub enqueued_epoch: i64,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DecisionResolution {
     Resolved(PendingDecisionRecord),
     AlreadyResolved(PendingDecisionRecord),
@@ -981,20 +999,49 @@ impl V2Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        // If the repository already has a wildcard lock held by someone else, reject
+        let wildcard_holder: Option<String> = tx
+            .query_row(
+                "SELECT task_id FROM path_locks WHERE repo = ?1 AND path = '*'",
+                params![repo],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = wildcard_holder
+            && existing != task_id
+        {
+            return Ok(false);
+        }
+
         for path in paths {
-            let holder: Option<String> = tx
-                .query_row(
-                    "SELECT task_id FROM path_locks WHERE repo = ?1 AND path = ?2",
-                    params![repo, path],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(existing) = holder
-                && existing != task_id
-            {
-                return Ok(false);
+            if path == "*" {
+                let any_holder: Option<String> = tx
+                    .query_row(
+                        "SELECT task_id FROM path_locks WHERE repo = ?1 AND task_id != ?2 LIMIT 1",
+                        params![repo, task_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if any_holder.is_some() {
+                    return Ok(false);
+                }
+            } else {
+                let holder: Option<String> = tx
+                    .query_row(
+                        "SELECT task_id FROM path_locks WHERE repo = ?1 AND path = ?2",
+                        params![repo, path],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(existing) = holder
+                    && existing != task_id
+                {
+                    return Ok(false);
+                }
             }
         }
+
         for path in paths {
             tx.execute(
                 "INSERT INTO path_locks(repo, path, task_id, acquired_epoch)
@@ -1017,6 +1064,185 @@ impl V2Store {
         )?;
         tx.commit()?;
         Ok(removed)
+    }
+
+    pub fn list_path_locks(
+        &self,
+        repo_filter: Option<&str>,
+    ) -> Result<Vec<PathLockRecord>, V2StoreError> {
+        let mut locks = Vec::new();
+        if let Some(repo) = repo_filter {
+            let mut stmt = self.conn.prepare(
+                "SELECT repo, path, task_id, acquired_epoch
+                 FROM path_locks WHERE repo = ?1 ORDER BY path ASC",
+            )?;
+            let rows = stmt.query_map(params![repo], |row| {
+                Ok(PathLockRecord {
+                    repo: row.get(0)?,
+                    path: row.get(1)?,
+                    task_id: row.get(2)?,
+                    acquired_epoch: row.get(3)?,
+                })
+            })?;
+            for r in rows {
+                locks.push(r?);
+            }
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT repo, path, task_id, acquired_epoch
+                 FROM path_locks ORDER BY repo ASC, path ASC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(PathLockRecord {
+                    repo: row.get(0)?,
+                    path: row.get(1)?,
+                    task_id: row.get(2)?,
+                    acquired_epoch: row.get(3)?,
+                })
+            })?;
+            for r in rows {
+                locks.push(r?);
+            }
+        }
+        Ok(locks)
+    }
+
+    pub fn enqueue_merge_queue(
+        &mut self,
+        repo: &str,
+        task_id: &str,
+        pr_number: i64,
+        reviewed_sha: &str,
+    ) -> Result<MergeQueueRecord, V2StoreError> {
+        let now = now_epoch();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO merge_queue(repo, task_id, pr_number, reviewed_sha, enqueued_epoch, state)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'QUEUED')
+             ON CONFLICT(repo, task_id) DO UPDATE SET
+                 pr_number = excluded.pr_number,
+                 reviewed_sha = excluded.reviewed_sha,
+                 enqueued_epoch = excluded.enqueued_epoch,
+                 state = 'QUEUED'",
+            params![repo, task_id, pr_number, reviewed_sha, now],
+        )?;
+        let task_group: String = tx
+            .query_row(
+                "SELECT task_group FROM tasks WHERE task_id = ?1",
+                params![task_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| "default".to_owned());
+        Self::insert_event_tx(
+            &tx,
+            task_id,
+            &task_group,
+            now,
+            "MERGE_ENQUEUED",
+            &serde_json::json!({
+                "repo": repo,
+                "task_id": task_id,
+                "pr_number": pr_number,
+                "reviewed_sha": reviewed_sha,
+            }),
+        )?;
+        tx.commit()?;
+        Ok(MergeQueueRecord {
+            repo: repo.to_owned(),
+            task_id: task_id.to_owned(),
+            pr_number,
+            reviewed_sha: reviewed_sha.to_owned(),
+            enqueued_epoch: now,
+            state: "QUEUED".to_owned(),
+        })
+    }
+
+    pub fn list_merge_queue(
+        &self,
+        repo_filter: Option<&str>,
+    ) -> Result<Vec<MergeQueueRecord>, V2StoreError> {
+        let mut entries = Vec::new();
+        if let Some(repo) = repo_filter {
+            let mut stmt = self.conn.prepare(
+                "SELECT repo, task_id, pr_number, reviewed_sha, enqueued_epoch, state
+                 FROM merge_queue WHERE repo = ?1 ORDER BY enqueued_epoch ASC",
+            )?;
+            let rows = stmt.query_map(params![repo], Self::map_merge_queue_row)?;
+            for r in rows {
+                entries.push(r?);
+            }
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT repo, task_id, pr_number, reviewed_sha, enqueued_epoch, state
+                 FROM merge_queue ORDER BY enqueued_epoch ASC",
+            )?;
+            let rows = stmt.query_map([], Self::map_merge_queue_row)?;
+            for r in rows {
+                entries.push(r?);
+            }
+        }
+        Ok(entries)
+    }
+
+    pub fn get_merge_queue_entry(
+        &self,
+        repo: &str,
+        task_id: &str,
+    ) -> Result<Option<MergeQueueRecord>, V2StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT repo, task_id, pr_number, reviewed_sha, enqueued_epoch, state
+             FROM merge_queue WHERE repo = ?1 AND task_id = ?2",
+        )?;
+        stmt.query_row(params![repo, task_id], Self::map_merge_queue_row)
+            .optional()
+            .map_err(V2StoreError::from)
+    }
+
+    pub fn update_merge_queue_state(
+        &mut self,
+        repo: &str,
+        task_id: &str,
+        new_state: &str,
+    ) -> Result<(), V2StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE merge_queue SET state = ?3 WHERE repo = ?1 AND task_id = ?2",
+            params![repo, task_id, new_state],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn remove_merge_queue_entry(
+        &mut self,
+        repo: &str,
+        task_id: &str,
+    ) -> Result<usize, V2StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let removed = tx.execute(
+            "DELETE FROM merge_queue WHERE repo = ?1 AND task_id = ?2",
+            params![repo, task_id],
+        )?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    fn map_merge_queue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MergeQueueRecord> {
+        Ok(MergeQueueRecord {
+            repo: row.get(0)?,
+            task_id: row.get(1)?,
+            pr_number: row.get(2)?,
+            reviewed_sha: row.get(3)?,
+            enqueued_epoch: row.get(4)?,
+            state: row.get(5)?,
+        })
     }
 
     pub fn max_seq_id(&self) -> Result<i64, V2StoreError> {
@@ -1237,5 +1463,90 @@ mod tests {
         for pair in events.windows(2) {
             assert!(pair[1].seq_id > pair[0].seq_id);
         }
+    }
+
+    #[test]
+    fn merge_queue_and_path_locks_work_as_expected() {
+        let mut store = V2Store::open_in_memory().expect("open store");
+
+        // Path locks: acquire specific paths
+        let paths1 = vec!["src/v2/router.rs".to_owned(), "src/v2/runner.rs".to_owned()];
+        assert!(store.acquire_path_locks("zach", &paths1, "TASK-1").unwrap());
+
+        // Same task re-acquiring same paths succeeds
+        assert!(store.acquire_path_locks("zach", &paths1, "TASK-1").unwrap());
+
+        // Different task trying to acquire overlapping path fails
+        let paths2 = vec![
+            "src/v2/runner.rs".to_owned(),
+            "src/v2/pipeline.rs".to_owned(),
+        ];
+        assert!(!store.acquire_path_locks("zach", &paths2, "TASK-2").unwrap());
+
+        // Wildcard conflicts with existing paths
+        assert!(
+            !store
+                .acquire_path_locks("zach", &[String::from("*")], "TASK-3")
+                .unwrap()
+        );
+
+        // Non-overlapping paths in same repo succeed
+        assert!(
+            store
+                .acquire_path_locks("zach", &[String::from("src/v2/intake.rs")], "TASK-2")
+                .unwrap()
+        );
+
+        // Overlapping path in different repo succeeds
+        assert!(
+            store
+                .acquire_path_locks("governance", &paths1, "TASK-2")
+                .unwrap()
+        );
+
+        // Check list_path_locks
+        let zach_locks = store.list_path_locks(Some("zach")).unwrap();
+        assert_eq!(zach_locks.len(), 3);
+        let all_locks = store.list_path_locks(None).unwrap();
+        assert_eq!(all_locks.len(), 5);
+
+        // Release TASK-1 locks
+        let released = store.release_path_locks("TASK-1").unwrap();
+        assert_eq!(released, 2);
+        assert_eq!(store.list_path_locks(Some("zach")).unwrap().len(), 1);
+
+        // Merge queue FIFO operations
+        let entry1 = store
+            .enqueue_merge_queue("zach", "TASK-1", 101, "sha-1")
+            .unwrap();
+        assert_eq!(entry1.state, "QUEUED");
+        assert_eq!(entry1.pr_number, 101);
+
+        let entry2 = store
+            .enqueue_merge_queue("zach", "TASK-2", 102, "sha-2")
+            .unwrap();
+        assert_eq!(entry2.state, "QUEUED");
+
+        let mq = store.list_merge_queue(Some("zach")).unwrap();
+        assert_eq!(mq.len(), 2);
+        assert_eq!(mq[0].task_id, "TASK-1");
+        assert_eq!(mq[1].task_id, "TASK-2");
+
+        // Update state
+        store
+            .update_merge_queue_state("zach", "TASK-1", "MERGING")
+            .unwrap();
+        let fetched = store
+            .get_merge_queue_entry("zach", "TASK-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.state, "MERGING");
+
+        // Remove entry
+        let removed = store.remove_merge_queue_entry("zach", "TASK-1").unwrap();
+        assert_eq!(removed, 1);
+        let remaining = store.list_merge_queue(Some("zach")).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].task_id, "TASK-2");
     }
 }
