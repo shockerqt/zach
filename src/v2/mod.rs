@@ -1,7 +1,9 @@
 pub mod intake;
+pub mod merge_queue;
 pub mod pipeline;
 pub mod router;
 pub mod runner;
+pub mod scheduler;
 pub mod store;
 
 use std::env;
@@ -48,4 +50,13 @@ pub fn default_ws_task_bin() -> PathBuf {
         return PathBuf::from(bin);
     }
     PathBuf::from("/home/ubuntu/workspace/governance/bin/ws-task")
+}
+
+pub fn default_gemini_worker_cli() -> PathBuf {
+    if let Ok(script) = env::var("ZACH_GEMINI_WORKER_CLI")
+        && !script.trim().is_empty()
+    {
+        return PathBuf::from(script);
+    }
+    PathBuf::from("/home/ubuntu/workspace/agent-tooling/plugins/gemini-worker/scripts/worker.mjs")
 }

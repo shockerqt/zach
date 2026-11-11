@@ -4,8 +4,10 @@ use std::path::PathBuf;
 
 use zach::ledger;
 use zach::v2::intake::{ingest_export_json, sync_from_ws_task};
-use zach::v2::pipeline::{execute_xs_s_pipeline, plan_task_execution};
+use zach::v2::merge_queue::{SystemMergeDriver, process_repo_merge_queue};
+use zach::v2::pipeline::{execute_m_l_pipeline, execute_xs_s_pipeline, plan_task_execution};
 use zach::v2::runner::reconcile_orphan_units;
+use zach::v2::scheduler::HeavyCheckSemaphore;
 use zach::v2::store::{DecisionResolution, V2Store};
 use zach::v2::{default_db_path, default_ws_task_bin};
 use zach::{AuditRequest, GithubConfig, audit_task_integration};
@@ -103,6 +105,33 @@ fn run_v2_queue(args: &[String]) {
         if let Err(error) = sync_from_ws_task(&mut store, &ws_task) {
             eprintln!("warning: ws-task sync failed: {error}");
         }
+    }
+    if has_flag(args, "--merge-queue") {
+        let entries = store.list_merge_queue(None).unwrap_or_else(|error| {
+            eprintln!("merge queue query failed: {error}");
+            std::process::exit(1);
+        });
+        if has_flag(args, "--json") {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_owned())
+            );
+        } else if entries.is_empty() {
+            println!("Merge queue is empty.");
+        } else {
+            for entry in &entries {
+                let sha_short = if entry.reviewed_sha.len() > 8 {
+                    &entry.reviewed_sha[..8]
+                } else {
+                    &entry.reviewed_sha
+                };
+                println!(
+                    "{:<16} {:<10} PR #{:<5} sha={:<8} state={}",
+                    entry.repo, entry.task_id, entry.pr_number, sha_short, entry.state
+                );
+            }
+        }
+        return;
     }
     let group = flag_value(args, "--group");
     let queue = store
@@ -279,7 +308,12 @@ fn run_v2_run(args: &[String]) {
                 std::process::exit(1);
             });
         if !dry_run {
-            queue.retain(|t| matches!(t.weight.to_ascii_uppercase().as_str(), "XS" | "S"));
+            queue.retain(|t| {
+                matches!(
+                    t.weight.to_ascii_uppercase().as_str(),
+                    "XS" | "S" | "M" | "L"
+                )
+            });
         }
         if once && queue.len() > 1 {
             queue.truncate(1);
@@ -307,7 +341,11 @@ fn run_v2_run(args: &[String]) {
 
     let mut completed = Vec::new();
     for task in &tasks {
-        match execute_xs_s_pipeline(&mut store, &task.task_id) {
+        let res = match task.weight.to_ascii_uppercase().as_str() {
+            "M" | "L" => execute_m_l_pipeline(&mut store, &task.task_id),
+            _ => execute_xs_s_pipeline(&mut store, &task.task_id),
+        };
+        match res {
             Ok(updated) => completed.push(updated),
             Err(error) => {
                 eprintln!("pipeline execution failed for {}: {error}", task.task_id);
@@ -317,6 +355,22 @@ fn run_v2_run(args: &[String]) {
         if once {
             break;
         }
+    }
+
+    // Process per-repository merge queue
+    let semaphore = HeavyCheckSemaphore::new();
+    let mut driver = SystemMergeDriver;
+    let repos: Vec<String> = store
+        .list_merge_queue(None)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| e.repo)
+        .collect();
+    let mut unique_repos = repos;
+    unique_repos.sort();
+    unique_repos.dedup();
+    for repo in unique_repos {
+        let _ = process_repo_merge_queue(&mut store, &repo, &mut driver, &semaphore);
     }
 
     println!(
@@ -378,7 +432,7 @@ fn print_usage() {
         "       zach governance.audit-task-integration --task-id <TASK-ID> --request-id <REQUEST-ID>"
     );
     println!("       zach status [--sync] [--json] [--db <PATH>]");
-    println!("       zach queue [--group <GROUP>] [--sync] [--json] [--db <PATH>]");
+    println!("       zach queue [--group <GROUP>] [--merge-queue] [--sync] [--json] [--db <PATH>]");
     println!("       zach decisions [--group <GROUP>] [--all] [--json] [--db <PATH>]");
     println!(
         "       zach decide <DECISION_ID> --choice <CHOICE> [--by <ACTOR>] [--note <NOTE>] [--db <PATH>]"
