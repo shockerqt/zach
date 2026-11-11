@@ -218,7 +218,11 @@ pub fn validate_pr_review_table(markdown: &str, expected_ac_ids: &[String]) -> R
                 "PR review row for '{ac_id}' is missing test evidence in column 4"
             ));
         }
-        if !status.eq_ignore_ascii_case("PASS") {
+        let is_pass = status.eq_ignore_ascii_case("PASS")
+            || status.eq_ignore_ascii_case("MET")
+            || status.eq_ignore_ascii_case("VERIFIED")
+            || status.eq_ignore_ascii_case("OK");
+        if !is_pass {
             return Err(format!(
                 "PR review row for '{ac_id}' did not PASS (status='{status}')"
             ));
@@ -2372,5 +2376,17 @@ mod tests {
         assert_eq!(mock.executed_routes.len(), 1);
         assert_eq!(mock.executed_routes[0].family, ModelFamily::OpenAiSol);
         assert_eq!(mock.executed_routes[0].model, "gpt-6.1-sol");
+    }
+
+    #[test]
+    fn validate_pr_review_table_accepts_met_and_verified() {
+        let md = "\
+| AC | Criterion | Code (file:line) | Test | Status |
+|---|---|---|---|---|
+| AC-1 | Feature works | src/lib.rs:10 | cargo test | Met |
+| AC-2 | API works | src/api.rs:20 | cargo test | Verified |
+";
+        let expected = vec!["AC-1".to_owned(), "AC-2".to_owned()];
+        assert!(validate_pr_review_table(md, &expected).is_ok());
     }
 }
