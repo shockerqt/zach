@@ -1,0 +1,48 @@
+pub mod intake;
+pub mod store;
+
+use std::env;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub const SCHEMA_VERSION: u32 = 2;
+
+pub fn now_epoch() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+pub fn default_state_dir() -> PathBuf {
+    if let Ok(dir) = env::var("ZACH_STATE_DIR")
+        && !dir.trim().is_empty()
+    {
+        return PathBuf::from(dir);
+    }
+    if let Ok(xdg) = env::var("XDG_STATE_HOME")
+        && !xdg.trim().is_empty()
+    {
+        return PathBuf::from(xdg).join("zach");
+    }
+    let home = env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_owned());
+    PathBuf::from(home).join(".local/state/zach")
+}
+
+pub fn default_db_path() -> PathBuf {
+    if let Ok(path) = env::var("ZACH_DB_PATH")
+        && !path.trim().is_empty()
+    {
+        return PathBuf::from(path);
+    }
+    default_state_dir().join("zach-v2.sqlite3")
+}
+
+pub fn default_ws_task_bin() -> PathBuf {
+    if let Ok(bin) = env::var("ZACH_WS_TASK_BIN")
+        && !bin.trim().is_empty()
+    {
+        return PathBuf::from(bin);
+    }
+    PathBuf::from("/home/ubuntu/workspace/governance/bin/ws-task")
+}
