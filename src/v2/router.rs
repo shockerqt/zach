@@ -312,6 +312,21 @@ pub fn resolve_stage_route(
         _ => return Err(format!("unsupported stage '{stage}' for weight '{weight}'")),
     };
 
+    let mut route = route;
+    let force_flash = std::env::var("ZACH_USE_FLASH_ONLY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let forced_model = std::env::var("ZACH_FORCE_MODEL").ok();
+    if force_flash || forced_model.is_some() {
+        let target_model = forced_model.unwrap_or_else(|| "gemini-3.8-flash-high".to_owned());
+        route.family = ModelFamily::GeminiAgy;
+        route.model = target_model;
+        route.effort = ReasoningEffort::High;
+        route.fallback_family = None;
+        route.fallback_model = None;
+        route.fallback_effort = None;
+    }
+
     validate_daemon_model(&route.model)?;
     if let Some(ref fb) = route.fallback_model {
         validate_daemon_model(fb)?;
@@ -453,5 +468,18 @@ mod tests {
         let xs_impl = resolve_stage_route("XS", "impl", 0, None).unwrap().unwrap();
         assert_eq!(xs_impl.effort, ReasoningEffort::Low);
         assert_eq!(xs_impl.max_task_tokens, 150_000);
+    }
+
+    #[test]
+    fn router_honors_flash_only_env_override() {
+        unsafe {
+            std::env::set_var("ZACH_USE_FLASH_ONLY", "1");
+        }
+        let route = resolve_stage_route("S", "impl", 0, None).unwrap().unwrap();
+        assert_eq!(route.family, ModelFamily::GeminiAgy);
+        assert_eq!(route.model, "gemini-3.8-flash-high");
+        unsafe {
+            std::env::remove_var("ZACH_USE_FLASH_ONLY");
+        }
     }
 }

@@ -191,6 +191,7 @@ pub fn build_systemd_stage_command_with_env(
         "--user".to_owned(),
         "--collect".to_owned(),
         "--wait".to_owned(),
+        "--pipe".to_owned(),
         format!("--unit={unit_name}"),
         "--slice=zach-workers.slice".to_owned(),
         "-p".to_owned(),
@@ -429,10 +430,119 @@ impl StageExecutor for SystemdStageExecutor {
 
     fn finalize_xs_s_delivery(
         &mut self,
-        _task: &TaskRecord,
+        task: &TaskRecord,
         _reviewed_sha: &str,
     ) -> Result<Option<i64>, String> {
-        Ok(None)
+        let worktree_path = match task.worktree_path.as_deref() {
+            Some(w) if !w.is_empty() => w,
+            _ => return Ok(None),
+        };
+
+        // 1. Commit uncommitted changes if worktree is dirty
+        let status_out = Command::new("git")
+            .args(["-C", worktree_path, "status", "--porcelain"])
+            .output()
+            .map_err(|e| format!("failed to check git status: {e}"))?;
+        let status_str = String::from_utf8_lossy(&status_out.stdout);
+        if !status_str.trim().is_empty() {
+            let add_out = Command::new("git")
+                .args(["-C", worktree_path, "add", "-A"])
+                .output()
+                .map_err(|e| format!("git add failed: {e}"))?;
+            if !add_out.status.success() {
+                return Err(format!(
+                    "git add failed: {}",
+                    String::from_utf8_lossy(&add_out.stderr)
+                ));
+            }
+
+            let commit_msg = format!(
+                "feat({}): {}\n\nGovernance-Task: {}\nZach-Attempt: {}",
+                task.task_id.to_ascii_lowercase(),
+                task.title,
+                task.task_id,
+                task.active_attempt_id.as_deref().unwrap_or("none")
+            );
+            let commit_out = Command::new("git")
+                .args(["-C", worktree_path, "commit", "-m", &commit_msg])
+                .output()
+                .map_err(|e| format!("git commit failed: {e}"))?;
+            if !commit_out.status.success() {
+                return Err(format!(
+                    "git commit failed: {}",
+                    String::from_utf8_lossy(&commit_out.stderr)
+                ));
+            }
+        }
+
+        // 2. Push branch
+        let branch = match task.branch.as_deref() {
+            Some(b) if !b.is_empty() && b != "none" => b,
+            _ => return Ok(None),
+        };
+
+        let push_out = Command::new("git")
+            .args(["-C", worktree_path, "push", "-u", "origin", branch])
+            .output()
+            .map_err(|e| format!("git push failed: {e}"))?;
+        if !push_out.status.success() {
+            return Err(format!(
+                "git push failed: {}",
+                String::from_utf8_lossy(&push_out.stderr)
+            ));
+        }
+
+        // 3. Find or create PR
+        let gh_repo = task.github_repo.as_deref().unwrap_or(&task.repository);
+        let list_out = Command::new("gh")
+            .args([
+                "pr",
+                "list",
+                "--repo",
+                gh_repo,
+                "--head",
+                branch,
+                "--json",
+                "number",
+                "-q",
+                ".[0].number",
+            ])
+            .output();
+
+        if let Ok(lo) = list_out {
+            let num_str = String::from_utf8_lossy(&lo.stdout).trim().to_owned();
+            if let Ok(num) = num_str.parse::<i64>() {
+                return Ok(Some(num));
+            }
+        }
+
+        let body = format!(
+            "Closes #{}\n\nGovernance-Task: {}",
+            task.issue_number.unwrap_or(0),
+            task.task_id
+        );
+        let title = format!("{}: {}", task.task_id, task.title);
+        let create_out = Command::new("gh")
+            .args([
+                "pr", "create", "--repo", gh_repo, "--head", branch, "--title", &title, "--body",
+                &body,
+            ])
+            .output()
+            .map_err(|e| format!("gh pr create failed: {e}"))?;
+
+        if !create_out.status.success() {
+            let err = String::from_utf8_lossy(&create_out.stderr);
+            return Err(format!("gh pr create failed: {err}"));
+        }
+
+        let pr_url = String::from_utf8_lossy(&create_out.stdout);
+        let pr_num = pr_url
+            .trim()
+            .rsplit('/')
+            .next()
+            .and_then(|s| s.parse::<i64>().ok());
+
+        Ok(pr_num)
     }
 }
 
