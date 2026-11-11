@@ -6,12 +6,24 @@ pub mod runner;
 pub mod scheduler;
 pub mod socket;
 pub mod store;
+pub mod web_gateway;
 
 use std::env;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const SCHEMA_VERSION: u32 = 2;
+pub const DEFAULT_WEB_PORT: u16 = 8096;
+pub const DEFAULT_WEB_ADDR: &str = "127.0.0.1:8096";
+
+pub fn default_web_addr() -> String {
+    if let Ok(addr) = env::var("ZACH_WEB_ADDR")
+        && !addr.trim().is_empty()
+    {
+        return addr;
+    }
+    format!("127.0.0.1:{DEFAULT_WEB_PORT}")
+}
 
 pub fn now_epoch() -> i64 {
     SystemTime::now()

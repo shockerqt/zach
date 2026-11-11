@@ -10,7 +10,8 @@ use zach::v2::runner::reconcile_orphan_units;
 use zach::v2::scheduler::HeavyCheckSemaphore;
 use zach::v2::socket::{ClientCommand, DaemonServer, write_ndjson};
 use zach::v2::store::{DecisionResolution, V2Store};
-use zach::v2::{default_db_path, default_socket_path, default_ws_task_bin};
+use zach::v2::web_gateway::WebGateway;
+use zach::v2::{DEFAULT_WEB_PORT, default_db_path, default_socket_path, default_ws_task_bin};
 use zach::{AuditRequest, GithubConfig, audit_task_integration};
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8090";
@@ -50,6 +51,7 @@ fn main() {
         "daemon" | "zachd" => run_v2_daemon(&args[2..]),
         "attach" => run_v2_attach(&args[2..]),
         "events" => run_v2_events(&args[2..]),
+        "web" => run_v2_web(&args[2..]),
         "--help" | "-h" => print_usage(),
         unknown => {
             eprintln!("unknown option: {unknown}");
@@ -445,6 +447,31 @@ fn run_v2_daemon(args: &[String]) {
         std::process::exit(1);
     });
 
+    let web_enabled = has_flag(args, "--web")
+        || flag_value(args, "--web-port").is_some()
+        || flag_value(args, "--port").is_some();
+    let web_gateway = if web_enabled {
+        let port = flag_value(args, "--web-port")
+            .or_else(|| flag_value(args, "--port"))
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(DEFAULT_WEB_PORT);
+        let db_path = flag_value(args, "--db")
+            .map(PathBuf::from)
+            .unwrap_or_else(default_db_path);
+        let bind_addr = format!("127.0.0.1:{port}");
+        let gateway = WebGateway::new(bind_addr.clone(), db_path, socket_path.clone());
+        let gw_clone = gateway.clone();
+        println!("zachd: web gateway listening on http://{bind_addr}");
+        std::thread::spawn(move || {
+            if let Err(e) = gw_clone.run_loop() {
+                eprintln!("web gateway error: {e}");
+            }
+        });
+        Some(gateway)
+    } else {
+        None
+    };
+
     println!(
         "zachd started · socket={} · initial_seq={} · once={}",
         socket_path.display(),
@@ -454,10 +481,43 @@ fn run_v2_daemon(args: &[String]) {
 
     if let Err(error) = server.run_loop(&mut store, once) {
         eprintln!("daemon error: {error}");
+        if let Some(gw) = web_gateway {
+            gw.request_shutdown();
+        }
         std::process::exit(1);
+    }
+    if let Some(gw) = web_gateway {
+        gw.request_shutdown();
     }
     if once {
         println!("zachd: completed single loop execution");
+    }
+}
+
+fn run_v2_web(args: &[String]) {
+    let db_path = flag_value(args, "--db")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_db_path);
+    let socket_path = flag_value(args, "--socket")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_socket_path);
+    let port = flag_value(args, "--web-port")
+        .or_else(|| flag_value(args, "--port"))
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(DEFAULT_WEB_PORT);
+    let bind_addr = flag_value(args, "--bind").unwrap_or_else(|| format!("127.0.0.1:{port}"));
+
+    let gateway = WebGateway::new(bind_addr.clone(), db_path.clone(), socket_path.clone());
+    println!(
+        "zach web gateway listening on http://{} · db={} · socket={}",
+        bind_addr,
+        db_path.display(),
+        socket_path.display()
+    );
+
+    if let Err(error) = gateway.run_loop() {
+        eprintln!("web gateway error: {error}");
+        std::process::exit(1);
     }
 }
 
@@ -580,11 +640,14 @@ fn print_usage() {
     println!(
         "       zach run [--task <TASK_ID>] [--group <GROUP>] [--once] [--dry-run] [--json] [--db <PATH>]"
     );
-    println!("       zach daemon [--socket <PATH>] [--db <PATH>] [--once]");
+    println!(
+        "       zach daemon [--socket <PATH>] [--db <PATH>] [--web] [--web-port <PORT>] [--once]"
+    );
     println!("       zach attach [--group <GROUP>] [--since-seq <N>] [--once] [--socket <PATH>]");
     println!(
         "       zach events [--group <GROUP>] [--since-seq <N>] [--wait] [--socket <PATH>] [--db <PATH>]"
     );
+    println!("       zach web [--web-port <PORT>] [--bind <ADDR>] [--socket <PATH>] [--db <PATH>]");
 }
 
 #[cfg(test)]
@@ -594,6 +657,11 @@ mod tests {
     #[test]
     fn default_bind_address_is_loopback() {
         assert_eq!(DEFAULT_BIND_ADDR, "127.0.0.1:8090");
+    }
+
+    #[test]
+    fn default_web_port_is_8096() {
+        assert_eq!(DEFAULT_WEB_PORT, 8096);
     }
 
     #[test]
