@@ -358,6 +358,50 @@ pub fn build_agy_cli_payload(
     })
 }
 
+pub fn build_impl_prompt(task: &TaskRecord, worktree_path: &str) -> String {
+    let mut prompt = format!(
+        "Implement task {} ({}) inside governed worktree {}.\n",
+        task.task_id, task.title, worktree_path
+    );
+    if !task.context_pack.acceptance_criteria.is_empty() {
+        prompt.push_str("\n## Acceptance Criteria:\n");
+        for ac in &task.context_pack.acceptance_criteria {
+            prompt.push_str(&format!("- {}: {}\n", ac.id, ac.description));
+        }
+    }
+    if !task.context_pack.target_files.is_empty() {
+        prompt.push_str("\n## Target Files:\n");
+        for tf in &task.context_pack.target_files {
+            prompt.push_str(&format!(
+                "- {} (action: {}, summary: {})\n",
+                tf.path, tf.action, tf.summary
+            ));
+        }
+    }
+    if !task.context_pack.verification_commands.is_empty() {
+        prompt.push_str("\n## Verification Commands:\n");
+        for cmd in &task.context_pack.verification_commands {
+            prompt.push_str(&format!("- {}\n", cmd));
+        }
+    }
+    prompt
+}
+
+pub fn build_pr_review_prompt(task: &TaskRecord, worktree_path: &str) -> String {
+    let mut prompt = format!(
+        "Review implementation of task {} ({}) inside worktree {}.\n\
+         You MUST inspect the code changes and test execution.\n\
+         You MUST output a 5-column markdown table in the exact format:\n\
+         | AC | Criterion | Code (file:line) | Test | Status |\n\
+         |---|---|---|---|---|\n",
+        task.task_id, task.title, worktree_path
+    );
+    for ac in &task.context_pack.acceptance_criteria {
+        prompt.push_str(&format!("Verify AC: {} - {}\n", ac.id, ac.description));
+    }
+    prompt
+}
+
 /// Parses the JSON stdout/stderr produced by `worker.mjs --cli`, mapping infrastructure
 /// failures to `AGY_STATUS`, `AGY_EXIT`, `AGY_TIMEOUT`, or `AGY_SPAWN`.
 pub fn parse_agy_cli_response(
@@ -437,6 +481,7 @@ pub fn parse_agy_cli_response(
 
     let summary = json
         .get("summary")
+        .or_else(|| json.get("response"))
         .and_then(|v| v.as_str())
         .unwrap_or("AGY worker completed successfully")
         .to_owned();
@@ -445,6 +490,7 @@ pub fn parse_agy_cli_response(
         .get("review_markdown")
         .or_else(|| json.get("review"))
         .or_else(|| json.get("review_target"))
+        .or_else(|| json.get("response"))
         .and_then(|v| v.as_str())
         .map(str::to_owned)
         .or_else(|| {
@@ -561,10 +607,7 @@ pub fn execute_xs_s_pipeline_with_executor(
         task.task_id.to_ascii_lowercase(),
         task.version
     );
-    let impl_prompt = format!(
-        "Implement task {} ({}) inside governed worktree {}",
-        task.task_id, task.title, worktree_path
-    );
+    let impl_prompt = build_impl_prompt(&task, &worktree_path);
     let impl_spec =
         build_systemd_stage_command(&task, &impl_attempt_id, &impl_route, &impl_prompt)?;
 
@@ -729,10 +772,7 @@ pub fn execute_xs_s_pipeline_with_executor(
             task.task_id.to_ascii_lowercase(),
             task.version
         );
-        let rev_prompt = format!(
-            "Review implementation of {} ({}) and produce AC verification table",
-            task.task_id, task.title
-        );
+        let rev_prompt = build_pr_review_prompt(&task, &worktree_path);
         let rev_spec =
             build_systemd_stage_command(&task, &rev_attempt_id, &review_route, &rev_prompt)?;
 
@@ -1295,10 +1335,7 @@ pub fn execute_m_l_pipeline_with_executor(
             task.task_id.to_ascii_lowercase(),
             task.version
         );
-        let impl_prompt = format!(
-            "Implement task {} ({}) inside governed worktree {}",
-            task.task_id, task.title, worktree_path
-        );
+        let impl_prompt = build_impl_prompt(&task, &worktree_path);
         let impl_spec =
             build_systemd_stage_command(&task, &impl_attempt_id, &impl_route, &impl_prompt)?;
 
@@ -1495,10 +1532,7 @@ pub fn execute_m_l_pipeline_with_executor(
             task.task_id.to_ascii_lowercase(),
             task.version
         );
-        let rev_prompt = format!(
-            "Review implementation of {} ({}) and produce AC verification table",
-            task.task_id, task.title
-        );
+        let rev_prompt = build_pr_review_prompt(&task, &worktree_path);
         let rev_spec =
             build_systemd_stage_command(&task, &rev_attempt_id, &rev_route, &rev_prompt)?;
 
