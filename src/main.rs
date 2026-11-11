@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use zach::ledger;
 use zach::v2::intake::{ingest_export_json, sync_from_ws_task};
+use zach::v2::pipeline::{execute_xs_s_pipeline, plan_task_execution};
+use zach::v2::runner::reconcile_orphan_units;
 use zach::v2::store::{DecisionResolution, V2Store};
 use zach::v2::{default_db_path, default_ws_task_bin};
 use zach::{AuditRequest, GithubConfig, audit_task_integration};
@@ -41,6 +43,7 @@ fn main() {
         "decide" => run_v2_decide(&args[2..]),
         "sync" => run_v2_sync(&args[2..]),
         "config" => run_v2_config(&args[2..]),
+        "run" => run_v2_run(&args[2..]),
         "--help" | "-h" => print_usage(),
         unknown => {
             eprintln!("unknown option: {unknown}");
@@ -248,6 +251,80 @@ fn run_v2_config(args: &[String]) {
     println!("max_parallel_tasks={max_parallel}");
 }
 
+fn run_v2_run(args: &[String]) {
+    let mut store = open_store(args);
+    let _ = reconcile_orphan_units(&mut store);
+
+    let dry_run = has_flag(args, "--dry-run");
+    let once = has_flag(args, "--once");
+    let group = flag_value(args, "--group");
+
+    let tasks = if let Some(task_id) = flag_value(args, "--task") {
+        match store.get_task(&task_id) {
+            Ok(Some(t)) => vec![t],
+            Ok(None) => {
+                eprintln!("task not found: {task_id}");
+                std::process::exit(1);
+            }
+            Err(error) => {
+                eprintln!("failed to query task {task_id}: {error}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        let mut queue = store
+            .list_ready_queue(group.as_deref())
+            .unwrap_or_else(|error| {
+                eprintln!("failed to query ready queue: {error}");
+                std::process::exit(1);
+            });
+        if !dry_run {
+            queue.retain(|t| matches!(t.weight.to_ascii_uppercase().as_str(), "XS" | "S"));
+        }
+        if once && queue.len() > 1 {
+            queue.truncate(1);
+        }
+        queue
+    };
+
+    if dry_run {
+        let mut plans = Vec::new();
+        for task in &tasks {
+            match plan_task_execution(task) {
+                Ok(plan) => plans.push(plan),
+                Err(error) => {
+                    eprintln!("dry-run planning failed for {}: {error}", task.task_id);
+                    std::process::exit(1);
+                }
+            }
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&plans).unwrap_or_else(|_| "[]".to_owned())
+        );
+        return;
+    }
+
+    let mut completed = Vec::new();
+    for task in &tasks {
+        match execute_xs_s_pipeline(&mut store, &task.task_id) {
+            Ok(updated) => completed.push(updated),
+            Err(error) => {
+                eprintln!("pipeline execution failed for {}: {error}", task.task_id);
+                std::process::exit(1);
+            }
+        }
+        if once {
+            break;
+        }
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&completed).unwrap_or_else(|_| "[]".to_owned())
+    );
+}
+
 fn run_ledger_validator(config: &BootstrapConfig) {
     if let Err(error) = ledger::serve_from_env(&config.bind_addr) {
         eprintln!("ledger validator failed: {error}");
@@ -308,6 +385,9 @@ fn print_usage() {
     );
     println!("       zach sync [--export-file <PATH>] [--ws-task-bin <PATH>] [--db <PATH>]");
     println!("       zach config [--max-parallel <1..16>] [--db <PATH>]");
+    println!(
+        "       zach run [--task <TASK_ID>] [--group <GROUP>] [--once] [--dry-run] [--json] [--db <PATH>]"
+    );
 }
 
 #[cfg(test)]
