@@ -173,13 +173,38 @@ pub fn verify_worktree_diff(
     DiffCheckOutcome::Clean
 }
 
+pub fn unwrap_json_markdown(text: &str) -> String {
+    let mut current = text.trim().to_owned();
+    while current.starts_with('{') && current.ends_with('}') {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&current) {
+            let found = val
+                .get("review_markdown")
+                .or_else(|| val.get("summary"))
+                .or_else(|| val.get("response"))
+                .and_then(|v| v.as_str());
+            if let Some(inner) = found {
+                current = inner.trim().to_owned();
+                continue;
+            }
+        }
+        break;
+    }
+    current
+}
+
 /// Validates that a `pr-review` markdown output contains a 5-column AC verification
 /// table (`| AC | Criterion | Code (file:line) | Test | Status |`) with `PASS` and
 /// a `file:line` reference for every expected AC.
 pub fn validate_pr_review_table(markdown: &str, expected_ac_ids: &[String]) -> Result<(), String> {
+    let unwrapped = unwrap_json_markdown(markdown);
+    let normalized = if unwrapped.contains("\\n") {
+        unwrapped.replace("\\n", "\n")
+    } else {
+        unwrapped
+    };
     let mut verified_acs = std::collections::BTreeMap::new();
 
-    for line in markdown.lines() {
+    for line in normalized.lines() {
         let trimmed = line.trim();
         if !trimmed.starts_with('|') || !trimmed.ends_with('|') {
             continue;
@@ -218,7 +243,11 @@ pub fn validate_pr_review_table(markdown: &str, expected_ac_ids: &[String]) -> R
                 "PR review row for '{ac_id}' is missing test evidence in column 4"
             ));
         }
-        if !status.eq_ignore_ascii_case("PASS") {
+        let is_pass = status.eq_ignore_ascii_case("PASS")
+            || status.eq_ignore_ascii_case("MET")
+            || status.eq_ignore_ascii_case("VERIFIED")
+            || status.eq_ignore_ascii_case("OK");
+        if !is_pass {
             return Err(format!(
                 "PR review row for '{ac_id}' did not PASS (status='{status}')"
             ));
@@ -486,20 +515,46 @@ pub fn parse_agy_cli_response(
         .unwrap_or("AGY worker completed successfully")
         .to_owned();
 
-    let review_markdown = json
+    let mut review_markdown = json
         .get("review_markdown")
         .or_else(|| json.get("review"))
         .or_else(|| json.get("review_target"))
-        .or_else(|| json.get("response"))
         .and_then(|v| v.as_str())
-        .map(str::to_owned)
-        .or_else(|| {
-            if summary.contains('|') {
-                Some(summary.clone())
+        .map(str::to_owned);
+
+    if review_markdown.is_none()
+        && let Some(resp_str) = json.get("response").and_then(|v| v.as_str())
+    {
+        if let Ok(inner_json) = serde_json::from_str::<serde_json::Value>(resp_str) {
+            if let Some(inner_summary) = inner_json.get("summary").and_then(|v| v.as_str()) {
+                review_markdown = Some(inner_summary.to_owned());
+            } else if let Some(inner_md) =
+                inner_json.get("review_markdown").and_then(|v| v.as_str())
+            {
+                review_markdown = Some(inner_md.to_owned());
             } else {
-                None
+                review_markdown = Some(resp_str.to_owned());
             }
+        } else {
+            review_markdown = Some(resp_str.to_owned());
+        }
+    }
+
+    if let Some(ref md) = review_markdown {
+        let unwrapped = unwrap_json_markdown(md);
+        if !unwrapped.is_empty() {
+            review_markdown = Some(unwrapped);
+        }
+    }
+
+    if review_markdown.is_none() && summary.contains('|') {
+        let unwrapped = unwrap_json_markdown(&summary);
+        review_markdown = Some(if unwrapped.is_empty() {
+            summary.clone()
+        } else {
+            unwrapped
         });
+    }
 
     let invocation_id = json
         .get("orchestration_id")
@@ -2372,5 +2427,31 @@ mod tests {
         assert_eq!(mock.executed_routes.len(), 1);
         assert_eq!(mock.executed_routes[0].family, ModelFamily::OpenAiSol);
         assert_eq!(mock.executed_routes[0].model, "gpt-6.1-sol");
+    }
+
+    #[test]
+    fn validate_pr_review_table_accepts_met_and_verified() {
+        let md = "\
+| AC | Criterion | Code (file:line) | Test | Status |
+|---|---|---|---|---|
+| AC-1 | Feature works | src/lib.rs:10 | cargo test | Met |
+| AC-2 | API works | src/api.rs:20 | cargo test | Verified |
+";
+        let expected = vec!["AC-1".to_owned(), "AC-2".to_owned()];
+        assert!(validate_pr_review_table(md, &expected).is_ok());
+    }
+
+    #[test]
+    fn validate_pr_review_table_handles_escaped_newlines() {
+        let escaped = "Summary\\n\\n| AC | Criterion | Code (file:line) | Test | Status |\\n|---|---|---|---|---|\\n| AC-1 | Feature works | src/lib.rs:10 | cargo test | PASS |\\n";
+        let expected = vec!["AC-1".to_owned()];
+        assert!(validate_pr_review_table(escaped, &expected).is_ok());
+    }
+
+    #[test]
+    fn validate_pr_review_table_unwraps_nested_json() {
+        let nested_json = r#"{"run_id":"test-123","review_markdown":"{\"status\":\"completed\",\"summary\":\"| AC | Criterion | Code (file:line) | Test | Status |\\n|---|---|---|---|---|\\n| AC-1 | Works | src/main.rs:1 | test_main | PASS |\\n\"}"}"#;
+        let expected = vec!["AC-1".to_owned()];
+        assert!(validate_pr_review_table(nested_json, &expected).is_ok());
     }
 }
