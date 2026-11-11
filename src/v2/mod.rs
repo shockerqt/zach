@@ -4,6 +4,7 @@ pub mod pipeline;
 pub mod router;
 pub mod runner;
 pub mod scheduler;
+pub mod socket;
 pub mod store;
 
 use std::env;
@@ -41,6 +42,15 @@ pub fn default_db_path() -> PathBuf {
         return PathBuf::from(path);
     }
     default_state_dir().join("zach-v2.sqlite3")
+}
+
+pub fn default_socket_path() -> PathBuf {
+    if let Ok(path) = env::var("ZACH_SOCKET_PATH")
+        && !path.trim().is_empty()
+    {
+        return PathBuf::from(path);
+    }
+    default_state_dir().join("zach.sock")
 }
 
 pub fn default_ws_task_bin() -> PathBuf {
