@@ -1,7 +1,11 @@
-use zach::ledger;
-
 use std::env;
+use std::fs;
+use std::path::PathBuf;
 
+use zach::ledger;
+use zach::v2::intake::{ingest_export_json, sync_from_ws_task};
+use zach::v2::store::{DecisionResolution, V2Store};
+use zach::v2::{default_db_path, default_ws_task_bin};
 use zach::{AuditRequest, GithubConfig, audit_task_integration};
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8090";
@@ -31,6 +35,12 @@ fn main() {
             run_ledger_validator(&config)
         }
         "governance.audit-task-integration" => run_audit(&args[2..]),
+        "status" => run_v2_status(&args[2..]),
+        "queue" => run_v2_queue(&args[2..]),
+        "decisions" => run_v2_decisions(&args[2..]),
+        "decide" => run_v2_decide(&args[2..]),
+        "sync" => run_v2_sync(&args[2..]),
+        "config" => run_v2_config(&args[2..]),
         "--help" | "-h" => print_usage(),
         unknown => {
             eprintln!("unknown option: {unknown}");
@@ -38,6 +48,204 @@ fn main() {
             std::process::exit(2);
         }
     }
+}
+
+fn open_store(args: &[String]) -> V2Store {
+    let db_path = flag_value(args, "--db")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_db_path);
+    V2Store::open(&db_path).unwrap_or_else(|error| {
+        eprintln!("failed to open v2 store at {}: {error}", db_path.display());
+        std::process::exit(1);
+    })
+}
+
+fn run_v2_status(args: &[String]) {
+    let mut store = open_store(args);
+    if has_flag(args, "--sync") {
+        let ws_task = default_ws_task_bin();
+        if let Err(error) = sync_from_ws_task(&mut store, &ws_task) {
+            eprintln!("warning: ws-task sync failed: {error}");
+        }
+    }
+    let summary = store.status_summary().unwrap_or_else(|error| {
+        eprintln!("status query failed: {error}");
+        std::process::exit(1);
+    });
+    if has_flag(args, "--json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_owned())
+        );
+    } else {
+        println!(
+            "Zach v{} · max_parallel={} · tasks={} · ready_eligible={} · in_progress={} · open_decisions={} · locks={} · merge_queue={} · max_seq={}",
+            summary.schema_version,
+            summary.max_parallel_tasks,
+            summary.total_tasks,
+            summary.ready_eligible_count,
+            summary.in_progress_count,
+            summary.open_decisions_count,
+            summary.active_locks_count,
+            summary.merge_queue_count,
+            summary.max_seq_id
+        );
+    }
+}
+
+fn run_v2_queue(args: &[String]) {
+    let mut store = open_store(args);
+    if has_flag(args, "--sync") {
+        let ws_task = default_ws_task_bin();
+        if let Err(error) = sync_from_ws_task(&mut store, &ws_task) {
+            eprintln!("warning: ws-task sync failed: {error}");
+        }
+    }
+    let group = flag_value(args, "--group");
+    let queue = store
+        .list_ready_queue(group.as_deref())
+        .unwrap_or_else(|error| {
+            eprintln!("queue query failed: {error}");
+            std::process::exit(1);
+        });
+    if has_flag(args, "--json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&queue).unwrap_or_else(|_| "[]".to_owned())
+        );
+    } else if queue.is_empty() {
+        println!("Ready queue is empty.");
+    } else {
+        for task in &queue {
+            println!(
+                "{:<10} [{:<2}] repo={:<16} group={:<6} stages={} · {}",
+                task.task_id,
+                task.weight,
+                task.repository,
+                task.task_group,
+                task.required_stages.join("->"),
+                task.title
+            );
+        }
+    }
+}
+
+fn run_v2_decisions(args: &[String]) {
+    let store = open_store(args);
+    let open_only = !has_flag(args, "--all");
+    let group = flag_value(args, "--group");
+    let decisions = store
+        .list_decisions(open_only, group.as_deref())
+        .unwrap_or_else(|error| {
+            eprintln!("decisions query failed: {error}");
+            std::process::exit(1);
+        });
+    if has_flag(args, "--json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&decisions).unwrap_or_else(|_| "[]".to_owned())
+        );
+    } else if decisions.is_empty() {
+        println!("No matching decisions.");
+    } else {
+        for dec in &decisions {
+            println!(
+                "{} [{}] task={} kind={} question={:?} options={:?}",
+                dec.decision_id, dec.status, dec.task_id, dec.kind, dec.question, dec.options
+            );
+        }
+    }
+}
+
+fn run_v2_decide(args: &[String]) {
+    let decision_id = args
+        .first()
+        .filter(|v| !v.starts_with("--"))
+        .cloned()
+        .or_else(|| flag_value(args, "--id"))
+        .unwrap_or_else(|| usage_error("missing <DECISION_ID>"));
+    let choice =
+        flag_value(args, "--choice").unwrap_or_else(|| usage_error("missing --choice <CHOICE>"));
+    let by = flag_value(args, "--by")
+        .or_else(|| env::var("USER").ok())
+        .unwrap_or_else(|| "operator".to_owned());
+    let note = flag_value(args, "--note");
+
+    let mut store = open_store(args);
+    match store.resolve_decision(&decision_id, &choice, &by, note.as_deref()) {
+        Ok(DecisionResolution::Resolved(rec)) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "outcome": "RESOLVED",
+                    "decision": rec,
+                }))
+                .unwrap_or_default()
+            );
+        }
+        Ok(DecisionResolution::AlreadyResolved(rec)) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "outcome": "ALREADY_RESOLVED",
+                    "decision": rec,
+                }))
+                .unwrap_or_default()
+            );
+        }
+        Ok(DecisionResolution::NotFound) => {
+            eprintln!("decision not found: {decision_id}");
+            std::process::exit(1);
+        }
+        Err(error) => {
+            eprintln!("decide failed: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_v2_sync(args: &[String]) {
+    let mut store = open_store(args);
+    let summary = if let Some(export_file) = flag_value(args, "--export-file") {
+        let payload = fs::read_to_string(&export_file).unwrap_or_else(|error| {
+            eprintln!("failed to read {export_file}: {error}");
+            std::process::exit(1);
+        });
+        ingest_export_json(&mut store, &payload)
+    } else {
+        let ws_task = flag_value(args, "--ws-task-bin")
+            .map(PathBuf::from)
+            .unwrap_or_else(default_ws_task_bin);
+        sync_from_ws_task(&mut store, &ws_task)
+    };
+
+    match summary {
+        Ok(result) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_owned())
+            );
+        }
+        Err(error) => {
+            eprintln!("sync failed: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_v2_config(args: &[String]) {
+    let mut store = open_store(args);
+    if let Some(raw_max) = flag_value(args, "--max-parallel") {
+        let parsed = raw_max
+            .parse::<usize>()
+            .unwrap_or_else(|_| usage_error("invalid --max-parallel value"));
+        if let Err(error) = store.set_max_parallel_tasks(parsed) {
+            eprintln!("config update failed: {error}");
+            std::process::exit(1);
+        }
+    }
+    let max_parallel = store.max_parallel_tasks().unwrap_or(2);
+    println!("max_parallel_tasks={max_parallel}");
 }
 
 fn run_ledger_validator(config: &BootstrapConfig) {
@@ -76,6 +284,10 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
         .map(|pair| pair[1].clone())
 }
 
+fn has_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|item| item == flag)
+}
+
 fn usage_error(message: &str) -> ! {
     eprintln!("{message}");
     print_usage();
@@ -88,6 +300,14 @@ fn print_usage() {
     println!(
         "       zach governance.audit-task-integration --task-id <TASK-ID> --request-id <REQUEST-ID>"
     );
+    println!("       zach status [--sync] [--json] [--db <PATH>]");
+    println!("       zach queue [--group <GROUP>] [--sync] [--json] [--db <PATH>]");
+    println!("       zach decisions [--group <GROUP>] [--all] [--json] [--db <PATH>]");
+    println!(
+        "       zach decide <DECISION_ID> --choice <CHOICE> [--by <ACTOR>] [--note <NOTE>] [--db <PATH>]"
+    );
+    println!("       zach sync [--export-file <PATH>] [--ws-task-bin <PATH>] [--db <PATH>]");
+    println!("       zach config [--max-parallel <1..16>] [--db <PATH>]");
 }
 
 #[cfg(test)]
