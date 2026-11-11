@@ -240,6 +240,7 @@ pub fn build_systemd_stage_command_with_env(
             ]);
         }
         ModelFamily::GeminiAgy => {
+            let worker_timeout = route.timeout_secs.min(1800);
             args.extend([
                 "node".to_owned(),
                 GEMINI_WORKER_CLI_SCRIPT.to_owned(),
@@ -249,7 +250,7 @@ pub fn build_systemd_stage_command_with_env(
                 "--worktree".to_owned(),
                 worktree_path.clone(),
                 "--timeout".to_owned(),
-                route.timeout_secs.to_string(),
+                worker_timeout.to_string(),
                 "--prompt".to_owned(),
                 prompt.to_owned(),
             ]);
@@ -739,5 +740,26 @@ other-user-unit.service loaded active running
         active.insert("zach-stage-zach-005-impl-att-1".to_owned());
         let orphans = parse_orphan_units(systemctl_out, &active);
         assert_eq!(orphans, vec!["zach-stage-lumi-007-impl-att-9".to_owned()]);
+    }
+
+    #[test]
+    fn gemini_worker_timeout_is_clamped_to_1800() {
+        let task = sample_task();
+        let mut route = resolve_stage_route("M", "impl", 0, None).unwrap().unwrap();
+        route.family = ModelFamily::GeminiAgy;
+        route.model = "gemini-3.8-flash-high".to_owned();
+        route.timeout_secs = 3600;
+
+        let clean_env = BTreeMap::new();
+        let spec =
+            build_systemd_stage_command_with_env(&task, "att-gemini", &route, "prompt", &clean_env)
+                .expect("build command");
+
+        let timeout_idx = spec
+            .args
+            .iter()
+            .position(|a| a == "--timeout")
+            .expect("timeout flag");
+        assert_eq!(spec.args[timeout_idx + 1], "1800");
     }
 }
