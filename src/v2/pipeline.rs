@@ -177,9 +177,14 @@ pub fn verify_worktree_diff(
 /// table (`| AC | Criterion | Code (file:line) | Test | Status |`) with `PASS` and
 /// a `file:line` reference for every expected AC.
 pub fn validate_pr_review_table(markdown: &str, expected_ac_ids: &[String]) -> Result<(), String> {
+    let normalized = if markdown.contains("\\n") {
+        markdown.replace("\\n", "\n")
+    } else {
+        markdown.to_owned()
+    };
     let mut verified_acs = std::collections::BTreeMap::new();
 
-    for line in markdown.lines() {
+    for line in normalized.lines() {
         let trimmed = line.trim();
         if !trimmed.starts_with('|') || !trimmed.ends_with('|') {
             continue;
@@ -490,20 +495,34 @@ pub fn parse_agy_cli_response(
         .unwrap_or("AGY worker completed successfully")
         .to_owned();
 
-    let review_markdown = json
+    let mut review_markdown = json
         .get("review_markdown")
         .or_else(|| json.get("review"))
         .or_else(|| json.get("review_target"))
-        .or_else(|| json.get("response"))
         .and_then(|v| v.as_str())
-        .map(str::to_owned)
-        .or_else(|| {
-            if summary.contains('|') {
-                Some(summary.clone())
+        .map(str::to_owned);
+
+    if review_markdown.is_none()
+        && let Some(resp_str) = json.get("response").and_then(|v| v.as_str())
+    {
+        if let Ok(inner_json) = serde_json::from_str::<serde_json::Value>(resp_str) {
+            if let Some(inner_summary) = inner_json.get("summary").and_then(|v| v.as_str()) {
+                review_markdown = Some(inner_summary.to_owned());
+            } else if let Some(inner_md) =
+                inner_json.get("review_markdown").and_then(|v| v.as_str())
+            {
+                review_markdown = Some(inner_md.to_owned());
             } else {
-                None
+                review_markdown = Some(resp_str.to_owned());
             }
-        });
+        } else {
+            review_markdown = Some(resp_str.to_owned());
+        }
+    }
+
+    if review_markdown.is_none() && summary.contains('|') {
+        review_markdown = Some(summary.clone());
+    }
 
     let invocation_id = json
         .get("orchestration_id")
@@ -2388,5 +2407,12 @@ mod tests {
 ";
         let expected = vec!["AC-1".to_owned(), "AC-2".to_owned()];
         assert!(validate_pr_review_table(md, &expected).is_ok());
+    }
+
+    #[test]
+    fn validate_pr_review_table_handles_escaped_newlines() {
+        let escaped = "Summary\\n\\n| AC | Criterion | Code (file:line) | Test | Status |\\n|---|---|---|---|---|\\n| AC-1 | Feature works | src/lib.rs:10 | cargo test | PASS |\\n";
+        let expected = vec!["AC-1".to_owned()];
+        assert!(validate_pr_review_table(escaped, &expected).is_ok());
     }
 }
