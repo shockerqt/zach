@@ -8,8 +8,9 @@ use zach::v2::merge_queue::{SystemMergeDriver, process_repo_merge_queue};
 use zach::v2::pipeline::{execute_m_l_pipeline, execute_xs_s_pipeline, plan_task_execution};
 use zach::v2::runner::reconcile_orphan_units;
 use zach::v2::scheduler::HeavyCheckSemaphore;
+use zach::v2::socket::{ClientCommand, DaemonServer, write_ndjson};
 use zach::v2::store::{DecisionResolution, V2Store};
-use zach::v2::{default_db_path, default_ws_task_bin};
+use zach::v2::{default_db_path, default_socket_path, default_ws_task_bin};
 use zach::{AuditRequest, GithubConfig, audit_task_integration};
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8090";
@@ -46,6 +47,9 @@ fn main() {
         "sync" => run_v2_sync(&args[2..]),
         "config" => run_v2_config(&args[2..]),
         "run" => run_v2_run(&args[2..]),
+        "daemon" | "zachd" => run_v2_daemon(&args[2..]),
+        "attach" => run_v2_attach(&args[2..]),
+        "events" => run_v2_events(&args[2..]),
         "--help" | "-h" => print_usage(),
         unknown => {
             eprintln!("unknown option: {unknown}");
@@ -425,6 +429,140 @@ fn usage_error(message: &str) -> ! {
     std::process::exit(2);
 }
 
+fn run_v2_daemon(args: &[String]) {
+    let mut store = open_store(args);
+    let socket_path = flag_value(args, "--socket")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_socket_path);
+    let once = has_flag(args, "--once");
+
+    let initial_seq = store.max_seq_id().unwrap_or(0);
+    let mut server = DaemonServer::bind(&socket_path, initial_seq).unwrap_or_else(|error| {
+        eprintln!(
+            "failed to bind daemon socket at {}: {error}",
+            socket_path.display()
+        );
+        std::process::exit(1);
+    });
+
+    println!(
+        "zachd started · socket={} · initial_seq={} · once={}",
+        socket_path.display(),
+        initial_seq,
+        once
+    );
+
+    if let Err(error) = server.run_loop(&mut store, once) {
+        eprintln!("daemon error: {error}");
+        std::process::exit(1);
+    }
+    if once {
+        println!("zachd: completed single loop execution");
+    }
+}
+
+fn run_v2_attach(args: &[String]) {
+    let socket_path = flag_value(args, "--socket")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_socket_path);
+    let group = flag_value(args, "--group");
+    let since_seq = flag_value(args, "--since-seq").and_then(|v| v.parse::<i64>().ok());
+    let once = has_flag(args, "--once");
+
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(&socket_path).unwrap_or_else(|error| {
+            eprintln!(
+                "failed to connect to socket at {}: {error}",
+                socket_path.display()
+            );
+            std::process::exit(1);
+        });
+
+    let cmd = ClientCommand::Subscribe {
+        group,
+        since_seq,
+        once: if once { Some(true) } else { None },
+    };
+
+    if let Err(error) = write_ndjson(&mut stream, &cmd) {
+        eprintln!("failed to send subscribe command: {error}");
+        std::process::exit(1);
+    }
+
+    use std::io::{BufRead, BufReader};
+    let reader = BufReader::new(stream);
+    for line_result in reader.lines() {
+        match line_result {
+            Ok(line) => {
+                println!("{line}");
+                if once {
+                    break;
+                }
+            }
+            Err(error) => {
+                eprintln!("connection closed: {error}");
+                break;
+            }
+        }
+    }
+}
+
+fn run_v2_events(args: &[String]) {
+    let group = flag_value(args, "--group");
+    let since_seq = flag_value(args, "--since-seq").and_then(|v| v.parse::<i64>().ok());
+    let wait = has_flag(args, "--wait");
+
+    if wait {
+        let socket_path = flag_value(args, "--socket")
+            .map(PathBuf::from)
+            .unwrap_or_else(default_socket_path);
+
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(&socket_path).unwrap_or_else(|error| {
+                eprintln!(
+                    "failed to connect to socket at {}: {error}",
+                    socket_path.display()
+                );
+                std::process::exit(1);
+            });
+
+        let cmd = ClientCommand::Subscribe {
+            group,
+            since_seq,
+            once: Some(false),
+        };
+
+        if let Err(error) = write_ndjson(&mut stream, &cmd) {
+            eprintln!("failed to send subscribe command: {error}");
+            std::process::exit(1);
+        }
+
+        use std::io::{BufRead, BufReader};
+        let reader = BufReader::new(stream);
+        for line_result in reader.lines() {
+            match line_result {
+                Ok(line) => println!("{line}"),
+                Err(error) => {
+                    eprintln!("connection closed: {error}");
+                    break;
+                }
+            }
+        }
+    } else {
+        let store = open_store(args);
+        let events = store
+            .list_events_since(group.as_deref(), since_seq.unwrap_or(0), 5000)
+            .unwrap_or_else(|error| {
+                eprintln!("events query failed: {error}");
+                std::process::exit(1);
+            });
+
+        for event in &events {
+            println!("{}", serde_json::to_string(event).unwrap_or_default());
+        }
+    }
+}
+
 fn print_usage() {
     println!("Usage: zach [--health | --config]");
     println!("       zach {}", ledger::PUBLIC_WEBHOOK_OPERATIONS[0]);
@@ -441,6 +579,11 @@ fn print_usage() {
     println!("       zach config [--max-parallel <1..16>] [--db <PATH>]");
     println!(
         "       zach run [--task <TASK_ID>] [--group <GROUP>] [--once] [--dry-run] [--json] [--db <PATH>]"
+    );
+    println!("       zach daemon [--socket <PATH>] [--db <PATH>] [--once]");
+    println!("       zach attach [--group <GROUP>] [--since-seq <N>] [--once] [--socket <PATH>]");
+    println!(
+        "       zach events [--group <GROUP>] [--since-seq <N>] [--wait] [--socket <PATH>] [--db <PATH>]"
     );
 }
 
