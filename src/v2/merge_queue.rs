@@ -23,6 +23,8 @@ pub enum MergeQueueOutcome {
 }
 
 pub trait MergeDriver {
+    fn default_branch(&mut self, repo: &str, worktree_path: &str) -> Result<String, String>;
+
     fn merge_origin_default(
         &mut self,
         repo: &str,
@@ -50,9 +52,76 @@ pub trait MergeDriver {
     fn verify_post_merge_ci(&mut self, repo: &str, merge_sha: &str) -> Result<bool, String>;
 }
 
+/// Pure helper to resolve the default branch name from `git symbolic-ref`
+/// and `git ls-remote` outputs.
+pub fn parse_default_branch(symbolic_ref_output: &str, ls_remote_output: &str) -> Option<String> {
+    let sym = symbolic_ref_output.trim();
+    if !sym.is_empty() {
+        let first_line = sym.lines().next().unwrap_or("").trim();
+        let stripped = first_line
+            .strip_prefix("refs/remotes/origin/")
+            .unwrap_or(first_line);
+        let branch = stripped.strip_prefix("origin/").unwrap_or(stripped).trim();
+        if !branch.is_empty() {
+            return Some(branch.to_owned());
+        }
+    }
+
+    for line in ls_remote_output.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("ref:") {
+            let target = rest.split_whitespace().next().unwrap_or("").trim();
+            let branch = target.strip_prefix("refs/heads/").unwrap_or(target).trim();
+            if !branch.is_empty() {
+                return Some(branch.to_owned());
+            }
+        }
+    }
+
+    None
+}
+
 pub struct SystemMergeDriver;
 
 impl MergeDriver for SystemMergeDriver {
+    fn default_branch(&mut self, repo: &str, worktree_path: &str) -> Result<String, String> {
+        let sym_output = Command::new("git")
+            .args([
+                "-C",
+                worktree_path,
+                "symbolic-ref",
+                "--short",
+                "refs/remotes/origin/HEAD",
+            ])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+            .unwrap_or_default();
+
+        let ls_remote_output = if parse_default_branch(&sym_output, "").is_none() {
+            Command::new("git")
+                .args([
+                    "-C",
+                    worktree_path,
+                    "ls-remote",
+                    "--symref",
+                    "origin",
+                    "HEAD",
+                ])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        parse_default_branch(&sym_output, &ls_remote_output)
+            .ok_or_else(|| format!("could not resolve default branch for repository {repo}"))
+    }
+
     fn merge_origin_default(
         &mut self,
         _repo: &str,
@@ -294,10 +363,28 @@ pub fn process_repo_merge_queue(
         .ok_or_else(|| format!("task '{}' not found in store", entry.task_id))?;
 
     let worktree_path = task.worktree_path.clone().unwrap_or_default();
-    let default_branch = "main";
+    let default_branch = match driver.default_branch(repo, &worktree_path) {
+        Ok(branch) => branch,
+        Err(err) => {
+            let _ = store.update_merge_queue_state(repo, &entry.task_id, "FAILED");
+            let _ = store.append_event(
+                &entry.task_id,
+                &task.task_group,
+                "MERGE_FAILED",
+                &serde_json::json!({
+                    "step": "default_branch",
+                    "error": err,
+                }),
+            );
+            return Ok(MergeQueueOutcome::Failed {
+                task_id: entry.task_id,
+                reason: err,
+            });
+        }
+    };
 
     // 1. Merge origin/<default_branch>
-    let merge_head = match driver.merge_origin_default(repo, &worktree_path, default_branch) {
+    let merge_head = match driver.merge_origin_default(repo, &worktree_path, &default_branch) {
         Ok(head) => head,
         Err(err) => {
             let _ = store.update_merge_queue_state(repo, &entry.task_id, "FAILED");
@@ -481,6 +568,9 @@ pub mod tests {
 
     #[derive(Default)]
     pub struct MockMergeDriver {
+        pub default_branch: Option<String>,
+        pub default_branch_error: Option<String>,
+        pub merged_against: Option<String>,
         pub origin_default_sha: Option<String>,
         pub merge_origin_error: Option<String>,
         pub gate_checks_error: Option<String>,
@@ -494,12 +584,23 @@ pub mod tests {
     }
 
     impl MergeDriver for MockMergeDriver {
+        fn default_branch(&mut self, _repo: &str, _worktree_path: &str) -> Result<String, String> {
+            if let Some(ref err) = self.default_branch_error {
+                return Err(err.clone());
+            }
+            Ok(self
+                .default_branch
+                .clone()
+                .unwrap_or_else(|| "main".to_owned()))
+        }
+
         fn merge_origin_default(
             &mut self,
             _repo: &str,
             _worktree_path: &str,
-            _default_branch: &str,
+            default_branch: &str,
         ) -> Result<String, String> {
+            self.merged_against = Some(default_branch.to_owned());
             self.steps.push("merge_origin_default".to_owned());
             if let Some(ref err) = self.merge_origin_error {
                 return Err(err.clone());
@@ -719,5 +820,75 @@ pub mod tests {
         let next_outcome =
             process_repo_merge_queue(&mut store, "zach", &mut driver, &semaphore).unwrap();
         assert!(matches!(next_outcome, MergeQueueOutcome::Blocked { .. }));
+    }
+
+    #[test]
+    fn parse_default_branch_scenarios() {
+        assert_eq!(
+            parse_default_branch("origin/master\n", ""),
+            Some("master".to_owned())
+        );
+        assert_eq!(
+            parse_default_branch("", "ref: refs/heads/master\tHEAD\nabc123\tHEAD\n"),
+            Some("master".to_owned())
+        );
+        assert_eq!(parse_default_branch("", ""), None);
+    }
+
+    #[test]
+    fn process_repo_merge_queue_uses_resolved_default_branch() {
+        let mut store = V2Store::open_in_memory().expect("open store");
+        let task = sample_task("GOV-1", "governance", vec!["README.md"]);
+        store.upsert_task(&task).unwrap();
+
+        enqueue_for_merge(&mut store, "governance", "GOV-1", 10, "rev-sha").unwrap();
+
+        let semaphore = HeavyCheckSemaphore::new();
+        let mut driver = MockMergeDriver {
+            default_branch: Some("master".to_owned()),
+            origin_default_sha: Some("sha-merge-head".to_owned()),
+            exact_sha_ci_result: true,
+            merge_pr_result: Some("final-commit-sha".to_owned()),
+            post_merge_ci_result: true,
+            ..Default::default()
+        };
+
+        let outcome =
+            process_repo_merge_queue(&mut store, "governance", &mut driver, &semaphore).unwrap();
+        assert!(matches!(outcome, MergeQueueOutcome::Merged { .. }));
+        assert_eq!(driver.merged_against, Some("master".to_owned()));
+    }
+
+    #[test]
+    fn process_repo_merge_queue_fails_when_default_branch_unresolvable() {
+        let mut store = V2Store::open_in_memory().expect("open store");
+        let task = sample_task("TASK-1", "zach", vec!["src/v2/merge_queue.rs"]);
+        store.upsert_task(&task).unwrap();
+
+        enqueue_for_merge(&mut store, "zach", "TASK-1", 42, "reviewed-sha-123").unwrap();
+
+        let semaphore = HeavyCheckSemaphore::new();
+        let mut driver = MockMergeDriver {
+            default_branch_error: Some(
+                "could not resolve default branch for repository zach".to_owned(),
+            ),
+            ..Default::default()
+        };
+
+        let outcome =
+            process_repo_merge_queue(&mut store, "zach", &mut driver, &semaphore).unwrap();
+        assert_eq!(
+            outcome,
+            MergeQueueOutcome::Failed {
+                task_id: "TASK-1".to_owned(),
+                reason: "could not resolve default branch for repository zach".to_owned(),
+            }
+        );
+
+        let entry = store
+            .get_merge_queue_entry("zach", "TASK-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.state, "FAILED");
     }
 }
