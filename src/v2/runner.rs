@@ -757,7 +757,7 @@ other-user-unit.service loaded active running
         let task = sample_task();
         let mut route = resolve_stage_route("M", "impl", 0, None).unwrap().unwrap();
         route.family = ModelFamily::GeminiAgy;
-        route.model = "gemini-3.8-flash-high".to_owned();
+        route.model = "gemini-4-hydrogen-high".to_owned();
         route.timeout_secs = 3600;
 
         let clean_env = BTreeMap::new();
