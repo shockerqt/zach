@@ -96,6 +96,25 @@ pub fn stage_timeout_secs(weight: &str, stage: &str) -> u64 {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RouterEnvOverrides {
+    pub flash_only: bool,
+    pub forced_model: Option<String>,
+}
+
+impl RouterEnvOverrides {
+    pub fn from_env() -> Self {
+        let flash_only = std::env::var("ZACH_USE_FLASH_ONLY")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let forced_model = std::env::var("ZACH_FORCE_MODEL").ok();
+        Self {
+            flash_only,
+            forced_model,
+        }
+    }
+}
+
 /// Deterministically resolves the model, reasoning effort, fallback, and budgets
 /// for a given `(weight, stage, retry_count, author_family)`.
 ///
@@ -106,6 +125,23 @@ pub fn resolve_stage_route(
     stage: &str,
     retry_count: i64,
     author_family: Option<ModelFamily>,
+) -> Result<Option<StageRoute>, String> {
+    resolve_stage_route_with(
+        weight,
+        stage,
+        retry_count,
+        author_family,
+        &RouterEnvOverrides::from_env(),
+    )
+}
+
+/// Pure route resolver accepting explicit environment overrides so tests do not mutate process env.
+pub fn resolve_stage_route_with(
+    weight: &str,
+    stage: &str,
+    retry_count: i64,
+    author_family: Option<ModelFamily>,
+    overrides: &RouterEnvOverrides,
 ) -> Result<Option<StageRoute>, String> {
     let norm_weight = weight.trim().to_ascii_uppercase();
     if !matches!(norm_weight.as_str(), "XS" | "S" | "M" | "L") {
@@ -313,12 +349,11 @@ pub fn resolve_stage_route(
     };
 
     let mut route = route;
-    let force_flash = std::env::var("ZACH_USE_FLASH_ONLY")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    let forced_model = std::env::var("ZACH_FORCE_MODEL").ok();
-    if force_flash || forced_model.is_some() {
-        let target_model = forced_model.unwrap_or_else(|| "gemini-3.8-flash-high".to_owned());
+    if overrides.flash_only || overrides.forced_model.is_some() {
+        let target_model = overrides
+            .forced_model
+            .clone()
+            .unwrap_or_else(|| "gemini-3.8-flash-high".to_owned());
         route.family = ModelFamily::GeminiAgy;
         route.model = target_model;
         route.effort = ReasoningEffort::High;
@@ -471,15 +506,38 @@ mod tests {
     }
 
     #[test]
-    fn router_honors_flash_only_env_override() {
-        unsafe {
-            std::env::set_var("ZACH_USE_FLASH_ONLY", "1");
-        }
-        let route = resolve_stage_route("S", "impl", 0, None).unwrap().unwrap();
-        assert_eq!(route.family, ModelFamily::GeminiAgy);
-        assert_eq!(route.model, "gemini-3.8-flash-high");
-        unsafe {
-            std::env::remove_var("ZACH_USE_FLASH_ONLY");
-        }
+    fn router_honors_flash_only_and_forced_model_overrides() {
+        let flash_route = resolve_stage_route_with(
+            "S",
+            "impl",
+            0,
+            None,
+            &RouterEnvOverrides {
+                flash_only: true,
+                forced_model: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(flash_route.family, ModelFamily::GeminiAgy);
+        assert_eq!(flash_route.model, "gemini-3.8-flash-high");
+        assert!(flash_route.fallback_model.is_none());
+
+        let forced_route = resolve_stage_route_with(
+            "M",
+            "plan",
+            0,
+            None,
+            &RouterEnvOverrides {
+                flash_only: false,
+                forced_model: Some("gemini-4-argon-high".to_owned()),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(forced_route.family, ModelFamily::GeminiAgy);
+        assert_eq!(forced_route.model, "gemini-4-argon-high");
+        assert_eq!(forced_route.effort, ReasoningEffort::High);
+        assert!(forced_route.fallback_model.is_none());
     }
 }
