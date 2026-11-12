@@ -45,9 +45,9 @@ pub struct StageExecutionResult {
     pub summary: String,
     pub review_markdown: Option<String>,
     pub invocation_id: Option<String>,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub total_tokens: u64,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
     pub sha_before: Option<String>,
     pub sha_after: Option<String>,
     pub diff_files: Vec<DiffFileEntry>,
@@ -544,6 +544,165 @@ impl SystemdStageExecutor {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedCodexOutput {
+    pub status: String,
+    pub summary: String,
+    pub review_markdown: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+}
+
+/// Parses `codex exec --json` JSONL events (`ThreadEvent` lines), summing token
+/// usage across `turn.completed` events and extracting the final `agent_message`
+/// or `turn.failed` / `error` summary. Returns `None` token fields when no valid
+/// `turn.completed` usage event is observed.
+pub fn parse_codex_jsonl_output(
+    stdout: &str,
+    stderr: &str,
+    exit_code: Option<i32>,
+) -> Result<ParsedCodexOutput, String> {
+    let mut parsed_json_events = 0usize;
+    let mut agent_messages: Vec<String> = Vec::new();
+    let mut error_messages: Vec<String> = Vec::new();
+    let mut saw_turn_failed = false;
+    let mut sum_input: u64 = 0;
+    let mut sum_output: u64 = 0;
+    let mut sum_total: u64 = 0;
+    let mut saw_valid_turn_usage = false;
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if !val.is_object() {
+            continue;
+        }
+        parsed_json_events += 1;
+
+        match val.get("type").and_then(|v| v.as_str()) {
+            Some("item.completed") => {
+                if val
+                    .get("item")
+                    .and_then(|i| i.get("type"))
+                    .and_then(|v| v.as_str())
+                    == Some("agent_message")
+                    && let Some(text) = val
+                        .get("item")
+                        .and_then(|i| i.get("text"))
+                        .and_then(|v| v.as_str())
+                    && !text.trim().is_empty()
+                {
+                    agent_messages.push(text.to_owned());
+                }
+            }
+            Some("turn.completed") => {
+                if let Some(usage) = val.get("usage").and_then(|v| v.as_object())
+                    && let (Some(inp), Some(out)) = (
+                        usage.get("input_tokens").and_then(|v| v.as_u64()),
+                        usage.get("output_tokens").and_then(|v| v.as_u64()),
+                    )
+                {
+                    // Codex ThreadEvent usage omits `total_tokens`; `input_tokens` already
+                    // includes `cached_input_tokens` and `output_tokens` includes reasoning.
+                    let tot = usage
+                        .get("total_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or_else(|| inp.saturating_add(out));
+                    sum_input = sum_input.saturating_add(inp);
+                    sum_output = sum_output.saturating_add(out);
+                    sum_total = sum_total.saturating_add(tot);
+                    saw_valid_turn_usage = true;
+                }
+            }
+            Some("turn.failed") => {
+                saw_turn_failed = true;
+                if let Some(msg) = val
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|v| v.as_str())
+                    && !msg.trim().is_empty()
+                {
+                    error_messages.push(msg.trim().to_owned());
+                }
+            }
+            Some("error") => {
+                if let Some(msg) = val.get("message").and_then(|v| v.as_str())
+                    && !msg.trim().is_empty()
+                {
+                    error_messages.push(msg.trim().to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let succeeded = exit_code == Some(0) && !saw_turn_failed;
+    let status = if succeeded { "PASSED" } else { "FAILED" }.to_owned();
+    let (input_tokens, output_tokens, total_tokens) = if saw_valid_turn_usage {
+        (Some(sum_input), Some(sum_output), Some(sum_total))
+    } else {
+        (None, None, None)
+    };
+
+    let last_agent_message = agent_messages.last().cloned();
+    let raw_summary = if !succeeded && let Some(err) = error_messages.last() {
+        err.clone()
+    } else if let Some(ref msg) = last_agent_message {
+        msg.clone()
+    } else if let Some(err) = error_messages.last() {
+        err.clone()
+    } else if parsed_json_events == 0 && !stdout.trim().is_empty() {
+        stdout.lines().take(10).collect::<Vec<_>>().join("\n")
+    } else if !stderr.trim().is_empty() {
+        stderr.lines().take(10).collect::<Vec<_>>().join("\n")
+    } else {
+        stdout.lines().take(10).collect::<Vec<_>>().join("\n")
+    };
+    let summary = truncate_utf8_bytes(&raw_summary, MAX_SUMMARY_BYTES);
+
+    let review_markdown = last_agent_message
+        .filter(|msg| msg.contains('|'))
+        .or_else(|| (parsed_json_events == 0 && stdout.contains('|')).then(|| stdout.to_owned()));
+
+    Ok(ParsedCodexOutput {
+        status,
+        summary,
+        review_markdown,
+        input_tokens,
+        output_tokens,
+        total_tokens,
+    })
+}
+
+fn write_stage_result_json(
+    attempt_dir: &std::path::Path,
+    attempt_id: &str,
+    task_id: &str,
+    stage: &str,
+    exit_code: Option<i32>,
+    result: &StageExecutionResult,
+) -> Result<(), String> {
+    let result_json = serde_json::json!({
+        "attempt_id": attempt_id,
+        "task_id": task_id,
+        "stage": stage,
+        "exit_code": exit_code,
+        "result": result,
+    });
+    write_secure_file(
+        &attempt_dir.join("result.json"),
+        serde_json::to_string_pretty(&result_json)
+            .unwrap_or_default()
+            .as_bytes(),
+    )
+}
+
 impl StageExecutor for SystemdStageExecutor {
     fn execute_stage(
         &mut self,
@@ -678,91 +837,74 @@ impl StageExecutor for SystemdStageExecutor {
         let sha_after = git_head_sha(&spec.worktree_path);
         let diff_files = collect_worktree_diff_entries(&spec.worktree_path);
 
-        match crate::v2::pipeline::parse_agy_cli_response(&stdout, &stderr, output.status.code()) {
-            Ok(mut parsed) => {
-                parsed.sha_before = sha_before;
-                parsed.sha_after = sha_after;
-                parsed.diff_files = diff_files;
-                parsed.summary = truncate_utf8_bytes(&parsed.summary, MAX_SUMMARY_BYTES);
-                let result_json = serde_json::json!({
-                    "attempt_id": valid_attempt_id,
-                    "task_id": task.task_id,
-                    "stage": route.stage,
-                    "exit_code": output.status.code(),
-                    "result": &parsed,
-                });
-                write_secure_file(
-                    &attempt_dir.join("result.json"),
-                    serde_json::to_string_pretty(&result_json)
-                        .unwrap_or_default()
-                        .as_bytes(),
-                )?;
-                return Ok(parsed);
+        match route.family {
+            ModelFamily::GeminiAgy => {
+                match crate::v2::pipeline::parse_agy_cli_response(
+                    &stdout,
+                    &stderr,
+                    output.status.code(),
+                ) {
+                    Ok(mut parsed) => {
+                        parsed.sha_before = sha_before;
+                        parsed.sha_after = sha_after;
+                        parsed.diff_files = diff_files;
+                        parsed.summary = truncate_utf8_bytes(&parsed.summary, MAX_SUMMARY_BYTES);
+                        write_stage_result_json(
+                            &attempt_dir,
+                            valid_attempt_id,
+                            &task.task_id,
+                            &route.stage,
+                            output.status.code(),
+                            &parsed,
+                        )?;
+                        Ok(parsed)
+                    }
+                    Err(agy_err) => {
+                        let err_msg = truncate_utf8_bytes(&agy_err.to_string(), MAX_SUMMARY_BYTES);
+                        let result_json = serde_json::json!({
+                            "attempt_id": valid_attempt_id,
+                            "task_id": task.task_id,
+                            "stage": route.stage,
+                            "status": "FAILED",
+                            "failure_class": agy_err.failure_class,
+                            "exit_code": output.status.code(),
+                            "summary": err_msg,
+                        });
+                        write_secure_file(
+                            &attempt_dir.join("result.json"),
+                            serde_json::to_string_pretty(&result_json)
+                                .unwrap_or_default()
+                                .as_bytes(),
+                        )?;
+                        Err(err_msg)
+                    }
+                }
             }
-            Err(agy_err) if route.family == ModelFamily::GeminiAgy => {
-                let err_msg = truncate_utf8_bytes(&agy_err.to_string(), MAX_SUMMARY_BYTES);
-                let result_json = serde_json::json!({
-                    "attempt_id": valid_attempt_id,
-                    "task_id": task.task_id,
-                    "stage": route.stage,
-                    "status": "FAILED",
-                    "failure_class": agy_err.failure_class,
-                    "exit_code": output.status.code(),
-                    "summary": err_msg,
-                });
-                write_secure_file(
-                    &attempt_dir.join("result.json"),
-                    serde_json::to_string_pretty(&result_json)
-                        .unwrap_or_default()
-                        .as_bytes(),
+            ModelFamily::OpenAiSol => {
+                let parsed = parse_codex_jsonl_output(&stdout, &stderr, output.status.code())?;
+                let result = StageExecutionResult {
+                    status: parsed.status,
+                    summary: parsed.summary,
+                    review_markdown: parsed.review_markdown,
+                    invocation_id: None,
+                    input_tokens: parsed.input_tokens,
+                    output_tokens: parsed.output_tokens,
+                    total_tokens: parsed.total_tokens,
+                    sha_before,
+                    sha_after,
+                    diff_files,
+                };
+                write_stage_result_json(
+                    &attempt_dir,
+                    valid_attempt_id,
+                    &task.task_id,
+                    &route.stage,
+                    output.status.code(),
+                    &result,
                 )?;
-                return Err(err_msg);
+                Ok(result)
             }
-            Err(_) => {}
         }
-
-        let status = if output.status.success() {
-            "PASSED".to_owned()
-        } else {
-            "FAILED".to_owned()
-        };
-        let raw_summary = if stdout.trim().is_empty() {
-            stderr.lines().take(10).collect::<Vec<_>>().join("\n")
-        } else {
-            stdout.lines().take(10).collect::<Vec<_>>().join("\n")
-        };
-        let summary = truncate_utf8_bytes(&raw_summary, MAX_SUMMARY_BYTES);
-
-        let result = StageExecutionResult {
-            status,
-            summary,
-            review_markdown: if stdout.contains('|') {
-                Some(stdout)
-            } else {
-                None
-            },
-            invocation_id: None,
-            input_tokens: 0,
-            output_tokens: 0,
-            total_tokens: 0,
-            sha_before,
-            sha_after,
-            diff_files,
-        };
-        let result_json = serde_json::json!({
-            "attempt_id": valid_attempt_id,
-            "task_id": task.task_id,
-            "stage": route.stage,
-            "exit_code": output.status.code(),
-            "result": &result,
-        });
-        write_secure_file(
-            &attempt_dir.join("result.json"),
-            serde_json::to_string_pretty(&result_json)
-                .unwrap_or_default()
-                .as_bytes(),
-        )?;
-        Ok(result)
     }
 
     fn run_checks(&mut self, worktree_path: &str, commands: &[String]) -> Result<(), String> {
@@ -2015,5 +2157,87 @@ other-user-unit.service loaded active running
         assert!(attempts_dir.join("stray-file.txt").exists());
         assert!(attempts_dir.join("sym-attempt").symlink_metadata().is_ok());
         assert!(outside.path().join("keep.txt").exists());
+    }
+
+    #[test]
+    fn parse_codex_jsonl_output_sums_turns_and_handles_failures() {
+        let ok_jsonl = include_str!("../../tests/fixtures/codex_exec_usage.jsonl");
+        let parsed = parse_codex_jsonl_output(ok_jsonl, "", Some(0)).expect("parse codex jsonl");
+        assert_eq!(parsed.status, "PASSED");
+        assert_eq!(
+            parsed.summary,
+            "Implemented token parsing and verified tests."
+        );
+        assert_eq!(parsed.input_tokens, Some(44_105));
+        assert_eq!(parsed.output_tokens, Some(132));
+        assert_eq!(parsed.total_tokens, Some(44_237));
+        assert_eq!(parsed.review_markdown, None);
+
+        let failed_jsonl = include_str!("../../tests/fixtures/codex_exec_failed.jsonl");
+        let failed =
+            parse_codex_jsonl_output(failed_jsonl, "", Some(1)).expect("parse failed codex jsonl");
+        assert_eq!(failed.status, "FAILED");
+        assert!(failed.summary.contains("usage limit"));
+        assert_eq!(failed.input_tokens, None);
+        assert_eq!(failed.output_tokens, None);
+        assert_eq!(failed.total_tokens, None);
+    }
+
+    #[test]
+    fn systemd_executor_branches_on_model_family_for_codex_and_gemini() {
+        let state_dir = TempTestDir::new("zach-020-exec-state");
+        let work_dir = TempTestDir::new("zach-020-exec-work");
+        let mut exec = SystemdStageExecutor::with_state_dir(state_dir.path());
+        let mut task = sample_task();
+        task.worktree_path = Some(work_dir.path_str().to_owned());
+
+        // 1. OpenAiSol executes codex JSONL branch
+        let codex_route = resolve_stage_route("S", "impl", 0, None).unwrap().unwrap();
+        assert_eq!(codex_route.family, ModelFamily::OpenAiSol);
+        let codex_fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/codex_exec_usage.jsonl");
+        let mut codex_spec = build_systemd_stage_command_with_env(
+            &task,
+            "att-codex-ok",
+            &codex_route,
+            "run codex",
+            &build_clean_env_from_process(),
+        )
+        .unwrap();
+        codex_spec.program = "/bin/cat".to_owned();
+        codex_spec.args = vec![codex_fixture.to_string_lossy().into_owned()];
+
+        let codex_res = exec
+            .execute_stage(&task, "att-codex-ok", &codex_route, &codex_spec)
+            .expect("codex fixture execution");
+        assert_eq!(codex_res.status, "PASSED");
+        assert_eq!(codex_res.input_tokens, Some(44_105));
+        assert_eq!(codex_res.output_tokens, Some(132));
+        assert_eq!(codex_res.total_tokens, Some(44_237));
+
+        // 2. GeminiAgy executes gemini-worker JSON branch
+        let mut gemini_route = resolve_stage_route("M", "impl", 0, None).unwrap().unwrap();
+        gemini_route.family = ModelFamily::GeminiAgy;
+        gemini_route.model = "gemini-4-hydrogen-medium".to_owned();
+        let gemini_fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/gemini_worker_usage.json");
+        let mut gemini_spec = build_systemd_stage_command_with_env(
+            &task,
+            "att-gemini-ok",
+            &gemini_route,
+            "run gemini",
+            &build_clean_env_from_process(),
+        )
+        .unwrap();
+        gemini_spec.program = "/bin/cat".to_owned();
+        gemini_spec.args = vec![gemini_fixture.to_string_lossy().into_owned()];
+
+        let gemini_res = exec
+            .execute_stage(&task, "att-gemini-ok", &gemini_route, &gemini_spec)
+            .expect("gemini fixture execution");
+        assert_eq!(gemini_res.status, "PASSED");
+        assert_eq!(gemini_res.input_tokens, Some(9_967));
+        assert_eq!(gemini_res.output_tokens, Some(43));
+        assert_eq!(gemini_res.total_tokens, Some(10_010));
     }
 }

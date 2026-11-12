@@ -646,24 +646,7 @@ pub fn parse_agy_cli_response(
         .and_then(|v| v.as_str())
         .map(str::to_owned);
 
-    let total_tokens = json
-        .get("task_usage")
-        .and_then(|u| u.get("total_tokens"))
-        .and_then(|v| v.as_u64())
-        .or_else(|| json.get("total_tokens").and_then(|v| v.as_u64()))
-        .unwrap_or(0);
-
-    let input_tokens = json
-        .get("task_usage")
-        .and_then(|u| u.get("input_tokens"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-
-    let output_tokens = json
-        .get("task_usage")
-        .and_then(|u| u.get("output_tokens"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let (input_tokens, output_tokens, total_tokens) = parse_agy_usage(&json);
 
     Ok(StageExecutionResult {
         status: "PASSED".to_owned(),
@@ -677,6 +660,42 @@ pub fn parse_agy_cli_response(
         sha_after: None,
         diff_files: Vec::new(),
     })
+}
+
+fn parse_agy_usage(json: &serde_json::Value) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let usage = json.get("usage").and_then(|v| v.as_object());
+    let input_tokens = usage
+        .and_then(|u| u.get("input_tokens"))
+        .and_then(|v| v.as_u64());
+    let output_tokens = usage
+        .and_then(|u| u.get("output_tokens"))
+        .and_then(|v| v.as_u64());
+    let direct_total = usage
+        .and_then(|u| u.get("total_tokens"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            input_tokens
+                .zip(output_tokens)
+                .map(|(i, o)| i.saturating_add(o))
+        });
+
+    if let Some(total) = direct_total {
+        return (input_tokens, output_tokens, Some(total));
+    }
+
+    // Fall back to per-invocation `budget.observed_total_tokens` only when
+    // `unknown_usage_calls == 0` and at least one call ran. Never fall back to
+    // `task_usage`, which accumulates across runs for the same orchestration_id.
+    if let Some(budget) = json.get("budget").and_then(|v| v.as_object()) {
+        let unknown_calls = budget.get("unknown_usage_calls").and_then(|v| v.as_u64());
+        let calls_used = budget.get("model_calls_used").and_then(|v| v.as_u64());
+        let observed = budget.get("observed_total_tokens").and_then(|v| v.as_u64());
+        if unknown_calls == Some(0) && calls_used.is_none_or(|c| c > 0) && observed.is_some() {
+            return (input_tokens, output_tokens, observed);
+        }
+    }
+
+    (None, None, None)
 }
 
 pub const FAILURE_CLASS_INFRA: &str = "infra";
@@ -751,6 +770,28 @@ pub fn classify_failure_class(stage: &str, status: &str, message: &str) -> &'sta
     }
 
     FAILURE_CLASS_INFRA
+}
+
+fn apply_stage_result_usage(
+    task: &mut TaskRecord,
+    attempt: &mut StageAttemptRecord,
+    stage: &str,
+    result: &StageExecutionResult,
+) {
+    attempt.ended_epoch = Some(now_epoch());
+    attempt.status = result.status.clone();
+    attempt.summary = Some(truncate_utf8_bytes(&result.summary, MAX_SUMMARY_BYTES));
+    attempt.invocation_id = result.invocation_id.clone();
+    attempt.input_tokens = result.input_tokens;
+    attempt.output_tokens = result.output_tokens;
+    attempt.total_tokens = result.total_tokens;
+    if let Some(tokens) = result.total_tokens {
+        *task
+            .memory
+            .token_usage_by_stage
+            .entry(stage.to_owned())
+            .or_insert(0) += tokens;
+    }
 }
 
 fn fail_stage_attempt(
@@ -930,9 +971,9 @@ pub fn execute_xs_s_pipeline_with_executor(
         status: "RUNNING".to_owned(),
         failure_class: None,
         summary: None,
-        input_tokens: 0,
-        output_tokens: 0,
-        total_tokens: 0,
+        input_tokens: None,
+        output_tokens: None,
+        total_tokens: None,
         sha_before: None,
         sha_after: None,
     };
@@ -949,26 +990,18 @@ pub fn execute_xs_s_pipeline_with_executor(
             return Err(format!("impl stage failed for {}: {}", task.task_id, err));
         }
     };
-    attempt_rec.ended_epoch = Some(now_epoch());
-    attempt_rec.status = impl_result.status.clone();
-    attempt_rec.summary = Some(truncate_utf8_bytes(&impl_result.summary, MAX_SUMMARY_BYTES));
-    attempt_rec.invocation_id = impl_result.invocation_id.clone();
-    attempt_rec.input_tokens = impl_result.input_tokens;
-    attempt_rec.output_tokens = impl_result.output_tokens;
-    attempt_rec.total_tokens = impl_result.total_tokens;
+    apply_stage_result_usage(&mut task, &mut attempt_rec, "impl", &impl_result);
     attempt_rec.sha_before = impl_result.sha_before.clone();
     attempt_rec.sha_after = impl_result.sha_after.clone();
-
-    *task
-        .memory
-        .token_usage_by_stage
-        .entry("impl".to_owned())
-        .or_insert(0) += impl_result.total_tokens;
     push_bounded_recent_attempt(
         &mut task,
         format!(
             "[impl:{}] status={} tokens={}",
-            impl_attempt_id, impl_result.status, impl_result.total_tokens
+            impl_attempt_id,
+            impl_result.status,
+            impl_result
+                .total_tokens
+                .map_or_else(|| "unknown".to_owned(), |t| t.to_string())
         ),
     );
 
@@ -1142,9 +1175,9 @@ pub fn execute_xs_s_pipeline_with_executor(
             status: "RUNNING".to_owned(),
             failure_class: None,
             summary: None,
-            input_tokens: 0,
-            output_tokens: 0,
-            total_tokens: 0,
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
             sha_before: Some(committed_sha.clone()),
             sha_after: Some(committed_sha.clone()),
         };
@@ -1171,13 +1204,7 @@ pub fn execute_xs_s_pipeline_with_executor(
                     ));
                 }
             };
-        rev_attempt.ended_epoch = Some(now_epoch());
-        rev_attempt.status = rev_result.status.clone();
-        rev_attempt.summary = Some(truncate_utf8_bytes(&rev_result.summary, MAX_SUMMARY_BYTES));
-        rev_attempt.invocation_id = rev_result.invocation_id.clone();
-        rev_attempt.input_tokens = rev_result.input_tokens;
-        rev_attempt.output_tokens = rev_result.output_tokens;
-        rev_attempt.total_tokens = rev_result.total_tokens;
+        apply_stage_result_usage(&mut task, &mut rev_attempt, "pr-review", &rev_result);
         if let Some(sha) = rev_result
             .sha_after
             .as_deref()
@@ -1186,12 +1213,6 @@ pub fn execute_xs_s_pipeline_with_executor(
         {
             rev_attempt.sha_after = Some(sha.to_owned());
         }
-
-        *task
-            .memory
-            .token_usage_by_stage
-            .entry("pr-review".to_owned())
-            .or_insert(0) += rev_result.total_tokens;
 
         if rev_result.status != "PASSED" {
             let class =
@@ -1362,9 +1383,9 @@ pub fn execute_m_l_pipeline_with_executor(
             status: "RUNNING".to_owned(),
             failure_class: None,
             summary: None,
-            input_tokens: 0,
-            output_tokens: 0,
-            total_tokens: 0,
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
             sha_before: None,
             sha_after: None,
         };
@@ -1412,19 +1433,7 @@ pub fn execute_m_l_pipeline_with_executor(
                 return Err(format!("plan stage failed for {}: {}", task.task_id, err));
             }
         };
-        plan_rec.ended_epoch = Some(now_epoch());
-        plan_rec.status = plan_result.status.clone();
-        plan_rec.summary = Some(truncate_utf8_bytes(&plan_result.summary, MAX_SUMMARY_BYTES));
-        plan_rec.invocation_id = plan_result.invocation_id.clone();
-        plan_rec.input_tokens = plan_result.input_tokens;
-        plan_rec.output_tokens = plan_result.output_tokens;
-        plan_rec.total_tokens = plan_result.total_tokens;
-
-        *task
-            .memory
-            .token_usage_by_stage
-            .entry("plan".to_owned())
-            .or_insert(0) += plan_result.total_tokens;
+        apply_stage_result_usage(&mut task, &mut plan_rec, "plan", &plan_result);
 
         if plan_result.status != "PASSED" {
             let class = classify_failure_class("plan", &plan_result.status, &plan_result.summary);
@@ -1510,9 +1519,9 @@ pub fn execute_m_l_pipeline_with_executor(
             status: "RUNNING".to_owned(),
             failure_class: None,
             summary: None,
-            input_tokens: 0,
-            output_tokens: 0,
-            total_tokens: 0,
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
             sha_before: None,
             sha_after: None,
         };
@@ -1563,19 +1572,7 @@ pub fn execute_m_l_pipeline_with_executor(
                 ));
             }
         };
-        rev_rec.ended_epoch = Some(now_epoch());
-        rev_rec.status = rev_result.status.clone();
-        rev_rec.summary = Some(truncate_utf8_bytes(&rev_result.summary, MAX_SUMMARY_BYTES));
-        rev_rec.invocation_id = rev_result.invocation_id.clone();
-        rev_rec.input_tokens = rev_result.input_tokens;
-        rev_rec.output_tokens = rev_result.output_tokens;
-        rev_rec.total_tokens = rev_result.total_tokens;
-
-        *task
-            .memory
-            .token_usage_by_stage
-            .entry("plan-review".to_owned())
-            .or_insert(0) += rev_result.total_tokens;
+        apply_stage_result_usage(&mut task, &mut rev_rec, "plan-review", &rev_result);
 
         if rev_result.status != "PASSED" {
             let class =
@@ -1730,9 +1727,9 @@ pub fn execute_m_l_pipeline_with_executor(
             status: "RUNNING".to_owned(),
             failure_class: None,
             summary: None,
-            input_tokens: 0,
-            output_tokens: 0,
-            total_tokens: 0,
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
             sha_before: None,
             sha_after: None,
         };
@@ -1781,21 +1778,9 @@ pub fn execute_m_l_pipeline_with_executor(
             }
         };
 
-        attempt_rec.ended_epoch = Some(now_epoch());
-        attempt_rec.status = impl_result.status.clone();
-        attempt_rec.summary = Some(truncate_utf8_bytes(&impl_result.summary, MAX_SUMMARY_BYTES));
-        attempt_rec.invocation_id = impl_result.invocation_id.clone();
-        attempt_rec.input_tokens = impl_result.input_tokens;
-        attempt_rec.output_tokens = impl_result.output_tokens;
-        attempt_rec.total_tokens = impl_result.total_tokens;
+        apply_stage_result_usage(&mut task, &mut attempt_rec, "impl", &impl_result);
         attempt_rec.sha_before = impl_result.sha_before.clone();
         attempt_rec.sha_after = impl_result.sha_after.clone();
-
-        *task
-            .memory
-            .token_usage_by_stage
-            .entry("impl".to_owned())
-            .or_insert(0) += impl_result.total_tokens;
 
         if impl_result.status != "PASSED" {
             let class = classify_failure_class("impl", &impl_result.status, &impl_result.summary);
@@ -1936,9 +1921,9 @@ pub fn execute_m_l_pipeline_with_executor(
             status: "RUNNING".to_owned(),
             failure_class: None,
             summary: None,
-            input_tokens: 0,
-            output_tokens: 0,
-            total_tokens: 0,
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
             sha_before: task.reviewed_sha.clone(),
             sha_after: task.reviewed_sha.clone(),
         };
@@ -1990,24 +1975,12 @@ pub fn execute_m_l_pipeline_with_executor(
             }
         };
 
-        rev_rec.ended_epoch = Some(now_epoch());
-        rev_rec.status = rev_result.status.clone();
-        rev_rec.summary = Some(truncate_utf8_bytes(&rev_result.summary, MAX_SUMMARY_BYTES));
-        rev_rec.invocation_id = rev_result.invocation_id.clone();
-        rev_rec.input_tokens = rev_result.input_tokens;
-        rev_rec.output_tokens = rev_result.output_tokens;
-        rev_rec.total_tokens = rev_result.total_tokens;
+        apply_stage_result_usage(&mut task, &mut rev_rec, "pr-review", &rev_result);
         if let Some(ref sha) = rev_result.sha_after
             && !sha.trim().is_empty()
         {
             rev_rec.sha_after = Some(sha.clone());
         }
-
-        *task
-            .memory
-            .token_usage_by_stage
-            .entry("pr-review".to_owned())
-            .or_insert(0) += rev_result.total_tokens;
 
         if rev_result.status != "PASSED" {
             let class =
@@ -2357,9 +2330,9 @@ mod tests {
                     summary: "Implemented router and runner".to_owned(),
                     review_markdown: None,
                     invocation_id: Some("inv-1".to_owned()),
-                    input_tokens: 12_000,
-                    output_tokens: 3_000,
-                    total_tokens: 15_000,
+                    input_tokens: Some(12_000),
+                    output_tokens: Some(3_000),
+                    total_tokens: Some(15_000),
                     sha_before: Some("abc1234".to_owned()),
                     sha_after: Some("abc1234".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -2379,9 +2352,9 @@ mod tests {
                             .to_owned(),
                     ),
                     invocation_id: Some("inv-2".to_owned()),
-                    input_tokens: 8_000,
-                    output_tokens: 1_500,
-                    total_tokens: 9_500,
+                    input_tokens: Some(8_000),
+                    output_tokens: Some(1_500),
+                    total_tokens: Some(9_500),
                     sha_before: Some("def5678".to_owned()),
                     sha_after: Some("def5678".to_owned()),
                     diff_files: Vec::new(),
@@ -2463,9 +2436,9 @@ mod tests {
                 summary: "Implemented XS change".to_owned(),
                 review_markdown: None,
                 invocation_id: Some("inv-xs-1".to_owned()),
-                input_tokens: 4_000,
-                output_tokens: 800,
-                total_tokens: 4_800,
+                input_tokens: Some(4_000),
+                output_tokens: Some(800),
+                total_tokens: Some(4_800),
                 sha_before: Some("abc1234".to_owned()),
                 sha_after: Some("xs-sha-1".to_owned()),
                 diff_files: vec![DiffFileEntry {
@@ -2545,9 +2518,9 @@ mod tests {
                     summary: "Architectural plan generated".to_owned(),
                     review_markdown: None,
                     invocation_id: Some("inv-plan".to_owned()),
-                    input_tokens: 10_000,
-                    output_tokens: 2_000,
-                    total_tokens: 12_000,
+                    input_tokens: Some(10_000),
+                    output_tokens: Some(2_000),
+                    total_tokens: Some(12_000),
                     sha_before: None,
                     sha_after: None,
                     diff_files: Vec::new(),
@@ -2558,9 +2531,9 @@ mod tests {
                     summary: "Plan review approved".to_owned(),
                     review_markdown: None,
                     invocation_id: Some("inv-plan-review".to_owned()),
-                    input_tokens: 8_000,
-                    output_tokens: 1_000,
-                    total_tokens: 9_000,
+                    input_tokens: Some(8_000),
+                    output_tokens: Some(1_000),
+                    total_tokens: Some(9_000),
                     sha_before: None,
                     sha_after: None,
                     diff_files: Vec::new(),
@@ -2571,9 +2544,9 @@ mod tests {
                     summary: "Implementation complete".to_owned(),
                     review_markdown: None,
                     invocation_id: Some("inv-impl".to_owned()),
-                    input_tokens: 15_000,
-                    output_tokens: 3_000,
-                    total_tokens: 18_000,
+                    input_tokens: Some(15_000),
+                    output_tokens: Some(3_000),
+                    total_tokens: Some(18_000),
                     sha_before: Some("base123".to_owned()),
                     sha_after: Some("base123".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -2594,9 +2567,9 @@ mod tests {
                             .to_owned(),
                     ),
                     invocation_id: Some("inv-pr-rev".to_owned()),
-                    input_tokens: 12_000,
-                    output_tokens: 2_000,
-                    total_tokens: 14_000,
+                    input_tokens: Some(12_000),
+                    output_tokens: Some(2_000),
+                    total_tokens: Some(14_000),
                     sha_before: Some("sha-m-impl".to_owned()),
                     sha_after: Some("sha-m-impl".to_owned()),
                     diff_files: Vec::new(),
@@ -2680,9 +2653,9 @@ mod tests {
                     summary: "L Plan".to_owned(),
                     review_markdown: None,
                     invocation_id: None,
-                    input_tokens: 1_000,
-                    output_tokens: 500,
-                    total_tokens: 1_500,
+                    input_tokens: Some(1_000),
+                    output_tokens: Some(500),
+                    total_tokens: Some(1_500),
                     sha_before: None,
                     sha_after: None,
                     diff_files: Vec::new(),
@@ -2693,9 +2666,9 @@ mod tests {
                     summary: "L Plan Review".to_owned(),
                     review_markdown: None,
                     invocation_id: None,
-                    input_tokens: 1_000,
-                    output_tokens: 500,
-                    total_tokens: 1_500,
+                    input_tokens: Some(1_000),
+                    output_tokens: Some(500),
+                    total_tokens: Some(1_500),
                     sha_before: None,
                     sha_after: None,
                     diff_files: Vec::new(),
@@ -2731,9 +2704,9 @@ mod tests {
             summary: "L Impl".to_owned(),
             review_markdown: None,
             invocation_id: None,
-            input_tokens: 5_000,
-            output_tokens: 1_000,
-            total_tokens: 6_000,
+            input_tokens: Some(5_000),
+            output_tokens: Some(1_000),
+            total_tokens: Some(6_000),
             sha_before: Some("base-l".to_owned()),
             sha_after: Some("sha-l-impl".to_owned()),
             diff_files: vec![DiffFileEntry {
@@ -2753,9 +2726,9 @@ mod tests {
                     .to_owned(),
             ),
             invocation_id: None,
-            input_tokens: 5_000,
-            output_tokens: 1_000,
-            total_tokens: 6_000,
+            input_tokens: Some(5_000),
+            output_tokens: Some(1_000),
+            total_tokens: Some(6_000),
             sha_before: Some("sha-l-impl".to_owned()),
             sha_after: Some("sha-l-impl".to_owned()),
             diff_files: Vec::new(),
@@ -2855,11 +2828,13 @@ mod tests {
         assert_eq!(payload["orchestration_id"], "zach-008");
         assert_eq!(payload["allowed_files"], serde_json::json!([]));
 
-        // 2. Test parse_agy_cli_response: success
-        let ok_json = r#"{"execution_succeeded":true,"summary":"Analysis complete","task_usage":{"total_tokens":5432}}"#;
+        // 2. Test parse_agy_cli_response: success with real worker.mjs usage shape
+        let ok_json = r#"{"execution_succeeded":true,"summary":"Analysis complete","usage":{"input_tokens":5000,"output_tokens":432,"total_tokens":5432},"budget":{"model_calls_used":1,"observed_total_tokens":5432,"unknown_usage_calls":0}}"#;
         let ok_res = parse_agy_cli_response(ok_json, "", Some(0)).unwrap();
         assert_eq!(ok_res.status, "PASSED");
-        assert_eq!(ok_res.total_tokens, 5432);
+        assert_eq!(ok_res.input_tokens, Some(5000));
+        assert_eq!(ok_res.output_tokens, Some(432));
+        assert_eq!(ok_res.total_tokens, Some(5432));
 
         // 3. Test parse_agy_cli_response: failures
         // AGY_SPAWN
@@ -2903,9 +2878,9 @@ mod tests {
                 summary: "Fallback succeeded".to_owned(),
                 review_markdown: None,
                 invocation_id: None,
-                input_tokens: 1_000,
-                output_tokens: 500,
-                total_tokens: 1_500,
+                input_tokens: Some(1_000),
+                output_tokens: Some(500),
+                total_tokens: Some(1_500),
                 sha_before: None,
                 sha_after: None,
                 diff_files: Vec::new(),
@@ -2988,9 +2963,9 @@ mod tests {
                 summary: "transient failure".to_owned(),
                 review_markdown: None,
                 invocation_id: Some("inv-fail".to_owned()),
-                input_tokens: 100,
-                output_tokens: 50,
-                total_tokens: 150,
+                input_tokens: Some(100),
+                output_tokens: Some(50),
+                total_tokens: Some(150),
                 sha_before: None,
                 sha_after: None,
                 diff_files: Vec::new(),
@@ -3059,9 +3034,9 @@ mod tests {
                     summary: "Plan ok".to_owned(),
                     review_markdown: None,
                     invocation_id: Some("inv-plan".to_owned()),
-                    input_tokens: 1_000,
-                    output_tokens: 200,
-                    total_tokens: 1_200,
+                    input_tokens: Some(1_000),
+                    output_tokens: Some(200),
+                    total_tokens: Some(1_200),
                     sha_before: None,
                     sha_after: None,
                     diff_files: Vec::new(),
@@ -3071,9 +3046,9 @@ mod tests {
                     summary: "Plan review ok".to_owned(),
                     review_markdown: None,
                     invocation_id: Some("inv-plan-rev".to_owned()),
-                    input_tokens: 800,
-                    output_tokens: 100,
-                    total_tokens: 900,
+                    input_tokens: Some(800),
+                    output_tokens: Some(100),
+                    total_tokens: Some(900),
                     sha_before: None,
                     sha_after: None,
                     diff_files: Vec::new(),
@@ -3083,9 +3058,9 @@ mod tests {
                     summary: "Impl ok".to_owned(),
                     review_markdown: None,
                     invocation_id: Some("inv-impl".to_owned()),
-                    input_tokens: 1_500,
-                    output_tokens: 300,
-                    total_tokens: 1_800,
+                    input_tokens: Some(1_500),
+                    output_tokens: Some(300),
+                    total_tokens: Some(1_800),
                     sha_before: Some("base123".to_owned()),
                     sha_after: Some("sha-m-impl".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -3105,9 +3080,9 @@ mod tests {
                             .to_owned(),
                     ),
                     invocation_id: Some("inv-pr-rev".to_owned()),
-                    input_tokens: 900,
-                    output_tokens: 150,
-                    total_tokens: 1_050,
+                    input_tokens: Some(900),
+                    output_tokens: Some(150),
+                    total_tokens: Some(1_050),
                     sha_before: Some("sha-m-impl".to_owned()),
                     sha_after: Some("sha-m-impl".to_owned()),
                     diff_files: Vec::new(),
@@ -3190,9 +3165,9 @@ mod tests {
                         .to_owned(),
                 ),
                 invocation_id: Some("inv-pr-rerev".to_owned()),
-                input_tokens: 500,
-                output_tokens: 100,
-                total_tokens: 600,
+                input_tokens: Some(500),
+                output_tokens: Some(100),
+                total_tokens: Some(600),
                 sha_before: Some("stale-reviewed-sha".to_owned()),
                 sha_after: Some("new-merged-reviewed-sha".to_owned()),
                 diff_files: Vec::new(),
@@ -3372,9 +3347,9 @@ mod tests {
                         summary: "impl ok".to_owned(),
                         review_markdown: None,
                         invocation_id: Some("inv-impl".to_owned()),
-                        input_tokens: 1_000,
-                        output_tokens: 200,
-                        total_tokens: 1_200,
+                        input_tokens: Some(1_000),
+                        output_tokens: Some(200),
+                        total_tokens: Some(1_200),
                         sha_before: Some("abc1234".to_owned()),
                         sha_after: Some("def5678".to_owned()),
                         diff_files: vec![DiffFileEntry {
@@ -3389,9 +3364,9 @@ mod tests {
                         summary: "missing table".to_owned(),
                         review_markdown: Some("No AC table here".to_owned()),
                         invocation_id: Some("inv-rev".to_owned()),
-                        input_tokens: 500,
-                        output_tokens: 100,
-                        total_tokens: 600,
+                        input_tokens: Some(500),
+                        output_tokens: Some(100),
+                        total_tokens: Some(600),
                         sha_before: Some("def5678".to_owned()),
                         sha_after: Some("def5678".to_owned()),
                         diff_files: Vec::new(),
@@ -3433,9 +3408,9 @@ mod tests {
                         summary: "impl ok".to_owned(),
                         review_markdown: None,
                         invocation_id: None,
-                        input_tokens: 100,
-                        output_tokens: 50,
-                        total_tokens: 150,
+                        input_tokens: Some(100),
+                        output_tokens: Some(50),
+                        total_tokens: Some(150),
                         sha_before: Some("abc".to_owned()),
                         sha_after: Some("def".to_owned()),
                         diff_files: vec![DiffFileEntry {
@@ -3478,9 +3453,9 @@ mod tests {
                     summary: "edited workflow".to_owned(),
                     review_markdown: None,
                     invocation_id: None,
-                    input_tokens: 100,
-                    output_tokens: 50,
-                    total_tokens: 150,
+                    input_tokens: Some(100),
+                    output_tokens: Some(50),
+                    total_tokens: Some(150),
                     sha_before: Some("abc".to_owned()),
                     sha_after: Some("def".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -3532,9 +3507,9 @@ mod tests {
                         summary: "plan ok".to_owned(),
                         review_markdown: None,
                         invocation_id: None,
-                        input_tokens: 100,
-                        output_tokens: 50,
-                        total_tokens: 150,
+                        input_tokens: Some(100),
+                        output_tokens: Some(50),
+                        total_tokens: Some(150),
                         sha_before: None,
                         sha_after: None,
                         diff_files: Vec::new(),
@@ -3544,9 +3519,9 @@ mod tests {
                         summary: "changes_requested: clarify migration steps".to_owned(),
                         review_markdown: None,
                         invocation_id: None,
-                        input_tokens: 100,
-                        output_tokens: 50,
-                        total_tokens: 150,
+                        input_tokens: Some(100),
+                        output_tokens: Some(50),
+                        total_tokens: Some(150),
                         sha_before: None,
                         sha_after: None,
                         diff_files: Vec::new(),
@@ -3585,9 +3560,9 @@ mod tests {
             summary: "impl ok".to_owned(),
             review_markdown: None,
             invocation_id: Some("inv-impl".to_owned()),
-            input_tokens: 1_000,
-            output_tokens: 200,
-            total_tokens: 1_200,
+            input_tokens: Some(1_000),
+            output_tokens: Some(200),
+            total_tokens: Some(1_200),
             sha_before: Some("abc1234".to_owned()),
             sha_after: Some("abc1234".to_owned()),
             diff_files: vec![DiffFileEntry {
@@ -3607,9 +3582,9 @@ mod tests {
                     .to_owned(),
             ),
             invocation_id: Some("inv-rev".to_owned()),
-            input_tokens: 500,
-            output_tokens: 100,
-            total_tokens: 600,
+            input_tokens: Some(500),
+            output_tokens: Some(100),
+            total_tokens: Some(600),
             sha_before: Some("real-sha".to_owned()),
             sha_after: Some("real-sha".to_owned()),
             diff_files: Vec::new(),
@@ -3741,9 +3716,9 @@ mod tests {
                         summary: "Modified router without committing".to_owned(),
                         review_markdown: None,
                         invocation_id: Some("inv-real-impl".to_owned()),
-                        input_tokens: 1_000,
-                        output_tokens: 200,
-                        total_tokens: 1_200,
+                        input_tokens: Some(1_000),
+                        output_tokens: Some(200),
+                        total_tokens: Some(1_200),
                         sha_before: Some(sha_before),
                         sha_after: Some(sha_after),
                         diff_files,
@@ -3767,9 +3742,9 @@ mod tests {
                             .to_owned(),
                     ),
                     invocation_id: Some("inv-real-rev".to_owned()),
-                    input_tokens: 600,
-                    output_tokens: 100,
-                    total_tokens: 700,
+                    input_tokens: Some(600),
+                    output_tokens: Some(100),
+                    total_tokens: Some(700),
                     sha_before: Some(head_sha.clone()),
                     sha_after: Some(head_sha),
                     diff_files: Vec::new(),
@@ -3999,9 +3974,9 @@ mod tests {
                 summary: format!("AGY_TIMEOUT: {giant_raw}"),
                 review_markdown: None,
                 invocation_id: None,
-                input_tokens: 100,
-                output_tokens: 50,
-                total_tokens: 150,
+                input_tokens: Some(100),
+                output_tokens: Some(50),
+                total_tokens: Some(150),
                 sha_before: None,
                 sha_after: None,
                 diff_files: Vec::new(),
@@ -4037,9 +4012,9 @@ mod tests {
                 summary: giant_raw.clone(),
                 review_markdown: None,
                 invocation_id: None,
-                input_tokens: 10,
-                output_tokens: 5,
-                total_tokens: 15,
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                total_tokens: Some(15),
                 sha_before: None,
                 sha_after: None,
                 diff_files: vec![DiffFileEntry {
@@ -4071,9 +4046,9 @@ mod tests {
                     summary: "impl ok".to_owned(),
                     review_markdown: None,
                     invocation_id: None,
-                    input_tokens: 10,
-                    output_tokens: 5,
-                    total_tokens: 15,
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    total_tokens: Some(15),
                     sha_before: Some("abc".to_owned()),
                     sha_after: Some("def".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -4109,5 +4084,233 @@ mod tests {
                 .all(|e| e.len() <= MAX_RECENT_ATTEMPT_BYTES)
         );
         assert!(pol_task.memory.recent_attempts[0].starts_with("entry-5-"));
+    }
+
+    #[test]
+    fn parse_agy_cli_response_parses_real_fixture_and_distinguishes_zero_vs_unknown() {
+        let fixture = include_str!("../../tests/fixtures/gemini_worker_usage.json");
+        let parsed = parse_agy_cli_response(fixture, "", Some(0)).expect("parse real fixture");
+        assert_eq!(parsed.status, "PASSED");
+        assert_eq!(parsed.summary, "OK");
+        assert_eq!(
+            parsed.invocation_id.as_deref(),
+            Some("task_d0e234eb4c1343aea395c9de8c5428b0")
+        );
+        assert_eq!(parsed.input_tokens, Some(9_967));
+        assert_eq!(parsed.output_tokens, Some(43));
+        assert_eq!(parsed.total_tokens, Some(10_010));
+
+        // Do not double-count or override per-invocation usage with cumulative task_usage.
+        let multi_run = r#"{
+            "execution_succeeded": true,
+            "summary": "Done",
+            "usage": {"input_tokens": 100, "output_tokens": 50, "total_tokens": 150},
+            "budget": {"model_calls_used": 1, "observed_total_tokens": 150, "unknown_usage_calls": 0},
+            "task_usage": {"usage_complete": true, "unknown_usage_calls": 0, "input_tokens": 80000, "output_tokens": 10000, "observed_total_tokens": 90000}
+        }"#;
+        let multi_res = parse_agy_cli_response(multi_run, "", Some(0)).unwrap();
+        assert_eq!(multi_res.input_tokens, Some(100));
+        assert_eq!(multi_res.output_tokens, Some(50));
+        assert_eq!(multi_res.total_tokens, Some(150));
+
+        // Compute total_tokens from input + output when total_tokens is omitted.
+        let computed_total = r#"{
+            "execution_succeeded": true,
+            "summary": "Computed total",
+            "usage": {"input_tokens": 200, "output_tokens": 40}
+        }"#;
+        let computed_res = parse_agy_cli_response(computed_total, "", Some(0)).unwrap();
+        assert_eq!(computed_res.input_tokens, Some(200));
+        assert_eq!(computed_res.output_tokens, Some(40));
+        assert_eq!(computed_res.total_tokens, Some(240));
+
+        // Explicit zero usage is recorded as Some(0), distinct from unknown None.
+        let explicit_zero = r#"{
+            "execution_succeeded": true,
+            "summary": "Cached zero",
+            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        }"#;
+        let zero_res = parse_agy_cli_response(explicit_zero, "", Some(0)).unwrap();
+        assert_eq!(zero_res.input_tokens, Some(0));
+        assert_eq!(zero_res.output_tokens, Some(0));
+        assert_eq!(zero_res.total_tokens, Some(0));
+
+        // Empty usage `{}` with unknown_usage_calls > 0 / usage_complete == false yields None.
+        let unknown_usage = r#"{
+            "execution_succeeded": true,
+            "summary": "Unparseable AGY usage",
+            "usage": {},
+            "budget": {"model_calls_used": 1, "observed_total_tokens": 0, "unknown_usage_calls": 1},
+            "task_usage": {"usage_complete": false, "unknown_usage_calls": 1, "observed_total_tokens": 5000}
+        }"#;
+        let unknown_res = parse_agy_cli_response(unknown_usage, "", Some(0)).unwrap();
+        assert_eq!(unknown_res.input_tokens, None);
+        assert_eq!(unknown_res.output_tokens, None);
+        assert_eq!(unknown_res.total_tokens, None);
+
+        // Fallback to budget.observed_total_tokens when usage is empty and unknown_usage_calls == 0.
+        let budget_fallback = r#"{
+            "execution_succeeded": true,
+            "summary": "Budget fallback",
+            "usage": {},
+            "budget": {"model_calls_used": 1, "observed_total_tokens": 333, "unknown_usage_calls": 0}
+        }"#;
+        let fallback_res = parse_agy_cli_response(budget_fallback, "", Some(0)).unwrap();
+        assert_eq!(fallback_res.input_tokens, None);
+        assert_eq!(fallback_res.output_tokens, None);
+        assert_eq!(fallback_res.total_tokens, Some(333));
+    }
+
+    #[test]
+    fn pipeline_accumulates_token_usage_enforces_budget_and_records_null_on_unknown() {
+        let mut store = V2Store::open_in_memory().expect("open store");
+        let mut task = sample_s_task("ZACH-020-ACC");
+        task.context_pack.target_files = vec![TargetFileSpec {
+            path: "src/v2/**".to_owned(),
+            action: "modify".to_owned(),
+            summary: "token usage".to_owned(),
+        }];
+        store.upsert_task(&task).unwrap();
+
+        let route = resolve_stage_route("S", "impl", 0, None).unwrap().unwrap();
+        assert_eq!(route.max_task_tokens, 400_000);
+
+        // Attempt 1: impl fails after consuming 250_000 tokens -> accumulated into token_usage_by_stage["impl"].
+        let mut fail_exec = MockStageExecutor {
+            staged_results: vec![StageExecutionResult {
+                status: "FAILED".to_owned(),
+                summary: "first impl failed".to_owned(),
+                review_markdown: None,
+                invocation_id: None,
+                input_tokens: Some(200_000),
+                output_tokens: Some(50_000),
+                total_tokens: Some(250_000),
+                sha_before: None,
+                sha_after: None,
+                diff_files: Vec::new(),
+            }],
+            ..MockStageExecutor::default()
+        };
+        assert!(
+            execute_xs_s_pipeline_with_executor(&mut store, "ZACH-020-ACC", &mut fail_exec)
+                .is_err()
+        );
+        let after_fail = store.get_task("ZACH-020-ACC").unwrap().unwrap();
+        assert_eq!(
+            after_fail.memory.token_usage_by_stage.get("impl").copied(),
+            Some(250_000)
+        );
+        assert_eq!(check_token_budget(&after_fail, &route).unwrap(), 150_000);
+
+        // Attempt 2 & 3: impl succeeds (100_000) + pr-review succeeds (60_000) -> total = 410_000 >= 400_000.
+        let mut pass_exec = MockStageExecutor {
+            staged_results: vec![
+                StageExecutionResult {
+                    status: "PASSED".to_owned(),
+                    summary: "impl ok".to_owned(),
+                    review_markdown: None,
+                    invocation_id: None,
+                    input_tokens: Some(80_000),
+                    output_tokens: Some(20_000),
+                    total_tokens: Some(100_000),
+                    sha_before: Some("abc".to_owned()),
+                    sha_after: Some("def".to_owned()),
+                    diff_files: vec![DiffFileEntry {
+                        path: "src/v2/runner.rs".to_owned(),
+                        status: "M".to_owned(),
+                        added_lines: 10,
+                        deleted_lines: 2,
+                    }],
+                },
+                StageExecutionResult {
+                    status: "PASSED".to_owned(),
+                    summary: "review ok".to_owned(),
+                    review_markdown: Some(
+                        "| AC | Criterion | Code (file:line) | Test | Status |\n\
+                         |---|---|---|---|---|\n\
+                         | AC-1 | Token usage parsed | src/v2/runner.rs:10 | runner::tests::parse_codex_jsonl_output_sums_turns_and_handles_failures | PASS |\n"
+                            .to_owned(),
+                    ),
+                    invocation_id: None,
+                    input_tokens: Some(50_000),
+                    output_tokens: Some(10_000),
+                    total_tokens: Some(60_000),
+                    sha_before: Some("def".to_owned()),
+                    sha_after: Some("def".to_owned()),
+                    diff_files: Vec::new(),
+                },
+            ],
+            ..MockStageExecutor::default()
+        };
+        let completed =
+            execute_xs_s_pipeline_with_executor(&mut store, "ZACH-020-ACC", &mut pass_exec)
+                .expect("pipeline succeeds before exceeding budget on next stage");
+        assert_eq!(
+            completed.memory.token_usage_by_stage.get("impl").copied(),
+            Some(350_000)
+        );
+        assert_eq!(
+            completed
+                .memory
+                .token_usage_by_stage
+                .get("pr-review")
+                .copied(),
+            Some(60_000)
+        );
+        let budget_err = check_token_budget(&completed, &route).unwrap_err();
+        assert!(budget_err.contains("token budget exhausted"));
+
+        // Unknown usage attempt (from real codex_exec_failed.jsonl) records SQL NULL (not 0).
+        let mut null_task = sample_s_task("ZACH-020-NULL");
+        null_task.weight = "XS".to_owned();
+        null_task.context_pack.weight = "XS".to_owned();
+        null_task.required_stages = vec!["impl".to_owned()];
+        store.upsert_task(&null_task).unwrap();
+        let failed_codex = crate::v2::runner::parse_codex_jsonl_output(
+            include_str!("../../tests/fixtures/codex_exec_failed.jsonl"),
+            "",
+            Some(1),
+        )
+        .unwrap();
+        let mut null_exec = MockStageExecutor {
+            staged_results: vec![StageExecutionResult {
+                status: failed_codex.status,
+                summary: failed_codex.summary,
+                review_markdown: failed_codex.review_markdown,
+                invocation_id: None,
+                input_tokens: failed_codex.input_tokens,
+                output_tokens: failed_codex.output_tokens,
+                total_tokens: failed_codex.total_tokens,
+                sha_before: None,
+                sha_after: None,
+                diff_files: Vec::new(),
+            }],
+            ..MockStageExecutor::default()
+        };
+        assert!(
+            execute_xs_s_pipeline_with_executor(&mut store, "ZACH-020-NULL", &mut null_exec)
+                .is_err()
+        );
+        null_task = store.get_task("ZACH-020-NULL").unwrap().unwrap();
+        assert!(null_task.memory.token_usage_by_stage.is_empty());
+
+        let attempts = store.list_stage_attempts("ZACH-020-NULL").unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].input_tokens, None);
+        assert_eq!(attempts[0].output_tokens, None);
+        assert_eq!(attempts[0].total_tokens, None);
+
+        let (raw_in, raw_out, raw_tot): (Option<i64>, Option<i64>, Option<i64>) = store
+            .connection_mut()
+            .query_row(
+                "SELECT input_tokens, output_tokens, total_tokens
+                 FROM stage_attempts WHERE attempt_id = ?1",
+                rusqlite::params![attempts[0].attempt_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(raw_in.is_none());
+        assert!(raw_out.is_none());
+        assert!(raw_tot.is_none());
     }
 }
