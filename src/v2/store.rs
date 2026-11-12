@@ -123,9 +123,9 @@ pub struct StageAttemptRecord {
     pub status: String,
     pub failure_class: Option<String>,
     pub summary: Option<String>,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub total_tokens: u64,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
     pub sha_before: Option<String>,
     pub sha_after: Option<String>,
 }
@@ -280,9 +280,9 @@ impl V2Store {
                  status TEXT NOT NULL,
                  failure_class TEXT,
                  summary TEXT,
-                 input_tokens INTEGER NOT NULL DEFAULT 0,
-                 output_tokens INTEGER NOT NULL DEFAULT 0,
-                 total_tokens INTEGER NOT NULL DEFAULT 0,
+                 input_tokens INTEGER,
+                 output_tokens INTEGER,
+                 total_tokens INTEGER,
                  sha_before TEXT,
                  sha_after TEXT,
                  FOREIGN KEY(task_id) REFERENCES tasks(task_id)
@@ -337,6 +337,8 @@ impl V2Store {
              );",
         )?;
 
+        self.migrate_stage_attempts_nullable_tokens()?;
+
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -354,6 +356,83 @@ impl V2Store {
             params![now_epoch().to_string()],
         )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Migrates pre-existing `stage_attempts` tables whose token columns were
+    /// created with `NOT NULL DEFAULT 0` to nullable `INTEGER` with no default.
+    fn migrate_stage_attempts_nullable_tokens(&mut self) -> Result<(), V2StoreError> {
+        let needs_migration = {
+            let mut stmt = self.conn.prepare("PRAGMA table_info('stage_attempts')")?;
+            let rows = stmt.query_map([], |row| {
+                let name: String = row.get(1)?;
+                let notnull: i64 = row.get(3)?;
+                let dflt: Option<String> = row.get(4)?;
+                Ok((name, notnull, dflt))
+            })?;
+            let mut needs = false;
+            for r in rows {
+                let (name, notnull, dflt) = r?;
+                if matches!(
+                    name.as_str(),
+                    "input_tokens" | "output_tokens" | "total_tokens"
+                ) && (notnull != 0 || dflt.is_some())
+                {
+                    needs = true;
+                }
+            }
+            needs
+        };
+
+        if !needs_migration {
+            return Ok(());
+        }
+
+        self.conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+        let res = (|| -> Result<(), V2StoreError> {
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(
+                "CREATE TABLE stage_attempts_new (
+                     attempt_id TEXT PRIMARY KEY,
+                     task_id TEXT NOT NULL,
+                     stage TEXT NOT NULL,
+                     model TEXT NOT NULL,
+                     effort TEXT NOT NULL,
+                     systemd_unit TEXT,
+                     invocation_id TEXT,
+                     started_epoch INTEGER NOT NULL,
+                     ended_epoch INTEGER,
+                     status TEXT NOT NULL,
+                     failure_class TEXT,
+                     summary TEXT,
+                     input_tokens INTEGER,
+                     output_tokens INTEGER,
+                     total_tokens INTEGER,
+                     sha_before TEXT,
+                     sha_after TEXT,
+                     FOREIGN KEY(task_id) REFERENCES tasks(task_id)
+                 );
+                 INSERT INTO stage_attempts_new (
+                     attempt_id, task_id, stage, model, effort, systemd_unit, invocation_id,
+                     started_epoch, ended_epoch, status, failure_class, summary,
+                     input_tokens, output_tokens, total_tokens, sha_before, sha_after
+                 )
+                 SELECT
+                     attempt_id, task_id, stage, model, effort, systemd_unit, invocation_id,
+                     started_epoch, ended_epoch, status, failure_class, summary,
+                     input_tokens, output_tokens, total_tokens, sha_before, sha_after
+                 FROM stage_attempts;
+                 DROP TABLE stage_attempts;
+                 ALTER TABLE stage_attempts_new RENAME TO stage_attempts;",
+            )?;
+            tx.commit()?;
+            Ok(())
+        })();
+        let fk_res = self.conn.execute_batch("PRAGMA foreign_keys=ON;");
+        res?;
+        fk_res?;
         Ok(())
     }
 
@@ -1026,9 +1105,15 @@ impl V2Store {
                 attempt.status,
                 attempt.failure_class,
                 bounded_summary,
-                attempt.input_tokens as i64,
-                attempt.output_tokens as i64,
-                attempt.total_tokens as i64,
+                attempt
+                    .input_tokens
+                    .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+                attempt
+                    .output_tokens
+                    .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+                attempt
+                    .total_tokens
+                    .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
                 attempt.sha_before,
                 attempt.sha_after,
             ],
@@ -1483,9 +1568,9 @@ impl V2Store {
     }
 
     fn map_stage_attempt_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StageAttemptRecord> {
-        let input_tokens: i64 = row.get(12)?;
-        let output_tokens: i64 = row.get(13)?;
-        let total_tokens: i64 = row.get(14)?;
+        let input_tokens: Option<i64> = row.get(12)?;
+        let output_tokens: Option<i64> = row.get(13)?;
+        let total_tokens: Option<i64> = row.get(14)?;
         Ok(StageAttemptRecord {
             attempt_id: row.get(0)?,
             task_id: row.get(1)?,
@@ -1499,9 +1584,9 @@ impl V2Store {
             status: row.get(9)?,
             failure_class: row.get(10)?,
             summary: row.get(11)?,
-            input_tokens: u64::try_from(input_tokens).unwrap_or(0),
-            output_tokens: u64::try_from(output_tokens).unwrap_or(0),
-            total_tokens: u64::try_from(total_tokens).unwrap_or(0),
+            input_tokens: input_tokens.and_then(|v| u64::try_from(v).ok()),
+            output_tokens: output_tokens.and_then(|v| u64::try_from(v).ok()),
+            total_tokens: total_tokens.and_then(|v| u64::try_from(v).ok()),
             sha_before: row.get(15)?,
             sha_after: row.get(16)?,
         })
@@ -1940,9 +2025,9 @@ mod tests {
             status: "FAILED".to_owned(),
             failure_class: Some("infra".to_owned()),
             summary: Some("worker timed out".to_owned()),
-            input_tokens: 100,
-            output_tokens: 20,
-            total_tokens: 120,
+            input_tokens: Some(100),
+            output_tokens: Some(20),
+            total_tokens: Some(120),
             sha_before: Some("abc".to_owned()),
             sha_after: None,
         };
@@ -1963,9 +2048,9 @@ mod tests {
             status: "PASSED".to_owned(),
             failure_class: None,
             summary: Some("implemented".to_owned()),
-            input_tokens: 200,
-            output_tokens: 50,
-            total_tokens: 250,
+            input_tokens: Some(200),
+            output_tokens: Some(50),
+            total_tokens: Some(250),
             sha_before: Some("abc".to_owned()),
             sha_after: Some("def".to_owned()),
         };
@@ -2017,9 +2102,9 @@ mod tests {
             status: "FAILED".to_owned(),
             failure_class: Some("infra".to_owned()),
             summary: Some(long_utf8.clone()),
-            input_tokens: 10,
-            output_tokens: 5,
-            total_tokens: 15,
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            total_tokens: Some(15),
             sha_before: None,
             sha_after: None,
         };
@@ -2048,5 +2133,159 @@ mod tests {
             .unwrap();
         assert!(dec.context_summary.len() <= 1024);
         assert!(dec.context_summary.ends_with("..."));
+    }
+
+    #[test]
+    fn stage_attempts_persist_unknown_tokens_as_sql_null_and_migrate_legacy_not_null_schema() {
+        let db_path = std::env::temp_dir().join("zach_test_v2_nullable_tokens_migration.db");
+        let _ = std::fs::remove_file(&db_path);
+
+        // Simulate a pre-ZACH-020 SQLite database with NOT NULL DEFAULT 0 token columns.
+        {
+            let conn = Connection::open(&db_path).expect("create legacy db");
+            conn.execute_batch(
+                "CREATE TABLE tasks (
+                     task_id TEXT PRIMARY KEY,
+                     task_group TEXT NOT NULL,
+                     title TEXT NOT NULL,
+                     repository TEXT NOT NULL,
+                     github_repo TEXT,
+                     issue_number INTEGER,
+                     weight TEXT NOT NULL,
+                     status TEXT NOT NULL,
+                     worktree_path TEXT,
+                     branch TEXT,
+                     context_pack_json TEXT NOT NULL,
+                     depends_on_json TEXT NOT NULL,
+                     required_stages_json TEXT NOT NULL,
+                     stages_completed_json TEXT NOT NULL,
+                     current_stage TEXT,
+                     active_attempt_id TEXT,
+                     plan_base_sha TEXT,
+                     reviewed_sha TEXT,
+                     pr_number INTEGER,
+                     executor TEXT,
+                     autonomous_consent INTEGER NOT NULL DEFAULT 1,
+                     retry_count INTEGER NOT NULL DEFAULT 0,
+                     memory_json TEXT NOT NULL DEFAULT '{}',
+                     version INTEGER NOT NULL DEFAULT 1,
+                     updated_epoch INTEGER NOT NULL
+                 );
+                 CREATE TABLE stage_attempts (
+                     attempt_id TEXT PRIMARY KEY,
+                     task_id TEXT NOT NULL,
+                     stage TEXT NOT NULL,
+                     model TEXT NOT NULL,
+                     effort TEXT NOT NULL,
+                     systemd_unit TEXT,
+                     invocation_id TEXT,
+                     started_epoch INTEGER NOT NULL,
+                     ended_epoch INTEGER,
+                     status TEXT NOT NULL,
+                     failure_class TEXT,
+                     summary TEXT,
+                     input_tokens INTEGER NOT NULL DEFAULT 0,
+                     output_tokens INTEGER NOT NULL DEFAULT 0,
+                     total_tokens INTEGER NOT NULL DEFAULT 0,
+                     sha_before TEXT,
+                     sha_after TEXT,
+                     FOREIGN KEY(task_id) REFERENCES tasks(task_id)
+                 );
+                 INSERT INTO tasks (
+                     task_id, task_group, title, repository, weight, status,
+                     context_pack_json, depends_on_json, required_stages_json,
+                     stages_completed_json, updated_epoch
+                 ) VALUES (
+                     'ZACH-020-LEGACY', 'zach', 'Legacy task', 'zach', 'S', 'Ready',
+                     '{}', '[]', '[]', '[]', 1000
+                 );
+                 INSERT INTO stage_attempts (
+                     attempt_id, task_id, stage, model, effort, started_epoch, status,
+                     input_tokens, output_tokens, total_tokens
+                 ) VALUES (
+                     'zach-020-legacy-1', 'ZACH-020-LEGACY', 'impl', 'gpt-6.1-sol', 'medium', 1000, 'PASSED',
+                     120, 30, 150
+                 );",
+            )
+            .expect("seed legacy schema");
+        }
+
+        let mut store = V2Store::open(&db_path).expect("open and migrate legacy db");
+
+        // Verify PRAGMA table_info now reports nullable with no default for all 3 token columns.
+        {
+            let mut stmt = store
+                .connection_mut()
+                .prepare("PRAGMA table_info('stage_attempts')")
+                .unwrap();
+            let cols: Vec<(String, i64, Option<String>)> = stmt
+                .query_map([], |row| Ok((row.get(1)?, row.get(3)?, row.get(4)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            for col_name in ["input_tokens", "output_tokens", "total_tokens"] {
+                let (_, notnull, dflt) = cols
+                    .iter()
+                    .find(|(name, _, _)| name == col_name)
+                    .expect("token column exists");
+                assert_eq!(*notnull, 0, "{col_name} must be nullable");
+                assert_eq!(*dflt, None, "{col_name} must not have DEFAULT 0");
+            }
+        }
+
+        // Legacy row values are preserved.
+        let legacy_row = store
+            .get_stage_attempt("zach-020-legacy-1")
+            .unwrap()
+            .expect("legacy row preserved");
+        assert_eq!(legacy_row.input_tokens, Some(120));
+        assert_eq!(legacy_row.output_tokens, Some(30));
+        assert_eq!(legacy_row.total_tokens, Some(150));
+
+        // Recording unknown usage persists SQL NULL (not 0).
+        let unknown_attempt = StageAttemptRecord {
+            attempt_id: "zach-020-unknown-1".to_owned(),
+            task_id: "ZACH-020-LEGACY".to_owned(),
+            stage: "impl".to_owned(),
+            model: "gpt-6.1-sol".to_owned(),
+            effort: "medium".to_owned(),
+            systemd_unit: Some("zach-stage-zach-020-unknown-1".to_owned()),
+            invocation_id: None,
+            started_epoch: 1010,
+            ended_epoch: Some(1020),
+            status: "FAILED".to_owned(),
+            failure_class: Some("infra".to_owned()),
+            summary: Some("quota exhausted".to_owned()),
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            sha_before: None,
+            sha_after: None,
+        };
+        store.record_stage_attempt(&unknown_attempt).unwrap();
+
+        let (raw_in, raw_out, raw_tot): (Option<i64>, Option<i64>, Option<i64>) = store
+            .connection_mut()
+            .query_row(
+                "SELECT input_tokens, output_tokens, total_tokens
+                 FROM stage_attempts WHERE attempt_id = ?1",
+                params!["zach-020-unknown-1"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(raw_in.is_none(), "expected SQL NULL input_tokens");
+        assert!(raw_out.is_none(), "expected SQL NULL output_tokens");
+        assert!(raw_tot.is_none(), "expected SQL NULL total_tokens");
+
+        let mapped = store
+            .get_stage_attempt("zach-020-unknown-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(mapped.input_tokens, None);
+        assert_eq!(mapped.output_tokens, None);
+        assert_eq!(mapped.total_tokens, None);
+
+        drop(store);
+        let _ = std::fs::remove_file(&db_path);
     }
 }
