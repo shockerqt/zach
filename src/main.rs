@@ -6,11 +6,11 @@ use zach::ledger;
 use zach::v2::intake::{ingest_export_json, sync_from_ws_task};
 use zach::v2::merge_queue::{SystemMergeDriver, process_repo_merge_queue};
 use zach::v2::pipeline::{execute_m_l_pipeline, execute_xs_s_pipeline, plan_task_execution};
-use zach::v2::runner::reconcile_orphan_units;
+use zach::v2::runner::{attempt_retention_from_env, prune_old_attempts, reconcile_orphan_units};
 use zach::v2::scheduler::HeavyCheckSemaphore;
 use zach::v2::socket::{ClientCommand, DaemonServer, write_ndjson};
 use zach::v2::store::{DecisionResolution, V2Store};
-use zach::v2::{default_db_path, default_socket_path, default_ws_task_bin};
+use zach::v2::{default_db_path, default_socket_path, default_state_dir, default_ws_task_bin};
 use zach::{AuditRequest, GithubConfig, audit_task_integration};
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8090";
@@ -289,6 +289,9 @@ fn run_v2_run(args: &[String]) {
     let _ = reconcile_orphan_units(&mut store);
 
     let dry_run = has_flag(args, "--dry-run");
+    if !dry_run {
+        let _ = prune_old_attempts(&default_state_dir(), attempt_retention_from_env());
+    }
     let once = has_flag(args, "--once");
     let group = flag_value(args, "--group");
 
@@ -431,6 +434,7 @@ fn usage_error(message: &str) -> ! {
 
 fn run_v2_daemon(args: &[String]) {
     let mut store = open_store(args);
+    let _ = prune_old_attempts(&default_state_dir(), attempt_retention_from_env());
     let socket_path = flag_value(args, "--socket")
         .map(PathBuf::from)
         .unwrap_or_else(default_socket_path);

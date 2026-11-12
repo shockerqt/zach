@@ -2,8 +2,9 @@ use crate::v2::intake::default_required_stages;
 use crate::v2::now_epoch;
 use crate::v2::router::{ModelFamily, ReasoningEffort, StageRoute, resolve_stage_route};
 use crate::v2::runner::{
-    StageExecutionResult, StageExecutor, SystemdStageExecutor, build_clean_env_from_process,
-    build_systemd_stage_command, build_systemd_stage_command_with_env, check_token_budget,
+    MAX_RECENT_ATTEMPT_BYTES, MAX_SUMMARY_BYTES, StageExecutionResult, StageExecutor,
+    SystemdStageExecutor, build_clean_env_from_process, build_systemd_stage_command,
+    build_systemd_stage_command_with_env, check_token_budget, truncate_utf8_bytes,
 };
 use crate::v2::store::{ContextPackSpec, StageAttemptRecord, TaskRecord, V2Store};
 use serde::{Deserialize, Serialize};
@@ -355,6 +356,92 @@ impl std::fmt::Display for AgyCliError {
 
 impl std::error::Error for AgyCliError {}
 
+const MAX_RECENT_ATTEMPTS: usize = 10;
+const MAX_ALLOWED_FILES: usize = 50;
+
+fn filter_existing_allowed_files(
+    worktree: &str,
+    target_files: &[crate::v2::store::TargetFileSpec],
+) -> Vec<String> {
+    let trimmed_wt = worktree.trim();
+    if trimmed_wt.is_empty() || trimmed_wt == "none" {
+        return Vec::new();
+    }
+    let Ok(canonical_wt) = std::fs::canonicalize(trimmed_wt) else {
+        return Vec::new();
+    };
+    let mut allowed = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for tf in target_files {
+        let raw = tf.path.trim();
+        if raw.is_empty()
+            || raw.contains('*')
+            || raw.contains('?')
+            || raw.contains('[')
+            || raw.contains(']')
+        {
+            continue;
+        }
+        let rel_path = std::path::Path::new(raw);
+        if rel_path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            continue;
+        }
+        let candidate = if rel_path.is_absolute() {
+            rel_path.to_path_buf()
+        } else {
+            canonical_wt.join(rel_path)
+        };
+        let Ok(canonical_file) = std::fs::canonicalize(&candidate) else {
+            continue;
+        };
+        if !canonical_file.starts_with(&canonical_wt) || !canonical_file.is_file() {
+            continue;
+        }
+        if let Ok(rel) = canonical_file.strip_prefix(&canonical_wt)
+            && let Some(rel_str) = rel.to_str()
+            && !rel_str.is_empty()
+            && seen.insert(rel_str.to_owned())
+        {
+            allowed.push(rel_str.to_owned());
+            if allowed.len() >= MAX_ALLOWED_FILES {
+                break;
+            }
+        }
+    }
+    allowed
+}
+
+/// Pushes a bounded pointer entry (`<= 256` bytes) into `task.memory.recent_attempts`,
+/// retaining at most `MAX_RECENT_ATTEMPTS` (10) recent entries.
+pub fn push_bounded_recent_attempt(task: &mut TaskRecord, entry: impl AsRef<str>) {
+    let bounded = truncate_utf8_bytes(entry.as_ref(), MAX_RECENT_ATTEMPT_BYTES);
+    task.memory.recent_attempts.push(bounded);
+    if task.memory.recent_attempts.len() > MAX_RECENT_ATTEMPTS {
+        let drain = task.memory.recent_attempts.len() - MAX_RECENT_ATTEMPTS;
+        task.memory.recent_attempts.drain(0..drain);
+    }
+}
+
+fn classify_agy_infra_failure(res: &Result<StageExecutionResult, String>) -> Option<&'static str> {
+    let msg = match res {
+        Err(e) => e.as_str(),
+        Ok(r) if r.status != "PASSED" => r.summary.as_str(),
+        _ => return None,
+    };
+    if msg.contains("TIMEOUT") {
+        Some("AGY_TIMEOUT")
+    } else if msg.contains("SPAWN") {
+        Some("AGY_SPAWN")
+    } else if msg.contains("EXIT") {
+        Some("AGY_EXIT")
+    } else {
+        Some("AGY_STATUS")
+    }
+}
+
 /// Builds a structured JSON payload for `agent-tooling/plugins/gemini-worker/scripts/worker.mjs --cli`.
 pub fn build_agy_cli_payload(
     task: &TaskRecord,
@@ -367,12 +454,9 @@ pub fn build_agy_cli_payload(
         _ => "code_analysis",
     };
     let worktree = task.worktree_path.clone().unwrap_or_default();
-    let allowed_files: Vec<String> = task
-        .context_pack
-        .target_files
-        .iter()
-        .map(|tf| tf.path.clone())
-        .collect();
+    let allowed_files = filter_existing_allowed_files(&worktree, &task.context_pack.target_files);
+    let timeout_seconds = route.timeout_secs.clamp(30, 1800);
+    let orchestration_id = task.task_id.to_ascii_lowercase();
 
     serde_json::json!({
         "action": "run",
@@ -382,8 +466,8 @@ pub fn build_agy_cli_payload(
         "workspace_paths": [worktree],
         "allowed_files": allowed_files,
         "confirmed": true,
-        "timeout_seconds": route.timeout_secs,
-        "orchestration_id": task.task_id,
+        "timeout_seconds": timeout_seconds,
+        "orchestration_id": orchestration_id,
     })
 }
 
@@ -682,7 +766,7 @@ fn fail_stage_attempt(
         attempt.status = "FAILED".to_owned();
     }
     attempt.failure_class = Some(failure_class.to_owned());
-    attempt.summary = Some(summary);
+    attempt.summary = Some(truncate_utf8_bytes(&summary, MAX_SUMMARY_BYTES));
     store
         .record_stage_attempt(attempt)
         .map_err(|e| e.to_string())?;
@@ -706,9 +790,10 @@ fn run_stage_checks(
         return Ok(());
     }
     if let Err(err) = executor.run_checks(worktree_path, commands) {
-        task.memory.last_check_failure = Some(err.clone());
+        let bounded_err = truncate_utf8_bytes(&err, MAX_SUMMARY_BYTES);
+        task.memory.last_check_failure = Some(bounded_err.clone());
         let class = classify_failure_class(&attempt.stage, "FAILED", &err);
-        fail_stage_attempt(store, task, attempt, class, err.clone(), true)?;
+        fail_stage_attempt(store, task, attempt, class, bounded_err, true)?;
         return Err(err);
     }
     Ok(())
@@ -754,7 +839,7 @@ fn commit_impl_worktree(
 }
 
 pub fn execute_xs_s_pipeline(store: &mut V2Store, task_id: &str) -> Result<TaskRecord, String> {
-    let mut executor = SystemdStageExecutor;
+    let mut executor = SystemdStageExecutor::default();
     execute_xs_s_pipeline_with_executor(store, task_id, &mut executor)
 }
 
@@ -866,7 +951,7 @@ pub fn execute_xs_s_pipeline_with_executor(
     };
     attempt_rec.ended_epoch = Some(now_epoch());
     attempt_rec.status = impl_result.status.clone();
-    attempt_rec.summary = Some(impl_result.summary.clone());
+    attempt_rec.summary = Some(truncate_utf8_bytes(&impl_result.summary, MAX_SUMMARY_BYTES));
     attempt_rec.invocation_id = impl_result.invocation_id.clone();
     attempt_rec.input_tokens = impl_result.input_tokens;
     attempt_rec.output_tokens = impl_result.output_tokens;
@@ -879,10 +964,13 @@ pub fn execute_xs_s_pipeline_with_executor(
         .token_usage_by_stage
         .entry("impl".to_owned())
         .or_insert(0) += impl_result.total_tokens;
-    task.memory.recent_attempts.push(format!(
-        "[impl:{}] status={} tokens={}",
-        impl_attempt_id, impl_result.status, impl_result.total_tokens
-    ));
+    push_bounded_recent_attempt(
+        &mut task,
+        format!(
+            "[impl:{}] status={} tokens={}",
+            impl_attempt_id, impl_result.status, impl_result.total_tokens
+        ),
+    );
 
     if impl_result.status != "PASSED" {
         let class = classify_failure_class("impl", &impl_result.status, &impl_result.summary);
@@ -922,6 +1010,7 @@ pub fn execute_xs_s_pipeline_with_executor(
                 true,
             )?;
             let dec_id = format!("dec-{}-forbidden", task.task_id.to_ascii_lowercase());
+            let bounded_context = truncate_utf8_bytes(&impl_result.summary, MAX_SUMMARY_BYTES);
             let _ = store.open_decision(
                 &dec_id,
                 &task.task_id,
@@ -933,7 +1022,7 @@ pub fn execute_xs_s_pipeline_with_executor(
                     "Inspect worktree".to_owned(),
                 ],
                 Some(0),
-                &impl_result.summary,
+                &bounded_context,
                 impl_result.sha_after.as_deref(),
             );
             return Err(err_msg);
@@ -952,6 +1041,7 @@ pub fn execute_xs_s_pipeline_with_executor(
                 true,
             )?;
             let dec_id = format!("dec-{}-scope", task.task_id.to_ascii_lowercase());
+            let bounded_context = truncate_utf8_bytes(&impl_result.summary, MAX_SUMMARY_BYTES);
             let _ = store.open_decision(
                 &dec_id,
                 &task.task_id,
@@ -963,7 +1053,7 @@ pub fn execute_xs_s_pipeline_with_executor(
                     "Reject attempt".to_owned(),
                 ],
                 Some(1),
-                &impl_result.summary,
+                &bounded_context,
                 impl_result.sha_after.as_deref(),
             );
             return Err(err_msg);
@@ -1083,7 +1173,7 @@ pub fn execute_xs_s_pipeline_with_executor(
             };
         rev_attempt.ended_epoch = Some(now_epoch());
         rev_attempt.status = rev_result.status.clone();
-        rev_attempt.summary = Some(rev_result.summary.clone());
+        rev_attempt.summary = Some(truncate_utf8_bytes(&rev_result.summary, MAX_SUMMARY_BYTES));
         rev_attempt.invocation_id = rev_result.invocation_id.clone();
         rev_attempt.input_tokens = rev_result.input_tokens;
         rev_attempt.output_tokens = rev_result.output_tokens;
@@ -1160,7 +1250,7 @@ pub fn execute_xs_s_pipeline_with_executor(
 }
 
 pub fn execute_m_l_pipeline(store: &mut V2Store, task_id: &str) -> Result<TaskRecord, String> {
-    let mut executor = SystemdStageExecutor;
+    let mut executor = SystemdStageExecutor::default();
     execute_m_l_pipeline_with_executor(store, task_id, &mut executor)
 }
 
@@ -1284,62 +1374,33 @@ pub fn execute_m_l_pipeline_with_executor(
 
         let mut plan_res = executor.execute_stage(&task, &plan_attempt_id, &plan_route, &plan_spec);
 
-        if plan_route.family == ModelFamily::GeminiAgy {
-            let is_infra_err = match &plan_res {
-                Err(e) => {
-                    let cls = if e.contains("TIMEOUT") {
-                        "AGY_TIMEOUT"
-                    } else if e.contains("SPAWN") {
-                        "AGY_SPAWN"
-                    } else if e.contains("EXIT") {
-                        "AGY_EXIT"
-                    } else {
-                        "AGY_STATUS"
-                    };
-                    Some((cls, e.clone()))
-                }
-                Ok(res) if res.status != "PASSED" => {
-                    let cls = if res.summary.contains("TIMEOUT") {
-                        "AGY_TIMEOUT"
-                    } else if res.summary.contains("SPAWN") {
-                        "AGY_SPAWN"
-                    } else if res.summary.contains("EXIT") {
-                        "AGY_EXIT"
-                    } else {
-                        "AGY_STATUS"
-                    };
-                    Some((cls, res.summary.clone()))
-                }
-                _ => None,
-            };
-
-            if let Some((cls, sum)) = is_infra_err {
-                task.memory
-                    .recent_attempts
-                    .push(format!("[AGY_INFRA:{cls}] {sum}"));
-                if count_agy_infra_failures(&task) >= 2 {
-                    let fb_route = StageRoute {
-                        family: ModelFamily::OpenAiSol,
-                        model: "gpt-6.1-sol".to_owned(),
-                        effort: ReasoningEffort::High,
-                        fallback_family: None,
-                        fallback_model: None,
-                        fallback_effort: None,
-                        ..plan_route.clone()
-                    };
-                    let fb_attempt_id = format!(
-                        "{}-plan-fb-{}",
-                        task.task_id.to_ascii_lowercase(),
-                        task.version
-                    );
-                    let fb_spec = build_systemd_stage_command(
-                        &task,
-                        &fb_attempt_id,
-                        &fb_route,
-                        &plan_prompt,
-                    )?;
-                    plan_res = executor.execute_stage(&task, &fb_attempt_id, &fb_route, &fb_spec);
-                }
+        if plan_route.family == ModelFamily::GeminiAgy
+            && let Some(cls) = classify_agy_infra_failure(&plan_res)
+        {
+            push_bounded_recent_attempt(
+                &mut task,
+                format!(
+                    "[AGY_INFRA:{cls}] stage=plan attempt={plan_attempt_id} log=attempts/{plan_attempt_id}/stderr.log"
+                ),
+            );
+            if count_agy_infra_failures(&task) >= 2 {
+                let fb_route = StageRoute {
+                    family: ModelFamily::OpenAiSol,
+                    model: "gpt-6.1-sol".to_owned(),
+                    effort: ReasoningEffort::High,
+                    fallback_family: None,
+                    fallback_model: None,
+                    fallback_effort: None,
+                    ..plan_route.clone()
+                };
+                let fb_attempt_id = format!(
+                    "{}-plan-fb-{}",
+                    task.task_id.to_ascii_lowercase(),
+                    task.version
+                );
+                let fb_spec =
+                    build_systemd_stage_command(&task, &fb_attempt_id, &fb_route, &plan_prompt)?;
+                plan_res = executor.execute_stage(&task, &fb_attempt_id, &fb_route, &fb_spec);
             }
         }
 
@@ -1353,7 +1414,7 @@ pub fn execute_m_l_pipeline_with_executor(
         };
         plan_rec.ended_epoch = Some(now_epoch());
         plan_rec.status = plan_result.status.clone();
-        plan_rec.summary = Some(plan_result.summary.clone());
+        plan_rec.summary = Some(truncate_utf8_bytes(&plan_result.summary, MAX_SUMMARY_BYTES));
         plan_rec.invocation_id = plan_result.invocation_id.clone();
         plan_rec.input_tokens = plan_result.input_tokens;
         plan_rec.output_tokens = plan_result.output_tokens;
@@ -1461,58 +1522,33 @@ pub fn execute_m_l_pipeline_with_executor(
 
         let mut rev_res = executor.execute_stage(&task, &rev_attempt_id, &rev_route, &rev_spec);
 
-        if rev_route.family == ModelFamily::GeminiAgy {
-            let is_infra_err = match &rev_res {
-                Err(e) => {
-                    let cls = if e.contains("TIMEOUT") {
-                        "AGY_TIMEOUT"
-                    } else if e.contains("SPAWN") {
-                        "AGY_SPAWN"
-                    } else if e.contains("EXIT") {
-                        "AGY_EXIT"
-                    } else {
-                        "AGY_STATUS"
-                    };
-                    Some((cls, e.clone()))
-                }
-                Ok(res) if res.status != "PASSED" => {
-                    let cls = if res.summary.contains("TIMEOUT") {
-                        "AGY_TIMEOUT"
-                    } else if res.summary.contains("SPAWN") {
-                        "AGY_SPAWN"
-                    } else if res.summary.contains("EXIT") {
-                        "AGY_EXIT"
-                    } else {
-                        "AGY_STATUS"
-                    };
-                    Some((cls, res.summary.clone()))
-                }
-                _ => None,
-            };
-
-            if let Some((cls, sum)) = is_infra_err {
-                task.memory
-                    .recent_attempts
-                    .push(format!("[AGY_INFRA:{cls}] {sum}"));
-                if count_agy_infra_failures(&task) >= 2 {
-                    let fb_route = StageRoute {
-                        family: ModelFamily::OpenAiSol,
-                        model: "gpt-6.1-sol".to_owned(),
-                        effort: ReasoningEffort::High,
-                        fallback_family: None,
-                        fallback_model: None,
-                        fallback_effort: None,
-                        ..rev_route.clone()
-                    };
-                    let fb_attempt_id = format!(
-                        "{}-plan-review-fb-{}",
-                        task.task_id.to_ascii_lowercase(),
-                        task.version
-                    );
-                    let fb_spec =
-                        build_systemd_stage_command(&task, &fb_attempt_id, &fb_route, &rev_prompt)?;
-                    rev_res = executor.execute_stage(&task, &fb_attempt_id, &fb_route, &fb_spec);
-                }
+        if rev_route.family == ModelFamily::GeminiAgy
+            && let Some(cls) = classify_agy_infra_failure(&rev_res)
+        {
+            push_bounded_recent_attempt(
+                &mut task,
+                format!(
+                    "[AGY_INFRA:{cls}] stage=plan-review attempt={rev_attempt_id} log=attempts/{rev_attempt_id}/stderr.log"
+                ),
+            );
+            if count_agy_infra_failures(&task) >= 2 {
+                let fb_route = StageRoute {
+                    family: ModelFamily::OpenAiSol,
+                    model: "gpt-6.1-sol".to_owned(),
+                    effort: ReasoningEffort::High,
+                    fallback_family: None,
+                    fallback_model: None,
+                    fallback_effort: None,
+                    ..rev_route.clone()
+                };
+                let fb_attempt_id = format!(
+                    "{}-plan-review-fb-{}",
+                    task.task_id.to_ascii_lowercase(),
+                    task.version
+                );
+                let fb_spec =
+                    build_systemd_stage_command(&task, &fb_attempt_id, &fb_route, &rev_prompt)?;
+                rev_res = executor.execute_stage(&task, &fb_attempt_id, &fb_route, &fb_spec);
             }
         }
 
@@ -1529,7 +1565,7 @@ pub fn execute_m_l_pipeline_with_executor(
         };
         rev_rec.ended_epoch = Some(now_epoch());
         rev_rec.status = rev_result.status.clone();
-        rev_rec.summary = Some(rev_result.summary.clone());
+        rev_rec.summary = Some(truncate_utf8_bytes(&rev_result.summary, MAX_SUMMARY_BYTES));
         rev_rec.invocation_id = rev_result.invocation_id.clone();
         rev_rec.input_tokens = rev_result.input_tokens;
         rev_rec.output_tokens = rev_result.output_tokens;
@@ -1706,62 +1742,33 @@ pub fn execute_m_l_pipeline_with_executor(
 
         let mut impl_res = executor.execute_stage(&task, &impl_attempt_id, &impl_route, &impl_spec);
 
-        if impl_route.family == ModelFamily::GeminiAgy {
-            let is_infra_err = match &impl_res {
-                Err(e) => {
-                    let cls = if e.contains("TIMEOUT") {
-                        "AGY_TIMEOUT"
-                    } else if e.contains("SPAWN") {
-                        "AGY_SPAWN"
-                    } else if e.contains("EXIT") {
-                        "AGY_EXIT"
-                    } else {
-                        "AGY_STATUS"
-                    };
-                    Some((cls, e.clone()))
-                }
-                Ok(res) if res.status != "PASSED" => {
-                    let cls = if res.summary.contains("TIMEOUT") {
-                        "AGY_TIMEOUT"
-                    } else if res.summary.contains("SPAWN") {
-                        "AGY_SPAWN"
-                    } else if res.summary.contains("EXIT") {
-                        "AGY_EXIT"
-                    } else {
-                        "AGY_STATUS"
-                    };
-                    Some((cls, res.summary.clone()))
-                }
-                _ => None,
-            };
-
-            if let Some((cls, sum)) = is_infra_err {
-                task.memory
-                    .recent_attempts
-                    .push(format!("[AGY_INFRA:{cls}] {sum}"));
-                if count_agy_infra_failures(&task) >= 2 {
-                    let fb_route = StageRoute {
-                        family: ModelFamily::OpenAiSol,
-                        model: "gpt-6.1-sol".to_owned(),
-                        effort: ReasoningEffort::High,
-                        fallback_family: None,
-                        fallback_model: None,
-                        fallback_effort: None,
-                        ..impl_route.clone()
-                    };
-                    let fb_attempt_id = format!(
-                        "{}-impl-fb-{}",
-                        task.task_id.to_ascii_lowercase(),
-                        task.version
-                    );
-                    let fb_spec = build_systemd_stage_command(
-                        &task,
-                        &fb_attempt_id,
-                        &fb_route,
-                        &impl_prompt,
-                    )?;
-                    impl_res = executor.execute_stage(&task, &fb_attempt_id, &fb_route, &fb_spec);
-                }
+        if impl_route.family == ModelFamily::GeminiAgy
+            && let Some(cls) = classify_agy_infra_failure(&impl_res)
+        {
+            push_bounded_recent_attempt(
+                &mut task,
+                format!(
+                    "[AGY_INFRA:{cls}] stage=impl attempt={impl_attempt_id} log=attempts/{impl_attempt_id}/stderr.log"
+                ),
+            );
+            if count_agy_infra_failures(&task) >= 2 {
+                let fb_route = StageRoute {
+                    family: ModelFamily::OpenAiSol,
+                    model: "gpt-6.1-sol".to_owned(),
+                    effort: ReasoningEffort::High,
+                    fallback_family: None,
+                    fallback_model: None,
+                    fallback_effort: None,
+                    ..impl_route.clone()
+                };
+                let fb_attempt_id = format!(
+                    "{}-impl-fb-{}",
+                    task.task_id.to_ascii_lowercase(),
+                    task.version
+                );
+                let fb_spec =
+                    build_systemd_stage_command(&task, &fb_attempt_id, &fb_route, &impl_prompt)?;
+                impl_res = executor.execute_stage(&task, &fb_attempt_id, &fb_route, &fb_spec);
             }
         }
 
@@ -1776,7 +1783,7 @@ pub fn execute_m_l_pipeline_with_executor(
 
         attempt_rec.ended_epoch = Some(now_epoch());
         attempt_rec.status = impl_result.status.clone();
-        attempt_rec.summary = Some(impl_result.summary.clone());
+        attempt_rec.summary = Some(truncate_utf8_bytes(&impl_result.summary, MAX_SUMMARY_BYTES));
         attempt_rec.invocation_id = impl_result.invocation_id.clone();
         attempt_rec.input_tokens = impl_result.input_tokens;
         attempt_rec.output_tokens = impl_result.output_tokens;
@@ -1941,58 +1948,33 @@ pub fn execute_m_l_pipeline_with_executor(
 
         let mut rev_res = executor.execute_stage(&task, &rev_attempt_id, &rev_route, &rev_spec);
 
-        if rev_route.family == ModelFamily::GeminiAgy {
-            let is_infra_err = match &rev_res {
-                Err(e) => {
-                    let cls = if e.contains("TIMEOUT") {
-                        "AGY_TIMEOUT"
-                    } else if e.contains("SPAWN") {
-                        "AGY_SPAWN"
-                    } else if e.contains("EXIT") {
-                        "AGY_EXIT"
-                    } else {
-                        "AGY_STATUS"
-                    };
-                    Some((cls, e.clone()))
-                }
-                Ok(res) if res.status != "PASSED" => {
-                    let cls = if res.summary.contains("TIMEOUT") {
-                        "AGY_TIMEOUT"
-                    } else if res.summary.contains("SPAWN") {
-                        "AGY_SPAWN"
-                    } else if res.summary.contains("EXIT") {
-                        "AGY_EXIT"
-                    } else {
-                        "AGY_STATUS"
-                    };
-                    Some((cls, res.summary.clone()))
-                }
-                _ => None,
-            };
-
-            if let Some((cls, sum)) = is_infra_err {
-                task.memory
-                    .recent_attempts
-                    .push(format!("[AGY_INFRA:{cls}] {sum}"));
-                if count_agy_infra_failures(&task) >= 2 {
-                    let fb_route = StageRoute {
-                        family: ModelFamily::OpenAiSol,
-                        model: "gpt-6.1-sol".to_owned(),
-                        effort: ReasoningEffort::High,
-                        fallback_family: None,
-                        fallback_model: None,
-                        fallback_effort: None,
-                        ..rev_route.clone()
-                    };
-                    let fb_attempt_id = format!(
-                        "{}-pr-review-fb-{}",
-                        task.task_id.to_ascii_lowercase(),
-                        task.version
-                    );
-                    let fb_spec =
-                        build_systemd_stage_command(&task, &fb_attempt_id, &fb_route, &rev_prompt)?;
-                    rev_res = executor.execute_stage(&task, &fb_attempt_id, &fb_route, &fb_spec);
-                }
+        if rev_route.family == ModelFamily::GeminiAgy
+            && let Some(cls) = classify_agy_infra_failure(&rev_res)
+        {
+            push_bounded_recent_attempt(
+                &mut task,
+                format!(
+                    "[AGY_INFRA:{cls}] stage=pr-review attempt={rev_attempt_id} log=attempts/{rev_attempt_id}/stderr.log"
+                ),
+            );
+            if count_agy_infra_failures(&task) >= 2 {
+                let fb_route = StageRoute {
+                    family: ModelFamily::OpenAiSol,
+                    model: "gpt-6.1-sol".to_owned(),
+                    effort: ReasoningEffort::High,
+                    fallback_family: None,
+                    fallback_model: None,
+                    fallback_effort: None,
+                    ..rev_route.clone()
+                };
+                let fb_attempt_id = format!(
+                    "{}-pr-review-fb-{}",
+                    task.task_id.to_ascii_lowercase(),
+                    task.version
+                );
+                let fb_spec =
+                    build_systemd_stage_command(&task, &fb_attempt_id, &fb_route, &rev_prompt)?;
+                rev_res = executor.execute_stage(&task, &fb_attempt_id, &fb_route, &fb_spec);
             }
         }
 
@@ -2010,7 +1992,7 @@ pub fn execute_m_l_pipeline_with_executor(
 
         rev_rec.ended_epoch = Some(now_epoch());
         rev_rec.status = rev_result.status.clone();
-        rev_rec.summary = Some(rev_result.summary.clone());
+        rev_rec.summary = Some(truncate_utf8_bytes(&rev_result.summary, MAX_SUMMARY_BYTES));
         rev_rec.invocation_id = rev_result.invocation_id.clone();
         rev_rec.input_tokens = rev_result.input_tokens;
         rev_rec.output_tokens = rev_result.output_tokens;
@@ -2870,6 +2852,8 @@ mod tests {
         assert_eq!(payload["confirmed"], true);
         assert_eq!(payload["model"], "gemini-4-argon-high");
         assert_eq!(payload["timeout_seconds"], 1200);
+        assert_eq!(payload["orchestration_id"], "zach-008");
+        assert_eq!(payload["allowed_files"], serde_json::json!([]));
 
         // 2. Test parse_agy_cli_response: success
         let ok_json = r#"{"execution_succeeded":true,"summary":"Analysis complete","task_usage":{"total_tokens":5432}}"#;
@@ -3869,7 +3853,7 @@ mod tests {
         store.upsert_task(&task).unwrap();
 
         let mut exec = RealGitPipelineExecutor {
-            systemd: SystemdStageExecutor,
+            systemd: SystemdStageExecutor::default(),
             pr_number: 101,
             pr_review_observed_task_reviewed_sha: None,
             pr_review_observed_head_sha: None,
@@ -3920,5 +3904,210 @@ mod tests {
         assert_eq!(attempts[1].stage, "pr-review");
         assert_eq!(attempts[1].sha_before.as_deref(), Some(reviewed_sha));
         assert_eq!(attempts[1].sha_after.as_deref(), Some(reviewed_sha));
+    }
+
+    #[test]
+    fn build_agy_cli_payload_filters_allowed_files_clamps_timeout_and_lowercases_id() {
+        let root = std::env::temp_dir().join(format!("zach-019-allowed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        for i in 0..55 {
+            std::fs::write(root.join(format!("src/file_{i:02}.rs")), "fn f() {}\n").unwrap();
+        }
+        let outside_file =
+            std::env::temp_dir().join(format!("zach-019-outside-{}.rs", std::process::id()));
+        std::fs::write(&outside_file, "fn out() {}\n").unwrap();
+
+        let mut target_files = vec![
+            TargetFileSpec {
+                path: "src/**".to_owned(),
+                action: "modify".to_owned(),
+                summary: "glob must be filtered".to_owned(),
+            },
+            TargetFileSpec {
+                path: "src/missing.rs".to_owned(),
+                action: "create".to_owned(),
+                summary: "missing file must be filtered".to_owned(),
+            },
+            TargetFileSpec {
+                path: "../outside.rs".to_owned(),
+                action: "modify".to_owned(),
+                summary: "traversal must be filtered".to_owned(),
+            },
+            TargetFileSpec {
+                path: outside_file.to_str().unwrap().to_owned(),
+                action: "modify".to_owned(),
+                summary: "outside worktree must be filtered".to_owned(),
+            },
+        ];
+        for i in 0..55 {
+            target_files.push(TargetFileSpec {
+                path: format!("src/file_{i:02}.rs"),
+                action: "modify".to_owned(),
+                summary: "existing file".to_owned(),
+            });
+        }
+
+        let mut task = sample_s_task("ZACH-019-AGY");
+        task.worktree_path = Some(root.to_str().unwrap().to_owned());
+        task.context_pack.target_files = target_files;
+
+        let route = StageRoute {
+            weight: "M".to_owned(),
+            stage: "plan".to_owned(),
+            family: ModelFamily::GeminiAgy,
+            model: "gemini-4-argon-high".to_owned(),
+            effort: ReasoningEffort::High,
+            fallback_family: Some(ModelFamily::OpenAiSol),
+            fallback_model: Some("gpt-6.1-sol".to_owned()),
+            fallback_effort: Some(ReasoningEffort::High),
+            max_task_tokens: 1_200_000,
+            timeout_secs: 9999,
+            stall_timeout_secs: 600,
+        };
+
+        let payload = build_agy_cli_payload(&task, &route, "Plan work");
+        assert_eq!(payload["orchestration_id"], "zach-019-agy");
+        assert_eq!(payload["timeout_seconds"], 1800);
+        let allowed = payload["allowed_files"].as_array().expect("array");
+        assert_eq!(allowed.len(), 50);
+        assert!(allowed.iter().all(|v| {
+            let s = v.as_str().unwrap();
+            s.starts_with("src/file_") && !s.contains('*') && !s.contains("..")
+        }));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&outside_file);
+    }
+
+    #[test]
+    fn pipeline_bounds_attempt_summary_check_failure_decision_context_and_recent_attempts() {
+        let mut store = V2Store::open_in_memory().expect("in-memory store");
+        let giant_raw = format!("RAW_STDERR_MARKER {}", "z".repeat(4000));
+
+        // 1. M pipeline AGY infra failure records bounded pointer (not raw stderr/summary) and truncates summary <= 1024
+        let mut m_task = sample_s_task("ZACH-019-BOUND-ML");
+        m_task.weight = "M".to_owned();
+        m_task.retry_count = 1; // ("M", "plan") routes to GeminiAgy on retry
+        m_task.context_pack = sample_context_pack("M");
+        m_task.required_stages = vec!["plan".to_owned()];
+        store.upsert_task(&m_task).unwrap();
+
+        let mut agy_fail_mock = MockStageExecutor {
+            staged_results: vec![StageExecutionResult {
+                status: "FAILED".to_owned(),
+                summary: format!("AGY_TIMEOUT: {giant_raw}"),
+                review_markdown: None,
+                invocation_id: None,
+                input_tokens: 100,
+                output_tokens: 50,
+                total_tokens: 150,
+                sha_before: None,
+                sha_after: None,
+                diff_files: Vec::new(),
+            }],
+            ..MockStageExecutor::default()
+        };
+        assert!(
+            execute_m_l_pipeline_with_executor(&mut store, "ZACH-019-BOUND-ML", &mut agy_fail_mock)
+                .is_err()
+        );
+
+        let updated_ml = store.get_task("ZACH-019-BOUND-ML").unwrap().unwrap();
+        assert_eq!(updated_ml.memory.recent_attempts.len(), 1);
+        let ptr = &updated_ml.memory.recent_attempts[0];
+        assert!(ptr.contains("[AGY_INFRA:AGY_TIMEOUT]"));
+        assert!(ptr.contains("stage=plan"));
+        assert!(ptr.contains("attempt=zach-019-bound-ml-plan-1"));
+        assert!(ptr.contains("log=attempts/zach-019-bound-ml-plan-1/stderr.log"));
+        assert!(!ptr.contains("RAW_STDERR_MARKER"));
+
+        let attempts = store.list_stage_attempts("ZACH-019-BOUND-ML").unwrap();
+        assert_eq!(attempts.len(), 1);
+        let sum = attempts[0].summary.as_deref().unwrap();
+        assert!(sum.len() <= MAX_SUMMARY_BYTES);
+        assert!(sum.ends_with("..."));
+
+        // 2. Forbidden path violation bounds open_decision context_summary <= 1024 and routes impl recent_attempts via push_bounded_recent_attempt
+        let mut pol_task = sample_s_task("ZACH-019-BOUND-POL");
+        store.upsert_task(&pol_task).unwrap();
+        let mut pol_mock = MockStageExecutor {
+            staged_results: vec![StageExecutionResult {
+                status: "PASSED".to_owned(),
+                summary: giant_raw.clone(),
+                review_markdown: None,
+                invocation_id: None,
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 15,
+                sha_before: None,
+                sha_after: None,
+                diff_files: vec![DiffFileEntry {
+                    path: ".github/workflows/ci.yml".to_owned(),
+                    status: "M".to_owned(),
+                    added_lines: 1,
+                    deleted_lines: 0,
+                }],
+            }],
+            ..MockStageExecutor::default()
+        };
+        assert!(
+            execute_xs_s_pipeline_with_executor(&mut store, "ZACH-019-BOUND-POL", &mut pol_mock)
+                .is_err()
+        );
+        let decs = store.list_decisions(true, None).unwrap();
+        assert_eq!(decs.len(), 1);
+        assert!(decs[0].context_summary.len() <= MAX_SUMMARY_BYTES);
+        assert!(decs[0].context_summary.ends_with("..."));
+
+        // 3. FailingChecksExecutor bounds task.memory.last_check_failure <= 1024
+        store
+            .upsert_task(&sample_s_task("ZACH-019-BOUND-CHK"))
+            .unwrap();
+        let mut chk_exec = FailingChecksExecutor {
+            inner: MockStageExecutor {
+                staged_results: vec![StageExecutionResult {
+                    status: "PASSED".to_owned(),
+                    summary: "impl ok".to_owned(),
+                    review_markdown: None,
+                    invocation_id: None,
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    total_tokens: 15,
+                    sha_before: Some("abc".to_owned()),
+                    sha_after: Some("def".to_owned()),
+                    diff_files: vec![DiffFileEntry {
+                        path: "src/v2/router.rs".to_owned(),
+                        status: "M".to_owned(),
+                        added_lines: 5,
+                        deleted_lines: 1,
+                    }],
+                }],
+                ..MockStageExecutor::default()
+            },
+            check_err: giant_raw,
+        };
+        assert!(
+            execute_xs_s_pipeline_with_executor(&mut store, "ZACH-019-BOUND-CHK", &mut chk_exec)
+                .is_err()
+        );
+        let chk_task = store.get_task("ZACH-019-BOUND-CHK").unwrap().unwrap();
+        let last_chk = chk_task.memory.last_check_failure.as_deref().unwrap();
+        assert!(last_chk.len() <= MAX_SUMMARY_BYTES);
+        assert!(last_chk.ends_with("..."));
+
+        // 4. push_bounded_recent_attempt caps at 10 entries and <= 256 bytes per entry
+        for i in 0..15 {
+            push_bounded_recent_attempt(&mut pol_task, format!("entry-{i}-{}", "a".repeat(400)));
+        }
+        assert_eq!(pol_task.memory.recent_attempts.len(), 10);
+        assert!(
+            pol_task
+                .memory
+                .recent_attempts
+                .iter()
+                .all(|e| e.len() <= MAX_RECENT_ATTEMPT_BYTES)
+        );
+        assert!(pol_task.memory.recent_attempts[0].starts_with("entry-5-"));
     }
 }

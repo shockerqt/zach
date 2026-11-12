@@ -809,6 +809,10 @@ impl V2Store {
         sha: Option<&str>,
     ) -> Result<PendingDecisionRecord, V2StoreError> {
         let now = now_epoch();
+        let bounded_context = crate::v2::runner::truncate_utf8_bytes(
+            context_summary,
+            crate::v2::runner::MAX_SUMMARY_BYTES,
+        );
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -842,7 +846,7 @@ impl V2Store {
                 question,
                 options_json,
                 recommended_option.map(|v| v as i64),
-                context_summary,
+                bounded_context,
                 sha,
                 seq_id,
             ],
@@ -981,6 +985,9 @@ impl V2Store {
         attempt: &StageAttemptRecord,
     ) -> Result<(), V2StoreError> {
         let now = now_epoch();
+        let bounded_summary = attempt.summary.as_deref().map(|s| {
+            crate::v2::runner::truncate_utf8_bytes(s, crate::v2::runner::MAX_SUMMARY_BYTES)
+        });
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1018,7 +1025,7 @@ impl V2Store {
                 attempt.ended_epoch,
                 attempt.status,
                 attempt.failure_class,
-                attempt.summary,
+                bounded_summary,
                 attempt.input_tokens as i64,
                 attempt.output_tokens as i64,
                 attempt.total_tokens as i64,
@@ -1988,5 +1995,58 @@ mod tests {
 
         drop(reopened);
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn record_stage_attempt_and_open_decision_enforce_1024_byte_summary_cap() {
+        let mut store = V2Store::open_in_memory().expect("in-memory store");
+        let task = sample_task("ZACH-019-STORE", "Ready", Vec::new());
+        store.upsert_task(&task).unwrap();
+
+        let long_utf8 = format!("{}€{}", "x".repeat(1020), "y".repeat(200));
+        let attempt = StageAttemptRecord {
+            attempt_id: "zach-019-store-impl-1".to_owned(),
+            task_id: "ZACH-019-STORE".to_owned(),
+            stage: "impl".to_owned(),
+            model: "gpt-6.1-sol".to_owned(),
+            effort: "medium".to_owned(),
+            systemd_unit: Some("zach-stage-zach-019-store-impl-1".to_owned()),
+            invocation_id: None,
+            started_epoch: 1000,
+            ended_epoch: Some(1005),
+            status: "FAILED".to_owned(),
+            failure_class: Some("infra".to_owned()),
+            summary: Some(long_utf8.clone()),
+            input_tokens: 10,
+            output_tokens: 5,
+            total_tokens: 15,
+            sha_before: None,
+            sha_after: None,
+        };
+        store.record_stage_attempt(&attempt).unwrap();
+
+        let saved = store
+            .get_stage_attempt("zach-019-store-impl-1")
+            .unwrap()
+            .unwrap();
+        let saved_summary = saved.summary.expect("summary present");
+        assert!(saved_summary.len() <= 1024);
+        assert!(saved_summary.ends_with("..."));
+
+        let dec = store
+            .open_decision(
+                "dec-019-store",
+                "ZACH-019-STORE",
+                "zach",
+                "scope_violation",
+                "Question?",
+                &["Abort".to_owned()],
+                Some(0),
+                &long_utf8,
+                None,
+            )
+            .unwrap();
+        assert!(dec.context_summary.len() <= 1024);
+        assert!(dec.context_summary.ends_with("..."));
     }
 }

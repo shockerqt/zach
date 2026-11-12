@@ -5,7 +5,12 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::process::Command;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+
+pub const MAX_SUMMARY_BYTES: usize = 1024;
+pub const MAX_RECENT_ATTEMPT_BYTES: usize = 256;
+pub const DEFAULT_ATTEMPT_RETENTION_DAYS: u64 = 7;
 
 pub const ALLOWED_ENV_KEYS: &[&str] = &[
     "HOME",
@@ -28,6 +33,10 @@ pub struct StageCommandSpec {
     pub worktree_path: String,
     pub timeout_secs: u64,
     pub stall_timeout_secs: u64,
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default)]
+    pub stdin_payload: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,7 +234,7 @@ pub fn build_systemd_stage_command_with_env(
 
     args.push("--".to_owned());
 
-    match route.family {
+    let stdin_payload = match route.family {
         ModelFamily::OpenAiSol => {
             args.extend([
                 "codex".to_owned(),
@@ -240,26 +249,21 @@ pub fn build_systemd_stage_command_with_env(
                 "-C".to_owned(),
                 worktree_path.clone(),
                 "--json".to_owned(),
-                prompt.to_owned(),
+                "-".to_owned(),
             ]);
+            prompt.to_owned()
         }
         ModelFamily::GeminiAgy => {
-            let worker_timeout = route.timeout_secs.min(1800);
             args.extend([
                 "node".to_owned(),
                 GEMINI_WORKER_CLI_SCRIPT.to_owned(),
                 "--cli".to_owned(),
-                "--model".to_owned(),
-                route.model.clone(),
-                "--worktree".to_owned(),
-                worktree_path.clone(),
-                "--timeout".to_owned(),
-                worker_timeout.to_string(),
-                "--prompt".to_owned(),
-                prompt.to_owned(),
             ]);
+            let payload = crate::v2::pipeline::build_agy_cli_payload(task, route, prompt);
+            serde_json::to_string(&payload)
+                .map_err(|e| format!("failed to serialize agy cli payload: {e}"))?
         }
-    }
+    };
 
     Ok(StageCommandSpec {
         unit_name,
@@ -269,6 +273,8 @@ pub fn build_systemd_stage_command_with_env(
         worktree_path,
         timeout_secs: route.timeout_secs,
         stall_timeout_secs: route.stall_timeout_secs,
+        prompt: prompt.to_owned(),
+        stdin_payload,
     })
 }
 
@@ -364,36 +370,355 @@ pub fn reconcile_orphan_units(store: &mut V2Store) -> Result<Vec<String>, String
     Ok(orphans)
 }
 
-pub struct SystemdStageExecutor;
+/// Truncates `input` so its UTF-8 byte length is `<= max_bytes` without splitting
+/// a multi-byte UTF-8 character. Appends `"..."` when `max_bytes >= 3`.
+pub fn truncate_utf8_bytes(input: &str, max_bytes: usize) -> String {
+    if input.len() <= max_bytes {
+        return input.to_owned();
+    }
+    if max_bytes < 3 {
+        let mut end = max_bytes;
+        while end > 0 && !input.is_char_boundary(end) {
+            end -= 1;
+        }
+        return input[..end].to_owned();
+    }
+    let mut end = max_bytes - 3;
+    while end > 0 && !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &input[..end])
+}
+
+/// Returns attempt directory retention from `ZACH_ATTEMPT_RETENTION_DAYS`
+/// (defaults to `DEFAULT_ATTEMPT_RETENTION_DAYS` = 7 days).
+pub fn attempt_retention_from_env() -> std::time::Duration {
+    let days = env::var("ZACH_ATTEMPT_RETENTION_DAYS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_ATTEMPT_RETENTION_DAYS);
+    std::time::Duration::from_secs(days.saturating_mul(86_400))
+}
+
+/// Prunes `<state_dir>/attempts/<attempt_id>` directories older than `retention`.
+pub fn prune_old_attempts(
+    state_dir: &std::path::Path,
+    retention: std::time::Duration,
+) -> Result<usize, String> {
+    prune_old_attempts_at(state_dir, retention, std::time::SystemTime::now())
+}
+
+/// Prunes `<state_dir>/attempts/<attempt_id>` directories older than `retention`
+/// relative to `now`, skipping symlinks and non-directories without following links.
+pub fn prune_old_attempts_at(
+    state_dir: &std::path::Path,
+    retention: std::time::Duration,
+    now: std::time::SystemTime,
+) -> Result<usize, String> {
+    let attempts_root = state_dir.join("attempts");
+    let root_meta = match std::fs::symlink_metadata(&attempts_root) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(format!("failed to stat {}: {e}", attempts_root.display())),
+    };
+    if root_meta.file_type().is_symlink() || !root_meta.file_type().is_dir() {
+        return Err(format!(
+            "attempts root {} is not a real directory",
+            attempts_root.display()
+        ));
+    }
+
+    let cutoff = now.checked_sub(retention).unwrap_or(std::time::UNIX_EPOCH);
+    let entries = std::fs::read_dir(&attempts_root)
+        .map_err(|e| format!("failed to read {}: {e}", attempts_root.display()))?;
+
+    let mut pruned = 0usize;
+    for entry_res in entries {
+        let Ok(entry) = entry_res else {
+            continue;
+        };
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() || !ft.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(dir_meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if dir_meta.file_type().is_symlink() || !dir_meta.file_type().is_dir() {
+            continue;
+        }
+        let Ok(modified) = dir_meta.modified() else {
+            continue;
+        };
+        if modified < cutoff && std::fs::remove_dir_all(&path).is_ok() {
+            pruned += 1;
+        }
+    }
+    Ok(pruned)
+}
+
+fn validate_attempt_id(attempt_id: &str) -> Result<&str, String> {
+    if attempt_id.is_empty()
+        || attempt_id == "."
+        || attempt_id == ".."
+        || attempt_id.contains(['/', '\\', '\0'])
+        || attempt_id.trim() != attempt_id
+    {
+        return Err(format!("invalid attempt_id '{attempt_id}'"));
+    }
+    Ok(attempt_id)
+}
+
+fn ensure_secure_dir(dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(format!("refusing symlink directory {}", dir.display()));
+            }
+            if !meta.file_type().is_dir() {
+                return Err(format!("expected directory at {}", dir.display()));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder
+                .create(dir)
+                .map_err(|err| format!("failed to create directory {}: {err}", dir.display()))?;
+        }
+        Err(e) => {
+            return Err(format!("failed to stat directory {}: {e}", dir.display()));
+        }
+    }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("failed to chmod 0700 {}: {e}", dir.display()))?;
+    Ok(dir.to_path_buf())
+}
+
+fn write_secure_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        return Err(format!("refusing to write to symlink {}", path.display()));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    file.write_all(bytes)
+        .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    file.flush()
+        .map_err(|e| format!("failed to flush {}: {e}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("failed to chmod 0600 {}: {e}", path.display()))?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct SystemdStageExecutor {
+    pub state_dir: PathBuf,
+}
+
+impl Default for SystemdStageExecutor {
+    fn default() -> Self {
+        Self {
+            state_dir: crate::v2::default_state_dir(),
+        }
+    }
+}
+
+impl SystemdStageExecutor {
+    pub fn with_state_dir(state_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            state_dir: state_dir.into(),
+        }
+    }
+}
 
 impl StageExecutor for SystemdStageExecutor {
     fn execute_stage(
         &mut self,
-        _task: &TaskRecord,
-        _attempt_id: &str,
-        _route: &StageRoute,
+        task: &TaskRecord,
+        attempt_id: &str,
+        route: &StageRoute,
         spec: &StageCommandSpec,
     ) -> Result<StageExecutionResult, String> {
+        let valid_attempt_id = validate_attempt_id(attempt_id)?;
+        std::fs::create_dir_all(&self.state_dir).map_err(|e| {
+            format!(
+                "failed to create state_dir {}: {e}",
+                self.state_dir.display()
+            )
+        })?;
+        let attempts_root = ensure_secure_dir(&self.state_dir.join("attempts"))?;
+        let attempt_dir = ensure_secure_dir(&attempts_root.join(valid_attempt_id))?;
+
+        write_secure_file(&attempt_dir.join("prompt.md"), spec.prompt.as_bytes())?;
+
         let sha_before = git_head_sha(&spec.worktree_path);
-        let output = Command::new(&spec.program)
+        let mut child = match Command::new(&spec.program)
             .args(&spec.args)
             .env_clear()
             .envs(&spec.env)
-            .output()
-            .map_err(|e| format!("failed to spawn {}: {e}", spec.program))?;
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) => {
+                let err_msg = truncate_utf8_bytes(
+                    &format!("failed to spawn {}: {e}", spec.program),
+                    MAX_SUMMARY_BYTES,
+                );
+                let _ = write_secure_file(&attempt_dir.join("stdout.jsonl"), b"");
+                let _ = write_secure_file(&attempt_dir.join("stderr.log"), err_msg.as_bytes());
+                let result_json = serde_json::json!({
+                    "attempt_id": valid_attempt_id,
+                    "task_id": task.task_id,
+                    "stage": route.stage,
+                    "status": "FAILED",
+                    "exit_code": serde_json::Value::Null,
+                    "summary": err_msg,
+                });
+                let _ = write_secure_file(
+                    &attempt_dir.join("result.json"),
+                    serde_json::to_string_pretty(&result_json)
+                        .unwrap_or_default()
+                        .as_bytes(),
+                );
+                return Err(err_msg);
+            }
+        };
+
+        let child_stdin = child.stdin.take();
+        let stdin_bytes = spec.stdin_payload.as_bytes();
+        let (writer_join, output_res) = std::thread::scope(|scope| {
+            let writer = scope.spawn(move || -> std::io::Result<()> {
+                use std::io::Write;
+                if let Some(mut stdin) = child_stdin
+                    && !stdin_bytes.is_empty()
+                {
+                    stdin.write_all(stdin_bytes)?;
+                    stdin.flush()?;
+                }
+                // `child_stdin` is dropped here to send EOF while `wait_with_output()` drains stdout/stderr.
+                Ok(())
+            });
+            let output_res = child.wait_with_output();
+            let writer_join = writer.join();
+            (writer_join, output_res)
+        });
+
+        let output = match output_res {
+            Ok(out) => out,
+            Err(e) => {
+                let err_msg = truncate_utf8_bytes(
+                    &format!("failed waiting for {}: {e}", spec.program),
+                    MAX_SUMMARY_BYTES,
+                );
+                let _ = write_secure_file(&attempt_dir.join("stdout.jsonl"), b"");
+                let _ = write_secure_file(&attempt_dir.join("stderr.log"), err_msg.as_bytes());
+                let result_json = serde_json::json!({
+                    "attempt_id": valid_attempt_id,
+                    "task_id": task.task_id,
+                    "stage": route.stage,
+                    "status": "FAILED",
+                    "exit_code": serde_json::Value::Null,
+                    "summary": err_msg,
+                });
+                let _ = write_secure_file(
+                    &attempt_dir.join("result.json"),
+                    serde_json::to_string_pretty(&result_json)
+                        .unwrap_or_default()
+                        .as_bytes(),
+                );
+                return Err(err_msg);
+            }
+        };
+
+        write_secure_file(&attempt_dir.join("stdout.jsonl"), &output.stdout)?;
+        write_secure_file(&attempt_dir.join("stderr.log"), &output.stderr)?;
+
+        if let Ok(Err(e)) = writer_join
+            && e.kind() != std::io::ErrorKind::BrokenPipe
+        {
+            let err_msg = truncate_utf8_bytes(
+                &format!("failed writing stdin to {}: {e}", spec.program),
+                MAX_SUMMARY_BYTES,
+            );
+            let result_json = serde_json::json!({
+                "attempt_id": valid_attempt_id,
+                "task_id": task.task_id,
+                "stage": route.stage,
+                "status": "FAILED",
+                "exit_code": output.status.code(),
+                "summary": err_msg,
+            });
+            let _ = write_secure_file(
+                &attempt_dir.join("result.json"),
+                serde_json::to_string_pretty(&result_json)
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
+            return Err(err_msg);
+        }
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         let sha_after = git_head_sha(&spec.worktree_path);
         let diff_files = collect_worktree_diff_entries(&spec.worktree_path);
 
-        if let Ok(mut parsed) =
-            crate::v2::pipeline::parse_agy_cli_response(&stdout, &stderr, output.status.code())
-        {
-            parsed.sha_before = sha_before;
-            parsed.sha_after = sha_after;
-            parsed.diff_files = diff_files;
-            return Ok(parsed);
+        match crate::v2::pipeline::parse_agy_cli_response(&stdout, &stderr, output.status.code()) {
+            Ok(mut parsed) => {
+                parsed.sha_before = sha_before;
+                parsed.sha_after = sha_after;
+                parsed.diff_files = diff_files;
+                parsed.summary = truncate_utf8_bytes(&parsed.summary, MAX_SUMMARY_BYTES);
+                let result_json = serde_json::json!({
+                    "attempt_id": valid_attempt_id,
+                    "task_id": task.task_id,
+                    "stage": route.stage,
+                    "exit_code": output.status.code(),
+                    "result": &parsed,
+                });
+                write_secure_file(
+                    &attempt_dir.join("result.json"),
+                    serde_json::to_string_pretty(&result_json)
+                        .unwrap_or_default()
+                        .as_bytes(),
+                )?;
+                return Ok(parsed);
+            }
+            Err(agy_err) if route.family == ModelFamily::GeminiAgy => {
+                let err_msg = truncate_utf8_bytes(&agy_err.to_string(), MAX_SUMMARY_BYTES);
+                let result_json = serde_json::json!({
+                    "attempt_id": valid_attempt_id,
+                    "task_id": task.task_id,
+                    "stage": route.stage,
+                    "status": "FAILED",
+                    "failure_class": agy_err.failure_class,
+                    "exit_code": output.status.code(),
+                    "summary": err_msg,
+                });
+                write_secure_file(
+                    &attempt_dir.join("result.json"),
+                    serde_json::to_string_pretty(&result_json)
+                        .unwrap_or_default()
+                        .as_bytes(),
+                )?;
+                return Err(err_msg);
+            }
+            Err(_) => {}
         }
 
         let status = if output.status.success() {
@@ -401,13 +726,14 @@ impl StageExecutor for SystemdStageExecutor {
         } else {
             "FAILED".to_owned()
         };
-        let summary = if stdout.trim().is_empty() {
+        let raw_summary = if stdout.trim().is_empty() {
             stderr.lines().take(10).collect::<Vec<_>>().join("\n")
         } else {
             stdout.lines().take(10).collect::<Vec<_>>().join("\n")
         };
+        let summary = truncate_utf8_bytes(&raw_summary, MAX_SUMMARY_BYTES);
 
-        Ok(StageExecutionResult {
+        let result = StageExecutionResult {
             status,
             summary,
             review_markdown: if stdout.contains('|') {
@@ -422,7 +748,21 @@ impl StageExecutor for SystemdStageExecutor {
             sha_before,
             sha_after,
             diff_files,
-        })
+        };
+        let result_json = serde_json::json!({
+            "attempt_id": valid_attempt_id,
+            "task_id": task.task_id,
+            "stage": route.stage,
+            "exit_code": output.status.code(),
+            "result": &result,
+        });
+        write_secure_file(
+            &attempt_dir.join("result.json"),
+            serde_json::to_string_pretty(&result_json)
+                .unwrap_or_default()
+                .as_bytes(),
+        )?;
+        Ok(result)
     }
 
     fn run_checks(&mut self, worktree_path: &str, commands: &[String]) -> Result<(), String> {
@@ -1021,6 +1361,10 @@ mod tests {
         );
         assert!(spec.args.contains(&"codex".to_owned()));
         assert!(spec.args.contains(&"--ignore-user-config".to_owned()));
+        assert_eq!(spec.args.last().map(String::as_str), Some("-"));
+        assert!(!spec.args.iter().any(|a| a.contains("Prompt text")));
+        assert_eq!(spec.prompt, "Prompt text");
+        assert_eq!(spec.stdin_payload, "Prompt text");
     }
 
     #[test]
@@ -1054,16 +1398,52 @@ other-user-unit.service loaded active running
         route.timeout_secs = 3600;
 
         let clean_env = BTreeMap::new();
-        let spec =
-            build_systemd_stage_command_with_env(&task, "att-gemini", &route, "prompt", &clean_env)
-                .expect("build command");
+        let secret_prompt = "prompt with sensitive instructions";
+        let spec = build_systemd_stage_command_with_env(
+            &task,
+            "att-gemini",
+            &route,
+            secret_prompt,
+            &clean_env,
+        )
+        .expect("build command");
 
-        let timeout_idx = spec
-            .args
-            .iter()
-            .position(|a| a == "--timeout")
-            .expect("timeout flag");
-        assert_eq!(spec.args[timeout_idx + 1], "1800");
+        assert!(spec.args.contains(&"--pipe".to_owned()));
+        assert!(!spec.args.iter().any(|a| a.contains(secret_prompt)));
+        for forbidden_flag in ["--model", "--worktree", "--timeout", "--prompt"] {
+            assert!(
+                !spec.args.iter().any(|a| a == forbidden_flag),
+                "unexpected flag {forbidden_flag} in argv: {:?}",
+                spec.args
+            );
+        }
+        assert!(
+            spec.args.ends_with(&[
+                "node".to_owned(),
+                GEMINI_WORKER_CLI_SCRIPT.to_owned(),
+                "--cli".to_owned()
+            ]),
+            "expected trailing node worker.mjs --cli, got {:?}",
+            spec.args
+        );
+        assert_eq!(spec.prompt, secret_prompt);
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&spec.stdin_payload).expect("valid JSON stdin_payload");
+        assert_eq!(payload["action"], "run");
+        assert_eq!(payload["model"], "gemini-4-hydrogen-high");
+        assert_eq!(payload["task"], secret_prompt);
+        assert_eq!(payload["timeout_seconds"], 1800);
+        assert_eq!(payload["orchestration_id"], "zach-005");
+
+        // Also verify lower bound clamp (30)
+        route.timeout_secs = 5;
+        let low_spec =
+            build_systemd_stage_command_with_env(&task, "att-gemini-low", &route, "p", &clean_env)
+                .expect("build low timeout command");
+        let low_payload: serde_json::Value =
+            serde_json::from_str(&low_spec.stdin_payload).expect("valid JSON");
+        assert_eq!(low_payload["timeout_seconds"], 30);
     }
 
     struct TempTestDir(std::path::PathBuf);
@@ -1408,7 +1788,7 @@ other-user-unit.service loaded active running
         task.worktree_path = Some(repo.path_str().to_owned());
         task.active_attempt_id = Some("zach-016-impl-1".to_owned());
 
-        let mut exec = SystemdStageExecutor;
+        let mut exec = SystemdStageExecutor::default();
         let committed_sha = exec
             .commit_worktree(&task, repo.path_str())
             .expect("commit_worktree should stage and commit dirty changes");
@@ -1439,7 +1819,7 @@ other-user-unit.service loaded active running
 
     #[test]
     fn systemd_push_and_ensure_pr_rejects_missing_sha_or_branch() {
-        let mut exec = SystemdStageExecutor;
+        let mut exec = SystemdStageExecutor::default();
         let mut task = sample_task();
         assert!(
             exec.push_and_ensure_pr(&task, "/tmp/zach--ZACH-005", "head-sha")
@@ -1454,5 +1834,186 @@ other-user-unit.service loaded active running
             exec.push_and_ensure_pr(&task, "/tmp/zach--ZACH-005", "abc1234")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn truncate_utf8_bytes_handles_small_limits_and_multibyte_boundaries() {
+        assert_eq!(truncate_utf8_bytes("hello", 10), "hello");
+        assert_eq!(truncate_utf8_bytes("hello", 5), "hello");
+        assert_eq!(truncate_utf8_bytes("hello", 0), "");
+        assert_eq!(truncate_utf8_bytes("€abc", 0), "");
+        assert_eq!(truncate_utf8_bytes("€abc", 1), "");
+        assert_eq!(truncate_utf8_bytes("€abc", 2), "");
+        assert_eq!(truncate_utf8_bytes("abc", 2), "ab");
+        assert_eq!(truncate_utf8_bytes("abcd", 3), "...");
+
+        // 1020 ASCII + 3-byte '€' + 2 ASCII = 1025 bytes; 1024 - 3 = 1021 falls inside '€'.
+        let mut input = "a".repeat(1020);
+        input.push('€');
+        input.push_str("bc");
+        let truncated = truncate_utf8_bytes(&input, MAX_SUMMARY_BYTES);
+        assert!(truncated.len() <= MAX_SUMMARY_BYTES);
+        assert_eq!(truncated.len(), 1023);
+        assert!(truncated.ends_with("..."));
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn systemd_executor_delivers_large_stdin_writes_secure_artifacts_and_bounds_summary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state_dir = TempTestDir::new("zach-019-exec-state");
+        let work_dir = TempTestDir::new("zach-019-exec-work");
+        let mut exec = SystemdStageExecutor::with_state_dir(state_dir.path());
+
+        let mut task = sample_task();
+        task.worktree_path = Some(work_dir.path_str().to_owned());
+        let route = resolve_stage_route("S", "impl", 0, None).unwrap().unwrap();
+
+        // > 64 KB stdin payload to prove concurrent writer + wait_with_output avoids pipe deadlock.
+        let large_prompt = "P".repeat(96 * 1024);
+        let mut spec = build_systemd_stage_command_with_env(
+            &task,
+            "att-real-1",
+            &route,
+            &large_prompt,
+            &build_clean_env_from_process(),
+        )
+        .expect("build spec");
+
+        // Replace systemd-run with a real subprocess reading all stdin and emitting > 1024B UTF-8 stdout + stderr.
+        spec.program = "/bin/sh".to_owned();
+        spec.args = vec![
+            "-c".to_owned(),
+            "bytes=$(wc -c); printf 'stdin_bytes=%s\\n' \"$bytes\"; printf '€%.0s' $(seq 1 600); echo 'err-line' >&2"
+                .to_owned(),
+        ];
+
+        let res = exec
+            .execute_stage(&task, "att-real-1", &route, &spec)
+            .expect("real subprocess execution should succeed");
+
+        assert_eq!(res.status, "PASSED");
+        assert!(res.summary.len() <= MAX_SUMMARY_BYTES);
+        assert!(res.summary.starts_with("stdin_bytes=98304"));
+        assert!(res.summary.ends_with("..."));
+
+        let attempts_dir = state_dir.path().join("attempts");
+        let attempt_dir = attempts_dir.join("att-real-1");
+        assert_eq!(
+            std::fs::metadata(&attempts_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&attempt_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+
+        for name in ["prompt.md", "stdout.jsonl", "stderr.log", "result.json"] {
+            let p = attempt_dir.join(name);
+            assert!(p.exists(), "missing artifact {name}");
+            assert_eq!(
+                std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "artifact {name} should have 0600 mode"
+            );
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(attempt_dir.join("prompt.md")).unwrap(),
+            large_prompt
+        );
+        let stdout_contents = std::fs::read_to_string(attempt_dir.join("stdout.jsonl")).unwrap();
+        assert!(stdout_contents.starts_with("stdin_bytes=98304\n"));
+        assert_eq!(
+            std::fs::read_to_string(attempt_dir.join("stderr.log")).unwrap(),
+            "err-line\n"
+        );
+        let result_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(attempt_dir.join("result.json")).unwrap(),
+        )
+        .expect("valid result.json");
+        assert_eq!(result_json["attempt_id"], "att-real-1");
+        assert_eq!(result_json["exit_code"], 0);
+        assert_eq!(result_json["result"]["status"], "PASSED");
+    }
+
+    #[test]
+    fn systemd_executor_rejects_invalid_attempt_ids_and_symlinks() {
+        let state_dir = TempTestDir::new("zach-019-sec");
+        let mut exec = SystemdStageExecutor::with_state_dir(state_dir.path());
+        let task = sample_task();
+        let route = resolve_stage_route("S", "impl", 0, None).unwrap().unwrap();
+        let mut spec = build_systemd_stage_command_with_env(
+            &task,
+            "att-sec",
+            &route,
+            "hello",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        spec.program = "/bin/true".to_owned();
+        spec.args = Vec::new();
+
+        for bad_id in ["", ".", "..", "a/b", "a\\b", " bad "] {
+            assert!(
+                exec.execute_stage(&task, bad_id, &route, &spec).is_err(),
+                "expected invalid attempt_id '{bad_id}' to be rejected"
+            );
+        }
+
+        // Symlink attempt dir is rejected
+        let attempts_dir = state_dir.path().join("attempts");
+        std::fs::create_dir_all(&attempts_dir).unwrap();
+        let outside = TempTestDir::new("zach-019-outside");
+        std::os::unix::fs::symlink(outside.path(), attempts_dir.join("sym-att")).unwrap();
+        assert!(exec.execute_stage(&task, "sym-att", &route, &spec).is_err());
+    }
+
+    #[test]
+    fn prune_old_attempts_at_prunes_expired_dirs_and_skips_symlinks_and_files() {
+        let state_dir = TempTestDir::new("zach-019-prune");
+        let outside = TempTestDir::new("zach-019-prune-outside");
+        write_rel(outside.path(), "keep.txt", "do not delete");
+
+        let attempts_dir = state_dir.path().join("attempts");
+        let old_dir = attempts_dir.join("old-attempt");
+        let fresh_dir = attempts_dir.join("fresh-attempt");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::create_dir_all(&fresh_dir).unwrap();
+        std::fs::write(old_dir.join("prompt.md"), "old").unwrap();
+        std::fs::write(fresh_dir.join("prompt.md"), "fresh").unwrap();
+        std::fs::write(attempts_dir.join("stray-file.txt"), "keep").unwrap();
+        std::os::unix::fs::symlink(outside.path(), attempts_dir.join("sym-attempt")).unwrap();
+
+        // Set old_dir mtime to 10 days ago using `touch`
+        let status = Command::new("touch")
+            .args(["-d", "10 days ago"])
+            .arg(&old_dir)
+            .status()
+            .expect("run touch");
+        assert!(status.success());
+
+        let pruned = prune_old_attempts_at(
+            state_dir.path(),
+            std::time::Duration::from_secs(7 * 86_400),
+            std::time::SystemTime::now(),
+        )
+        .expect("prune succeeds");
+
+        assert_eq!(pruned, 1);
+        assert!(!old_dir.exists());
+        assert!(fresh_dir.exists());
+        assert!(attempts_dir.join("stray-file.txt").exists());
+        assert!(attempts_dir.join("sym-attempt").symlink_metadata().is_ok());
+        assert!(outside.path().join("keep.txt").exists());
     }
 }
