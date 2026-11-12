@@ -720,7 +720,8 @@ pub fn execute_xs_s_pipeline(store: &mut V2Store, task_id: &str) -> Result<TaskR
 }
 
 /// Drives an `XS` or `S` task end-to-end through `impl`, mechanical diff & check gates,
-/// cross-model `pr-review` (when `S`), and exact-SHA delivery.
+/// cross-model `pr-review` (when `S`), and enqueues the pull request into the per-repo FIFO
+/// `merge_queue` (retaining `path_locks` until merge completes).
 pub fn execute_xs_s_pipeline_with_executor(
     store: &mut V2Store,
     task_id: &str,
@@ -970,6 +971,11 @@ pub fn execute_xs_s_pipeline_with_executor(
     if !task.stages_completed.iter().any(|s| s == "impl") {
         task.stages_completed.push("impl".to_owned());
     }
+    if let Some(ref sha) = impl_result.sha_after
+        && !sha.trim().is_empty()
+    {
+        task.reviewed_sha = Some(sha.clone());
+    }
 
     // Stage 2: Cross-model pr-review for weight S
     if task.weight.eq_ignore_ascii_case("S")
@@ -1097,24 +1103,15 @@ pub fn execute_xs_s_pipeline_with_executor(
         if !task.stages_completed.iter().any(|s| s == "pr-review") {
             task.stages_completed.push("pr-review".to_owned());
         }
+        if let Some(ref sha) = rev_result.sha_after
+            && !sha.trim().is_empty()
+        {
+            task.reviewed_sha = Some(sha.clone());
+        }
     }
 
-    let reviewed_sha = impl_result
-        .sha_after
-        .clone()
-        .unwrap_or_else(|| "head-sha".to_owned());
-    task.reviewed_sha = Some(reviewed_sha.clone());
-    if let Some(pr_num) = executor.finalize_xs_s_delivery(&task, &reviewed_sha)? {
-        task.pr_number = Some(pr_num);
-    }
-
-    task.status = "Done".to_owned();
-    task.current_stage = None;
-    task.active_attempt_id = None;
-    task = store.upsert_task(&task).map_err(|e| e.to_string())?;
-    let _ = store.release_path_locks(&task.task_id);
-
-    Ok(task)
+    // Final: Enqueue into FIFO merge queue (path locks remain held until merge completes!)
+    enqueue_pipeline_task_for_merge(store, executor, task, impl_result.sha_after)
 }
 
 pub fn execute_m_l_pipeline(store: &mut V2Store, task_id: &str) -> Result<TaskRecord, String> {
@@ -2090,10 +2087,23 @@ pub fn execute_m_l_pipeline_with_executor(
     }
 
     // Step 5: Enqueue into FIFO merge queue (path locks remain held until merge completes!)
+    let fallback_sha = impl_result_holder.and_then(|r| r.sha_after);
+    enqueue_pipeline_task_for_merge(store, executor, task, fallback_sha)
+}
+
+/// Finalizes PR delivery (if not already opened), enqueues the task into the per-repo
+/// FIFO `merge_queue`, and transitions the task to `Queued for Merge` while keeping
+/// `path_locks` held until `merge_queue` completes.
+fn enqueue_pipeline_task_for_merge(
+    store: &mut V2Store,
+    executor: &mut dyn StageExecutor,
+    mut task: TaskRecord,
+    fallback_reviewed_sha: Option<String>,
+) -> Result<TaskRecord, String> {
     let reviewed_sha = task
         .reviewed_sha
         .clone()
-        .or_else(|| impl_result_holder.and_then(|r| r.sha_after))
+        .or(fallback_reviewed_sha)
         .unwrap_or_else(|| "head-sha".to_owned());
     task.reviewed_sha = Some(reviewed_sha.clone());
 
@@ -2239,6 +2249,46 @@ mod tests {
         }
     }
 
+    fn assert_merge_queue_completes_task(
+        store: &mut V2Store,
+        repo: &str,
+        task_id: &str,
+        pr_number: i64,
+        merge_sha: &str,
+    ) {
+        let semaphore = crate::v2::scheduler::HeavyCheckSemaphore::new();
+        let mut merge_driver = crate::v2::merge_queue::tests::MockMergeDriver {
+            origin_default_sha: Some(format!("{task_id}-merge-head")),
+            merge_pr_result: Some(merge_sha.to_owned()),
+            ..Default::default()
+        };
+        let ci_cfg = crate::v2::merge_queue::CiPollConfig {
+            timeout: std::time::Duration::from_secs(30),
+            poll_interval: std::time::Duration::from_secs(10),
+        };
+        let outcome = crate::v2::merge_queue::process_repo_merge_queue_with_config(
+            store,
+            repo,
+            &mut merge_driver,
+            &semaphore,
+            ci_cfg,
+            |_| {},
+        )
+        .expect("merge queue should succeed");
+        assert_eq!(
+            outcome,
+            crate::v2::merge_queue::MergeQueueOutcome::Merged {
+                task_id: task_id.to_owned(),
+                pr_number,
+                merge_sha: merge_sha.to_owned(),
+            }
+        );
+        let merged = store.get_task(task_id).unwrap().unwrap();
+        assert_eq!(merged.status, "Done");
+        assert!(store.list_merge_queue(Some(repo)).unwrap().is_empty());
+        assert!(store.list_path_locks(Some(repo)).unwrap().is_empty());
+    }
+
     #[test]
     fn execute_xs_s_pipeline_drives_s_task_through_impl_and_cross_model_pr_review() {
         let mut store = V2Store::open_in_memory().expect("in-memory store");
@@ -2311,14 +2361,15 @@ mod tests {
             ..MockStageExecutor::default()
         };
 
-        let completed = execute_xs_s_pipeline_with_executor(&mut store, "ZACH-005", &mut mock)
-            .expect("pipeline should succeed");
+        let queued = execute_xs_s_pipeline_with_executor(&mut store, "ZACH-005", &mut mock)
+            .expect("pipeline should succeed and enqueue for merge");
 
-        assert_eq!(completed.status, "Done");
-        assert_eq!(completed.reviewed_sha.as_deref(), Some("def5678"));
-        assert_eq!(completed.pr_number, Some(42));
+        assert_eq!(queued.status, "Queued for Merge");
+        assert_eq!(queued.current_stage.as_deref(), Some("merge_queue"));
+        assert_eq!(queued.reviewed_sha.as_deref(), Some("def5678"));
+        assert_eq!(queued.pr_number, Some(42));
         assert_eq!(
-            completed.stages_completed,
+            queued.stages_completed,
             vec!["impl".to_owned(), "pr-review".to_owned()]
         );
         assert_eq!(mock.executed_routes.len(), 2);
@@ -2326,6 +2377,92 @@ mod tests {
         assert_eq!(mock.executed_routes[0].family, ModelFamily::OpenAiSol);
         assert_eq!(mock.executed_routes[1].family, ModelFamily::GeminiAgy);
         assert_eq!(mock.finalized_sha.as_deref(), Some("def5678"));
+
+        // Verify merge queue entry exists and path locks remain held until merge completes
+        let mq = store.list_merge_queue(Some("zach")).unwrap();
+        assert_eq!(mq.len(), 1);
+        assert_eq!(mq[0].task_id, "ZACH-005");
+        assert_eq!(mq[0].pr_number, 42);
+        assert_eq!(mq[0].reviewed_sha, "def5678");
+        assert_eq!(mq[0].state, "QUEUED");
+        assert_eq!(store.list_path_locks(Some("zach")).unwrap().len(), 2);
+
+        // Done only occurs after merge_queue succeeds
+        assert_merge_queue_completes_task(&mut store, "zach", "ZACH-005", 42, "final-merge-sha");
+    }
+
+    #[test]
+    fn execute_xs_pipeline_enqueues_for_merge_and_marks_done_only_after_merge() {
+        let mut store = V2Store::open_in_memory().expect("in-memory store");
+        let task = TaskRecord {
+            task_id: "ZACH-023-XS".to_owned(),
+            task_group: "zach".to_owned(),
+            title: "XS pipeline test".to_owned(),
+            repository: "zach".to_owned(),
+            github_repo: Some("shockerqt/zach".to_owned()),
+            issue_number: Some(56),
+            weight: "XS".to_owned(),
+            status: "Ready".to_owned(),
+            worktree_path: Some("/home/ubuntu/workspace/zach--ZACH-023-XS".to_owned()),
+            branch: Some("task/ZACH-023-XS".to_owned()),
+            context_pack: sample_context_pack("XS"),
+            depends_on: Vec::new(),
+            required_stages: vec!["impl".to_owned()],
+            stages_completed: Vec::new(),
+            current_stage: None,
+            active_attempt_id: None,
+            plan_base_sha: Some("abc1234".to_owned()),
+            reviewed_sha: None,
+            pr_number: None,
+            executor: None,
+            autonomous_consent: true,
+            retry_count: 0,
+            memory: TaskMemory::default(),
+            version: 1,
+            updated_epoch: 1000,
+        };
+        store.upsert_task(&task).expect("upsert task");
+
+        let mut mock = MockStageExecutor {
+            staged_results: vec![StageExecutionResult {
+                status: "PASSED".to_owned(),
+                summary: "Implemented XS change".to_owned(),
+                review_markdown: None,
+                invocation_id: Some("inv-xs-1".to_owned()),
+                input_tokens: 4_000,
+                output_tokens: 800,
+                total_tokens: 4_800,
+                sha_before: Some("abc1234".to_owned()),
+                sha_after: Some("xs-sha-1".to_owned()),
+                diff_files: vec![DiffFileEntry {
+                    path: "src/v2/router.rs".to_owned(),
+                    status: "M".to_owned(),
+                    added_lines: 5,
+                    deleted_lines: 2,
+                }],
+            }],
+            pr_number_to_return: Some(77),
+            ..MockStageExecutor::default()
+        };
+
+        let queued = execute_xs_s_pipeline_with_executor(&mut store, "ZACH-023-XS", &mut mock)
+            .expect("XS pipeline should enqueue for merge");
+
+        assert_eq!(queued.status, "Queued for Merge");
+        assert_eq!(queued.current_stage.as_deref(), Some("merge_queue"));
+        assert_eq!(queued.reviewed_sha.as_deref(), Some("xs-sha-1"));
+        assert_eq!(queued.pr_number, Some(77));
+        assert_eq!(queued.stages_completed, vec!["impl".to_owned()]);
+
+        let mq = store.list_merge_queue(Some("zach")).unwrap();
+        assert_eq!(mq.len(), 1);
+        assert_eq!(mq[0].task_id, "ZACH-023-XS");
+        assert_eq!(mq[0].pr_number, 77);
+        assert_eq!(mq[0].reviewed_sha, "xs-sha-1");
+        assert_eq!(mq[0].state, "QUEUED");
+        assert_eq!(store.list_path_locks(Some("zach")).unwrap().len(), 2);
+
+        assert_merge_queue_completes_task(&mut store, "zach", "ZACH-023-XS", 77, "xs-final-sha");
     }
 
     #[test]
