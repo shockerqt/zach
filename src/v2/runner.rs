@@ -55,11 +55,15 @@ pub trait StageExecutor {
 
     fn run_checks(&mut self, worktree_path: &str, commands: &[String]) -> Result<(), String>;
 
-    fn finalize_xs_s_delivery(
+    fn commit_worktree(&mut self, task: &TaskRecord, worktree_path: &str)
+    -> Result<String, String>;
+
+    fn push_and_ensure_pr(
         &mut self,
         task: &TaskRecord,
+        worktree_path: &str,
         reviewed_sha: &str,
-    ) -> Result<Option<i64>, String>;
+    ) -> Result<i64, String>;
 }
 
 /// Builds a strict allowlisted environment map for worker execution, explicitly
@@ -439,31 +443,42 @@ impl StageExecutor for SystemdStageExecutor {
         Ok(())
     }
 
-    fn finalize_xs_s_delivery(
+    fn commit_worktree(
         &mut self,
         task: &TaskRecord,
-        _reviewed_sha: &str,
-    ) -> Result<Option<i64>, String> {
-        let worktree_path = match task.worktree_path.as_deref() {
-            Some(w) if !w.is_empty() => w,
-            _ => return Ok(None),
-        };
+        worktree_path: &str,
+    ) -> Result<String, String> {
+        let trimmed_worktree = worktree_path.trim();
+        if trimmed_worktree.is_empty() || trimmed_worktree == "none" {
+            return Err(format!(
+                "task {} has no governed worktree_path to commit",
+                task.task_id
+            ));
+        }
 
-        // 1. Commit uncommitted changes if worktree is dirty
+        // Commit uncommitted changes if worktree is dirty
         let status_out = Command::new("git")
-            .args(["-C", worktree_path, "status", "--porcelain"])
+            .args(["-C", trimmed_worktree, "status", "--porcelain"])
             .output()
             .map_err(|e| format!("failed to check git status: {e}"))?;
+        if !status_out.status.success() {
+            return Err(format!(
+                "git status failed in '{}': {}",
+                trimmed_worktree,
+                String::from_utf8_lossy(&status_out.stderr).trim()
+            ));
+        }
+
         let status_str = String::from_utf8_lossy(&status_out.stdout);
         if !status_str.trim().is_empty() {
             let add_out = Command::new("git")
-                .args(["-C", worktree_path, "add", "-A"])
+                .args(["-C", trimmed_worktree, "add", "-A"])
                 .output()
                 .map_err(|e| format!("git add failed: {e}"))?;
             if !add_out.status.success() {
                 return Err(format!(
                     "git add failed: {}",
-                    String::from_utf8_lossy(&add_out.stderr)
+                    String::from_utf8_lossy(&add_out.stderr).trim()
                 ));
             }
 
@@ -475,35 +490,72 @@ impl StageExecutor for SystemdStageExecutor {
                 task.active_attempt_id.as_deref().unwrap_or("none")
             );
             let commit_out = Command::new("git")
-                .args(["-C", worktree_path, "commit", "-m", &commit_msg])
+                .args(["-C", trimmed_worktree, "commit", "-m", &commit_msg])
                 .output()
                 .map_err(|e| format!("git commit failed: {e}"))?;
             if !commit_out.status.success() {
                 return Err(format!(
                     "git commit failed: {}",
-                    String::from_utf8_lossy(&commit_out.stderr)
+                    String::from_utf8_lossy(&commit_out.stderr).trim()
                 ));
             }
         }
 
-        // 2. Push branch
-        let branch = match task.branch.as_deref() {
-            Some(b) if !b.is_empty() && b != "none" => b,
-            _ => return Ok(None),
-        };
+        git_head_sha(trimmed_worktree)
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty() && s != "head-sha")
+            .ok_or_else(|| {
+                format!(
+                    "failed to resolve committed HEAD SHA in worktree '{}'",
+                    trimmed_worktree
+                )
+            })
+    }
+
+    fn push_and_ensure_pr(
+        &mut self,
+        task: &TaskRecord,
+        worktree_path: &str,
+        reviewed_sha: &str,
+    ) -> Result<i64, String> {
+        let trimmed_worktree = worktree_path.trim();
+        if trimmed_worktree.is_empty() || trimmed_worktree == "none" {
+            return Err(format!(
+                "task {} has no governed worktree_path for PR delivery",
+                task.task_id
+            ));
+        }
+
+        let trimmed_sha = reviewed_sha.trim();
+        if trimmed_sha.is_empty() || trimmed_sha == "head-sha" {
+            return Err(format!(
+                "task {} is missing a valid reviewed_sha for PR delivery",
+                task.task_id
+            ));
+        }
+
+        let branch = task
+            .branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty() && *b != "none")
+            .ok_or_else(|| format!("task {} has no branch for PR push", task.task_id))?;
 
         let push_out = Command::new("git")
-            .args(["-C", worktree_path, "push", "-u", "origin", branch])
+            .args(["-C", trimmed_worktree, "push", "-u", "origin", branch])
             .output()
             .map_err(|e| format!("git push failed: {e}"))?;
         if !push_out.status.success() {
             return Err(format!(
                 "git push failed: {}",
-                String::from_utf8_lossy(&push_out.stderr)
+                String::from_utf8_lossy(&push_out.stderr).trim()
             ));
         }
 
-        // 3. Find or create PR
+        if let Some(pr) = task.pr_number.filter(|&p| p > 0) {
+            return Ok(pr);
+        }
+
         let gh_repo = task.github_repo.as_deref().unwrap_or(&task.repository);
         let list_out = Command::new("gh")
             .args([
@@ -520,10 +572,14 @@ impl StageExecutor for SystemdStageExecutor {
             ])
             .output();
 
-        if let Ok(lo) = list_out {
+        if let Ok(lo) = list_out
+            && lo.status.success()
+        {
             let num_str = String::from_utf8_lossy(&lo.stdout).trim().to_owned();
-            if let Ok(num) = num_str.parse::<i64>() {
-                return Ok(Some(num));
+            if let Ok(num) = num_str.parse::<i64>()
+                && num > 0
+            {
+                return Ok(num);
             }
         }
 
@@ -543,17 +599,22 @@ impl StageExecutor for SystemdStageExecutor {
 
         if !create_out.status.success() {
             let err = String::from_utf8_lossy(&create_out.stderr);
-            return Err(format!("gh pr create failed: {err}"));
+            return Err(format!("gh pr create failed: {}", err.trim()));
         }
 
         let pr_url = String::from_utf8_lossy(&create_out.stdout);
-        let pr_num = pr_url
+        pr_url
             .trim()
             .rsplit('/')
             .next()
-            .and_then(|s| s.parse::<i64>().ok());
-
-        Ok(pr_num)
+            .and_then(|s| s.parse::<i64>().ok())
+            .filter(|&n| n > 0)
+            .ok_or_else(|| {
+                format!(
+                    "gh pr create did not return a valid PR number in output: '{}'",
+                    pr_url.trim()
+                )
+            })
     }
 }
 
@@ -803,6 +864,9 @@ pub struct MockStageExecutor {
     pub executed_specs: Vec<StageCommandSpec>,
     pub executed_routes: Vec<StageRoute>,
     pub executed_checks: Vec<String>,
+    pub executed_stage_reviewed_shas: Vec<Option<String>>,
+    pub committed_worktrees: Vec<String>,
+    pub committed_sha_to_return: Option<String>,
     pub finalized_sha: Option<String>,
     pub pr_number_to_return: Option<i64>,
 }
@@ -814,6 +878,9 @@ impl Default for MockStageExecutor {
             executed_specs: Vec::new(),
             executed_routes: Vec::new(),
             executed_checks: Vec::new(),
+            executed_stage_reviewed_shas: Vec::new(),
+            committed_worktrees: Vec::new(),
+            committed_sha_to_return: Some("mock-committed-sha".to_owned()),
             finalized_sha: None,
             pr_number_to_return: Some(42),
         }
@@ -823,13 +890,15 @@ impl Default for MockStageExecutor {
 impl StageExecutor for MockStageExecutor {
     fn execute_stage(
         &mut self,
-        _task: &TaskRecord,
+        task: &TaskRecord,
         _attempt_id: &str,
         route: &StageRoute,
         spec: &StageCommandSpec,
     ) -> Result<StageExecutionResult, String> {
         self.executed_routes.push(route.clone());
         self.executed_specs.push(spec.clone());
+        self.executed_stage_reviewed_shas
+            .push(task.reviewed_sha.clone());
         if self.staged_results.is_empty() {
             return Err("MockStageExecutor had no staged_results left".to_owned());
         }
@@ -841,13 +910,35 @@ impl StageExecutor for MockStageExecutor {
         Ok(())
     }
 
-    fn finalize_xs_s_delivery(
+    fn commit_worktree(
         &mut self,
-        _task: &TaskRecord,
+        task: &TaskRecord,
+        worktree_path: &str,
+    ) -> Result<String, String> {
+        self.committed_worktrees.push(worktree_path.to_owned());
+        self.committed_sha_to_return
+            .as_deref()
+            .map(str::trim)
+            .filter(|sha| !sha.is_empty() && *sha != "head-sha")
+            .map(str::to_owned)
+            .ok_or_else(|| format!("missing committed_sha for task {}", task.task_id))
+    }
+
+    fn push_and_ensure_pr(
+        &mut self,
+        task: &TaskRecord,
+        _worktree_path: &str,
         reviewed_sha: &str,
-    ) -> Result<Option<i64>, String> {
-        self.finalized_sha = Some(reviewed_sha.to_owned());
-        Ok(self.pr_number_to_return)
+    ) -> Result<i64, String> {
+        let trimmed_sha = reviewed_sha.trim();
+        if trimmed_sha.is_empty() || trimmed_sha == "head-sha" {
+            return Err(format!("missing reviewed_sha for task {}", task.task_id));
+        }
+        self.finalized_sha = Some(trimmed_sha.to_owned());
+        task.pr_number
+            .filter(|&p| p > 0)
+            .or_else(|| self.pr_number_to_return.filter(|&p| p > 0))
+            .ok_or_else(|| format!("missing pr_number for task {}", task.task_id))
     }
 }
 
@@ -1295,5 +1386,73 @@ other-user-unit.service loaded active running
         assert_eq!(statuses.get("copy.rs").map(String::as_str), Some("A"));
         assert_eq!(stats.get("new.rs"), Some(&(4, 2)));
         assert_eq!(stats.get("copy.rs"), Some(&(10, 0)));
+    }
+
+    #[test]
+    fn systemd_commit_worktree_commits_dirty_changes_and_handles_clean_tree() {
+        let repo = TempTestDir::new("zach-016-commit-worktree");
+        git(repo.path(), &["init", "-b", "main"]);
+        init_git_identity(repo.path());
+        write_rel(repo.path(), "src/lib.rs", "pub fn base() -> i32 { 1 }\n");
+        git(repo.path(), &["add", "src/lib.rs"]);
+        git(repo.path(), &["commit", "-m", "initial commit"]);
+
+        let sha_before = git(repo.path(), &["rev-parse", "HEAD"]).trim().to_owned();
+
+        // Worker modifies a tracked file and creates an untracked file without committing.
+        write_rel(repo.path(), "src/lib.rs", "pub fn base() -> i32 { 2 }\n");
+        write_rel(repo.path(), "src/added.rs", "pub fn added() -> i32 { 3 }\n");
+
+        let mut task = sample_task();
+        task.task_id = "ZACH-016".to_owned();
+        task.worktree_path = Some(repo.path_str().to_owned());
+        task.active_attempt_id = Some("zach-016-impl-1".to_owned());
+
+        let mut exec = SystemdStageExecutor;
+        let committed_sha = exec
+            .commit_worktree(&task, repo.path_str())
+            .expect("commit_worktree should stage and commit dirty changes");
+
+        assert_ne!(committed_sha, sha_before);
+        assert_eq!(
+            committed_sha,
+            git(repo.path(), &["rev-parse", "HEAD"]).trim()
+        );
+        assert!(
+            git(repo.path(), &["status", "--porcelain"])
+                .trim()
+                .is_empty()
+        );
+        let changed = git(
+            repo.path(),
+            &["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+        );
+        assert!(changed.lines().any(|l| l == "src/lib.rs"));
+        assert!(changed.lines().any(|l| l == "src/added.rs"));
+
+        // Second call on a clean tree should succeed without error and return the same HEAD.
+        let second_sha = exec
+            .commit_worktree(&task, repo.path_str())
+            .expect("commit_worktree on clean tree should return HEAD");
+        assert_eq!(second_sha, committed_sha);
+    }
+
+    #[test]
+    fn systemd_push_and_ensure_pr_rejects_missing_sha_or_branch() {
+        let mut exec = SystemdStageExecutor;
+        let mut task = sample_task();
+        assert!(
+            exec.push_and_ensure_pr(&task, "/tmp/zach--ZACH-005", "head-sha")
+                .is_err()
+        );
+        assert!(
+            exec.push_and_ensure_pr(&task, "/tmp/zach--ZACH-005", "")
+                .is_err()
+        );
+        task.branch = None;
+        assert!(
+            exec.push_and_ensure_pr(&task, "/tmp/zach--ZACH-005", "abc1234")
+                .is_err()
+        );
     }
 }

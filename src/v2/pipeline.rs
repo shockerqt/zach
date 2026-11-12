@@ -714,6 +714,45 @@ fn run_stage_checks(
     Ok(())
 }
 
+fn commit_impl_worktree(
+    store: &mut V2Store,
+    executor: &mut dyn StageExecutor,
+    task: &mut TaskRecord,
+    attempt: &mut StageAttemptRecord,
+    worktree_path: &str,
+) -> Result<String, String> {
+    let raw_sha = match executor.commit_worktree(task, worktree_path) {
+        Ok(sha) => sha,
+        Err(err) => {
+            let class = classify_failure_class("impl", "FAILED", &err);
+            fail_stage_attempt(store, task, attempt, class, err.clone(), true)?;
+            return Err(format!(
+                "failed to commit worktree for {}: {}",
+                task.task_id, err
+            ));
+        }
+    };
+    let committed_sha = raw_sha.trim().to_owned();
+    if committed_sha.is_empty() || committed_sha == "head-sha" {
+        let err = format!(
+            "commit_worktree returned invalid SHA '{}' for {}",
+            committed_sha, task.task_id
+        );
+        fail_stage_attempt(store, task, attempt, FAILURE_CLASS_INFRA, err.clone(), true)?;
+        return Err(err);
+    }
+    attempt.sha_after = Some(committed_sha.clone());
+    store
+        .record_stage_attempt(attempt)
+        .map_err(|e| e.to_string())?;
+    task.reviewed_sha = Some(committed_sha.clone());
+    if !task.stages_completed.iter().any(|s| s == "impl") {
+        task.stages_completed.push("impl".to_owned());
+    }
+    *task = store.upsert_task(task).map_err(|e| e.to_string())?;
+    Ok(committed_sha)
+}
+
 pub fn execute_xs_s_pipeline(store: &mut V2Store, task_id: &str) -> Result<TaskRecord, String> {
     let mut executor = SystemdStageExecutor;
     execute_xs_s_pipeline_with_executor(store, task_id, &mut executor)
@@ -968,14 +1007,8 @@ pub fn execute_xs_s_pipeline_with_executor(
         &gate_checks,
     )?;
 
-    if !task.stages_completed.iter().any(|s| s == "impl") {
-        task.stages_completed.push("impl".to_owned());
-    }
-    if let Some(ref sha) = impl_result.sha_after
-        && !sha.trim().is_empty()
-    {
-        task.reviewed_sha = Some(sha.clone());
-    }
+    let committed_sha =
+        commit_impl_worktree(store, executor, &mut task, &mut attempt_rec, &worktree_path)?;
 
     // Stage 2: Cross-model pr-review for weight S
     if task.weight.eq_ignore_ascii_case("S")
@@ -1022,8 +1055,8 @@ pub fn execute_xs_s_pipeline_with_executor(
             input_tokens: 0,
             output_tokens: 0,
             total_tokens: 0,
-            sha_before: impl_result.sha_after.clone(),
-            sha_after: impl_result.sha_after.clone(),
+            sha_before: Some(committed_sha.clone()),
+            sha_after: Some(committed_sha.clone()),
         };
         store
             .record_stage_attempt(&rev_attempt)
@@ -1055,6 +1088,14 @@ pub fn execute_xs_s_pipeline_with_executor(
         rev_attempt.input_tokens = rev_result.input_tokens;
         rev_attempt.output_tokens = rev_result.output_tokens;
         rev_attempt.total_tokens = rev_result.total_tokens;
+        if let Some(sha) = rev_result
+            .sha_after
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "head-sha")
+        {
+            rev_attempt.sha_after = Some(sha.to_owned());
+        }
 
         *task
             .memory
@@ -1103,15 +1144,19 @@ pub fn execute_xs_s_pipeline_with_executor(
         if !task.stages_completed.iter().any(|s| s == "pr-review") {
             task.stages_completed.push("pr-review".to_owned());
         }
-        if let Some(ref sha) = rev_result.sha_after
-            && !sha.trim().is_empty()
+        if let Some(sha) = rev_result
+            .sha_after
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "head-sha")
+            && rev_result.sha_after != rev_result.sha_before
         {
-            task.reviewed_sha = Some(sha.clone());
+            task.reviewed_sha = Some(sha.to_owned());
         }
     }
 
     // Final: Enqueue into FIFO merge queue (path locks remain held until merge completes!)
-    enqueue_pipeline_task_for_merge(store, executor, task, impl_result.sha_after)
+    enqueue_pipeline_task_for_merge(store, executor, task, &worktree_path)
 }
 
 pub fn execute_m_l_pipeline(store: &mut V2Store, task_id: &str) -> Result<TaskRecord, String> {
@@ -1579,7 +1624,7 @@ pub fn execute_m_l_pipeline_with_executor(
     }
 
     // Stage 3: impl (Atomic path_locks acquired before impl and held!)
-    let mut impl_result_holder = None;
+    let mut impl_committed_in_run = false;
     if !task.stages_completed.iter().any(|s| s == "impl")
         && (task.required_stages.is_empty() || task.required_stages.iter().any(|s| s == "impl"))
     {
@@ -1824,12 +1869,9 @@ pub fn execute_m_l_pipeline_with_executor(
             &gate_checks,
         )?;
 
-        task.stages_completed.push("impl".to_owned());
-        if let Some(ref sha) = impl_result.sha_after {
-            task.reviewed_sha = Some(sha.clone());
-        }
-        task = store.upsert_task(&task).map_err(|e| e.to_string())?;
-        impl_result_holder = Some(impl_result);
+        let _committed_sha =
+            commit_impl_worktree(store, executor, &mut task, &mut attempt_rec, &worktree_path)?;
+        impl_committed_in_run = true;
     }
 
     // Stage 4: pr-review (Cross-model review, path_locks remain held!)
@@ -2024,10 +2066,14 @@ pub fn execute_m_l_pipeline_with_executor(
         }
 
         task.stages_completed.push("pr-review".to_owned());
-        if let Some(ref sha) = rev_result.sha_after
-            && !sha.trim().is_empty()
+        if let Some(sha) = rev_result
+            .sha_after
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "head-sha")
+            && (!impl_committed_in_run || rev_result.sha_after != rev_result.sha_before)
         {
-            task.reviewed_sha = Some(sha.clone());
+            task.reviewed_sha = Some(sha.to_owned());
         }
         task = store.upsert_task(&task).map_err(|e| e.to_string())?;
     }
@@ -2087,34 +2133,35 @@ pub fn execute_m_l_pipeline_with_executor(
     }
 
     // Step 5: Enqueue into FIFO merge queue (path locks remain held until merge completes!)
-    let fallback_sha = impl_result_holder.and_then(|r| r.sha_after);
-    enqueue_pipeline_task_for_merge(store, executor, task, fallback_sha)
+    enqueue_pipeline_task_for_merge(store, executor, task, &worktree_path)
 }
 
-/// Finalizes PR delivery (if not already opened), enqueues the task into the per-repo
-/// FIFO `merge_queue`, and transitions the task to `Queued for Merge` while keeping
-/// `path_locks` held until `merge_queue` completes.
+/// Pushes the committed branch and opens (or looks up) its pull request, enqueues the
+/// task into the per-repo FIFO `merge_queue`, and transitions the task to
+/// `Queued for Merge` while keeping `path_locks` held until `merge_queue` completes.
 fn enqueue_pipeline_task_for_merge(
     store: &mut V2Store,
     executor: &mut dyn StageExecutor,
     mut task: TaskRecord,
-    fallback_reviewed_sha: Option<String>,
+    worktree_path: &str,
 ) -> Result<TaskRecord, String> {
     let reviewed_sha = task
         .reviewed_sha
-        .clone()
-        .or(fallback_reviewed_sha)
-        .unwrap_or_else(|| "head-sha".to_owned());
+        .as_deref()
+        .map(str::trim)
+        .filter(|sha| !sha.is_empty() && *sha != "head-sha")
+        .ok_or_else(|| format!("task {} is missing a valid reviewed_sha", task.task_id))?
+        .to_owned();
     task.reviewed_sha = Some(reviewed_sha.clone());
 
-    let pr_number = if let Some(pr) = task.pr_number {
-        pr
-    } else if let Some(pr) = executor.finalize_xs_s_delivery(&task, &reviewed_sha)? {
-        task.pr_number = Some(pr);
-        pr
-    } else {
-        1
-    };
+    let pr_number = executor.push_and_ensure_pr(&task, worktree_path, &reviewed_sha)?;
+    if pr_number <= 0 {
+        return Err(format!(
+            "invalid pr_number {} returned for task {}",
+            pr_number, task.task_id
+        ));
+    }
+    task.pr_number = Some(pr_number);
 
     crate::v2::merge_queue::enqueue_for_merge(
         store,
@@ -2332,7 +2379,7 @@ mod tests {
                     output_tokens: 3_000,
                     total_tokens: 15_000,
                     sha_before: Some("abc1234".to_owned()),
-                    sha_after: Some("def5678".to_owned()),
+                    sha_after: Some("abc1234".to_owned()),
                     diff_files: vec![DiffFileEntry {
                         path: "src/v2/router.rs".to_owned(),
                         status: "M".to_owned(),
@@ -2358,6 +2405,7 @@ mod tests {
                     diff_files: Vec::new(),
                 },
             ],
+            committed_sha_to_return: Some("def5678".to_owned()),
             ..MockStageExecutor::default()
         };
 
@@ -2376,6 +2424,10 @@ mod tests {
         // Verify cross-model family separation between impl and pr-review
         assert_eq!(mock.executed_routes[0].family, ModelFamily::OpenAiSol);
         assert_eq!(mock.executed_routes[1].family, ModelFamily::GeminiAgy);
+        assert_eq!(
+            mock.executed_stage_reviewed_shas,
+            vec![None, Some("def5678".to_owned())]
+        );
         assert_eq!(mock.finalized_sha.as_deref(), Some("def5678"));
 
         // Verify merge queue entry exists and path locks remain held until merge completes
@@ -2441,6 +2493,7 @@ mod tests {
                     deleted_lines: 2,
                 }],
             }],
+            committed_sha_to_return: Some("xs-sha-1".to_owned()),
             pr_number_to_return: Some(77),
             ..MockStageExecutor::default()
         };
@@ -2540,7 +2593,7 @@ mod tests {
                     output_tokens: 3_000,
                     total_tokens: 18_000,
                     sha_before: Some("base123".to_owned()),
-                    sha_after: Some("sha-m-impl".to_owned()),
+                    sha_after: Some("base123".to_owned()),
                     diff_files: vec![DiffFileEntry {
                         path: "src/v2/router.rs".to_owned(),
                         status: "M".to_owned(),
@@ -2567,6 +2620,7 @@ mod tests {
                     diff_files: Vec::new(),
                 },
             ],
+            committed_sha_to_return: Some("sha-m-impl".to_owned()),
             ..MockStageExecutor::default()
         };
 
@@ -2576,6 +2630,10 @@ mod tests {
         // Verify task state
         assert_eq!(result.status, "Queued for Merge");
         assert_eq!(result.current_stage.as_deref(), Some("merge_queue"));
+        assert_eq!(
+            mock.executed_stage_reviewed_shas,
+            vec![None, None, None, Some("sha-m-impl".to_owned())]
+        );
         assert_eq!(
             result.stages_completed,
             vec!["plan", "plan-review", "impl", "pr-review"]
@@ -2661,6 +2719,7 @@ mod tests {
                     diff_files: Vec::new(),
                 },
             ],
+            committed_sha_to_return: Some("sha-l-impl".to_owned()),
             ..MockStageExecutor::default()
         };
 
@@ -2842,6 +2901,7 @@ mod tests {
         // 4. Test automatic fallback to gpt-6.1-sol after 2 AGY infrastructure failures
         let mut store = V2Store::open_in_memory().expect("open store");
         let mut agy_task = task.clone();
+        agy_task.reviewed_sha = Some("plan-sha-008".to_owned());
         // Pre-populate 2 AGY infra failures in task memory
         agy_task
             .memory
@@ -3069,6 +3129,7 @@ mod tests {
                     diff_files: Vec::new(),
                 },
             ],
+            committed_sha_to_return: Some("sha-m-impl".to_owned()),
             ..MockStageExecutor::default()
         };
 
@@ -3188,12 +3249,22 @@ mod tests {
             Err(self.check_err.clone())
         }
 
-        fn finalize_xs_s_delivery(
+        fn commit_worktree(
             &mut self,
             task: &TaskRecord,
+            worktree_path: &str,
+        ) -> Result<String, String> {
+            self.inner.commit_worktree(task, worktree_path)
+        }
+
+        fn push_and_ensure_pr(
+            &mut self,
+            task: &TaskRecord,
+            worktree_path: &str,
             reviewed_sha: &str,
-        ) -> Result<Option<i64>, String> {
-            self.inner.finalize_xs_s_delivery(task, reviewed_sha)
+        ) -> Result<i64, String> {
+            self.inner
+                .push_and_ensure_pr(task, worktree_path, reviewed_sha)
         }
     }
 
@@ -3519,5 +3590,335 @@ mod tests {
             assert_eq!(attempts[1].failure_class.as_deref(), Some("semantic"));
         }
         let _ = std::fs::remove_file(&db_ml);
+    }
+
+    #[test]
+    fn missing_reviewed_sha_or_pr_number_returns_error_without_fallbacks() {
+        let mut store = V2Store::open_in_memory().expect("in-memory store");
+
+        let s_impl_ok = || StageExecutionResult {
+            status: "PASSED".to_owned(),
+            summary: "impl ok".to_owned(),
+            review_markdown: None,
+            invocation_id: Some("inv-impl".to_owned()),
+            input_tokens: 1_000,
+            output_tokens: 200,
+            total_tokens: 1_200,
+            sha_before: Some("abc1234".to_owned()),
+            sha_after: Some("abc1234".to_owned()),
+            diff_files: vec![DiffFileEntry {
+                path: "src/v2/router.rs".to_owned(),
+                status: "M".to_owned(),
+                added_lines: 5,
+                deleted_lines: 1,
+            }],
+        };
+        let s_rev_ok = || StageExecutionResult {
+            status: "PASSED".to_owned(),
+            summary: "review ok".to_owned(),
+            review_markdown: Some(
+                "| AC | Criterion | Code (file:line) | Test | Status |\n\
+                 |---|---|---|---|---|\n\
+                 | AC-1 | Works | src/v2/router.rs:102 | test_router | PASS |\n"
+                    .to_owned(),
+            ),
+            invocation_id: Some("inv-rev".to_owned()),
+            input_tokens: 500,
+            output_tokens: 100,
+            total_tokens: 600,
+            sha_before: Some("real-sha".to_owned()),
+            sha_after: Some("real-sha".to_owned()),
+            diff_files: Vec::new(),
+        };
+
+        // 1. Missing committed SHA returns Err (never falls back to "head-sha")
+        store
+            .upsert_task(&sample_s_task("ZACH-016-NO-SHA"))
+            .unwrap();
+        let mut no_sha_mock = MockStageExecutor {
+            staged_results: vec![s_impl_ok(), s_rev_ok()],
+            committed_sha_to_return: None,
+            ..MockStageExecutor::default()
+        };
+        assert!(
+            execute_xs_s_pipeline_with_executor(&mut store, "ZACH-016-NO-SHA", &mut no_sha_mock)
+                .is_err()
+        );
+        assert!(store.list_merge_queue(Some("zach")).unwrap().is_empty());
+
+        // 2. Literal placeholder "head-sha" is rejected as invalid
+        store
+            .upsert_task(&sample_s_task("ZACH-016-PLACEHOLDER-SHA"))
+            .unwrap();
+        let mut placeholder_mock = MockStageExecutor {
+            staged_results: vec![s_impl_ok(), s_rev_ok()],
+            committed_sha_to_return: Some("head-sha".to_owned()),
+            ..MockStageExecutor::default()
+        };
+        assert!(
+            execute_xs_s_pipeline_with_executor(
+                &mut store,
+                "ZACH-016-PLACEHOLDER-SHA",
+                &mut placeholder_mock
+            )
+            .is_err()
+        );
+        assert!(store.list_merge_queue(Some("zach")).unwrap().is_empty());
+
+        // 3. Missing PR number returns Err (never falls back to 1)
+        store.upsert_task(&sample_s_task("ZACH-016-NO-PR")).unwrap();
+        let mut no_pr_mock = MockStageExecutor {
+            staged_results: vec![s_impl_ok(), s_rev_ok()],
+            committed_sha_to_return: Some("real-sha".to_owned()),
+            pr_number_to_return: None,
+            ..MockStageExecutor::default()
+        };
+        assert!(
+            execute_xs_s_pipeline_with_executor(&mut store, "ZACH-016-NO-PR", &mut no_pr_mock)
+                .is_err()
+        );
+        assert!(store.list_merge_queue(Some("zach")).unwrap().is_empty());
+
+        // 4. Direct enqueue_pipeline_task_for_merge rejects None and "head-sha"
+        let mut bad_task = sample_s_task("ZACH-016-ENQ");
+        let mut ok_mock = MockStageExecutor::default();
+        assert!(
+            enqueue_pipeline_task_for_merge(&mut store, &mut ok_mock, bad_task.clone(), "/tmp")
+                .is_err()
+        );
+        bad_task.reviewed_sha = Some("head-sha".to_owned());
+        assert!(
+            enqueue_pipeline_task_for_merge(&mut store, &mut ok_mock, bad_task, "/tmp").is_err()
+        );
+    }
+
+    #[test]
+    fn temp_git_repo_pipeline_commits_before_pr_review_and_records_committed_reviewed_sha() {
+        use std::process::Command;
+
+        struct TempRepoGuard(std::path::PathBuf);
+        impl Drop for TempRepoGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn run_git(dir: &std::path::Path, args: &[&str]) -> String {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(
+                out.status.success(),
+                "git {:?} failed in {}: {}",
+                args,
+                dir.display(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        }
+
+        struct RealGitPipelineExecutor {
+            systemd: SystemdStageExecutor,
+            pr_number: i64,
+            pr_review_observed_task_reviewed_sha: Option<String>,
+            pr_review_observed_head_sha: Option<String>,
+            pr_review_observed_porcelain: Option<String>,
+        }
+
+        impl StageExecutor for RealGitPipelineExecutor {
+            fn execute_stage(
+                &mut self,
+                task: &TaskRecord,
+                _attempt_id: &str,
+                route: &StageRoute,
+                spec: &crate::v2::runner::StageCommandSpec,
+            ) -> Result<StageExecutionResult, String> {
+                let worktree = std::path::Path::new(&spec.worktree_path);
+                if route.stage == "impl" {
+                    let sha_before = run_git(worktree, &["rev-parse", "HEAD"]).trim().to_owned();
+                    // Worker modifies a file in target_files WITHOUT committing (zachd must commit).
+                    std::fs::write(
+                        worktree.join("src/v2/router.rs"),
+                        "pub fn route() -> &'static str { \"v2\" }\n",
+                    )
+                    .expect("modify router.rs");
+                    let sha_after = run_git(worktree, &["rev-parse", "HEAD"]).trim().to_owned();
+                    assert_eq!(
+                        sha_before, sha_after,
+                        "impl worker does not commit on its own"
+                    );
+                    let diff_files =
+                        crate::v2::runner::collect_worktree_diff_entries(&spec.worktree_path);
+                    return Ok(StageExecutionResult {
+                        status: "PASSED".to_owned(),
+                        summary: "Modified router without committing".to_owned(),
+                        review_markdown: None,
+                        invocation_id: Some("inv-real-impl".to_owned()),
+                        input_tokens: 1_000,
+                        output_tokens: 200,
+                        total_tokens: 1_200,
+                        sha_before: Some(sha_before),
+                        sha_after: Some(sha_after),
+                        diff_files,
+                    });
+                }
+
+                // pr-review: verify worktree was ALREADY committed and clean before review started!
+                let head_sha = run_git(worktree, &["rev-parse", "HEAD"]).trim().to_owned();
+                let porcelain = run_git(worktree, &["status", "--porcelain"]);
+                self.pr_review_observed_task_reviewed_sha = task.reviewed_sha.clone();
+                self.pr_review_observed_head_sha = Some(head_sha.clone());
+                self.pr_review_observed_porcelain = Some(porcelain);
+
+                Ok(StageExecutionResult {
+                    status: "PASSED".to_owned(),
+                    summary: "Reviewed committed head".to_owned(),
+                    review_markdown: Some(
+                        "| AC | Criterion | Code (file:line) | Test | Status |\n\
+                         |---|---|---|---|---|\n\
+                         | AC-1 | Router maps models deterministically | src/v2/router.rs:1 | test_router | PASS |\n"
+                            .to_owned(),
+                    ),
+                    invocation_id: Some("inv-real-rev".to_owned()),
+                    input_tokens: 600,
+                    output_tokens: 100,
+                    total_tokens: 700,
+                    sha_before: Some(head_sha.clone()),
+                    sha_after: Some(head_sha),
+                    diff_files: Vec::new(),
+                })
+            }
+
+            fn run_checks(
+                &mut self,
+                _worktree_path: &str,
+                _commands: &[String],
+            ) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn commit_worktree(
+                &mut self,
+                task: &TaskRecord,
+                worktree_path: &str,
+            ) -> Result<String, String> {
+                self.systemd.commit_worktree(task, worktree_path)
+            }
+
+            fn push_and_ensure_pr(
+                &mut self,
+                task: &TaskRecord,
+                worktree_path: &str,
+                reviewed_sha: &str,
+            ) -> Result<i64, String> {
+                let branch = task.branch.as_deref().expect("task branch");
+                let out = Command::new("git")
+                    .args(["-C", worktree_path, "push", "-u", "origin", branch])
+                    .output()
+                    .expect("git push");
+                assert!(
+                    out.status.success(),
+                    "git push failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                assert!(!reviewed_sha.is_empty() && reviewed_sha != "head-sha");
+                Ok(self.pr_number)
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!("zach-016-real-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let origin_dir = root.join("origin.git");
+        let work_dir = root.join("work");
+        std::fs::create_dir_all(&origin_dir).unwrap();
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let _guard = TempRepoGuard(root);
+
+        run_git(&origin_dir, &["init", "--bare", "-b", "main"]);
+        run_git(&work_dir, &["init", "-b", "main"]);
+        run_git(
+            &work_dir,
+            &["config", "user.email", "zach-test@example.com"],
+        );
+        run_git(&work_dir, &["config", "user.name", "Zach Test"]);
+        std::fs::create_dir_all(work_dir.join("src/v2")).unwrap();
+        std::fs::write(
+            work_dir.join("src/v2/router.rs"),
+            "pub fn route() -> &'static str { \"v1\" }\n",
+        )
+        .unwrap();
+        run_git(&work_dir, &["add", "."]);
+        run_git(&work_dir, &["commit", "-m", "base commit"]);
+        run_git(
+            &work_dir,
+            &["remote", "add", "origin", origin_dir.to_str().unwrap()],
+        );
+        run_git(&work_dir, &["push", "-u", "origin", "main"]);
+        run_git(&work_dir, &["checkout", "-b", "task/ZACH-016-REAL"]);
+
+        let sha_before = run_git(&work_dir, &["rev-parse", "HEAD"]).trim().to_owned();
+
+        let mut store = V2Store::open_in_memory().expect("in-memory store");
+        let mut task = sample_s_task("ZACH-016-REAL");
+        task.worktree_path = Some(work_dir.to_str().unwrap().to_owned());
+        task.branch = Some("task/ZACH-016-REAL".to_owned());
+        task.plan_base_sha = Some(sha_before.clone());
+        store.upsert_task(&task).unwrap();
+
+        let mut exec = RealGitPipelineExecutor {
+            systemd: SystemdStageExecutor,
+            pr_number: 101,
+            pr_review_observed_task_reviewed_sha: None,
+            pr_review_observed_head_sha: None,
+            pr_review_observed_porcelain: None,
+        };
+
+        let queued = execute_xs_s_pipeline_with_executor(&mut store, "ZACH-016-REAL", &mut exec)
+            .expect("pipeline with real git repo should succeed");
+
+        let committed_head = run_git(&work_dir, &["rev-parse", "HEAD"]).trim().to_owned();
+        let reviewed_sha = queued.reviewed_sha.as_deref().expect("reviewed_sha set");
+
+        assert_ne!(reviewed_sha, sha_before);
+        assert_eq!(reviewed_sha, committed_head);
+        assert_eq!(queued.pr_number, Some(101));
+
+        // Prove commit happened BEFORE pr-review ran and worktree was clean during pr-review
+        assert_eq!(
+            exec.pr_review_observed_task_reviewed_sha.as_deref(),
+            Some(reviewed_sha)
+        );
+        assert_eq!(
+            exec.pr_review_observed_head_sha.as_deref(),
+            Some(reviewed_sha)
+        );
+        assert_eq!(exec.pr_review_observed_porcelain.as_deref(), Some(""));
+
+        // Prove the commit on HEAD contains the implementation diff and remote received it
+        let changed_files = run_git(
+            &work_dir,
+            &["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+        );
+        assert!(changed_files.lines().any(|l| l == "src/v2/router.rs"));
+        let remote_sha = run_git(&origin_dir, &["rev-parse", "refs/heads/task/ZACH-016-REAL"]);
+        assert_eq!(remote_sha.trim(), reviewed_sha);
+
+        // Prove merge_queue and stage_attempts recorded the exact committed reviewed_sha
+        let mq = store.list_merge_queue(Some("zach")).unwrap();
+        assert_eq!(mq.len(), 1);
+        assert_eq!(mq[0].reviewed_sha, reviewed_sha);
+        assert_eq!(mq[0].pr_number, 101);
+
+        let attempts = store.list_stage_attempts("ZACH-016-REAL").unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].stage, "impl");
+        assert_eq!(attempts[0].sha_before.as_deref(), Some(sha_before.as_str()));
+        assert_eq!(attempts[0].sha_after.as_deref(), Some(reviewed_sha));
+        assert_eq!(attempts[1].stage, "pr-review");
+        assert_eq!(attempts[1].sha_before.as_deref(), Some(reviewed_sha));
+        assert_eq!(attempts[1].sha_after.as_deref(), Some(reviewed_sha));
     }
 }
