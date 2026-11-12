@@ -403,168 +403,255 @@ impl V2Store {
             .clamp(1, 16))
     }
 
-    pub fn upsert_task(&mut self, task: &TaskRecord) -> Result<TaskRecord, V2StoreError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing: Option<(String, String, i64, String)> = tx
-            .query_row(
-                "SELECT status, weight, version, memory_json FROM tasks WHERE task_id = ?1",
-                params![task.task_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()?;
+    fn get_task_tx(
+        tx: &rusqlite::Transaction<'_>,
+        task_id: &str,
+    ) -> Result<Option<TaskRecord>, V2StoreError> {
+        let mut stmt = tx.prepare(
+            "SELECT task_id, task_group, title, repository, github_repo, issue_number,
+                    weight, status, worktree_path, branch, context_pack_json,
+                    depends_on_json, required_stages_json, stages_completed_json,
+                    current_stage, active_attempt_id, plan_base_sha, reviewed_sha,
+                    pr_number, executor, autonomous_consent, retry_count, memory_json,
+                    version, updated_epoch
+             FROM tasks WHERE task_id = ?1",
+        )?;
+        stmt.query_row(params![task_id], Self::map_task_row)
+            .optional()
+            .map_err(V2StoreError::from)
+    }
 
+    fn insert_task_tx(
+        tx: &rusqlite::Transaction<'_>,
+        task: &TaskRecord,
+        now: i64,
+    ) -> Result<TaskRecord, V2StoreError> {
         let context_pack_json = serde_json::to_string(&task.context_pack)?;
         let depends_on_json = serde_json::to_string(&task.depends_on)?;
         let required_stages_json = serde_json::to_string(&task.required_stages)?;
         let stages_completed_json = serde_json::to_string(&task.stages_completed)?;
+        let memory_json = serde_json::to_string(&task.memory)?;
+        tx.execute(
+            "INSERT INTO tasks (
+                task_id, task_group, title, repository, github_repo, issue_number,
+                weight, status, worktree_path, branch, context_pack_json,
+                depends_on_json, required_stages_json, stages_completed_json,
+                current_stage, active_attempt_id, plan_base_sha, reviewed_sha,
+                pr_number, executor, autonomous_consent, retry_count, memory_json,
+                version, updated_epoch
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6,
+                ?7, ?8, ?9, ?10, ?11,
+                ?12, ?13, ?14,
+                ?15, ?16, ?17, ?18,
+                ?19, ?20, ?21, ?22, ?23,
+                1, ?24
+             )",
+            params![
+                task.task_id,
+                task.task_group,
+                task.title,
+                task.repository,
+                task.github_repo,
+                task.issue_number,
+                task.weight,
+                task.status,
+                task.worktree_path,
+                task.branch,
+                context_pack_json,
+                depends_on_json,
+                required_stages_json,
+                stages_completed_json,
+                task.current_stage,
+                task.active_attempt_id,
+                task.plan_base_sha,
+                task.reviewed_sha,
+                task.pr_number,
+                task.executor,
+                i64::from(task.autonomous_consent),
+                task.retry_count,
+                memory_json,
+                now,
+            ],
+        )?;
+        let mut inserted = task.clone();
+        inserted.version = 1;
+        inserted.updated_epoch = now;
+        Ok(inserted)
+    }
+
+    fn update_task_tx(
+        tx: &rusqlite::Transaction<'_>,
+        old: &TaskRecord,
+        next: &TaskRecord,
+        now: i64,
+    ) -> Result<TaskRecord, V2StoreError> {
+        let context_pack_json = serde_json::to_string(&next.context_pack)?;
+        let depends_on_json = serde_json::to_string(&next.depends_on)?;
+        let required_stages_json = serde_json::to_string(&next.required_stages)?;
+        let stages_completed_json = serde_json::to_string(&next.stages_completed)?;
+        let memory_json = serde_json::to_string(&next.memory)?;
+        let next_ver = old.version + 1;
+
+        tx.execute(
+            "UPDATE tasks SET
+                task_group = ?2,
+                title = ?3,
+                repository = ?4,
+                github_repo = ?5,
+                issue_number = ?6,
+                weight = ?7,
+                status = ?8,
+                worktree_path = ?9,
+                branch = ?10,
+                context_pack_json = ?11,
+                depends_on_json = ?12,
+                required_stages_json = ?13,
+                stages_completed_json = ?14,
+                current_stage = ?15,
+                active_attempt_id = ?16,
+                plan_base_sha = ?17,
+                reviewed_sha = ?18,
+                pr_number = ?19,
+                executor = ?20,
+                autonomous_consent = ?21,
+                retry_count = ?22,
+                memory_json = ?23,
+                version = ?24,
+                updated_epoch = ?25
+             WHERE task_id = ?1 AND version = ?26",
+            params![
+                next.task_id,
+                next.task_group,
+                next.title,
+                next.repository,
+                next.github_repo,
+                next.issue_number,
+                next.weight,
+                next.status,
+                next.worktree_path,
+                next.branch,
+                context_pack_json,
+                depends_on_json,
+                required_stages_json,
+                stages_completed_json,
+                next.current_stage,
+                next.active_attempt_id,
+                next.plan_base_sha,
+                next.reviewed_sha,
+                next.pr_number,
+                next.executor,
+                i64::from(next.autonomous_consent),
+                next.retry_count,
+                memory_json,
+                next_ver,
+                now,
+                old.version,
+            ],
+        )?;
+
+        if old.weight != next.weight {
+            Self::insert_event_tx(
+                tx,
+                &next.task_id,
+                &next.task_group,
+                now,
+                "WEIGHT_ESCALATED",
+                &serde_json::json!({
+                    "from_weight": old.weight,
+                    "to_weight": next.weight,
+                }),
+            )?;
+        }
+        if old.status != next.status && next.status.eq_ignore_ascii_case("Done") {
+            Self::insert_event_tx(
+                tx,
+                &next.task_id,
+                &next.task_group,
+                now,
+                "TASK_DONE",
+                &serde_json::json!({ "status": next.status }),
+            )?;
+        }
+
+        let mut updated = next.clone();
+        updated.version = next_ver;
+        updated.updated_epoch = now;
+        Ok(updated)
+    }
+
+    pub fn upsert_task(&mut self, task: &TaskRecord) -> Result<TaskRecord, V2StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = if task.updated_epoch > 0 {
             task.updated_epoch
         } else {
             now_epoch()
         };
-
-        let next_version = match &existing {
-            Some((old_status, old_weight, old_version, old_memory_json)) => {
-                let merged_memory_json = if task.memory == TaskMemory::default() {
-                    old_memory_json.clone()
-                } else {
-                    serde_json::to_string(&task.memory)?
-                };
-                let next_ver = old_version + 1;
-                tx.execute(
-                    "UPDATE tasks SET
-                        task_group = ?2,
-                        title = ?3,
-                        repository = ?4,
-                        github_repo = ?5,
-                        issue_number = ?6,
-                        weight = ?7,
-                        status = ?8,
-                        worktree_path = ?9,
-                        branch = ?10,
-                        context_pack_json = ?11,
-                        depends_on_json = ?12,
-                        required_stages_json = ?13,
-                        stages_completed_json = ?14,
-                        current_stage = COALESCE(?15, current_stage),
-                        active_attempt_id = COALESCE(?16, active_attempt_id),
-                        plan_base_sha = COALESCE(?17, plan_base_sha),
-                        reviewed_sha = COALESCE(?18, reviewed_sha),
-                        pr_number = COALESCE(?19, pr_number),
-                        executor = ?20,
-                        autonomous_consent = ?21,
-                        memory_json = ?22,
-                        version = ?23,
-                        updated_epoch = ?24
-                     WHERE task_id = ?1 AND version = ?25",
-                    params![
-                        task.task_id,
-                        task.task_group,
-                        task.title,
-                        task.repository,
-                        task.github_repo,
-                        task.issue_number,
-                        task.weight,
-                        task.status,
-                        task.worktree_path,
-                        task.branch,
-                        context_pack_json,
-                        depends_on_json,
-                        required_stages_json,
-                        stages_completed_json,
-                        task.current_stage,
-                        task.active_attempt_id,
-                        task.plan_base_sha,
-                        task.reviewed_sha,
-                        task.pr_number,
-                        task.executor,
-                        i64::from(task.autonomous_consent),
-                        merged_memory_json,
-                        next_ver,
-                        now,
-                        old_version,
-                    ],
-                )?;
-                if old_weight != &task.weight {
-                    Self::insert_event_tx(
-                        &tx,
-                        &task.task_id,
-                        &task.task_group,
-                        now,
-                        "WEIGHT_ESCALATED",
-                        &serde_json::json!({
-                            "from_weight": old_weight,
-                            "to_weight": task.weight,
-                        }),
-                    )?;
+        let result = match Self::get_task_tx(&tx, &task.task_id)? {
+            Some(old) => {
+                let mut next = task.clone();
+                if next.current_stage.is_none() {
+                    next.current_stage = old.current_stage.clone();
                 }
-                if old_status != &task.status && task.status == "Done" {
-                    Self::insert_event_tx(
-                        &tx,
-                        &task.task_id,
-                        &task.task_group,
-                        now,
-                        "TASK_DONE",
-                        &serde_json::json!({ "status": "Done" }),
-                    )?;
+                if next.active_attempt_id.is_none() {
+                    next.active_attempt_id = old.active_attempt_id.clone();
                 }
-                next_ver
+                if next.plan_base_sha.is_none() {
+                    next.plan_base_sha = old.plan_base_sha.clone();
+                }
+                if next.reviewed_sha.is_none() {
+                    next.reviewed_sha = old.reviewed_sha.clone();
+                }
+                if next.pr_number.is_none() {
+                    next.pr_number = old.pr_number;
+                }
+                if next.memory == TaskMemory::default() {
+                    next.memory = old.memory.clone();
+                }
+                Self::update_task_tx(&tx, &old, &next, now)?
             }
-            None => {
-                let memory_json = serde_json::to_string(&task.memory)?;
-                tx.execute(
-                    "INSERT INTO tasks (
-                        task_id, task_group, title, repository, github_repo, issue_number,
-                        weight, status, worktree_path, branch, context_pack_json,
-                        depends_on_json, required_stages_json, stages_completed_json,
-                        current_stage, active_attempt_id, plan_base_sha, reviewed_sha,
-                        pr_number, executor, autonomous_consent, retry_count, memory_json,
-                        version, updated_epoch
-                     ) VALUES (
-                        ?1, ?2, ?3, ?4, ?5, ?6,
-                        ?7, ?8, ?9, ?10, ?11,
-                        ?12, ?13, ?14,
-                        ?15, ?16, ?17, ?18,
-                        ?19, ?20, ?21, ?22, ?23,
-                        1, ?24
-                     )",
-                    params![
-                        task.task_id,
-                        task.task_group,
-                        task.title,
-                        task.repository,
-                        task.github_repo,
-                        task.issue_number,
-                        task.weight,
-                        task.status,
-                        task.worktree_path,
-                        task.branch,
-                        context_pack_json,
-                        depends_on_json,
-                        required_stages_json,
-                        stages_completed_json,
-                        task.current_stage,
-                        task.active_attempt_id,
-                        task.plan_base_sha,
-                        task.reviewed_sha,
-                        task.pr_number,
-                        task.executor,
-                        i64::from(task.autonomous_consent),
-                        task.retry_count,
-                        memory_json,
-                        now,
-                    ],
-                )?;
-                1
-            }
+            None => Self::insert_task_tx(&tx, task, now)?,
         };
         tx.commit()?;
-        let mut updated = task.clone();
-        updated.version = next_version;
-        updated.updated_epoch = now;
-        Ok(updated)
+        Ok(result)
+    }
+
+    /// Syncs a board-exported task record into the store while preserving Zach-owned
+    /// runtime state for active (non-terminal) tasks unless the board status is terminal.
+    pub fn sync_task(&mut self, incoming: &TaskRecord) -> Result<TaskRecord, V2StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = if incoming.updated_epoch > 0 {
+            incoming.updated_epoch
+        } else {
+            now_epoch()
+        };
+        let result = match Self::get_task_tx(&tx, &incoming.task_id)? {
+            Some(old) => {
+                let mut next = incoming.clone();
+                if should_preserve_zach_state(&old, incoming) {
+                    next.status = old.status.clone();
+                    next.stages_completed = old.stages_completed.clone();
+                    next.current_stage = old.current_stage.clone();
+                    next.active_attempt_id = old.active_attempt_id.clone();
+                    next.plan_base_sha = old.plan_base_sha.clone();
+                    next.reviewed_sha = old.reviewed_sha.clone();
+                    next.pr_number = old.pr_number;
+                    next.executor = old.executor.clone();
+                    next.retry_count = old.retry_count;
+                    next.memory = old.memory.clone();
+                } else if next.memory == TaskMemory::default() {
+                    next.memory = old.memory.clone();
+                }
+                Self::update_task_tx(&tx, &old, &next, now)?
+            }
+            None => Self::insert_task_tx(&tx, incoming, now)?,
+        };
+        tx.commit()?;
+        Ok(result)
     }
 
     pub fn get_task(&self, task_id: &str) -> Result<Option<TaskRecord>, V2StoreError> {
@@ -1370,6 +1457,20 @@ impl V2Store {
     }
 }
 
+fn is_terminal_task_status(status: &str) -> bool {
+    status.eq_ignore_ascii_case("Done") || status.eq_ignore_ascii_case("Cancelled")
+}
+
+fn is_zach_executor(executor: Option<&str>) -> bool {
+    executor.is_some_and(|e| e.trim().eq_ignore_ascii_case("zach"))
+}
+
+fn should_preserve_zach_state(existing: &TaskRecord, incoming: &TaskRecord) -> bool {
+    is_zach_executor(existing.executor.as_deref())
+        && !is_terminal_task_status(&existing.status)
+        && !is_terminal_task_status(&incoming.status)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1548,5 +1649,177 @@ mod tests {
         let remaining = store.list_merge_queue(Some("zach")).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].task_id, "TASK-2");
+    }
+
+    #[test]
+    fn sync_task_preserves_zach_owned_runtime_state_and_refreshes_spec_fields() {
+        let mut db_path = std::env::temp_dir();
+        db_path.push(format!(
+            "zach_v2_sync_preserve_{}_{}.sqlite3",
+            std::process::id(),
+            now_epoch()
+        ));
+        let _ = std::fs::remove_file(&db_path);
+
+        let mut store = V2Store::open(&db_path).expect("open file-backed sqlite store");
+
+        let mut mem = TaskMemory::default();
+        mem.recent_attempts.push("impl-attempt-1".to_owned());
+        mem.token_usage_by_stage.insert("impl".to_owned(), 4200);
+        mem.last_check_failure = Some("clippy warning".to_owned());
+
+        let mut internal = sample_task("ZACH-021", "Queued for Merge", vec!["ZACH-020".into()]);
+        internal.executor = Some("Zach".to_owned());
+        internal.stages_completed = vec![
+            "plan".to_owned(),
+            "plan-review".to_owned(),
+            "impl".to_owned(),
+            "pr-review".to_owned(),
+        ];
+        internal.current_stage = Some("merge_queue".to_owned());
+        internal.active_attempt_id = Some("zach-021-pr-review-3".to_owned());
+        internal.plan_base_sha = Some("base-sha-111".to_owned());
+        internal.reviewed_sha = Some("reviewed-sha-222".to_owned());
+        internal.pr_number = Some(54);
+        internal.retry_count = 2;
+        internal.memory = mem.clone();
+        store.upsert_task(&internal).expect("seed zach-owned task");
+
+        // Incoming board sync with stale/reset runtime fields and updated spec fields.
+        let mut incoming = sample_task("ZACH-021", "Ready", vec!["GOV-050".into()]);
+        incoming.task_group = "platform".to_owned();
+        incoming.title = "Refreshed spec title".to_owned();
+        incoming.repository = "zach-core".to_owned();
+        incoming.github_repo = Some("shockerqt/zach-core".to_owned());
+        incoming.issue_number = Some(99);
+        incoming.weight = "M".to_owned();
+        incoming.branch = Some("task/ZACH-021-refreshed".to_owned());
+        incoming.worktree_path = Some("/tmp/zach--ZACH-021-refreshed".to_owned());
+        incoming.autonomous_consent = false;
+        incoming.context_pack = ContextPackSpec {
+            weight: "M".to_owned(),
+            base_sha: Some("board-base-sha-999".to_owned()),
+            target_files: vec![TargetFileSpec {
+                path: "src/v2/intake.rs".to_owned(),
+                action: "modify".to_owned(),
+                summary: "Use sync_task".to_owned(),
+            }],
+            ..ContextPackSpec::default()
+        };
+        incoming.stages_completed = Vec::new();
+        incoming.current_stage = None;
+        incoming.active_attempt_id = None;
+        incoming.plan_base_sha = Some("board-base-sha-999".to_owned());
+        incoming.reviewed_sha = Some("board-reviewed-sha-888".to_owned());
+        incoming.pr_number = None;
+        incoming.executor = None;
+        incoming.retry_count = 0;
+        incoming.memory = TaskMemory::default();
+
+        let synced = store.sync_task(&incoming).expect("sync_task");
+        assert_eq!(synced.version, 2);
+
+        // Re-open from disk to prove SQLite persistence.
+        drop(store);
+        let reopened = V2Store::open(&db_path).expect("reopen file-backed sqlite store");
+        let stored = reopened.get_task("ZACH-021").unwrap().unwrap();
+
+        // AC-1: Runtime state preserved untouched
+        assert_eq!(stored.status, "Queued for Merge");
+        assert_eq!(
+            stored.stages_completed,
+            vec!["plan", "plan-review", "impl", "pr-review"]
+        );
+        assert_eq!(stored.current_stage.as_deref(), Some("merge_queue"));
+        assert_eq!(
+            stored.active_attempt_id.as_deref(),
+            Some("zach-021-pr-review-3")
+        );
+        assert_eq!(stored.plan_base_sha.as_deref(), Some("base-sha-111"));
+        assert_eq!(stored.reviewed_sha.as_deref(), Some("reviewed-sha-222"));
+        assert_eq!(stored.pr_number, Some(54));
+        assert_eq!(stored.executor.as_deref(), Some("Zach"));
+        assert_eq!(stored.retry_count, 2);
+        assert_eq!(stored.memory, mem);
+
+        // AC-2: Spec fields refreshed
+        assert_eq!(stored.title, "Refreshed spec title");
+        assert_eq!(stored.context_pack, incoming.context_pack);
+        assert_eq!(stored.weight, "M");
+        assert_eq!(stored.depends_on, vec!["GOV-050".to_owned()]);
+        assert_eq!(stored.branch.as_deref(), Some("task/ZACH-021-refreshed"));
+        assert_eq!(
+            stored.worktree_path.as_deref(),
+            Some("/tmp/zach--ZACH-021-refreshed")
+        );
+        assert_eq!(stored.task_group, "platform");
+        assert_eq!(stored.repository, "zach-core");
+        assert_eq!(stored.github_repo.as_deref(), Some("shockerqt/zach-core"));
+        assert_eq!(stored.issue_number, Some(99));
+        assert!(!stored.autonomous_consent);
+
+        drop(reopened);
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn sync_task_allows_terminal_board_status_and_non_zach_overrides() {
+        let mut store = V2Store::open_in_memory().expect("open store");
+
+        // 1. Zach-owned non-terminal task overridden when board status is Cancelled or Done
+        let mut zach_task = sample_task("ZACH-100", "In Progress", Vec::new());
+        zach_task.executor = Some("zach".to_owned());
+        zach_task.current_stage = Some("impl".to_owned());
+        zach_task.stages_completed = vec!["plan".to_owned()];
+        zach_task.retry_count = 1;
+        store.upsert_task(&zach_task).unwrap();
+
+        let mut board_cancelled = sample_task("ZACH-100", "Cancelled", Vec::new());
+        board_cancelled.title = "Cancelled on board".to_owned();
+        board_cancelled.executor = None;
+        let res_cancel = store.sync_task(&board_cancelled).unwrap();
+        assert_eq!(res_cancel.status, "Cancelled");
+        assert_eq!(res_cancel.title, "Cancelled on board");
+        assert_eq!(
+            store.get_task("ZACH-100").unwrap().unwrap().status,
+            "Cancelled"
+        );
+
+        // 2. Reopening a terminal Zach task (Done/Cancelled) from board succeeds
+        let mut board_reopened = sample_task("ZACH-100", "Ready", Vec::new());
+        board_reopened.executor = Some("zach".to_owned());
+        let res_reopen = store.sync_task(&board_reopened).unwrap();
+        assert_eq!(res_reopen.status, "Ready");
+
+        // 3. Board status Done wins over Zach-owned non-terminal state and emits TASK_DONE
+        let mut zach_queued = sample_task("ZACH-101", "Queued for Merge", Vec::new());
+        zach_queued.executor = Some("zach".to_owned());
+        store.upsert_task(&zach_queued).unwrap();
+
+        let board_done = sample_task("ZACH-101", "Done", Vec::new());
+        let res_done = store.sync_task(&board_done).unwrap();
+        assert_eq!(res_done.status, "Done");
+        let events = store.list_events_since(Some("zach"), 0, 100).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.task_id == "ZACH-101" && e.event_type == "TASK_DONE")
+        );
+
+        // 4. Non-Zach task does not preserve runtime state on sync
+        let mut other_task = sample_task("ZACH-102", "In Progress", Vec::new());
+        other_task.executor = Some("agy".to_owned());
+        other_task.current_stage = Some("impl".to_owned());
+        other_task.stages_completed = vec!["plan".to_owned()];
+        other_task.retry_count = 3;
+        store.upsert_task(&other_task).unwrap();
+
+        let board_reset = sample_task("ZACH-102", "Ready", Vec::new());
+        let res_other = store.sync_task(&board_reset).unwrap();
+        assert_eq!(res_other.status, "Ready");
+        assert_eq!(res_other.current_stage, None);
+        assert!(res_other.stages_completed.is_empty());
+        assert_eq!(res_other.executor, None);
+        assert_eq!(res_other.retry_count, 0);
     }
 }

@@ -288,7 +288,7 @@ pub fn ingest_export_json(
             version: 1,
             updated_epoch: now,
         };
-        store.upsert_task(&record)?;
+        store.sync_task(&record)?;
         ingested_count += 1;
     }
 
@@ -389,5 +389,138 @@ mod tests {
         assert_eq!(z4.context_pack.target_files.len(), 1);
         assert_eq!(z4.context_pack.target_files[0].path, "src/v2/store.rs");
         assert_eq!(z4.context_pack.acceptance_criteria[0].id, "AC-1");
+    }
+
+    #[test]
+    fn ingest_export_json_preserves_zach_owned_task_state_and_honors_terminal_board_status() {
+        let mut store = V2Store::open_in_memory().expect("in-memory store");
+
+        let mut memory = TaskMemory::default();
+        memory.recent_attempts.push("attempt-1".to_owned());
+        memory.token_usage_by_stage.insert("impl".to_owned(), 1500);
+        memory.last_check_failure = Some("prior failure".to_owned());
+
+        let zach_task = TaskRecord {
+            task_id: "ZACH-021".to_owned(),
+            task_group: "zach".to_owned(),
+            title: "Original title".to_owned(),
+            repository: "zach".to_owned(),
+            github_repo: Some("shockerqt/zach".to_owned()),
+            issue_number: Some(54),
+            weight: "S".to_owned(),
+            status: "Queued for Merge".to_owned(),
+            worktree_path: Some("/tmp/old-wt".to_owned()),
+            branch: Some("task/old-branch".to_owned()),
+            context_pack: ContextPackSpec::default(),
+            depends_on: Vec::new(),
+            required_stages: default_required_stages("S"),
+            stages_completed: vec!["impl".to_owned(), "pr-review".to_owned()],
+            current_stage: Some("merge_queue".to_owned()),
+            active_attempt_id: Some("zach-021-pr-review-2".to_owned()),
+            plan_base_sha: Some("internal-base-sha".to_owned()),
+            reviewed_sha: Some("internal-reviewed-sha".to_owned()),
+            pr_number: Some(65),
+            executor: Some("zach".to_owned()),
+            autonomous_consent: true,
+            retry_count: 2,
+            memory: memory.clone(),
+            version: 1,
+            updated_epoch: 1000,
+        };
+        store.upsert_task(&zach_task).expect("seed zach task");
+
+        // Sync while board still says Ready with empty stages_completed and no executor,
+        // but updated spec fields.
+        let sync_payload = r#"{
+            "schema_version": 2,
+            "tasks": [
+                {
+                    "id": "ZACH-021",
+                    "task_group": "platform",
+                    "title": "Updated title from board",
+                    "repository": "zach-next",
+                    "github_repo": "shockerqt/zach-next",
+                    "issue_number": 77,
+                    "status": "Ready",
+                    "weight": "M",
+                    "branch": "task/new-branch",
+                    "worktree": "/tmp/new-wt",
+                    "depends_on": ["GOV-001"],
+                    "stages_completed": [],
+                    "reviewed_sha": "board-reviewed-sha",
+                    "executor": null,
+                    "autonomous_consent": false,
+                    "context_pack": {
+                        "weight": "M",
+                        "base_sha": "board-base-sha",
+                        "target_files": ["src/v2/intake.rs", "src/v2/store.rs"],
+                        "acceptance_criteria": ["AC-1: preserve runtime state"]
+                    }
+                }
+            ]
+        }"#;
+
+        let summary = ingest_export_json(&mut store, sync_payload).expect("sync ingest");
+        assert_eq!(summary.ingested_count, 1);
+        // Must NOT be placed back in ready queue since internal status remains Queued for Merge.
+        assert!(summary.ready_task_ids.is_empty());
+
+        let persisted = store.get_task("ZACH-021").unwrap().unwrap();
+        // AC-1: Runtime state preserved
+        assert_eq!(persisted.status, "Queued for Merge");
+        assert_eq!(persisted.stages_completed, vec!["impl", "pr-review"]);
+        assert_eq!(persisted.current_stage.as_deref(), Some("merge_queue"));
+        assert_eq!(
+            persisted.active_attempt_id.as_deref(),
+            Some("zach-021-pr-review-2")
+        );
+        assert_eq!(
+            persisted.plan_base_sha.as_deref(),
+            Some("internal-base-sha")
+        );
+        assert_eq!(
+            persisted.reviewed_sha.as_deref(),
+            Some("internal-reviewed-sha")
+        );
+        assert_eq!(persisted.pr_number, Some(65));
+        assert_eq!(persisted.executor.as_deref(), Some("zach"));
+        assert_eq!(persisted.retry_count, 2);
+        assert_eq!(persisted.memory, memory);
+
+        // AC-2: Spec fields refreshed
+        assert_eq!(persisted.title, "Updated title from board");
+        assert_eq!(persisted.weight, "M");
+        assert_eq!(persisted.depends_on, vec!["GOV-001".to_owned()]);
+        assert_eq!(persisted.branch.as_deref(), Some("task/new-branch"));
+        assert_eq!(persisted.worktree_path.as_deref(), Some("/tmp/new-wt"));
+        assert_eq!(persisted.task_group, "platform");
+        assert_eq!(persisted.repository, "zach-next");
+        assert_eq!(
+            persisted.github_repo.as_deref(),
+            Some("shockerqt/zach-next")
+        );
+        assert_eq!(persisted.issue_number, Some(77));
+        assert!(!persisted.autonomous_consent);
+        assert_eq!(persisted.context_pack.target_files.len(), 2);
+
+        // AC-2: Board status of Cancelled wins even when executor == "zach"
+        let cancel_payload = r#"{
+            "schema_version": 2,
+            "tasks": [
+                {
+                    "id": "ZACH-021",
+                    "task_group": "platform",
+                    "title": "Cancelled title",
+                    "repository": "zach-next",
+                    "status": "Cancelled",
+                    "weight": "M",
+                    "autonomous_consent": true
+                }
+            ]
+        }"#;
+        ingest_export_json(&mut store, cancel_payload).expect("cancel ingest");
+        let cancelled = store.get_task("ZACH-021").unwrap().unwrap();
+        assert_eq!(cancelled.status, "Cancelled");
+        assert_eq!(cancelled.title, "Cancelled title");
     }
 }
