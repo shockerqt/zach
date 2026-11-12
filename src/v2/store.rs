@@ -78,6 +78,12 @@ pub struct TaskMemory {
     pub token_usage_by_stage: BTreeMap<String, u64>,
     #[serde(default)]
     pub last_check_failure: Option<String>,
+    #[serde(default)]
+    pub approved_plan: Option<String>,
+    #[serde(default)]
+    pub last_review_findings: Option<String>,
+    #[serde(default)]
+    pub review_rework_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
