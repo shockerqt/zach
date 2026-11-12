@@ -1,0 +1,242 @@
+[
+  {
+    "name": "small_doc_only_xs",
+    "repo": "zach",
+    "requested": "XS",
+    "paths": "README.md,docs/guide.md",
+    "diff_lines": 0,
+    "new_files": 0,
+    "output": {
+      "repository": "zach",
+      "requested_weight": "XS",
+      "floor_weight": "XS",
+      "effective_weight": "XS",
+      "escalated": false,
+      "required_stages": [
+        "impl"
+      ],
+      "reasons": [
+        "[XS] bounded change within <=2 code/config files, <=30 lines, no critical paths"
+      ]
+    }
+  },
+  {
+    "name": "executable_rust_over_15_lines_s",
+    "repo": "zach",
+    "requested": "XS",
+    "paths": "src/v2/router.rs",
+    "diff_lines": 20,
+    "new_files": 0,
+    "output": {
+      "repository": "zach",
+      "requested_weight": "XS",
+      "floor_weight": "S",
+      "effective_weight": "S",
+      "escalated": true,
+      "required_stages": [
+        "impl",
+        "pr-review"
+      ],
+      "reasons": [
+        "[S] modifies executable code above 15 lines"
+      ]
+    }
+  },
+  {
+    "name": "diff_lines_over_150_m",
+    "repo": "zach",
+    "requested": "S",
+    "paths": "src/v2/router.rs",
+    "diff_lines": 160,
+    "new_files": 0,
+    "output": {
+      "repository": "zach",
+      "requested_weight": "S",
+      "floor_weight": "M",
+      "effective_weight": "M",
+      "escalated": true,
+      "required_stages": [
+        "plan",
+        "plan-review",
+        "impl",
+        "pr-review"
+      ],
+      "reasons": [
+        "[M] modifies 160 code/config lines (> 150 lines threshold)"
+      ]
+    }
+  },
+  {
+    "name": "new_code_file_m",
+    "repo": "zach",
+    "requested": "S",
+    "paths": "src/v2/new_helper.rs",
+    "diff_lines": 2,
+    "new_files": 1,
+    "output": {
+      "repository": "zach",
+      "requested_weight": "S",
+      "floor_weight": "M",
+      "effective_weight": "M",
+      "escalated": true,
+      "required_stages": [
+        "plan",
+        "plan-review",
+        "impl",
+        "pr-review"
+      ],
+      "reasons": [
+        "[M] adds 1 new code/config file(s)"
+      ]
+    }
+  },
+  {
+    "name": "cargo_toml_manifest_m",
+    "repo": "zach",
+    "requested": "XS",
+    "paths": "Cargo.toml",
+    "diff_lines": 3,
+    "new_files": 0,
+    "output": {
+      "repository": "zach",
+      "requested_weight": "XS",
+      "floor_weight": "M",
+      "effective_weight": "M",
+      "escalated": true,
+      "required_stages": [
+        "plan",
+        "plan-review",
+        "impl",
+        "pr-review"
+      ],
+      "reasons": [
+        "[M] path 'Cargo.toml' modifies dependency/package manifest"
+      ]
+    }
+  },
+  {
+    "name": "critical_auth_path_l",
+    "repo": "zach",
+    "requested": "M",
+    "paths": "src/auth/token.rs",
+    "diff_lines": 10,
+    "new_files": 0,
+    "output": {
+      "repository": "zach",
+      "requested_weight": "M",
+      "floor_weight": "L",
+      "effective_weight": "L",
+      "escalated": true,
+      "required_stages": [
+        "plan",
+        "plan-review",
+        "human-plan-approval",
+        "impl",
+        "pr-review",
+        "human-merge-approval"
+      ],
+      "reasons": [
+        "[L] path 'src/auth/token.rs' matches critical L-tier pattern (infra/auth/DB/CI/contracts)"
+      ]
+    }
+  },
+  {
+    "name": "critical_workflow_path_l",
+    "repo": "zach",
+    "requested": "S",
+    "paths": ".github/workflows/ci.yml",
+    "diff_lines": 3,
+    "new_files": 0,
+    "output": {
+      "repository": "zach",
+      "requested_weight": "S",
+      "floor_weight": "L",
+      "effective_weight": "L",
+      "escalated": true,
+      "required_stages": [
+        "plan",
+        "plan-review",
+        "human-plan-approval",
+        "impl",
+        "pr-review",
+        "human-merge-approval"
+      ],
+      "reasons": [
+        "[L] path '.github/workflows/ci.yml' matches critical L-tier pattern (infra/auth/DB/CI/contracts)"
+      ]
+    }
+  },
+  {
+    "name": "mixed_doc_lockfile_and_small_code_xs",
+    "repo": "zach",
+    "requested": "XS",
+    "paths": "README.md,Cargo.lock,src/v2/router.rs",
+    "diff_lines": 10,
+    "new_files": 0,
+    "output": {
+      "repository": "zach",
+      "requested_weight": "XS",
+      "floor_weight": "XS",
+      "effective_weight": "XS",
+      "escalated": false,
+      "required_stages": [
+        "impl"
+      ],
+      "reasons": [
+        "[XS] bounded change within <=2 code/config files, <=30 lines, no critical paths"
+      ]
+    }
+  },
+  {
+    "name": "infrastructure_repo_non_empty_l",
+    "repo": "infrastructure",
+    "requested": "XS",
+    "paths": "README.md",
+    "diff_lines": 0,
+    "new_files": 0,
+    "output": {
+      "repository": "infrastructure",
+      "requested_weight": "XS",
+      "floor_weight": "L",
+      "effective_weight": "L",
+      "escalated": true,
+      "required_stages": [
+        "plan",
+        "plan-review",
+        "human-plan-approval",
+        "impl",
+        "pr-review",
+        "human-merge-approval"
+      ],
+      "reasons": [
+        "[L] target repository is infrastructure (production/network state)"
+      ]
+    }
+  },
+  {
+    "name": "infrastructure_repo_empty_diff_l",
+    "repo": "infrastructure",
+    "requested": "XS",
+    "paths": "",
+    "diff_lines": 0,
+    "new_files": 0,
+    "output": {
+      "repository": "infrastructure",
+      "requested_weight": "XS",
+      "floor_weight": "L",
+      "effective_weight": "L",
+      "escalated": true,
+      "required_stages": [
+        "plan",
+        "plan-review",
+        "human-plan-approval",
+        "impl",
+        "pr-review",
+        "human-merge-approval"
+      ],
+      "reasons": [
+        "[L] target repository is infrastructure (production/network state)"
+      ]
+    }
+  }
+]
