@@ -1,16 +1,25 @@
 use crate::v2::default_ws_task_bin;
 use crate::v2::intake::default_required_stages;
 use crate::v2::now_epoch;
-use crate::v2::router::{ModelFamily, ReasoningEffort, StageRoute, resolve_stage_route};
+use crate::v2::router::{
+    ModelFamily, ReasoningEffort, StageRoute, infer_model_family,
+    is_no_cross_family_reviewer_error, resolve_stage_route,
+};
 use crate::v2::runner::{
-    MAX_RECENT_ATTEMPT_BYTES, MAX_SUMMARY_BYTES, StageExecutionResult, StageExecutor,
-    SystemdStageExecutor, build_clean_env_from_process, build_systemd_stage_command,
-    build_systemd_stage_command_with_env, check_token_budget, truncate_utf8_bytes,
+    MAX_RECENT_ATTEMPT_BYTES, MAX_SUMMARY_BYTES, ReviewedDiffContext, StageExecutionResult,
+    StageExecutor, SystemdStageExecutor, build_clean_env_from_process, build_systemd_stage_command,
+    build_systemd_stage_command_with_env, check_token_budget, normalize_cited_diff_path,
+    truncate_utf8_bytes,
 };
 use crate::v2::store::{ContextPackSpec, StageAttemptRecord, TaskRecord, V2Store};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
+
+pub const MAX_APPROVED_PLAN_BYTES: usize = 2048;
+pub const MAX_REVIEW_REWORK_LOOPS: u32 = 2;
+pub const MAX_WORKER_PROMPT_BYTES: usize = 16_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffFileEntry {
@@ -273,103 +282,242 @@ pub fn verify_worktree_diff_with(
     Ok(DiffCheckOutcome::Clean)
 }
 
-pub fn unwrap_json_markdown(text: &str) -> String {
-    let mut current = text.trim().to_owned();
-    while current.starts_with('{') && current.ends_with('}') {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&current) {
-            let found = val
-                .get("review_markdown")
-                .or_else(|| val.get("summary"))
-                .or_else(|| val.get("response"))
-                .and_then(|v| v.as_str());
-            if let Some(inner) = found {
-                current = inner.trim().to_owned();
-                continue;
-            }
-        }
-        break;
-    }
-    current
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcResultEntry {
+    pub id: String,
+    pub status: String,
+    pub file: String,
+    pub line: usize,
+    pub evidence: String,
 }
 
-/// Validates that a `pr-review` markdown output contains a 5-column AC verification
-/// table (`| AC | Criterion | Code (file:line) | Test | Status |`) with `PASS` and
-/// a `file:line` reference for every expected AC.
-pub fn validate_pr_review_table(markdown: &str, expected_ac_ids: &[String]) -> Result<(), String> {
-    let unwrapped = unwrap_json_markdown(markdown);
-    let normalized = if unwrapped.contains("\\n") {
-        unwrapped.replace("\\n", "\n")
-    } else {
-        unwrapped
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewFindingEntry {
+    pub severity: String,
+    pub file: String,
+    pub line: usize,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewVerdict {
+    pub verdict: String,
+    pub ac_results: Vec<AcResultEntry>,
+    pub findings: Vec<ReviewFindingEntry>,
+    pub summary: String,
+}
+
+/// Returns the strict JSON Schema enforced on `pr-review` verdicts.
+pub fn review_verdict_json_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["verdict", "ac_results", "findings", "summary"],
+        "properties": {
+            "verdict": {
+                "type": "string",
+                "enum": ["APPROVED", "CHANGES_REQUESTED"]
+            },
+            "ac_results": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["id", "status", "file", "line", "evidence"],
+                    "properties": {
+                        "id": { "type": "string", "minLength": 1 },
+                        "status": { "type": "string", "enum": ["PASS", "FAIL"] },
+                        "file": { "type": "string", "minLength": 1 },
+                        "line": { "type": "integer", "minimum": 1 },
+                        "evidence": { "type": "string", "minLength": 1 }
+                    }
+                }
+            },
+            "findings": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["severity", "file", "line", "summary"],
+                    "properties": {
+                        "severity": { "type": "string", "enum": ["blocking", "non_blocking"] },
+                        "file": { "type": "string", "minLength": 1 },
+                        "line": { "type": "integer", "minimum": 1 },
+                        "summary": { "type": "string", "minLength": 1 }
+                    }
+                }
+            },
+            "summary": { "type": "string", "minLength": 1 }
+        }
+    })
+}
+
+pub fn review_verdict_json_schema_string() -> String {
+    serde_json::to_string_pretty(&review_verdict_json_schema()).unwrap_or_default()
+}
+
+fn verify_cited_diff_location(
+    file: &str,
+    line: usize,
+    context_label: &str,
+    reviewed_diff: &ReviewedDiffContext,
+    worktree_path: &str,
+) -> Result<(), String> {
+    if line < 1 {
+        return Err(format!(
+            "PR review {context_label} cites invalid line {line} (< 1) in '{file}'"
+        ));
+    }
+    let norm_path = normalize_cited_diff_path(file, worktree_path)
+        .map_err(|e| format!("PR review {context_label} has invalid path: {e}"))?;
+    let Some(ranges) = reviewed_diff.files.get(&norm_path) else {
+        return Err(format!(
+            "PR review {context_label} cites '{norm_path}:{line}' which is not in reviewed diff {}",
+            reviewed_diff.commit_range
+        ));
     };
-    let mut verified_acs = std::collections::BTreeMap::new();
+    if !ranges.iter().any(|r| r.contains(line)) {
+        return Err(format!(
+            "PR review {context_label} cites '{norm_path}:{line}' which is outside reviewed diff hunks in {}",
+            reviewed_diff.commit_range
+        ));
+    }
+    Ok(())
+}
 
-    for line in normalized.lines() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with('|') || !trimmed.ends_with('|') {
-            continue;
-        }
-        let cols: Vec<&str> = trimmed
-            .trim_matches('|')
-            .split('|')
-            .map(str::trim)
-            .collect();
-        if cols.len() < 5 {
-            continue;
-        }
-        let ac_id = cols[0];
-        if ac_id.eq_ignore_ascii_case("AC") || ac_id.chars().all(|c| c == '-' || c == ':') {
-            continue;
-        }
-        let code_ref = cols[2];
-        let test_ref = cols[3];
-        let status = cols[4];
+/// Strictly validates a `pr-review` JSON verdict against [`ReviewVerdict`],
+/// acceptance criterion coverage, consistency rules, and real diff hunk ranges.
+/// Free-form markdown is never parsed.
+pub fn validate_review_verdict(
+    raw_json: &str,
+    expected_ac_ids: &[String],
+    reviewed_diff: &ReviewedDiffContext,
+    worktree_path: &str,
+) -> Result<ReviewVerdict, String> {
+    let trimmed = raw_json.trim();
+    if trimmed.is_empty() {
+        return Err("PR review verdict is empty (expected strict ReviewVerdict JSON)".to_owned());
+    }
+    let verdict: ReviewVerdict = serde_json::from_str(trimmed).map_err(|e| {
+        format!("PR review verdict failed ReviewVerdict JSON schema validation: {e}")
+    })?;
 
-        let has_file_line = code_ref.split_once(':').is_some_and(|(file, line_part)| {
-            !file.trim().is_empty()
-                && line_part
-                    .trim_matches('`')
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_digit())
-        });
-        if !has_file_line {
-            return Err(format!(
-                "PR review row for '{ac_id}' is missing a valid file:line reference in column 3 ('{code_ref}')"
-            ));
-        }
-        if test_ref.is_empty() || test_ref == "-" {
-            return Err(format!(
-                "PR review row for '{ac_id}' is missing test evidence in column 4"
-            ));
-        }
-        let is_pass = status.eq_ignore_ascii_case("PASS")
-            || status.eq_ignore_ascii_case("MET")
-            || status.eq_ignore_ascii_case("VERIFIED")
-            || status.eq_ignore_ascii_case("OK");
-        if !is_pass {
-            return Err(format!(
-                "PR review row for '{ac_id}' did not PASS (status='{status}')"
-            ));
-        }
-        verified_acs.insert(ac_id.to_owned(), true);
+    if !matches!(verdict.verdict.as_str(), "APPROVED" | "CHANGES_REQUESTED") {
+        return Err(format!(
+            "PR review verdict has invalid verdict '{}' (expected APPROVED or CHANGES_REQUESTED)",
+            verdict.verdict
+        ));
+    }
+    if verdict.summary.trim().is_empty() {
+        return Err("PR review verdict summary must be non-empty".to_owned());
     }
 
-    if expected_ac_ids.is_empty() {
-        if verified_acs.is_empty() {
-            return Err("PR review markdown contains no valid PASS rows in AC table".to_owned());
+    let mut seen_ac_ids = BTreeSet::new();
+    for ac in &verdict.ac_results {
+        let ac_id = ac.id.trim();
+        if ac_id.is_empty() {
+            return Err("PR review ac_results entry has empty id".to_owned());
         }
-        return Ok(());
+        if !seen_ac_ids.insert(ac_id.to_owned()) {
+            return Err(format!(
+                "PR review ac_results contains duplicate id '{ac_id}'"
+            ));
+        }
+        if !matches!(ac.status.as_str(), "PASS" | "FAIL") {
+            return Err(format!(
+                "PR review ac_results '{ac_id}' has invalid status '{}' (expected PASS or FAIL)",
+                ac.status
+            ));
+        }
+        if ac.file.trim().is_empty() {
+            return Err(format!("PR review ac_results '{ac_id}' has empty file"));
+        }
+        if ac.evidence.trim().is_empty() {
+            return Err(format!("PR review ac_results '{ac_id}' has empty evidence"));
+        }
+        verify_cited_diff_location(
+            &ac.file,
+            ac.line,
+            &format!("AC '{ac_id}'"),
+            reviewed_diff,
+            worktree_path,
+        )?;
     }
 
     for expected in expected_ac_ids {
-        if !verified_acs.contains_key(expected) {
+        if !seen_ac_ids.contains(expected.trim()) {
             return Err(format!(
-                "PR review table is missing PASS verification row for '{expected}'"
+                "PR review verdict is missing ac_results entry for '{expected}'"
             ));
         }
     }
-    Ok(())
+
+    for (idx, finding) in verdict.findings.iter().enumerate() {
+        if !matches!(finding.severity.as_str(), "blocking" | "non_blocking") {
+            return Err(format!(
+                "PR review finding[{idx}] has invalid severity '{}' (expected blocking or non_blocking)",
+                finding.severity
+            ));
+        }
+        if finding.file.trim().is_empty() {
+            return Err(format!("PR review finding[{idx}] has empty file"));
+        }
+        if finding.summary.trim().is_empty() {
+            return Err(format!("PR review finding[{idx}] has empty summary"));
+        }
+        verify_cited_diff_location(
+            &finding.file,
+            finding.line,
+            &format!("finding[{idx}]"),
+            reviewed_diff,
+            worktree_path,
+        )?;
+    }
+
+    if verdict.verdict == "APPROVED" {
+        if let Some(failed_ac) = verdict.ac_results.iter().find(|a| a.status != "PASS") {
+            return Err(format!(
+                "PR review verdict is APPROVED but AC '{}' has status '{}'",
+                failed_ac.id, failed_ac.status
+            ));
+        }
+        if let Some(blocking) = verdict.findings.iter().find(|f| f.severity == "blocking") {
+            return Err(format!(
+                "PR review verdict is APPROVED despite blocking finding at {}:{}",
+                blocking.file, blocking.line
+            ));
+        }
+    }
+
+    Ok(verdict)
+}
+
+/// Formats bounded findings and failing ACs from a `CHANGES_REQUESTED` verdict
+/// for persistence in `task.memory.last_review_findings`.
+pub fn format_review_findings(verdict: &ReviewVerdict) -> String {
+    let mut lines = vec![format!("Summary: {}", verdict.summary.trim())];
+    for ac in verdict.ac_results.iter().filter(|a| a.status != "PASS") {
+        lines.push(format!(
+            "- [AC {} FAIL] {}:{} - {}",
+            ac.id.trim(),
+            ac.file.trim(),
+            ac.line,
+            ac.evidence.trim()
+        ));
+    }
+    for f in &verdict.findings {
+        lines.push(format!(
+            "- [{}] {}:{} - {}",
+            f.severity.trim(),
+            f.file.trim(),
+            f.line,
+            f.summary.trim()
+        ));
+    }
+    truncate_utf8_bytes(&lines.join("\n"), MAX_SUMMARY_BYTES)
 }
 
 /// Builds a dry-run execution plan for a task without spawning any worker units.
@@ -575,6 +723,27 @@ pub fn build_impl_prompt(task: &TaskRecord, worktree_path: &str) -> String {
         "Implement task {} ({}) inside governed worktree {}.\n",
         task.task_id, task.title, worktree_path
     );
+    if let Some(ref plan) = task.memory.approved_plan
+        && !plan.trim().is_empty()
+    {
+        prompt.push_str("\n## Approved Plan:\n");
+        prompt.push_str(plan.trim());
+        prompt.push('\n');
+    }
+    if let Some(ref findings) = task.memory.last_review_findings
+        && !findings.trim().is_empty()
+    {
+        prompt.push_str("\n## Prior Review Findings (Address All Blocking Items):\n");
+        prompt.push_str(findings.trim());
+        prompt.push('\n');
+    }
+    if let Some(ref check_err) = task.memory.last_check_failure
+        && !check_err.trim().is_empty()
+    {
+        prompt.push_str("\n## Prior Check Failure:\n");
+        prompt.push_str(check_err.trim());
+        prompt.push('\n');
+    }
     if !task.context_pack.acceptance_criteria.is_empty() {
         prompt.push_str("\n## Acceptance Criteria:\n");
         for ac in &task.context_pack.acceptance_criteria {
@@ -596,22 +765,98 @@ pub fn build_impl_prompt(task: &TaskRecord, worktree_path: &str) -> String {
             prompt.push_str(&format!("- {}\n", cmd));
         }
     }
-    prompt
+    truncate_utf8_bytes(&prompt, MAX_WORKER_PROMPT_BYTES)
 }
 
-pub fn build_pr_review_prompt(task: &TaskRecord, worktree_path: &str) -> String {
+pub fn build_pr_review_prompt(
+    task: &TaskRecord,
+    worktree_path: &str,
+    diff_ctx: &ReviewedDiffContext,
+) -> String {
+    let schema_str = review_verdict_json_schema_string();
     let mut prompt = format!(
-        "Review implementation of task {} ({}) inside worktree {}.\n\
-         You MUST inspect the code changes and test execution.\n\
-         You MUST output a 5-column markdown table in the exact format:\n\
-         | AC | Criterion | Code (file:line) | Test | Status |\n\
-         |---|---|---|---|---|\n",
-        task.task_id, task.title, worktree_path
+        "Review implementation of task {} ({}) inside governed worktree {}.\n\
+         You MUST inspect the real git diff over the commit range below and verify every acceptance criterion.\n\n\
+         ## Reviewed Commit Range:\n\
+         - Range: {}\n\
+         - Merge Base SHA: {}\n\
+         - Reviewed SHA: {}\n\
+         - Inspect with: git diff {}\n",
+        task.task_id,
+        task.title,
+        worktree_path,
+        diff_ctx.commit_range,
+        diff_ctx.merge_base_sha,
+        diff_ctx.reviewed_sha,
+        diff_ctx.commit_range
     );
-    for ac in &task.context_pack.acceptance_criteria {
-        prompt.push_str(&format!("Verify AC: {} - {}\n", ac.id, ac.description));
+
+    prompt.push_str("\n## Changed Files & Valid Line Ranges:\n");
+    if diff_ctx.files.is_empty() {
+        prompt.push_str("- (no changed files detected in commit range)\n");
+    } else {
+        for (path, ranges) in &diff_ctx.files {
+            let range_list: Vec<String> = ranges
+                .iter()
+                .map(|r| format!("{}-{}", r.start, r.end))
+                .collect();
+            prompt.push_str(&format!("- {}: lines [{}]\n", path, range_list.join(", ")));
+        }
     }
-    prompt
+
+    prompt.push_str("\n## Approved Plan:\n");
+    if let Some(ref plan) = task.memory.approved_plan
+        && !plan.trim().is_empty()
+    {
+        prompt.push_str(&truncate_utf8_bytes(plan.trim(), MAX_APPROVED_PLAN_BYTES));
+        prompt.push('\n');
+    } else {
+        prompt.push_str("No approved plan recorded (XS/S task or pre-plan resume).\n");
+    }
+
+    if let Some(ref prior_findings) = task.memory.last_review_findings
+        && !prior_findings.trim().is_empty()
+    {
+        prompt.push_str("\n## Prior Review Findings:\n");
+        prompt.push_str(&truncate_utf8_bytes(
+            prior_findings.trim(),
+            MAX_SUMMARY_BYTES,
+        ));
+        prompt.push('\n');
+    }
+
+    prompt.push_str("\n## Acceptance Criteria:\n");
+    if task.context_pack.acceptance_criteria.is_empty() {
+        prompt.push_str("- (no acceptance criteria specified)\n");
+    } else {
+        for ac in &task.context_pack.acceptance_criteria {
+            prompt.push_str(&format!("- {}: {}\n", ac.id, ac.description));
+        }
+    }
+
+    let footer = format!(
+        "\n## Required Output Format (Strict JSON Only):\n\
+         Output ONLY a single valid JSON object matching this exact schema (no markdown fences, no prose before or after).\n\
+         Every cited `file` and `line` in `ac_results` and `findings` MUST exist in the reviewed commit range `{}`.\n\
+         {}\n",
+        diff_ctx.commit_range, schema_str
+    );
+
+    let remaining_for_excerpt = MAX_WORKER_PROMPT_BYTES
+        .saturating_sub(prompt.len())
+        .saturating_sub(footer.len())
+        .saturating_sub(64);
+    if !diff_ctx.diff_excerpt.trim().is_empty() && remaining_for_excerpt >= 128 {
+        prompt.push_str("\n## Diff Excerpt (--unified=0):\n");
+        prompt.push_str(&truncate_utf8_bytes(
+            diff_ctx.diff_excerpt.trim(),
+            remaining_for_excerpt,
+        ));
+        prompt.push('\n');
+    }
+
+    prompt.push_str(&footer);
+    truncate_utf8_bytes(&prompt, MAX_WORKER_PROMPT_BYTES)
 }
 
 /// Parses the JSON stdout/stderr produced by `worker.mjs --cli`, mapping infrastructure
@@ -698,46 +943,31 @@ pub fn parse_agy_cli_response(
         .unwrap_or("AGY worker completed successfully")
         .to_owned();
 
-    let mut review_markdown = json
+    let raw_response = json
+        .get("response")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let explicit_review = json
         .get("review_markdown")
         .or_else(|| json.get("review"))
         .or_else(|| json.get("review_target"))
         .and_then(|v| v.as_str())
         .map(str::to_owned);
 
-    if review_markdown.is_none()
-        && let Some(resp_str) = json.get("response").and_then(|v| v.as_str())
-    {
-        if let Ok(inner_json) = serde_json::from_str::<serde_json::Value>(resp_str) {
-            if let Some(inner_summary) = inner_json.get("summary").and_then(|v| v.as_str()) {
-                review_markdown = Some(inner_summary.to_owned());
-            } else if let Some(inner_md) =
-                inner_json.get("review_markdown").and_then(|v| v.as_str())
-            {
-                review_markdown = Some(inner_md.to_owned());
-            } else {
-                review_markdown = Some(resp_str.to_owned());
-            }
-        } else {
-            review_markdown = Some(resp_str.to_owned());
-        }
-    }
-
-    if let Some(ref md) = review_markdown {
-        let unwrapped = unwrap_json_markdown(md);
-        if !unwrapped.is_empty() {
-            review_markdown = Some(unwrapped);
-        }
-    }
-
-    if review_markdown.is_none() && summary.contains('|') {
-        let unwrapped = unwrap_json_markdown(&summary);
-        review_markdown = Some(if unwrapped.is_empty() {
-            summary.clone()
-        } else {
-            unwrapped
+    // Preserve the full untruncated worker response (including ReviewVerdict JSON)
+    // without discarding it via `.summary`.
+    let review_output = raw_response
+        .clone()
+        .or_else(|| explicit_review.clone())
+        .or_else(|| {
+            json.get("verdict")
+                .is_some()
+                .then(|| trimmed_out.to_owned())
         });
-    }
+
+    let review_markdown = explicit_review
+        .or_else(|| raw_response.filter(|r| r.contains('|')))
+        .or_else(|| summary.contains('|').then(|| summary.clone()));
 
     let invocation_id = json
         .get("orchestration_id")
@@ -751,6 +981,7 @@ pub fn parse_agy_cli_response(
         status: "PASSED".to_owned(),
         summary,
         review_markdown,
+        review_output,
         invocation_id,
         input_tokens,
         output_tokens,
@@ -849,6 +1080,10 @@ pub fn classify_failure_class(stage: &str, status: &str, message: &str) -> &'sta
 
     if lower_msg.contains("changes_requested")
         || lower_msg.contains("changes requested")
+        || lower_msg.contains("review verdict")
+        || lower_msg.contains("not in reviewed diff")
+        || lower_msg.contains("outside reviewed diff")
+        || lower_msg.contains("invalid review")
         || lower_msg.contains("check '")
         || lower_msg.contains("verification")
         || lower_msg.contains("validation")
@@ -996,6 +1231,370 @@ fn apply_weight_escalation(
         .push(format!("weight escalated to {to_weight}: {reason}"));
 }
 
+fn count_agy_infra_for_stage(task: &TaskRecord, stage: &str) -> usize {
+    let stage_marker = format!("stage={stage}");
+    task.memory
+        .recent_attempts
+        .iter()
+        .filter(|line| {
+            line.starts_with("[AGY_INFRA:")
+                && (!line.contains("stage=") || line.contains(&stage_marker))
+        })
+        .count()
+}
+
+fn resolve_author_family(
+    store: &V2Store,
+    task_id: &str,
+    stage: &str,
+    in_run_family: Option<ModelFamily>,
+) -> Result<ModelFamily, String> {
+    if let Some(family) = in_run_family {
+        return Ok(family);
+    }
+    let attempts = store
+        .list_stage_attempts(task_id)
+        .map_err(|e| e.to_string())?;
+    if let Some(attempt) = attempts
+        .iter()
+        .rev()
+        .find(|a| a.stage == stage && a.status == "PASSED")
+        .or_else(|| attempts.iter().rev().find(|a| a.stage == stage))
+    {
+        return Ok(infer_model_family(&attempt.model));
+    }
+    Ok(ModelFamily::OpenAiSol)
+}
+
+fn pause_for_missing_cross_family_reviewer(
+    store: &mut V2Store,
+    task: &mut TaskRecord,
+    stage: &str,
+    author_family: ModelFamily,
+    reason: &str,
+) -> Result<TaskRecord, String> {
+    let dec_id = format!(
+        "dec-{}-{}-cross-family-v{}",
+        task.task_id.to_ascii_lowercase(),
+        stage,
+        task.version
+    );
+    let question = format!(
+        "Cross-family reviewer unavailable for {} at stage '{}' (author family: {}).",
+        task.task_id,
+        stage,
+        author_family.as_str()
+    );
+    let context_summary = truncate_utf8_bytes(reason, MAX_SUMMARY_BYTES);
+    store
+        .open_decision(
+            &dec_id,
+            &task.task_id,
+            &task.task_group,
+            "cross_family_reviewer_unavailable",
+            &question,
+            &[
+                "Wait for cross-family model availability".to_owned(),
+                "Abort task".to_owned(),
+            ],
+            Some(0),
+            &context_summary,
+            task.reviewed_sha
+                .as_deref()
+                .or(task.plan_base_sha.as_deref()),
+        )
+        .map_err(|e| e.to_string())?;
+    task.memory.decisions_log.push(format!(
+        "paused at {stage}: cross-family reviewer unavailable (author={})",
+        author_family.as_str()
+    ));
+    task.status = "Blocked".to_owned();
+    task.current_stage = Some(stage.to_owned());
+    task.active_attempt_id = None;
+    store.upsert_task(task).map_err(|e| e.to_string())
+}
+
+enum PrReviewOutcome {
+    Approved(TaskRecord),
+    NeedsRework(TaskRecord),
+    PausedBlocked(TaskRecord),
+}
+
+fn execute_pr_review_gate(
+    store: &mut V2Store,
+    executor: &mut dyn StageExecutor,
+    mut task: TaskRecord,
+    worktree_path: &str,
+    author_family: ModelFamily,
+    impl_committed_in_run: bool,
+) -> Result<PrReviewOutcome, String> {
+    let rev_route = match resolve_stage_route(
+        &task.weight,
+        "pr-review",
+        task.retry_count,
+        Some(author_family),
+    ) {
+        Ok(Some(route)) => route,
+        Ok(None) => return Err("missing pr-review route".to_owned()),
+        Err(err) if is_no_cross_family_reviewer_error(&err) => {
+            let paused = pause_for_missing_cross_family_reviewer(
+                store,
+                &mut task,
+                "pr-review",
+                author_family,
+                &err,
+            )?;
+            return Ok(PrReviewOutcome::PausedBlocked(paused));
+        }
+        Err(err) => return Err(err),
+    };
+
+    if rev_route.family == ModelFamily::GeminiAgy
+        && count_agy_infra_for_stage(&task, "pr-review") >= 2
+    {
+        let paused = pause_for_missing_cross_family_reviewer(
+            store,
+            &mut task,
+            "pr-review",
+            author_family,
+            "Gemini AGY reviewer unavailable after >= 2 AGY infra failures; refusing same-family review fallback",
+        )?;
+        return Ok(PrReviewOutcome::PausedBlocked(paused));
+    }
+
+    check_token_budget(&task, &rev_route)?;
+
+    let reviewed_sha = task
+        .reviewed_sha
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("pr-review requires reviewed_sha on task {}", task.task_id))?;
+
+    let diff_ctx = executor
+        .collect_reviewed_diff(&task, worktree_path, &reviewed_sha)
+        .map_err(|err| {
+            format!(
+                "failed to collect reviewed diff for {}: {err}",
+                task.task_id
+            )
+        })?;
+
+    let rev_attempt_id = format!(
+        "{}-pr-review-{}",
+        task.task_id.to_ascii_lowercase(),
+        task.version
+    );
+    let rev_prompt = build_pr_review_prompt(&task, worktree_path, &diff_ctx);
+    let rev_spec = build_systemd_stage_command(&task, &rev_attempt_id, &rev_route, &rev_prompt)?;
+
+    task.status = "PR Review".to_owned();
+    task.current_stage = Some("pr-review".to_owned());
+    task.active_attempt_id = Some(rev_attempt_id.clone());
+    task = store.upsert_task(&task).map_err(|e| e.to_string())?;
+
+    let rev_started = now_epoch();
+    let mut rev_attempt = StageAttemptRecord {
+        attempt_id: rev_attempt_id.clone(),
+        task_id: task.task_id.clone(),
+        stage: "pr-review".to_owned(),
+        model: rev_route.model.clone(),
+        effort: rev_route.effort.as_str().to_owned(),
+        systemd_unit: Some(rev_spec.unit_name.clone()),
+        invocation_id: None,
+        started_epoch: rev_started,
+        ended_epoch: None,
+        status: "RUNNING".to_owned(),
+        failure_class: None,
+        summary: None,
+        input_tokens: None,
+        output_tokens: None,
+        total_tokens: None,
+        sha_before: Some(reviewed_sha.clone()),
+        sha_after: Some(reviewed_sha),
+    };
+    store
+        .record_stage_attempt(&rev_attempt)
+        .map_err(|e| e.to_string())?;
+
+    let rev_res = executor.execute_stage(&task, &rev_attempt_id, &rev_route, &rev_spec);
+    if rev_route.family == ModelFamily::GeminiAgy
+        && let Some(cls) = classify_agy_infra_failure(&rev_res)
+    {
+        push_bounded_recent_attempt(
+            &mut task,
+            format!(
+                "[AGY_INFRA:{cls}] stage=pr-review attempt={rev_attempt_id} log=attempts/{rev_attempt_id}/stderr.log"
+            ),
+        );
+        if count_agy_infra_for_stage(&task, "pr-review") >= 2 {
+            let reason = match &rev_res {
+                Err(e) => format!("cross-family AGY reviewer unavailable ({cls}): {e}"),
+                Ok(res) => format!(
+                    "cross-family AGY reviewer unavailable ({cls}): {}",
+                    res.summary
+                ),
+            };
+            rev_attempt.ended_epoch = Some(now_epoch());
+            rev_attempt.status = "FAILED".to_owned();
+            rev_attempt.failure_class = Some(FAILURE_CLASS_INFRA.to_owned());
+            rev_attempt.summary = Some(truncate_utf8_bytes(&reason, MAX_SUMMARY_BYTES));
+            store
+                .record_stage_attempt(&rev_attempt)
+                .map_err(|e| e.to_string())?;
+            let paused = pause_for_missing_cross_family_reviewer(
+                store,
+                &mut task,
+                "pr-review",
+                author_family,
+                &reason,
+            )?;
+            return Ok(PrReviewOutcome::PausedBlocked(paused));
+        }
+    }
+
+    let rev_result = match rev_res {
+        Ok(res) => res,
+        Err(err) => {
+            let class = classify_failure_class("pr-review", "FAILED", &err);
+            fail_stage_attempt(store, &mut task, &mut rev_attempt, class, err.clone(), true)?;
+            return Err(format!(
+                "pr-review stage failed for {}: {}",
+                task.task_id, err
+            ));
+        }
+    };
+
+    apply_stage_result_usage(&mut task, &mut rev_attempt, "pr-review", &rev_result);
+    if let Some(sha) = rev_result
+        .sha_after
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "head-sha")
+    {
+        rev_attempt.sha_after = Some(sha.to_owned());
+    }
+
+    if rev_result.status != "PASSED" {
+        let class = classify_failure_class("pr-review", &rev_result.status, &rev_result.summary);
+        fail_stage_attempt(
+            store,
+            &mut task,
+            &mut rev_attempt,
+            class,
+            rev_result.summary.clone(),
+            true,
+        )?;
+        return Err(format!(
+            "pr-review stage failed for {}: {}",
+            task.task_id, rev_result.summary
+        ));
+    }
+
+    let expected_acs: Vec<String> = task
+        .context_pack
+        .acceptance_criteria
+        .iter()
+        .map(|ac| ac.id.clone())
+        .collect();
+    let raw_verdict = rev_result
+        .review_output
+        .as_deref()
+        .unwrap_or(&rev_result.summary);
+    let verdict =
+        match validate_review_verdict(raw_verdict, &expected_acs, &diff_ctx, worktree_path) {
+            Ok(verdict) => verdict,
+            Err(err) => {
+                let class = classify_failure_class("pr-review", "FAILED", &err);
+                fail_stage_attempt(store, &mut task, &mut rev_attempt, class, err.clone(), true)?;
+                return Err(err);
+            }
+        };
+
+    rev_attempt.failure_class = None;
+    rev_attempt.summary = Some(truncate_utf8_bytes(
+        &format!("{}: {}", verdict.verdict, verdict.summary),
+        MAX_SUMMARY_BYTES,
+    ));
+    store
+        .record_stage_attempt(&rev_attempt)
+        .map_err(|e| e.to_string())?;
+
+    if verdict.verdict == "APPROVED" {
+        if !task.stages_completed.iter().any(|s| s == "pr-review") {
+            task.stages_completed.push("pr-review".to_owned());
+        }
+        task.memory.last_review_findings = None;
+        if let Some(sha) = rev_result
+            .sha_after
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "head-sha")
+            && (!impl_committed_in_run || rev_result.sha_after != rev_result.sha_before)
+        {
+            task.reviewed_sha = Some(sha.to_owned());
+        }
+        task = store.upsert_task(&task).map_err(|e| e.to_string())?;
+        return Ok(PrReviewOutcome::Approved(task));
+    }
+
+    let findings_text = format_review_findings(&verdict);
+    task.memory.last_review_findings = Some(findings_text.clone());
+    if task.memory.review_rework_count >= MAX_REVIEW_REWORK_LOOPS {
+        let dec_id = format!(
+            "dec-{}-review-rework-{}",
+            task.task_id.to_ascii_lowercase(),
+            task.memory.review_rework_count
+        );
+        let question = format!(
+            "PR review requested changes on {} after {} rework loop(s). How should we proceed?",
+            task.task_id, task.memory.review_rework_count
+        );
+        store
+            .open_decision(
+                &dec_id,
+                &task.task_id,
+                &task.task_group,
+                "review_rework_limit",
+                &question,
+                &[
+                    "Authorize additional impl rework".to_owned(),
+                    "Abort task".to_owned(),
+                ],
+                Some(0),
+                &findings_text,
+                task.reviewed_sha.as_deref(),
+            )
+            .map_err(|e| e.to_string())?;
+        task.memory.decisions_log.push(format!(
+            "paused at pr-review: rework limit ({MAX_REVIEW_REWORK_LOOPS}) reached"
+        ));
+        task.status = "Blocked".to_owned();
+        task.current_stage = Some("pr-review".to_owned());
+        task.active_attempt_id = None;
+        let paused = store.upsert_task(&task).map_err(|e| e.to_string())?;
+        return Ok(PrReviewOutcome::PausedBlocked(paused));
+    }
+
+    task.memory.review_rework_count = task.memory.review_rework_count.saturating_add(1);
+    let rework_num = task.memory.review_rework_count;
+    push_bounded_recent_attempt(
+        &mut task,
+        format!(
+            "[pr-review:{}] CHANGES_REQUESTED rework={}/{}",
+            rev_attempt_id, rework_num, MAX_REVIEW_REWORK_LOOPS
+        ),
+    );
+    task.stages_completed
+        .retain(|s| s != "impl" && s != "pr-review");
+    task.status = "In Progress".to_owned();
+    task.current_stage = Some("impl".to_owned());
+    task.active_attempt_id = None;
+    let updated = store.upsert_task(&task).map_err(|e| e.to_string())?;
+    Ok(PrReviewOutcome::NeedsRework(updated))
+}
+
 pub fn execute_xs_s_pipeline(store: &mut V2Store, task_id: &str) -> Result<TaskRecord, String> {
     let mut executor = SystemdStageExecutor::default();
     execute_xs_s_pipeline_with_executor(store, task_id, &mut executor)
@@ -1069,346 +1668,264 @@ pub fn execute_xs_s_pipeline_with_executor_and_ws_task(
     }
     let worktree_path = task.worktree_path.clone().unwrap_or_default();
 
-    // Stage 1: impl
-    let impl_route = resolve_stage_route(&task.weight, "impl", task.retry_count, None)?
-        .ok_or_else(|| "missing impl route".to_owned())?;
-    check_token_budget(&task, &impl_route)?;
+    let mut impl_author_family: Option<ModelFamily> = None;
+    let mut impl_committed_in_run = false;
+    loop {
+        // Stage 1: impl
+        if !task.stages_completed.iter().any(|s| s == "impl")
+            && (task.required_stages.is_empty() || task.required_stages.iter().any(|s| s == "impl"))
+        {
+            let impl_route = resolve_stage_route(&task.weight, "impl", task.retry_count, None)?
+                .ok_or_else(|| "missing impl route".to_owned())?;
+            impl_author_family = Some(impl_route.family);
+            check_token_budget(&task, &impl_route)?;
 
-    let impl_attempt_id = format!(
-        "{}-impl-{}",
-        task.task_id.to_ascii_lowercase(),
-        task.version
-    );
-    let impl_prompt = build_impl_prompt(&task, &worktree_path);
-    let impl_spec =
-        build_systemd_stage_command(&task, &impl_attempt_id, &impl_route, &impl_prompt)?;
-
-    task.status = "In Progress".to_owned();
-    task.current_stage = Some("impl".to_owned());
-    task.active_attempt_id = Some(impl_attempt_id.clone());
-    task.executor = Some("zach".to_owned());
-    task = store.upsert_task(&task).map_err(|e| e.to_string())?;
-
-    let started_epoch = now_epoch();
-    let mut attempt_rec = StageAttemptRecord {
-        attempt_id: impl_attempt_id.clone(),
-        task_id: task.task_id.clone(),
-        stage: "impl".to_owned(),
-        model: impl_route.model.clone(),
-        effort: impl_route.effort.as_str().to_owned(),
-        systemd_unit: Some(impl_spec.unit_name.clone()),
-        invocation_id: None,
-        started_epoch,
-        ended_epoch: None,
-        status: "RUNNING".to_owned(),
-        failure_class: None,
-        summary: None,
-        input_tokens: None,
-        output_tokens: None,
-        total_tokens: None,
-        sha_before: None,
-        sha_after: None,
-    };
-    store
-        .record_stage_attempt(&attempt_rec)
-        .map_err(|e| e.to_string())?;
-
-    let impl_result = match executor.execute_stage(&task, &impl_attempt_id, &impl_route, &impl_spec)
-    {
-        Ok(res) => res,
-        Err(err) => {
-            let class = classify_failure_class("impl", "FAILED", &err);
-            fail_stage_attempt(store, &mut task, &mut attempt_rec, class, err.clone(), true)?;
-            return Err(format!("impl stage failed for {}: {}", task.task_id, err));
-        }
-    };
-    apply_stage_result_usage(&mut task, &mut attempt_rec, "impl", &impl_result);
-    attempt_rec.sha_before = impl_result.sha_before.clone();
-    attempt_rec.sha_after = impl_result.sha_after.clone();
-    push_bounded_recent_attempt(
-        &mut task,
-        format!(
-            "[impl:{}] status={} tokens={}",
-            impl_attempt_id,
-            impl_result.status,
-            impl_result
-                .total_tokens
-                .map_or_else(|| "unknown".to_owned(), |t| t.to_string())
-        ),
-    );
-
-    if impl_result.status != "PASSED" {
-        let class = classify_failure_class("impl", &impl_result.status, &impl_result.summary);
-        fail_stage_attempt(
-            store,
-            &mut task,
-            &mut attempt_rec,
-            class,
-            impl_result.summary.clone(),
-            true,
-        )?;
-        return Err(format!(
-            "impl stage failed for {}: {}",
-            task.task_id, impl_result.summary
-        ));
-    }
-
-    attempt_rec.failure_class = None;
-    store
-        .record_stage_attempt(&attempt_rec)
-        .map_err(|e| e.to_string())?;
-
-    // Mechanical Gate 1: Worktree diff verification (forbidden_paths, target_files, ws-task weight floor)
-    match verify_worktree_diff_with(
-        &task.repository,
-        &task.weight,
-        &task.context_pack,
-        &impl_result.diff_files,
-        ws_task_bin,
-    ) {
-        Ok(DiffCheckOutcome::Clean) => {}
-        Ok(DiffCheckOutcome::ForbiddenPathViolation { path, pattern }) => {
-            let err_msg = format!(
-                "forbidden path violation on {}: {} matches {}",
-                task.task_id, path, pattern
+            let impl_attempt_id = format!(
+                "{}-impl-{}",
+                task.task_id.to_ascii_lowercase(),
+                task.version
             );
-            fail_stage_attempt(
-                store,
-                &mut task,
-                &mut attempt_rec,
-                FAILURE_CLASS_POLICY,
-                err_msg.clone(),
-                true,
-            )?;
-            let dec_id = format!("dec-{}-forbidden", task.task_id.to_ascii_lowercase());
-            let bounded_context = truncate_utf8_bytes(&impl_result.summary, MAX_SUMMARY_BYTES);
-            let _ = store.open_decision(
-                &dec_id,
-                &task.task_id,
-                &task.task_group,
-                "scope_violation",
-                &format!("Worker modified forbidden path '{path}' (matching '{pattern}')"),
-                &[
-                    "Revert and cancel".to_owned(),
-                    "Inspect worktree".to_owned(),
-                ],
-                Some(0),
-                &bounded_context,
-                impl_result.sha_after.as_deref(),
-            );
-            return Err(err_msg);
-        }
-        Ok(DiffCheckOutcome::OutOfScopeFiles { files }) => {
-            let err_msg = format!(
-                "out-of-scope files modified on {}: {:?}",
-                task.task_id, files
-            );
-            fail_stage_attempt(
-                store,
-                &mut task,
-                &mut attempt_rec,
-                FAILURE_CLASS_POLICY,
-                err_msg.clone(),
-                true,
-            )?;
-            let dec_id = format!("dec-{}-scope", task.task_id.to_ascii_lowercase());
-            let bounded_context = truncate_utf8_bytes(&impl_result.summary, MAX_SUMMARY_BYTES);
-            let _ = store.open_decision(
-                &dec_id,
-                &task.task_id,
-                &task.task_group,
-                "scope_violation",
-                &format!("Worker modified files outside target_files: {:?}", files),
-                &[
-                    "Expand target_files".to_owned(),
-                    "Reject attempt".to_owned(),
-                ],
-                Some(1),
-                &bounded_context,
-                impl_result.sha_after.as_deref(),
-            );
-            return Err(err_msg);
-        }
-        Ok(DiffCheckOutcome::WeightEscalated {
-            from_weight: _,
-            to_weight,
-            required_stages,
-            reason,
-        }) => {
-            apply_weight_escalation(&mut task, to_weight.clone(), required_stages, &reason);
+            let impl_prompt = build_impl_prompt(&task, &worktree_path);
+            let impl_spec =
+                build_systemd_stage_command(&task, &impl_attempt_id, &impl_route, &impl_prompt)?;
+
+            task.status = "In Progress".to_owned();
+            task.current_stage = Some("impl".to_owned());
+            task.active_attempt_id = Some(impl_attempt_id.clone());
+            task.executor = Some("zach".to_owned());
             task = store.upsert_task(&task).map_err(|e| e.to_string())?;
-            if matches!(to_weight.as_str(), "M" | "L") {
-                let _ = store.release_path_locks(&task.task_id);
-                return Ok(task);
-            }
-        }
-        Err(err) => {
-            fail_stage_attempt(
-                store,
+
+            let started_epoch = now_epoch();
+            let mut attempt_rec = StageAttemptRecord {
+                attempt_id: impl_attempt_id.clone(),
+                task_id: task.task_id.clone(),
+                stage: "impl".to_owned(),
+                model: impl_route.model.clone(),
+                effort: impl_route.effort.as_str().to_owned(),
+                systemd_unit: Some(impl_spec.unit_name.clone()),
+                invocation_id: None,
+                started_epoch,
+                ended_epoch: None,
+                status: "RUNNING".to_owned(),
+                failure_class: None,
+                summary: None,
+                input_tokens: None,
+                output_tokens: None,
+                total_tokens: None,
+                sha_before: None,
+                sha_after: None,
+            };
+            store
+                .record_stage_attempt(&attempt_rec)
+                .map_err(|e| e.to_string())?;
+
+            let impl_result =
+                match executor.execute_stage(&task, &impl_attempt_id, &impl_route, &impl_spec) {
+                    Ok(res) => res,
+                    Err(err) => {
+                        let class = classify_failure_class("impl", "FAILED", &err);
+                        fail_stage_attempt(
+                            store,
+                            &mut task,
+                            &mut attempt_rec,
+                            class,
+                            err.clone(),
+                            true,
+                        )?;
+                        return Err(format!("impl stage failed for {}: {}", task.task_id, err));
+                    }
+                };
+            apply_stage_result_usage(&mut task, &mut attempt_rec, "impl", &impl_result);
+            attempt_rec.sha_before = impl_result.sha_before.clone();
+            attempt_rec.sha_after = impl_result.sha_after.clone();
+            push_bounded_recent_attempt(
                 &mut task,
-                &mut attempt_rec,
-                FAILURE_CLASS_INFRA,
-                err.clone(),
-                true,
-            )?;
-            return Err(err);
-        }
-    }
+                format!(
+                    "[impl:{}] status={} tokens={}",
+                    impl_attempt_id,
+                    impl_result.status,
+                    impl_result
+                        .total_tokens
+                        .map_or_else(|| "unknown".to_owned(), |t| t.to_string())
+                ),
+            );
 
-    // Mechanical Gate 2: worker_checks and gate_checks
-    let worker_checks = task.context_pack.worker_checks.clone();
-    run_stage_checks(
-        store,
-        &mut task,
-        &mut attempt_rec,
-        executor,
-        &worktree_path,
-        &worker_checks,
-    )?;
-    let gate_checks = task.context_pack.gate_checks.clone();
-    run_stage_checks(
-        store,
-        &mut task,
-        &mut attempt_rec,
-        executor,
-        &worktree_path,
-        &gate_checks,
-    )?;
+            if impl_result.status != "PASSED" {
+                let class =
+                    classify_failure_class("impl", &impl_result.status, &impl_result.summary);
+                fail_stage_attempt(
+                    store,
+                    &mut task,
+                    &mut attempt_rec,
+                    class,
+                    impl_result.summary.clone(),
+                    true,
+                )?;
+                return Err(format!(
+                    "impl stage failed for {}: {}",
+                    task.task_id, impl_result.summary
+                ));
+            }
 
-    let committed_sha =
-        commit_impl_worktree(store, executor, &mut task, &mut attempt_rec, &worktree_path)?;
+            attempt_rec.failure_class = None;
+            store
+                .record_stage_attempt(&attempt_rec)
+                .map_err(|e| e.to_string())?;
 
-    // Stage 2: Cross-model pr-review for weight S
-    if task.weight.eq_ignore_ascii_case("S")
-        || task.required_stages.iter().any(|s| s == "pr-review")
-    {
-        let review_route = resolve_stage_route(
-            &task.weight,
-            "pr-review",
-            task.retry_count,
-            Some(impl_route.family),
-        )?
-        .ok_or_else(|| "missing pr-review route".to_owned())?;
-
-        check_token_budget(&task, &review_route)?;
-
-        let rev_attempt_id = format!(
-            "{}-pr-review-{}",
-            task.task_id.to_ascii_lowercase(),
-            task.version
-        );
-        let rev_prompt = build_pr_review_prompt(&task, &worktree_path);
-        let rev_spec =
-            build_systemd_stage_command(&task, &rev_attempt_id, &review_route, &rev_prompt)?;
-
-        task.status = "PR Review".to_owned();
-        task.current_stage = Some("pr-review".to_owned());
-        task.active_attempt_id = Some(rev_attempt_id.clone());
-        task = store.upsert_task(&task).map_err(|e| e.to_string())?;
-
-        let rev_started = now_epoch();
-        let mut rev_attempt = StageAttemptRecord {
-            attempt_id: rev_attempt_id.clone(),
-            task_id: task.task_id.clone(),
-            stage: "pr-review".to_owned(),
-            model: review_route.model.clone(),
-            effort: review_route.effort.as_str().to_owned(),
-            systemd_unit: Some(rev_spec.unit_name.clone()),
-            invocation_id: None,
-            started_epoch: rev_started,
-            ended_epoch: None,
-            status: "RUNNING".to_owned(),
-            failure_class: None,
-            summary: None,
-            input_tokens: None,
-            output_tokens: None,
-            total_tokens: None,
-            sha_before: Some(committed_sha.clone()),
-            sha_after: Some(committed_sha.clone()),
-        };
-        store
-            .record_stage_attempt(&rev_attempt)
-            .map_err(|e| e.to_string())?;
-
-        let rev_result =
-            match executor.execute_stage(&task, &rev_attempt_id, &review_route, &rev_spec) {
-                Ok(res) => res,
-                Err(err) => {
-                    let class = classify_failure_class("pr-review", "FAILED", &err);
+            // Mechanical Gate 1: Worktree diff verification (forbidden_paths, target_files, ws-task weight floor)
+            match verify_worktree_diff_with(
+                &task.repository,
+                &task.weight,
+                &task.context_pack,
+                &impl_result.diff_files,
+                ws_task_bin,
+            ) {
+                Ok(DiffCheckOutcome::Clean) => {}
+                Ok(DiffCheckOutcome::ForbiddenPathViolation { path, pattern }) => {
+                    let err_msg = format!(
+                        "forbidden path violation on {}: {} matches {}",
+                        task.task_id, path, pattern
+                    );
                     fail_stage_attempt(
                         store,
                         &mut task,
-                        &mut rev_attempt,
-                        class,
+                        &mut attempt_rec,
+                        FAILURE_CLASS_POLICY,
+                        err_msg.clone(),
+                        true,
+                    )?;
+                    let dec_id = format!("dec-{}-forbidden", task.task_id.to_ascii_lowercase());
+                    let bounded_context =
+                        truncate_utf8_bytes(&impl_result.summary, MAX_SUMMARY_BYTES);
+                    let _ = store.open_decision(
+                        &dec_id,
+                        &task.task_id,
+                        &task.task_group,
+                        "scope_violation",
+                        &format!("Worker modified forbidden path '{path}' (matching '{pattern}')"),
+                        &[
+                            "Revert and cancel".to_owned(),
+                            "Inspect worktree".to_owned(),
+                        ],
+                        Some(0),
+                        &bounded_context,
+                        impl_result.sha_after.as_deref(),
+                    );
+                    return Err(err_msg);
+                }
+                Ok(DiffCheckOutcome::OutOfScopeFiles { files }) => {
+                    let err_msg = format!(
+                        "out-of-scope files modified on {}: {:?}",
+                        task.task_id, files
+                    );
+                    fail_stage_attempt(
+                        store,
+                        &mut task,
+                        &mut attempt_rec,
+                        FAILURE_CLASS_POLICY,
+                        err_msg.clone(),
+                        true,
+                    )?;
+                    let dec_id = format!("dec-{}-scope", task.task_id.to_ascii_lowercase());
+                    let bounded_context =
+                        truncate_utf8_bytes(&impl_result.summary, MAX_SUMMARY_BYTES);
+                    let _ = store.open_decision(
+                        &dec_id,
+                        &task.task_id,
+                        &task.task_group,
+                        "scope_violation",
+                        &format!("Worker modified files outside target_files: {:?}", files),
+                        &[
+                            "Expand target_files".to_owned(),
+                            "Reject attempt".to_owned(),
+                        ],
+                        Some(1),
+                        &bounded_context,
+                        impl_result.sha_after.as_deref(),
+                    );
+                    return Err(err_msg);
+                }
+                Ok(DiffCheckOutcome::WeightEscalated {
+                    from_weight: _,
+                    to_weight,
+                    required_stages,
+                    reason,
+                }) => {
+                    apply_weight_escalation(&mut task, to_weight.clone(), required_stages, &reason);
+                    task = store.upsert_task(&task).map_err(|e| e.to_string())?;
+                    if matches!(to_weight.as_str(), "M" | "L") {
+                        let _ = store.release_path_locks(&task.task_id);
+                        return Ok(task);
+                    }
+                }
+                Err(err) => {
+                    fail_stage_attempt(
+                        store,
+                        &mut task,
+                        &mut attempt_rec,
+                        FAILURE_CLASS_INFRA,
                         err.clone(),
                         true,
                     )?;
-                    return Err(format!(
-                        "pr-review stage failed for {}: {}",
-                        task.task_id, err
-                    ));
+                    return Err(err);
                 }
-            };
-        apply_stage_result_usage(&mut task, &mut rev_attempt, "pr-review", &rev_result);
-        if let Some(sha) = rev_result
-            .sha_after
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && *s != "head-sha")
-        {
-            rev_attempt.sha_after = Some(sha.to_owned());
-        }
+            }
 
-        if rev_result.status != "PASSED" {
-            let class =
-                classify_failure_class("pr-review", &rev_result.status, &rev_result.summary);
-            fail_stage_attempt(
+            // Mechanical Gate 2: worker_checks and gate_checks
+            let worker_checks = task.context_pack.worker_checks.clone();
+            run_stage_checks(
                 store,
                 &mut task,
-                &mut rev_attempt,
-                class,
-                rev_result.summary.clone(),
-                true,
+                &mut attempt_rec,
+                executor,
+                &worktree_path,
+                &worker_checks,
             )?;
-            return Err(format!(
-                "pr-review stage failed for {}: {}",
-                task.task_id, rev_result.summary
-            ));
+            let gate_checks = task.context_pack.gate_checks.clone();
+            run_stage_checks(
+                store,
+                &mut task,
+                &mut attempt_rec,
+                executor,
+                &worktree_path,
+                &gate_checks,
+            )?;
+
+            let _committed_sha =
+                commit_impl_worktree(store, executor, &mut task, &mut attempt_rec, &worktree_path)?;
+            impl_committed_in_run = true;
         }
 
-        rev_attempt.failure_class = None;
-        store
-            .record_stage_attempt(&rev_attempt)
-            .map_err(|e| e.to_string())?;
-
-        let expected_acs: Vec<String> = task
-            .context_pack
-            .acceptance_criteria
-            .iter()
-            .map(|ac| ac.id.clone())
-            .collect();
-        let review_md = rev_result
-            .review_markdown
-            .as_deref()
-            .unwrap_or(&rev_result.summary);
-        if let Err(err) = validate_pr_review_table(review_md, &expected_acs) {
-            let class = classify_failure_class("pr-review", "FAILED", &err);
-            fail_stage_attempt(store, &mut task, &mut rev_attempt, class, err.clone(), true)?;
-            return Err(err);
-        }
-
-        if !task.stages_completed.iter().any(|s| s == "pr-review") {
-            task.stages_completed.push("pr-review".to_owned());
-        }
-        if let Some(sha) = rev_result
-            .sha_after
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && *s != "head-sha")
-            && rev_result.sha_after != rev_result.sha_before
+        // Stage 2: Cross-model pr-review for weight S
+        if !task.stages_completed.iter().any(|s| s == "pr-review")
+            && (task.weight.eq_ignore_ascii_case("S")
+                || task.required_stages.iter().any(|s| s == "pr-review"))
         {
-            task.reviewed_sha = Some(sha.to_owned());
+            let author_family =
+                resolve_author_family(store, &task.task_id, "impl", impl_author_family)?;
+            match execute_pr_review_gate(
+                store,
+                executor,
+                task,
+                &worktree_path,
+                author_family,
+                impl_committed_in_run,
+            )? {
+                PrReviewOutcome::Approved(updated) => {
+                    task = updated;
+                    break;
+                }
+                PrReviewOutcome::NeedsRework(updated) => {
+                    task = updated;
+                    impl_committed_in_run = false;
+                    continue;
+                }
+                PrReviewOutcome::PausedBlocked(paused) => {
+                    return Ok(paused);
+                }
+            }
         }
+        break;
     }
 
     // Final: Enqueue into FIFO merge queue (path locks remain held until merge completes!)
@@ -1486,6 +2003,7 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
     };
 
     // Stage 1: plan (read-only, no path locks)
+    let mut plan_author_family: Option<ModelFamily> = None;
     if !task.stages_completed.iter().any(|s| s == "plan")
         && (task.required_stages.is_empty() || task.required_stages.iter().any(|s| s == "plan"))
     {
@@ -1503,6 +2021,7 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                 plan_route.effort = effort;
             }
         }
+        plan_author_family = Some(plan_route.family);
 
         check_token_budget(&task, &plan_route)?;
 
@@ -1576,6 +2095,7 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                 );
                 let fb_spec =
                     build_systemd_stage_command(&task, &fb_attempt_id, &fb_route, &plan_prompt)?;
+                plan_author_family = Some(fb_route.family);
                 plan_res = executor.execute_stage(&task, &fb_attempt_id, &fb_route, &fb_spec);
             }
         }
@@ -1611,6 +2131,15 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
             .record_stage_attempt(&plan_rec)
             .map_err(|e| e.to_string())?;
 
+        let plan_text = plan_result
+            .review_output
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(&plan_result.summary);
+        if !plan_text.trim().is_empty() {
+            task.memory.approved_plan =
+                Some(truncate_utf8_bytes(plan_text, MAX_APPROVED_PLAN_BYTES));
+        }
         task.stages_completed.push("plan".to_owned());
         task = store.upsert_task(&task).map_err(|e| e.to_string())?;
     }
@@ -1620,24 +2149,37 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
         && (task.required_stages.is_empty()
             || task.required_stages.iter().any(|s| s == "plan-review"))
     {
-        let rev_route_initial = resolve_stage_route(
+        let plan_author = resolve_author_family(store, &task.task_id, "plan", plan_author_family)?;
+        let rev_route = match resolve_stage_route(
             &task.weight,
             "plan-review",
             task.retry_count,
-            Some(ModelFamily::OpenAiSol),
-        )?
-        .ok_or_else(|| "missing plan-review route".to_owned())?;
-
-        let mut rev_route = rev_route_initial;
-        if rev_route.family == ModelFamily::GeminiAgy && count_agy_infra_failures(&task) >= 2 {
-            rev_route.family = ModelFamily::OpenAiSol;
-            rev_route.model = rev_route
-                .fallback_model
-                .clone()
-                .unwrap_or_else(|| "gpt-6.1-sol".to_owned());
-            if let Some(effort) = rev_route.fallback_effort {
-                rev_route.effort = effort;
+            Some(plan_author),
+        ) {
+            Ok(Some(route)) => route,
+            Ok(None) => return Err("missing plan-review route".to_owned()),
+            Err(err) if is_no_cross_family_reviewer_error(&err) => {
+                return pause_for_missing_cross_family_reviewer(
+                    store,
+                    &mut task,
+                    "plan-review",
+                    plan_author,
+                    &err,
+                );
             }
+            Err(err) => return Err(err),
+        };
+
+        if rev_route.family == ModelFamily::GeminiAgy
+            && count_agy_infra_for_stage(&task, "plan-review") >= 2
+        {
+            return pause_for_missing_cross_family_reviewer(
+                store,
+                &mut task,
+                "plan-review",
+                plan_author,
+                "Gemini AGY plan reviewer unavailable after >= 2 AGY infra failures; refusing same-family fallback",
+            );
         }
 
         check_token_budget(&task, &rev_route)?;
@@ -1684,7 +2226,7 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
             .record_stage_attempt(&rev_rec)
             .map_err(|e| e.to_string())?;
 
-        let mut rev_res = executor.execute_stage(&task, &rev_attempt_id, &rev_route, &rev_spec);
+        let rev_res = executor.execute_stage(&task, &rev_attempt_id, &rev_route, &rev_spec);
 
         if rev_route.family == ModelFamily::GeminiAgy
             && let Some(cls) = classify_agy_infra_failure(&rev_res)
@@ -1695,24 +2237,28 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                     "[AGY_INFRA:{cls}] stage=plan-review attempt={rev_attempt_id} log=attempts/{rev_attempt_id}/stderr.log"
                 ),
             );
-            if count_agy_infra_failures(&task) >= 2 {
-                let fb_route = StageRoute {
-                    family: ModelFamily::OpenAiSol,
-                    model: "gpt-6.1-sol".to_owned(),
-                    effort: ReasoningEffort::High,
-                    fallback_family: None,
-                    fallback_model: None,
-                    fallback_effort: None,
-                    ..rev_route.clone()
+            if count_agy_infra_for_stage(&task, "plan-review") >= 2 {
+                let reason = match &rev_res {
+                    Err(e) => format!("cross-family AGY plan reviewer unavailable ({cls}): {e}"),
+                    Ok(res) => format!(
+                        "cross-family AGY plan reviewer unavailable ({cls}): {}",
+                        res.summary
+                    ),
                 };
-                let fb_attempt_id = format!(
-                    "{}-plan-review-fb-{}",
-                    task.task_id.to_ascii_lowercase(),
-                    task.version
+                rev_rec.ended_epoch = Some(now_epoch());
+                rev_rec.status = "FAILED".to_owned();
+                rev_rec.failure_class = Some(FAILURE_CLASS_INFRA.to_owned());
+                rev_rec.summary = Some(truncate_utf8_bytes(&reason, MAX_SUMMARY_BYTES));
+                store
+                    .record_stage_attempt(&rev_rec)
+                    .map_err(|e| e.to_string())?;
+                return pause_for_missing_cross_family_reviewer(
+                    store,
+                    &mut task,
+                    "plan-review",
+                    plan_author,
+                    &reason,
                 );
-                let fb_spec =
-                    build_systemd_stage_command(&task, &fb_attempt_id, &fb_route, &rev_prompt)?;
-                rev_res = executor.execute_stage(&task, &fb_attempt_id, &fb_route, &fb_spec);
             }
         }
 
@@ -1811,403 +2357,286 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
         }
     }
 
-    // Stage 3: impl (Atomic path_locks acquired before impl and held!)
+    // Stage 3 + 4 loop: impl (Atomic path_locks acquired before impl and held!) -> pr-review (rework on CHANGES_REQUESTED)
+    let mut impl_author_family: Option<ModelFamily> = None;
     let mut impl_committed_in_run = false;
-    if !task.stages_completed.iter().any(|s| s == "impl")
-        && (task.required_stages.is_empty() || task.required_stages.iter().any(|s| s == "impl"))
-    {
-        let lock_paths: Vec<String> = if task.context_pack.target_files.is_empty() {
-            vec!["*".to_owned()]
-        } else {
-            task.context_pack
-                .target_files
-                .iter()
-                .map(|tf| tf.path.clone())
-                .collect()
-        };
-
-        let acquired = store
-            .acquire_path_locks(&task.repository, &lock_paths, &task.task_id)
-            .map_err(|e| e.to_string())?;
-        if !acquired {
-            return Err(format!(
-                "path locks busy for repository '{}' on task {}",
-                task.repository, task.task_id
-            ));
-        }
-
-        let impl_route_initial = resolve_stage_route(&task.weight, "impl", task.retry_count, None)?
-            .ok_or_else(|| "missing impl route".to_owned())?;
-
-        let mut impl_route = impl_route_initial;
-        if impl_route.family == ModelFamily::GeminiAgy && count_agy_infra_failures(&task) >= 2 {
-            impl_route.family = ModelFamily::OpenAiSol;
-            impl_route.model = impl_route
-                .fallback_model
-                .clone()
-                .unwrap_or_else(|| "gpt-6.1-sol".to_owned());
-            if let Some(effort) = impl_route.fallback_effort {
-                impl_route.effort = effort;
-            }
-        }
-
-        check_token_budget(&task, &impl_route)?;
-
-        let impl_attempt_id = format!(
-            "{}-impl-{}",
-            task.task_id.to_ascii_lowercase(),
-            task.version
-        );
-        let impl_prompt = build_impl_prompt(&task, &worktree_path);
-        let impl_spec =
-            build_systemd_stage_command(&task, &impl_attempt_id, &impl_route, &impl_prompt)?;
-
-        task.status = "In Progress".to_owned();
-        task.current_stage = Some("impl".to_owned());
-        task.active_attempt_id = Some(impl_attempt_id.clone());
-        task.executor = Some("zach".to_owned());
-        task = store.upsert_task(&task).map_err(|e| e.to_string())?;
-
-        let started_epoch = now_epoch();
-        let mut attempt_rec = StageAttemptRecord {
-            attempt_id: impl_attempt_id.clone(),
-            task_id: task.task_id.clone(),
-            stage: "impl".to_owned(),
-            model: impl_route.model.clone(),
-            effort: impl_route.effort.as_str().to_owned(),
-            systemd_unit: Some(impl_spec.unit_name.clone()),
-            invocation_id: None,
-            started_epoch,
-            ended_epoch: None,
-            status: "RUNNING".to_owned(),
-            failure_class: None,
-            summary: None,
-            input_tokens: None,
-            output_tokens: None,
-            total_tokens: None,
-            sha_before: None,
-            sha_after: None,
-        };
-        store
-            .record_stage_attempt(&attempt_rec)
-            .map_err(|e| e.to_string())?;
-
-        let mut impl_res = executor.execute_stage(&task, &impl_attempt_id, &impl_route, &impl_spec);
-
-        if impl_route.family == ModelFamily::GeminiAgy
-            && let Some(cls) = classify_agy_infra_failure(&impl_res)
+    loop {
+        if !task.stages_completed.iter().any(|s| s == "impl")
+            && (task.required_stages.is_empty() || task.required_stages.iter().any(|s| s == "impl"))
         {
-            push_bounded_recent_attempt(
-                &mut task,
-                format!(
-                    "[AGY_INFRA:{cls}] stage=impl attempt={impl_attempt_id} log=attempts/{impl_attempt_id}/stderr.log"
-                ),
+            let lock_paths: Vec<String> = if task.context_pack.target_files.is_empty() {
+                vec!["*".to_owned()]
+            } else {
+                task.context_pack
+                    .target_files
+                    .iter()
+                    .map(|tf| tf.path.clone())
+                    .collect()
+            };
+
+            let acquired = store
+                .acquire_path_locks(&task.repository, &lock_paths, &task.task_id)
+                .map_err(|e| e.to_string())?;
+            if !acquired {
+                return Err(format!(
+                    "path locks busy for repository '{}' on task {}",
+                    task.repository, task.task_id
+                ));
+            }
+
+            let impl_route_initial =
+                resolve_stage_route(&task.weight, "impl", task.retry_count, None)?
+                    .ok_or_else(|| "missing impl route".to_owned())?;
+
+            let mut impl_route = impl_route_initial;
+            if impl_route.family == ModelFamily::GeminiAgy && count_agy_infra_failures(&task) >= 2 {
+                impl_route.family = ModelFamily::OpenAiSol;
+                impl_route.model = impl_route
+                    .fallback_model
+                    .clone()
+                    .unwrap_or_else(|| "gpt-6.1-sol".to_owned());
+                if let Some(effort) = impl_route.fallback_effort {
+                    impl_route.effort = effort;
+                }
+            }
+            impl_author_family = Some(impl_route.family);
+
+            check_token_budget(&task, &impl_route)?;
+
+            let impl_attempt_id = format!(
+                "{}-impl-{}",
+                task.task_id.to_ascii_lowercase(),
+                task.version
             );
-            if count_agy_infra_failures(&task) >= 2 {
-                let fb_route = StageRoute {
-                    family: ModelFamily::OpenAiSol,
-                    model: "gpt-6.1-sol".to_owned(),
-                    effort: ReasoningEffort::High,
-                    fallback_family: None,
-                    fallback_model: None,
-                    fallback_effort: None,
-                    ..impl_route.clone()
-                };
-                let fb_attempt_id = format!(
-                    "{}-impl-fb-{}",
-                    task.task_id.to_ascii_lowercase(),
-                    task.version
+            let impl_prompt = build_impl_prompt(&task, &worktree_path);
+            let impl_spec =
+                build_systemd_stage_command(&task, &impl_attempt_id, &impl_route, &impl_prompt)?;
+
+            task.status = "In Progress".to_owned();
+            task.current_stage = Some("impl".to_owned());
+            task.active_attempt_id = Some(impl_attempt_id.clone());
+            task.executor = Some("zach".to_owned());
+            task = store.upsert_task(&task).map_err(|e| e.to_string())?;
+
+            let started_epoch = now_epoch();
+            let mut attempt_rec = StageAttemptRecord {
+                attempt_id: impl_attempt_id.clone(),
+                task_id: task.task_id.clone(),
+                stage: "impl".to_owned(),
+                model: impl_route.model.clone(),
+                effort: impl_route.effort.as_str().to_owned(),
+                systemd_unit: Some(impl_spec.unit_name.clone()),
+                invocation_id: None,
+                started_epoch,
+                ended_epoch: None,
+                status: "RUNNING".to_owned(),
+                failure_class: None,
+                summary: None,
+                input_tokens: None,
+                output_tokens: None,
+                total_tokens: None,
+                sha_before: None,
+                sha_after: None,
+            };
+            store
+                .record_stage_attempt(&attempt_rec)
+                .map_err(|e| e.to_string())?;
+
+            let mut impl_res =
+                executor.execute_stage(&task, &impl_attempt_id, &impl_route, &impl_spec);
+
+            if impl_route.family == ModelFamily::GeminiAgy
+                && let Some(cls) = classify_agy_infra_failure(&impl_res)
+            {
+                push_bounded_recent_attempt(
+                    &mut task,
+                    format!(
+                        "[AGY_INFRA:{cls}] stage=impl attempt={impl_attempt_id} log=attempts/{impl_attempt_id}/stderr.log"
+                    ),
                 );
-                let fb_spec =
-                    build_systemd_stage_command(&task, &fb_attempt_id, &fb_route, &impl_prompt)?;
-                impl_res = executor.execute_stage(&task, &fb_attempt_id, &fb_route, &fb_spec);
+                if count_agy_infra_failures(&task) >= 2 {
+                    let fb_route = StageRoute {
+                        family: ModelFamily::OpenAiSol,
+                        model: "gpt-6.1-sol".to_owned(),
+                        effort: ReasoningEffort::High,
+                        fallback_family: None,
+                        fallback_model: None,
+                        fallback_effort: None,
+                        ..impl_route.clone()
+                    };
+                    let fb_attempt_id = format!(
+                        "{}-impl-fb-{}",
+                        task.task_id.to_ascii_lowercase(),
+                        task.version
+                    );
+                    let fb_spec = build_systemd_stage_command(
+                        &task,
+                        &fb_attempt_id,
+                        &fb_route,
+                        &impl_prompt,
+                    )?;
+                    impl_author_family = Some(fb_route.family);
+                    impl_res = executor.execute_stage(&task, &fb_attempt_id, &fb_route, &fb_spec);
+                }
             }
-        }
 
-        let impl_result = match impl_res {
-            Ok(res) => res,
-            Err(err) => {
-                let class = classify_failure_class("impl", "FAILED", &err);
-                fail_stage_attempt(store, &mut task, &mut attempt_rec, class, err.clone(), true)?;
-                return Err(format!("impl stage failed for {}: {}", task.task_id, err));
+            let impl_result = match impl_res {
+                Ok(res) => res,
+                Err(err) => {
+                    let class = classify_failure_class("impl", "FAILED", &err);
+                    fail_stage_attempt(
+                        store,
+                        &mut task,
+                        &mut attempt_rec,
+                        class,
+                        err.clone(),
+                        true,
+                    )?;
+                    return Err(format!("impl stage failed for {}: {}", task.task_id, err));
+                }
+            };
+
+            apply_stage_result_usage(&mut task, &mut attempt_rec, "impl", &impl_result);
+            attempt_rec.sha_before = impl_result.sha_before.clone();
+            attempt_rec.sha_after = impl_result.sha_after.clone();
+
+            if impl_result.status != "PASSED" {
+                let class =
+                    classify_failure_class("impl", &impl_result.status, &impl_result.summary);
+                fail_stage_attempt(
+                    store,
+                    &mut task,
+                    &mut attempt_rec,
+                    class,
+                    impl_result.summary.clone(),
+                    true,
+                )?;
+                return Err(format!(
+                    "impl stage failed for {}: {}",
+                    task.task_id, impl_result.summary
+                ));
             }
-        };
 
-        apply_stage_result_usage(&mut task, &mut attempt_rec, "impl", &impl_result);
-        attempt_rec.sha_before = impl_result.sha_before.clone();
-        attempt_rec.sha_after = impl_result.sha_after.clone();
+            attempt_rec.failure_class = None;
+            store
+                .record_stage_attempt(&attempt_rec)
+                .map_err(|e| e.to_string())?;
 
-        if impl_result.status != "PASSED" {
-            let class = classify_failure_class("impl", &impl_result.status, &impl_result.summary);
-            fail_stage_attempt(
+            // Mechanical diff verification
+            match verify_worktree_diff_with(
+                &task.repository,
+                &task.weight,
+                &task.context_pack,
+                &impl_result.diff_files,
+                ws_task_bin,
+            ) {
+                Ok(DiffCheckOutcome::Clean) => {}
+                Ok(DiffCheckOutcome::ForbiddenPathViolation { path, pattern }) => {
+                    let err_msg = format!(
+                        "forbidden path violation on {}: {} matches {}",
+                        task.task_id, path, pattern
+                    );
+                    fail_stage_attempt(
+                        store,
+                        &mut task,
+                        &mut attempt_rec,
+                        FAILURE_CLASS_POLICY,
+                        err_msg.clone(),
+                        true,
+                    )?;
+                    return Err(err_msg);
+                }
+                Ok(DiffCheckOutcome::OutOfScopeFiles { files }) => {
+                    let err_msg = format!(
+                        "out-of-scope files modified on {}: {:?}",
+                        task.task_id, files
+                    );
+                    fail_stage_attempt(
+                        store,
+                        &mut task,
+                        &mut attempt_rec,
+                        FAILURE_CLASS_POLICY,
+                        err_msg.clone(),
+                        true,
+                    )?;
+                    return Err(err_msg);
+                }
+                Ok(DiffCheckOutcome::WeightEscalated {
+                    from_weight: _,
+                    to_weight,
+                    required_stages,
+                    reason,
+                }) => {
+                    apply_weight_escalation(&mut task, to_weight, required_stages, &reason);
+                    task = store.upsert_task(&task).map_err(|e| e.to_string())?;
+                }
+                Err(err) => {
+                    fail_stage_attempt(
+                        store,
+                        &mut task,
+                        &mut attempt_rec,
+                        FAILURE_CLASS_INFRA,
+                        err.clone(),
+                        true,
+                    )?;
+                    return Err(err);
+                }
+            }
+
+            let worker_checks = task.context_pack.worker_checks.clone();
+            run_stage_checks(
                 store,
                 &mut task,
                 &mut attempt_rec,
-                class,
-                impl_result.summary.clone(),
-                true,
+                executor,
+                &worktree_path,
+                &worker_checks,
             )?;
-            return Err(format!(
-                "impl stage failed for {}: {}",
-                task.task_id, impl_result.summary
-            ));
-        }
-
-        attempt_rec.failure_class = None;
-        store
-            .record_stage_attempt(&attempt_rec)
-            .map_err(|e| e.to_string())?;
-
-        // Mechanical diff verification
-        match verify_worktree_diff_with(
-            &task.repository,
-            &task.weight,
-            &task.context_pack,
-            &impl_result.diff_files,
-            ws_task_bin,
-        ) {
-            Ok(DiffCheckOutcome::Clean) => {}
-            Ok(DiffCheckOutcome::ForbiddenPathViolation { path, pattern }) => {
-                let err_msg = format!(
-                    "forbidden path violation on {}: {} matches {}",
-                    task.task_id, path, pattern
-                );
-                fail_stage_attempt(
-                    store,
-                    &mut task,
-                    &mut attempt_rec,
-                    FAILURE_CLASS_POLICY,
-                    err_msg.clone(),
-                    true,
-                )?;
-                return Err(err_msg);
-            }
-            Ok(DiffCheckOutcome::OutOfScopeFiles { files }) => {
-                let err_msg = format!(
-                    "out-of-scope files modified on {}: {:?}",
-                    task.task_id, files
-                );
-                fail_stage_attempt(
-                    store,
-                    &mut task,
-                    &mut attempt_rec,
-                    FAILURE_CLASS_POLICY,
-                    err_msg.clone(),
-                    true,
-                )?;
-                return Err(err_msg);
-            }
-            Ok(DiffCheckOutcome::WeightEscalated {
-                from_weight: _,
-                to_weight,
-                required_stages,
-                reason,
-            }) => {
-                apply_weight_escalation(&mut task, to_weight, required_stages, &reason);
-                task = store.upsert_task(&task).map_err(|e| e.to_string())?;
-            }
-            Err(err) => {
-                fail_stage_attempt(
-                    store,
-                    &mut task,
-                    &mut attempt_rec,
-                    FAILURE_CLASS_INFRA,
-                    err.clone(),
-                    true,
-                )?;
-                return Err(err);
-            }
-        }
-
-        let worker_checks = task.context_pack.worker_checks.clone();
-        run_stage_checks(
-            store,
-            &mut task,
-            &mut attempt_rec,
-            executor,
-            &worktree_path,
-            &worker_checks,
-        )?;
-        let gate_checks = task.context_pack.gate_checks.clone();
-        run_stage_checks(
-            store,
-            &mut task,
-            &mut attempt_rec,
-            executor,
-            &worktree_path,
-            &gate_checks,
-        )?;
-
-        let _committed_sha =
-            commit_impl_worktree(store, executor, &mut task, &mut attempt_rec, &worktree_path)?;
-        impl_committed_in_run = true;
-    }
-
-    // Stage 4: pr-review (Cross-model review, path_locks remain held!)
-    if !task.stages_completed.iter().any(|s| s == "pr-review")
-        && (task.required_stages.is_empty()
-            || task.required_stages.iter().any(|s| s == "pr-review"))
-    {
-        let rev_route_initial = resolve_stage_route(
-            &task.weight,
-            "pr-review",
-            task.retry_count,
-            Some(ModelFamily::OpenAiSol),
-        )?
-        .ok_or_else(|| "missing pr-review route".to_owned())?;
-
-        let mut rev_route = rev_route_initial;
-        if rev_route.family == ModelFamily::GeminiAgy && count_agy_infra_failures(&task) >= 2 {
-            rev_route.family = ModelFamily::OpenAiSol;
-            rev_route.model = rev_route
-                .fallback_model
-                .clone()
-                .unwrap_or_else(|| "gpt-6.1-sol".to_owned());
-            if let Some(effort) = rev_route.fallback_effort {
-                rev_route.effort = effort;
-            }
-        }
-
-        check_token_budget(&task, &rev_route)?;
-
-        let rev_attempt_id = format!(
-            "{}-pr-review-{}",
-            task.task_id.to_ascii_lowercase(),
-            task.version
-        );
-        let rev_prompt = build_pr_review_prompt(&task, &worktree_path);
-        let rev_spec =
-            build_systemd_stage_command(&task, &rev_attempt_id, &rev_route, &rev_prompt)?;
-
-        task.status = "PR Review".to_owned();
-        task.current_stage = Some("pr-review".to_owned());
-        task.active_attempt_id = Some(rev_attempt_id.clone());
-        task = store.upsert_task(&task).map_err(|e| e.to_string())?;
-
-        let rev_started = now_epoch();
-        let mut rev_rec = StageAttemptRecord {
-            attempt_id: rev_attempt_id.clone(),
-            task_id: task.task_id.clone(),
-            stage: "pr-review".to_owned(),
-            model: rev_route.model.clone(),
-            effort: rev_route.effort.as_str().to_owned(),
-            systemd_unit: Some(rev_spec.unit_name.clone()),
-            invocation_id: None,
-            started_epoch: rev_started,
-            ended_epoch: None,
-            status: "RUNNING".to_owned(),
-            failure_class: None,
-            summary: None,
-            input_tokens: None,
-            output_tokens: None,
-            total_tokens: None,
-            sha_before: task.reviewed_sha.clone(),
-            sha_after: task.reviewed_sha.clone(),
-        };
-        store
-            .record_stage_attempt(&rev_rec)
-            .map_err(|e| e.to_string())?;
-
-        let mut rev_res = executor.execute_stage(&task, &rev_attempt_id, &rev_route, &rev_spec);
-
-        if rev_route.family == ModelFamily::GeminiAgy
-            && let Some(cls) = classify_agy_infra_failure(&rev_res)
-        {
-            push_bounded_recent_attempt(
-                &mut task,
-                format!(
-                    "[AGY_INFRA:{cls}] stage=pr-review attempt={rev_attempt_id} log=attempts/{rev_attempt_id}/stderr.log"
-                ),
-            );
-            if count_agy_infra_failures(&task) >= 2 {
-                let fb_route = StageRoute {
-                    family: ModelFamily::OpenAiSol,
-                    model: "gpt-6.1-sol".to_owned(),
-                    effort: ReasoningEffort::High,
-                    fallback_family: None,
-                    fallback_model: None,
-                    fallback_effort: None,
-                    ..rev_route.clone()
-                };
-                let fb_attempt_id = format!(
-                    "{}-pr-review-fb-{}",
-                    task.task_id.to_ascii_lowercase(),
-                    task.version
-                );
-                let fb_spec =
-                    build_systemd_stage_command(&task, &fb_attempt_id, &fb_route, &rev_prompt)?;
-                rev_res = executor.execute_stage(&task, &fb_attempt_id, &fb_route, &fb_spec);
-            }
-        }
-
-        let rev_result = match rev_res {
-            Ok(res) => res,
-            Err(err) => {
-                let class = classify_failure_class("pr-review", "FAILED", &err);
-                fail_stage_attempt(store, &mut task, &mut rev_rec, class, err.clone(), true)?;
-                return Err(format!(
-                    "pr-review stage failed for {}: {}",
-                    task.task_id, err
-                ));
-            }
-        };
-
-        apply_stage_result_usage(&mut task, &mut rev_rec, "pr-review", &rev_result);
-        if let Some(ref sha) = rev_result.sha_after
-            && !sha.trim().is_empty()
-        {
-            rev_rec.sha_after = Some(sha.clone());
-        }
-
-        if rev_result.status != "PASSED" {
-            let class =
-                classify_failure_class("pr-review", &rev_result.status, &rev_result.summary);
-            fail_stage_attempt(
+            let gate_checks = task.context_pack.gate_checks.clone();
+            run_stage_checks(
                 store,
                 &mut task,
-                &mut rev_rec,
-                class,
-                rev_result.summary.clone(),
-                true,
+                &mut attempt_rec,
+                executor,
+                &worktree_path,
+                &gate_checks,
             )?;
-            return Err(format!(
-                "pr-review stage failed for {}: {}",
-                task.task_id, rev_result.summary
-            ));
+
+            let _committed_sha =
+                commit_impl_worktree(store, executor, &mut task, &mut attempt_rec, &worktree_path)?;
+            impl_committed_in_run = true;
         }
 
-        rev_rec.failure_class = None;
-        store
-            .record_stage_attempt(&rev_rec)
-            .map_err(|e| e.to_string())?;
-
-        let expected_acs: Vec<String> = task
-            .context_pack
-            .acceptance_criteria
-            .iter()
-            .map(|ac| ac.id.clone())
-            .collect();
-        let review_md = rev_result
-            .review_markdown
-            .as_deref()
-            .unwrap_or(&rev_result.summary);
-        if let Err(err) = validate_pr_review_table(review_md, &expected_acs) {
-            let class = classify_failure_class("pr-review", "FAILED", &err);
-            fail_stage_attempt(store, &mut task, &mut rev_rec, class, err.clone(), true)?;
-            return Err(err);
-        }
-
-        task.stages_completed.push("pr-review".to_owned());
-        if let Some(sha) = rev_result
-            .sha_after
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && *s != "head-sha")
-            && (!impl_committed_in_run || rev_result.sha_after != rev_result.sha_before)
+        // Stage 4: pr-review (Cross-model review, path_locks remain held!)
+        if !task.stages_completed.iter().any(|s| s == "pr-review")
+            && (task.required_stages.is_empty()
+                || task.required_stages.iter().any(|s| s == "pr-review"))
         {
-            task.reviewed_sha = Some(sha.to_owned());
+            let author_family =
+                resolve_author_family(store, &task.task_id, "impl", impl_author_family)?;
+            match execute_pr_review_gate(
+                store,
+                executor,
+                task,
+                &worktree_path,
+                author_family,
+                impl_committed_in_run,
+            )? {
+                PrReviewOutcome::Approved(updated) => {
+                    task = updated;
+                    break;
+                }
+                PrReviewOutcome::NeedsRework(updated) => {
+                    task = updated;
+                    impl_committed_in_run = false;
+                    continue;
+                }
+                PrReviewOutcome::PausedBlocked(paused) => {
+                    return Ok(paused);
+                }
+            }
         }
-        task = store.upsert_task(&task).map_err(|e| e.to_string())?;
+        break;
     }
 
     // Human Gate 2: human-merge-approval for L tasks (check live task.weight after any M->L escalation)
@@ -2569,6 +2998,26 @@ print(json.dumps({
         assert!(store.list_path_locks(Some(repo)).unwrap().is_empty());
     }
 
+    fn approved_verdict_json(ac_id: &str, file_line: &str) -> String {
+        let (file, line_str) = file_line
+            .rsplit_once(':')
+            .expect("test file_line must be path:line");
+        let line: u32 = line_str.parse().expect("valid line number");
+        serde_json::json!({
+            "verdict": "APPROVED",
+            "ac_results": [{
+                "id": ac_id,
+                "status": "PASS",
+                "file": file,
+                "line": line,
+                "evidence": "cargo test"
+            }],
+            "findings": [],
+            "summary": "All acceptance criteria verified against the reviewed diff."
+        })
+        .to_string()
+    }
+
     #[test]
     fn execute_xs_s_pipeline_drives_s_task_through_impl_and_cross_model_pr_review() {
         let mut store = V2Store::open_in_memory().expect("in-memory store");
@@ -2607,6 +3056,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "Implemented router and runner".to_owned(),
                     review_markdown: None,
+                    review_output: None,
                     invocation_id: Some("inv-1".to_owned()),
                     input_tokens: Some(12_000),
                     output_tokens: Some(3_000),
@@ -2623,12 +3073,8 @@ print(json.dumps({
                 StageExecutionResult {
                     status: "PASSED".to_owned(),
                     summary: "PR Review LGTM".to_owned(),
-                    review_markdown: Some(
-                        "| AC | Criterion | Code (file:line) | Test | Status |\n\
-                         |---|---|---|---|---|\n\
-                         | AC-1 | Router maps models deterministically | src/v2/router.rs:102 | router::tests::router_enforces_cross_model_review_family_separation_and_retry_escalation | PASS |\n"
-                            .to_owned(),
-                    ),
+                    review_markdown: None,
+                    review_output: Some(approved_verdict_json("AC-1", "src/v2/router.rs:10")),
                     invocation_id: Some("inv-2".to_owned()),
                     input_tokens: Some(8_000),
                     output_tokens: Some(1_500),
@@ -2719,6 +3165,7 @@ print(json.dumps({
                 status: "PASSED".to_owned(),
                 summary: "Implemented XS change".to_owned(),
                 review_markdown: None,
+                review_output: None,
                 invocation_id: Some("inv-xs-1".to_owned()),
                 input_tokens: Some(4_000),
                 output_tokens: Some(800),
@@ -2807,6 +3254,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "Architectural plan generated".to_owned(),
                     review_markdown: None,
+                    review_output: None,
                     invocation_id: Some("inv-plan".to_owned()),
                     input_tokens: Some(10_000),
                     output_tokens: Some(2_000),
@@ -2820,6 +3268,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "Plan review approved".to_owned(),
                     review_markdown: None,
+                    review_output: None,
                     invocation_id: Some("inv-plan-review".to_owned()),
                     input_tokens: Some(8_000),
                     output_tokens: Some(1_000),
@@ -2833,6 +3282,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "Implementation complete".to_owned(),
                     review_markdown: None,
+                    review_output: None,
                     invocation_id: Some("inv-impl".to_owned()),
                     input_tokens: Some(15_000),
                     output_tokens: Some(3_000),
@@ -2850,12 +3300,8 @@ print(json.dumps({
                 StageExecutionResult {
                     status: "PASSED".to_owned(),
                     summary: "PR review verified".to_owned(),
-                    review_markdown: Some(
-                        "| AC | Criterion | Code (file:line) | Test | Status |\n\
-                         |---|---|---|---|---|\n\
-                         | AC-1 | Router maps models deterministically | src/v2/router.rs:102 | router::tests::router_enforces_cross_model_review_family_separation_and_retry_escalation | PASS |\n"
-                            .to_owned(),
-                    ),
+                    review_markdown: None,
+                    review_output: Some(approved_verdict_json("AC-1", "src/v2/router.rs:10")),
                     invocation_id: Some("inv-pr-rev".to_owned()),
                     input_tokens: Some(12_000),
                     output_tokens: Some(2_000),
@@ -2948,6 +3394,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "L Plan".to_owned(),
                     review_markdown: None,
+                    review_output: None,
                     invocation_id: None,
                     input_tokens: Some(1_000),
                     output_tokens: Some(500),
@@ -2961,6 +3408,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "L Plan Review".to_owned(),
                     review_markdown: None,
+                    review_output: None,
                     invocation_id: None,
                     input_tokens: Some(1_000),
                     output_tokens: Some(500),
@@ -3006,6 +3454,7 @@ print(json.dumps({
             status: "PASSED".to_owned(),
             summary: "L Impl".to_owned(),
             review_markdown: None,
+            review_output: None,
             invocation_id: None,
             input_tokens: Some(5_000),
             output_tokens: Some(1_000),
@@ -3022,12 +3471,8 @@ print(json.dumps({
         mock.staged_results.push(StageExecutionResult {
             status: "PASSED".to_owned(),
             summary: "L PR Review".to_owned(),
-            review_markdown: Some(
-                "| AC | Criterion | Code (file:line) | Test | Status |\n\
-                 |---|---|---|---|---|\n\
-                 | AC-1 | Router maps models deterministically | src/v2/router.rs:102 | test:1 | PASS |\n"
-                    .to_owned(),
-            ),
+            review_markdown: None,
+            review_output: Some(approved_verdict_json("AC-1", "src/v2/router.rs:10")),
             invocation_id: None,
             input_tokens: Some(5_000),
             output_tokens: Some(1_000),
@@ -3190,6 +3635,7 @@ print(json.dumps({
                 status: "PASSED".to_owned(),
                 summary: "Fallback succeeded".to_owned(),
                 review_markdown: None,
+                review_output: None,
                 invocation_id: None,
                 input_tokens: Some(1_000),
                 output_tokens: Some(500),
@@ -3218,29 +3664,650 @@ print(json.dumps({
     }
 
     #[test]
-    fn validate_pr_review_table_accepts_met_and_verified() {
+    fn validate_review_verdict_enforces_schema_acs_and_diff_hunks() {
+        let mut files = std::collections::BTreeMap::new();
+        files.insert(
+            "src/v2/router.rs".to_owned(),
+            vec![crate::v2::runner::LineRange { start: 10, end: 25 }],
+        );
+        let diff_ctx = crate::v2::runner::ReviewedDiffContext {
+            merge_base_sha: "abc1234".to_owned(),
+            reviewed_sha: "def5678".to_owned(),
+            commit_range: "abc1234..def5678".to_owned(),
+            files,
+            diff_excerpt: String::new(),
+        };
+        let expected = vec!["AC-1".to_owned(), "AC-2".to_owned()];
+
+        // 1. Valid APPROVED verdict citing diff hunk lines passes
+        let valid_json = serde_json::json!({
+            "verdict": "APPROVED",
+            "ac_results": [
+                {
+                    "id": "AC-1",
+                    "status": "PASS",
+                    "file": "src/v2/router.rs",
+                    "line": 10,
+                    "evidence": "cargo test"
+                },
+                {
+                    "id": "AC-2",
+                    "status": "PASS",
+                    "file": "./src/v2/router.rs",
+                    "line": 25,
+                    "evidence": "cargo test"
+                }
+            ],
+            "findings": [],
+            "summary": "Verified cleanly."
+        })
+        .to_string();
+        assert!(validate_review_verdict(&valid_json, &expected, &diff_ctx, "").is_ok());
+
+        // 2. Markdown table or free-form prose is rejected (AC-2)
         let md = "\
 | AC | Criterion | Code (file:line) | Test | Status |
 |---|---|---|---|---|
-| AC-1 | Feature works | src/lib.rs:10 | cargo test | Met |
-| AC-2 | API works | src/api.rs:20 | cargo test | Verified |
+| AC-1 | Feature works | src/v2/router.rs:10 | cargo test | PASS |
 ";
-        let expected = vec!["AC-1".to_owned(), "AC-2".to_owned()];
-        assert!(validate_pr_review_table(md, &expected).is_ok());
+        assert!(validate_review_verdict(md, &["AC-1".to_owned()], &diff_ctx, "").is_err());
+
+        // 3. Extra unknown fields are rejected by #[serde(deny_unknown_fields)] (AC-2)
+        let extra_field = serde_json::json!({
+            "verdict": "APPROVED",
+            "ac_results": [{
+                "id": "AC-1",
+                "status": "PASS",
+                "file": "src/v2/router.rs",
+                "line": 12,
+                "evidence": "cargo test"
+            }],
+            "findings": [],
+            "summary": "ok",
+            "unexpected": true
+        })
+        .to_string();
+        assert!(
+            validate_review_verdict(&extra_field, &["AC-1".to_owned()], &diff_ctx, "").is_err()
+        );
+
+        // 4. Cited line outside reviewed diff hunks is rejected (AC-3)
+        let outside_line = serde_json::json!({
+            "verdict": "APPROVED",
+            "ac_results": [{
+                "id": "AC-1",
+                "status": "PASS",
+                "file": "src/v2/router.rs",
+                "line": 99,
+                "evidence": "cargo test"
+            }],
+            "findings": [],
+            "summary": "bad line"
+        })
+        .to_string();
+        let err = validate_review_verdict(&outside_line, &["AC-1".to_owned()], &diff_ctx, "")
+            .unwrap_err();
+        assert!(
+            err.contains("outside reviewed diff hunks"),
+            "unexpected err: {err}"
+        );
+
+        // 5. Finding citing file:line outside reviewed diff hunks is rejected (AC-3)
+        let bad_finding = serde_json::json!({
+            "verdict": "CHANGES_REQUESTED",
+            "ac_results": [{
+                "id": "AC-1",
+                "status": "FAIL",
+                "file": "src/v2/router.rs",
+                "line": 12,
+                "evidence": "cargo test"
+            }],
+            "findings": [{
+                "severity": "blocking",
+                "file": "src/other.rs",
+                "line": 1,
+                "summary": "Untouched file"
+            }],
+            "summary": "needs fix"
+        })
+        .to_string();
+        assert!(
+            validate_review_verdict(&bad_finding, &["AC-1".to_owned()], &diff_ctx, "").is_err()
+        );
+
+        // 6. APPROVED with FAIL ac_result or blocking finding is rejected
+        let approved_with_fail = serde_json::json!({
+            "verdict": "APPROVED",
+            "ac_results": [{
+                "id": "AC-1",
+                "status": "FAIL",
+                "file": "src/v2/router.rs",
+                "line": 12,
+                "evidence": "cargo test"
+            }],
+            "findings": [],
+            "summary": "contradictory"
+        })
+        .to_string();
+        assert!(
+            validate_review_verdict(&approved_with_fail, &["AC-1".to_owned()], &diff_ctx, "")
+                .is_err()
+        );
     }
 
     #[test]
-    fn validate_pr_review_table_handles_escaped_newlines() {
-        let escaped = "Summary\\n\\n| AC | Criterion | Code (file:line) | Test | Status |\\n|---|---|---|---|---|\\n| AC-1 | Feature works | src/lib.rs:10 | cargo test | PASS |\\n";
-        let expected = vec!["AC-1".to_owned()];
-        assert!(validate_pr_review_table(escaped, &expected).is_ok());
+    fn ac1_pr_review_and_impl_prompts_include_context_and_stay_bounded() {
+        let mut task = sample_s_task("ZACH-026-AC1");
+        task.memory.approved_plan = Some(format!("Plan step: {}", "p".repeat(5000)));
+        task.memory.last_review_findings = Some(format!("Blocking: {}", "f".repeat(2000)));
+        task.memory.last_check_failure = Some("cargo test failed on test_x".to_owned());
+
+        let mut files = std::collections::BTreeMap::new();
+        files.insert(
+            "src/v2/router.rs".to_owned(),
+            vec![crate::v2::runner::LineRange { start: 10, end: 25 }],
+        );
+        let diff_ctx = crate::v2::runner::ReviewedDiffContext {
+            merge_base_sha: "abc1234".to_owned(),
+            reviewed_sha: "def5678".to_owned(),
+            commit_range: "abc1234..def5678".to_owned(),
+            files,
+            diff_excerpt: format!("+changed\n{}", "+x".repeat(20_000)),
+        };
+
+        let impl_prompt = build_impl_prompt(&task, "/tmp/wt");
+        assert!(impl_prompt.contains("## Approved Plan:"));
+        assert!(impl_prompt.contains("## Prior Review Findings"));
+        assert!(impl_prompt.contains("## Prior Check Failure:"));
+        assert!(impl_prompt.len() <= MAX_WORKER_PROMPT_BYTES);
+
+        let rev_prompt = build_pr_review_prompt(&task, "/tmp/wt", &diff_ctx);
+        assert!(rev_prompt.contains("abc1234..def5678"));
+        assert!(rev_prompt.contains("src/v2/router.rs: lines [10-25]"));
+        assert!(rev_prompt.contains("AC-1"));
+        assert!(rev_prompt.contains("## Approved Plan:"));
+        assert!(rev_prompt.contains("\"ac_results\""));
+        assert!(rev_prompt.contains("\"findings\""));
+        assert!(rev_prompt.len() <= MAX_WORKER_PROMPT_BYTES);
     }
 
     #[test]
-    fn validate_pr_review_table_unwraps_nested_json() {
-        let nested_json = r#"{"run_id":"test-123","review_markdown":"{\"status\":\"completed\",\"summary\":\"| AC | Criterion | Code (file:line) | Test | Status |\\n|---|---|---|---|---|\\n| AC-1 | Works | src/main.rs:1 | test_main | PASS |\\n\"}"}"#;
-        let expected = vec!["AC-1".to_owned()];
-        assert!(validate_pr_review_table(nested_json, &expected).is_ok());
+    fn ac2_parse_agy_cli_response_preserves_full_review_verdict_json_beyond_summary_cap() {
+        let long_evidence = "cargo test --locked passed all 226 cases cleanly; ".repeat(30);
+        let full_verdict_json = serde_json::json!({
+            "verdict": "APPROVED",
+            "ac_results": [{
+                "id": "AC-1",
+                "status": "PASS",
+                "file": "src/v2/router.rs",
+                "line": 12,
+                "evidence": long_evidence
+            }],
+            "findings": [],
+            "summary": "Verified complete implementation against AC-1."
+        })
+        .to_string();
+        assert!(full_verdict_json.len() > MAX_SUMMARY_BYTES);
+
+        let truncated_summary = truncate_utf8_bytes(&full_verdict_json, MAX_SUMMARY_BYTES);
+        let agy_payload = serde_json::json!({
+            "execution_succeeded": true,
+            "summary": truncated_summary,
+            "response": full_verdict_json,
+            "usage": {
+                "input_tokens": 2000,
+                "output_tokens": 500,
+                "total_tokens": 2500
+            }
+        })
+        .to_string();
+
+        let parsed = parse_agy_cli_response(&agy_payload, "", Some(0)).unwrap();
+        assert_eq!(parsed.status, "PASSED");
+        assert!(parsed.summary.len() <= MAX_SUMMARY_BYTES);
+        assert_eq!(
+            parsed.review_output.as_deref(),
+            Some(full_verdict_json.as_str())
+        );
+
+        let mut files = std::collections::BTreeMap::new();
+        files.insert(
+            "src/v2/router.rs".to_owned(),
+            vec![crate::v2::runner::LineRange { start: 10, end: 20 }],
+        );
+        let diff_ctx = crate::v2::runner::ReviewedDiffContext {
+            merge_base_sha: "abc".to_owned(),
+            reviewed_sha: "def".to_owned(),
+            commit_range: "abc..def".to_owned(),
+            files,
+            diff_excerpt: String::new(),
+        };
+        let verdict = validate_review_verdict(
+            parsed.review_output.as_deref().unwrap(),
+            &["AC-1".to_owned()],
+            &diff_ctx,
+            "",
+        )
+        .expect("untruncated review_output should validate cleanly");
+        assert_eq!(verdict.verdict, "APPROVED");
+    }
+
+    #[test]
+    fn ac4_changes_requested_rework_loops_for_s_and_m_and_blocks_at_limit() {
+        let ws_stub = StubWsTask::passthrough_clean("zach-026-ac4");
+        let changes_requested_json = serde_json::json!({
+            "verdict": "CHANGES_REQUESTED",
+            "ac_results": [{
+                "id": "AC-1",
+                "status": "FAIL",
+                "file": "src/v2/router.rs",
+                "line": 10,
+                "evidence": "Missing edge case handling"
+            }],
+            "findings": [{
+                "severity": "blocking",
+                "file": "src/v2/router.rs",
+                "line": 12,
+                "summary": "Handle empty route fallback cleanly"
+            }],
+            "summary": "Fix blocking finding before merge."
+        })
+        .to_string();
+
+        // 1. S pipeline: impl -> pr-review (CHANGES_REQUESTED) -> rework impl -> pr-review (APPROVED)
+        let mut s_store = V2Store::open_in_memory().expect("open store");
+        s_store
+            .upsert_task(&sample_s_task("ZACH-026-S-REWORK"))
+            .unwrap();
+        let mut s_mock = MockStageExecutor {
+            staged_results: vec![
+                StageExecutionResult {
+                    status: "PASSED".to_owned(),
+                    summary: "Initial impl".to_owned(),
+                    review_markdown: None,
+                    review_output: None,
+                    invocation_id: Some("impl-1".to_owned()),
+                    input_tokens: Some(1_000),
+                    output_tokens: Some(200),
+                    total_tokens: Some(1_200),
+                    sha_before: Some("abc1234".to_owned()),
+                    sha_after: Some("sha-impl-1".to_owned()),
+                    diff_files: vec![DiffFileEntry {
+                        path: "src/v2/router.rs".to_owned(),
+                        status: "M".to_owned(),
+                        added_lines: 10,
+                        deleted_lines: 1,
+                    }],
+                },
+                StageExecutionResult {
+                    status: "PASSED".to_owned(),
+                    summary: "Requested changes".to_owned(),
+                    review_markdown: None,
+                    review_output: Some(changes_requested_json.clone()),
+                    invocation_id: Some("rev-1".to_owned()),
+                    input_tokens: Some(500),
+                    output_tokens: Some(100),
+                    total_tokens: Some(600),
+                    sha_before: Some("mock-committed-sha".to_owned()),
+                    sha_after: Some("mock-committed-sha".to_owned()),
+                    diff_files: Vec::new(),
+                },
+                StageExecutionResult {
+                    status: "PASSED".to_owned(),
+                    summary: "Rework impl".to_owned(),
+                    review_markdown: None,
+                    review_output: None,
+                    invocation_id: Some("impl-2".to_owned()),
+                    input_tokens: Some(1_000),
+                    output_tokens: Some(200),
+                    total_tokens: Some(1_200),
+                    sha_before: Some("mock-committed-sha".to_owned()),
+                    sha_after: Some("sha-impl-2".to_owned()),
+                    diff_files: vec![DiffFileEntry {
+                        path: "src/v2/router.rs".to_owned(),
+                        status: "M".to_owned(),
+                        added_lines: 12,
+                        deleted_lines: 1,
+                    }],
+                },
+                StageExecutionResult {
+                    status: "PASSED".to_owned(),
+                    summary: "Approved rework".to_owned(),
+                    review_markdown: None,
+                    review_output: Some(approved_verdict_json("AC-1", "src/v2/router.rs:10")),
+                    invocation_id: Some("rev-2".to_owned()),
+                    input_tokens: Some(500),
+                    output_tokens: Some(100),
+                    total_tokens: Some(600),
+                    sha_before: Some("mock-committed-sha".to_owned()),
+                    sha_after: Some("mock-committed-sha".to_owned()),
+                    diff_files: Vec::new(),
+                },
+            ],
+            committed_sha_to_return: Some("mock-committed-sha".to_owned()),
+            ..MockStageExecutor::default()
+        };
+        let s_done = execute_xs_s_pipeline_with_executor_and_ws_task(
+            &mut s_store,
+            "ZACH-026-S-REWORK",
+            &mut s_mock,
+            ws_stub.path(),
+        )
+        .expect("S rework loop should succeed");
+        assert_eq!(s_done.status, "Queued for Merge");
+        assert_eq!(s_done.retry_count, 0);
+        assert_eq!(s_done.memory.review_rework_count, 1);
+        assert_eq!(s_done.memory.last_review_findings, None);
+        assert_eq!(s_mock.executed_specs.len(), 4);
+        assert!(s_mock.executed_specs[1].output_schema_json.is_some());
+        assert!(
+            s_mock.executed_specs[2]
+                .prompt
+                .contains("Handle empty route fallback cleanly")
+        );
+        let s_attempts = s_store.list_stage_attempts("ZACH-026-S-REWORK").unwrap();
+        assert!(s_attempts.iter().all(|a| a.status == "PASSED"));
+
+        // 2. M pipeline: plan populates approved_plan -> plan-review -> impl -> pr-review (CHANGES_REQUESTED) -> rework impl -> pr-review (APPROVED)
+        let mut m_store = V2Store::open_in_memory().expect("open store");
+        let mut m_task = sample_s_task("ZACH-026-M-REWORK");
+        m_task.weight = "M".to_owned();
+        m_task.context_pack = sample_context_pack("M");
+        m_task.required_stages = vec![
+            "plan".to_owned(),
+            "plan-review".to_owned(),
+            "impl".to_owned(),
+            "pr-review".to_owned(),
+        ];
+        m_store.upsert_task(&m_task).unwrap();
+        let long_plan = format!("Step 1: update router {}", "x".repeat(3000));
+        let mut m_mock = MockStageExecutor {
+            staged_results: vec![
+                StageExecutionResult {
+                    status: "PASSED".to_owned(),
+                    summary: "Plan done".to_owned(),
+                    review_markdown: None,
+                    review_output: Some(long_plan),
+                    invocation_id: None,
+                    input_tokens: Some(500),
+                    output_tokens: Some(100),
+                    total_tokens: Some(600),
+                    sha_before: None,
+                    sha_after: None,
+                    diff_files: Vec::new(),
+                },
+                StageExecutionResult {
+                    status: "PASSED".to_owned(),
+                    summary: "Plan approved".to_owned(),
+                    review_markdown: None,
+                    review_output: None,
+                    invocation_id: None,
+                    input_tokens: Some(500),
+                    output_tokens: Some(100),
+                    total_tokens: Some(600),
+                    sha_before: None,
+                    sha_after: None,
+                    diff_files: Vec::new(),
+                },
+                StageExecutionResult {
+                    status: "PASSED".to_owned(),
+                    summary: "Impl 1".to_owned(),
+                    review_markdown: None,
+                    review_output: None,
+                    invocation_id: None,
+                    input_tokens: Some(500),
+                    output_tokens: Some(100),
+                    total_tokens: Some(600),
+                    sha_before: Some("abc".to_owned()),
+                    sha_after: Some("sha-1".to_owned()),
+                    diff_files: vec![DiffFileEntry {
+                        path: "src/v2/router.rs".to_owned(),
+                        status: "M".to_owned(),
+                        added_lines: 10,
+                        deleted_lines: 1,
+                    }],
+                },
+                StageExecutionResult {
+                    status: "PASSED".to_owned(),
+                    summary: "Changes requested".to_owned(),
+                    review_markdown: None,
+                    review_output: Some(changes_requested_json.clone()),
+                    invocation_id: None,
+                    input_tokens: Some(500),
+                    output_tokens: Some(100),
+                    total_tokens: Some(600),
+                    sha_before: Some("sha-m-1".to_owned()),
+                    sha_after: Some("sha-m-1".to_owned()),
+                    diff_files: Vec::new(),
+                },
+                StageExecutionResult {
+                    status: "PASSED".to_owned(),
+                    summary: "Impl 2".to_owned(),
+                    review_markdown: None,
+                    review_output: None,
+                    invocation_id: None,
+                    input_tokens: Some(500),
+                    output_tokens: Some(100),
+                    total_tokens: Some(600),
+                    sha_before: Some("sha-m-1".to_owned()),
+                    sha_after: Some("sha-2".to_owned()),
+                    diff_files: vec![DiffFileEntry {
+                        path: "src/v2/router.rs".to_owned(),
+                        status: "M".to_owned(),
+                        added_lines: 10,
+                        deleted_lines: 1,
+                    }],
+                },
+                StageExecutionResult {
+                    status: "PASSED".to_owned(),
+                    summary: "Approved".to_owned(),
+                    review_markdown: None,
+                    review_output: Some(approved_verdict_json("AC-1", "src/v2/router.rs:10")),
+                    invocation_id: None,
+                    input_tokens: Some(500),
+                    output_tokens: Some(100),
+                    total_tokens: Some(600),
+                    sha_before: Some("sha-m-2".to_owned()),
+                    sha_after: Some("sha-m-2".to_owned()),
+                    diff_files: Vec::new(),
+                },
+            ],
+            committed_sha_to_return: Some("sha-m-rework".to_owned()),
+            ..MockStageExecutor::default()
+        };
+        let m_done = execute_m_l_pipeline_with_executor_and_ws_task(
+            &mut m_store,
+            "ZACH-026-M-REWORK",
+            &mut m_mock,
+            ws_stub.path(),
+        )
+        .expect("M rework loop should succeed");
+        assert_eq!(m_done.status, "Queued for Merge");
+        assert_eq!(m_done.retry_count, 0);
+        assert_eq!(m_done.memory.review_rework_count, 1);
+        let saved_plan = m_done.memory.approved_plan.as_deref().unwrap();
+        assert!(saved_plan.contains("Step 1: update router"));
+        assert!(saved_plan.len() <= MAX_APPROVED_PLAN_BYTES);
+        assert!(
+            m_mock.executed_specs[3]
+                .prompt
+                .contains("Step 1: update router")
+        );
+        assert!(
+            m_mock.executed_specs[4]
+                .prompt
+                .contains("Handle empty route fallback cleanly")
+        );
+
+        // 3. Exceeding MAX_REVIEW_REWORK_LOOPS pauses cleanly as Blocked with DECISION_REQUIRED and keeps path locks
+        let mut limit_store = V2Store::open_in_memory().expect("open store");
+        let mut limit_task = sample_s_task("ZACH-026-REWORK-LIMIT");
+        limit_task.memory.review_rework_count = MAX_REVIEW_REWORK_LOOPS;
+        limit_store.upsert_task(&limit_task).unwrap();
+        let mut limit_mock = MockStageExecutor {
+            staged_results: vec![
+                StageExecutionResult {
+                    status: "PASSED".to_owned(),
+                    summary: "Impl".to_owned(),
+                    review_markdown: None,
+                    review_output: None,
+                    invocation_id: None,
+                    input_tokens: Some(500),
+                    output_tokens: Some(100),
+                    total_tokens: Some(600),
+                    sha_before: Some("abc".to_owned()),
+                    sha_after: Some("sha-limit".to_owned()),
+                    diff_files: vec![DiffFileEntry {
+                        path: "src/v2/router.rs".to_owned(),
+                        status: "M".to_owned(),
+                        added_lines: 10,
+                        deleted_lines: 1,
+                    }],
+                },
+                StageExecutionResult {
+                    status: "PASSED".to_owned(),
+                    summary: "Still needs changes".to_owned(),
+                    review_markdown: None,
+                    review_output: Some(changes_requested_json),
+                    invocation_id: None,
+                    input_tokens: Some(500),
+                    output_tokens: Some(100),
+                    total_tokens: Some(600),
+                    sha_before: Some("sha-limit".to_owned()),
+                    sha_after: Some("sha-limit".to_owned()),
+                    diff_files: Vec::new(),
+                },
+            ],
+            committed_sha_to_return: Some("sha-limit".to_owned()),
+            ..MockStageExecutor::default()
+        };
+        let paused = execute_xs_s_pipeline_with_executor_and_ws_task(
+            &mut limit_store,
+            "ZACH-026-REWORK-LIMIT",
+            &mut limit_mock,
+            ws_stub.path(),
+        )
+        .expect("rework limit should pause cleanly as Blocked");
+        assert_eq!(paused.status, "Blocked");
+        assert_eq!(paused.current_stage.as_deref(), Some("pr-review"));
+        let decs = limit_store.list_decisions(true, None).unwrap();
+        assert_eq!(decs.len(), 1);
+        assert_eq!(decs[0].kind, "review_rework_limit");
+        assert_eq!(
+            decs[0].decision_id,
+            "dec-zach-026-rework-limit-review-rework-2"
+        );
+        assert!(
+            !limit_store
+                .list_path_locks(Some("zach"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn ac5_missing_cross_family_reviewer_pauses_blocked_instead_of_same_family_fallback() {
+        let mut store = V2Store::open_in_memory().expect("open store");
+        let mut task = sample_s_task("ZACH-026-AC5");
+        task.weight = "M".to_owned();
+        task.context_pack = sample_context_pack("M");
+        task.required_stages = vec![
+            "plan".to_owned(),
+            "plan-review".to_owned(),
+            "impl".to_owned(),
+            "pr-review".to_owned(),
+        ];
+        task.stages_completed = vec!["plan".to_owned(), "plan-review".to_owned()];
+        // Simulate 1 prior pr-review AGY infra failure; next failure hits >= 2 and must pause Blocked
+        task.memory
+            .recent_attempts
+            .push("[AGY_INFRA:AGY_TIMEOUT] stage=pr-review attempt=zach-026-ac5-pr-review-1 log=attempts/1/stderr.log".to_owned());
+        store.upsert_task(&task).unwrap();
+
+        let ws_stub = StubWsTask::passthrough_clean("zach-026-ac5");
+        let mut mock = MockStageExecutor {
+            staged_results: vec![
+                StageExecutionResult {
+                    status: "PASSED".to_owned(),
+                    summary: "impl ok".to_owned(),
+                    review_markdown: None,
+                    review_output: None,
+                    invocation_id: None,
+                    input_tokens: Some(1_000),
+                    output_tokens: Some(200),
+                    total_tokens: Some(1_200),
+                    sha_before: Some("abc".to_owned()),
+                    sha_after: Some("sha-ac5".to_owned()),
+                    diff_files: vec![DiffFileEntry {
+                        path: "src/v2/router.rs".to_owned(),
+                        status: "M".to_owned(),
+                        added_lines: 5,
+                        deleted_lines: 1,
+                    }],
+                },
+                StageExecutionResult {
+                    status: "FAILED".to_owned(),
+                    summary: "AGY_TIMEOUT: gemini worker timed out".to_owned(),
+                    review_markdown: None,
+                    review_output: None,
+                    invocation_id: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    total_tokens: None,
+                    sha_before: None,
+                    sha_after: None,
+                    diff_files: Vec::new(),
+                },
+            ],
+            committed_sha_to_return: Some("sha-ac5".to_owned()),
+            ..MockStageExecutor::default()
+        };
+
+        let paused = execute_m_l_pipeline_with_executor_and_ws_task(
+            &mut store,
+            "ZACH-026-AC5",
+            &mut mock,
+            ws_stub.path(),
+        )
+        .expect("missing cross-family reviewer should pause cleanly as Blocked");
+
+        assert_eq!(paused.status, "Blocked");
+        assert_eq!(paused.current_stage.as_deref(), Some("pr-review"));
+        assert_eq!(mock.executed_routes.len(), 2);
+        assert_eq!(mock.executed_routes[0].family, ModelFamily::OpenAiSol);
+        assert_eq!(mock.executed_routes[1].family, ModelFamily::GeminiAgy);
+
+        let decs = store.list_decisions(true, None).unwrap();
+        assert_eq!(decs.len(), 1);
+        assert_eq!(decs[0].kind, "cross_family_reviewer_unavailable");
+        assert!(!store.list_path_locks(Some("zach")).unwrap().is_empty());
+
+        // Also verify resolve_author_family infers author family from prior PASSED attempt on resume
+        store
+            .record_stage_attempt(&StageAttemptRecord {
+                attempt_id: "zach-026-ac5-impl-prior".to_owned(),
+                task_id: "ZACH-026-AC5".to_owned(),
+                stage: "impl".to_owned(),
+                model: "gemini-4-hydrogen-high".to_owned(),
+                effort: "high".to_owned(),
+                systemd_unit: None,
+                invocation_id: None,
+                started_epoch: 100,
+                ended_epoch: Some(110),
+                status: "PASSED".to_owned(),
+                failure_class: None,
+                summary: Some("ok".to_owned()),
+                input_tokens: None,
+                output_tokens: None,
+                total_tokens: None,
+                sha_before: None,
+                sha_after: None,
+            })
+            .unwrap();
+        assert_eq!(
+            resolve_author_family(&store, "ZACH-026-AC5", "impl", None).unwrap(),
+            ModelFamily::GeminiAgy
+        );
     }
 
     #[test]
@@ -3281,6 +4348,7 @@ print(json.dumps({
                 status: "FAILED".to_owned(),
                 summary: "transient failure".to_owned(),
                 review_markdown: None,
+                review_output: None,
                 invocation_id: Some("inv-fail".to_owned()),
                 input_tokens: Some(100),
                 output_tokens: Some(50),
@@ -3359,6 +4427,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "Plan ok".to_owned(),
                     review_markdown: None,
+                    review_output: None,
                     invocation_id: Some("inv-plan".to_owned()),
                     input_tokens: Some(1_000),
                     output_tokens: Some(200),
@@ -3371,6 +4440,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "Plan review ok".to_owned(),
                     review_markdown: None,
+                    review_output: None,
                     invocation_id: Some("inv-plan-rev".to_owned()),
                     input_tokens: Some(800),
                     output_tokens: Some(100),
@@ -3383,6 +4453,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "Impl ok".to_owned(),
                     review_markdown: None,
+                    review_output: None,
                     invocation_id: Some("inv-impl".to_owned()),
                     input_tokens: Some(1_500),
                     output_tokens: Some(300),
@@ -3399,12 +4470,8 @@ print(json.dumps({
                 StageExecutionResult {
                     status: "PASSED".to_owned(),
                     summary: "PR review ok".to_owned(),
-                    review_markdown: Some(
-                        "| AC | Criterion | Code (file:line) | Test | Status |\n\
-                         |---|---|---|---|---|\n\
-                         | AC-1 | Works | src/v2/router.rs:102 | test_router | PASS |\n"
-                            .to_owned(),
-                    ),
+                    review_markdown: None,
+                    review_output: Some(approved_verdict_json("AC-1", "src/v2/router.rs:10")),
                     invocation_id: Some("inv-pr-rev".to_owned()),
                     input_tokens: Some(900),
                     output_tokens: Some(150),
@@ -3489,12 +4556,8 @@ print(json.dumps({
             staged_results: vec![StageExecutionResult {
                 status: "PASSED".to_owned(),
                 summary: "Re-review ok".to_owned(),
-                review_markdown: Some(
-                    "| AC | Criterion | Code (file:line) | Test | Status |\n\
-                     |---|---|---|---|---|\n\
-                     | AC-1 | Works | src/v2/router.rs:102 | test_router | PASS |\n"
-                        .to_owned(),
-                ),
+                review_markdown: None,
+                review_output: Some(approved_verdict_json("AC-1", "src/v2/router.rs:10")),
                 invocation_id: Some("inv-pr-rerev".to_owned()),
                 input_tokens: Some(500),
                 output_tokens: Some(100),
@@ -3551,6 +4614,16 @@ print(json.dumps({
             worktree_path: &str,
         ) -> Result<String, String> {
             self.inner.commit_worktree(task, worktree_path)
+        }
+
+        fn collect_reviewed_diff(
+            &mut self,
+            task: &TaskRecord,
+            worktree_path: &str,
+            reviewed_sha: &str,
+        ) -> Result<crate::v2::runner::ReviewedDiffContext, String> {
+            self.inner
+                .collect_reviewed_diff(task, worktree_path, reviewed_sha)
         }
 
         fn push_and_ensure_pr(
@@ -3689,6 +4762,7 @@ print(json.dumps({
                         status: "PASSED".to_owned(),
                         summary: "impl ok".to_owned(),
                         review_markdown: None,
+                        review_output: None,
                         invocation_id: Some("inv-impl".to_owned()),
                         input_tokens: Some(1_000),
                         output_tokens: Some(200),
@@ -3706,6 +4780,7 @@ print(json.dumps({
                         status: "PASSED".to_owned(),
                         summary: "missing table".to_owned(),
                         review_markdown: Some("No AC table here".to_owned()),
+                        review_output: None,
                         invocation_id: Some("inv-rev".to_owned()),
                         input_tokens: Some(500),
                         output_tokens: Some(100),
@@ -3755,6 +4830,7 @@ print(json.dumps({
                         status: "PASSED".to_owned(),
                         summary: "impl ok".to_owned(),
                         review_markdown: None,
+                        review_output: None,
                         invocation_id: None,
                         input_tokens: Some(100),
                         output_tokens: Some(50),
@@ -3805,6 +4881,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "edited workflow".to_owned(),
                     review_markdown: None,
+                    review_output: None,
                     invocation_id: None,
                     input_tokens: Some(100),
                     output_tokens: Some(50),
@@ -3864,6 +4941,7 @@ print(json.dumps({
                         status: "PASSED".to_owned(),
                         summary: "plan ok".to_owned(),
                         review_markdown: None,
+                        review_output: None,
                         invocation_id: None,
                         input_tokens: Some(100),
                         output_tokens: Some(50),
@@ -3876,6 +4954,7 @@ print(json.dumps({
                         status: "FAILED".to_owned(),
                         summary: "changes_requested: clarify migration steps".to_owned(),
                         review_markdown: None,
+                        review_output: None,
                         invocation_id: None,
                         input_tokens: Some(100),
                         output_tokens: Some(50),
@@ -3923,6 +5002,7 @@ print(json.dumps({
             status: "PASSED".to_owned(),
             summary: "impl ok".to_owned(),
             review_markdown: None,
+            review_output: None,
             invocation_id: Some("inv-impl".to_owned()),
             input_tokens: Some(1_000),
             output_tokens: Some(200),
@@ -3939,12 +5019,8 @@ print(json.dumps({
         let s_rev_ok = || StageExecutionResult {
             status: "PASSED".to_owned(),
             summary: "review ok".to_owned(),
-            review_markdown: Some(
-                "| AC | Criterion | Code (file:line) | Test | Status |\n\
-                 |---|---|---|---|---|\n\
-                 | AC-1 | Works | src/v2/router.rs:102 | test_router | PASS |\n"
-                    .to_owned(),
-            ),
+            review_markdown: None,
+            review_output: Some(approved_verdict_json("AC-1", "src/v2/router.rs:10")),
             invocation_id: Some("inv-rev".to_owned()),
             input_tokens: Some(500),
             output_tokens: Some(100),
@@ -4090,6 +5166,7 @@ print(json.dumps({
                         status: "PASSED".to_owned(),
                         summary: "Modified router without committing".to_owned(),
                         review_markdown: None,
+                        review_output: None,
                         invocation_id: Some("inv-real-impl".to_owned()),
                         input_tokens: Some(1_000),
                         output_tokens: Some(200),
@@ -4110,12 +5187,8 @@ print(json.dumps({
                 Ok(StageExecutionResult {
                     status: "PASSED".to_owned(),
                     summary: "Reviewed committed head".to_owned(),
-                    review_markdown: Some(
-                        "| AC | Criterion | Code (file:line) | Test | Status |\n\
-                         |---|---|---|---|---|\n\
-                         | AC-1 | Router maps models deterministically | src/v2/router.rs:1 | test_router | PASS |\n"
-                            .to_owned(),
-                    ),
+                    review_markdown: None,
+                    review_output: Some(approved_verdict_json("AC-1", "src/v2/router.rs:1")),
                     invocation_id: Some("inv-real-rev".to_owned()),
                     input_tokens: Some(600),
                     output_tokens: Some(100),
@@ -4140,6 +5213,16 @@ print(json.dumps({
                 worktree_path: &str,
             ) -> Result<String, String> {
                 self.systemd.commit_worktree(task, worktree_path)
+            }
+
+            fn collect_reviewed_diff(
+                &mut self,
+                task: &TaskRecord,
+                worktree_path: &str,
+                reviewed_sha: &str,
+            ) -> Result<crate::v2::runner::ReviewedDiffContext, String> {
+                self.systemd
+                    .collect_reviewed_diff(task, worktree_path, reviewed_sha)
             }
 
             fn push_and_ensure_pr(
@@ -4355,6 +5438,7 @@ print(json.dumps({
                 status: "FAILED".to_owned(),
                 summary: format!("AGY_TIMEOUT: {giant_raw}"),
                 review_markdown: None,
+                review_output: None,
                 invocation_id: None,
                 input_tokens: Some(100),
                 output_tokens: Some(50),
@@ -4398,6 +5482,7 @@ print(json.dumps({
                 status: "PASSED".to_owned(),
                 summary: giant_raw.clone(),
                 review_markdown: None,
+                review_output: None,
                 invocation_id: None,
                 input_tokens: Some(10),
                 output_tokens: Some(5),
@@ -4437,6 +5522,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "impl ok".to_owned(),
                     review_markdown: None,
+                    review_output: None,
                     invocation_id: None,
                     input_tokens: Some(10),
                     output_tokens: Some(5),
@@ -4579,6 +5665,7 @@ print(json.dumps({
                 status: "FAILED".to_owned(),
                 summary: "first impl failed".to_owned(),
                 review_markdown: None,
+                review_output: None,
                 invocation_id: None,
                 input_tokens: Some(200_000),
                 output_tokens: Some(50_000),
@@ -4612,6 +5699,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "impl ok".to_owned(),
                     review_markdown: None,
+                    review_output: None,
                     invocation_id: None,
                     input_tokens: Some(80_000),
                     output_tokens: Some(20_000),
@@ -4628,12 +5716,8 @@ print(json.dumps({
                 StageExecutionResult {
                     status: "PASSED".to_owned(),
                     summary: "review ok".to_owned(),
-                    review_markdown: Some(
-                        "| AC | Criterion | Code (file:line) | Test | Status |\n\
-                         |---|---|---|---|---|\n\
-                         | AC-1 | Token usage parsed | src/v2/runner.rs:10 | runner::tests::parse_codex_jsonl_output_sums_turns_and_handles_failures | PASS |\n"
-                            .to_owned(),
-                    ),
+                    review_markdown: None,
+                    review_output: Some(approved_verdict_json("AC-1", "src/v2/runner.rs:10")),
                     invocation_id: None,
                     input_tokens: Some(50_000),
                     output_tokens: Some(10_000),
@@ -4684,6 +5768,7 @@ print(json.dumps({
                 status: failed_codex.status,
                 summary: failed_codex.summary,
                 review_markdown: failed_codex.review_markdown,
+                review_output: failed_codex.review_output,
                 invocation_id: None,
                 input_tokens: failed_codex.input_tokens,
                 output_tokens: failed_codex.output_tokens,
@@ -4929,6 +6014,7 @@ raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={
                 status: "PASSED".to_owned(),
                 summary: "impl ok".to_owned(),
                 review_markdown: None,
+                review_output: None,
                 invocation_id: None,
                 input_tokens: Some(100),
                 output_tokens: Some(50),
@@ -4965,6 +6051,7 @@ raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={
                 status: "PASSED".to_owned(),
                 summary: "impl ok".to_owned(),
                 review_markdown: None,
+                review_output: None,
                 invocation_id: None,
                 input_tokens: Some(100),
                 output_tokens: Some(50),
@@ -5016,6 +6103,7 @@ raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={
                     status: "PASSED".to_owned(),
                     summary: "impl touched critical path".to_owned(),
                     review_markdown: None,
+                    review_output: None,
                     invocation_id: Some("inv-impl".to_owned()),
                     input_tokens: Some(1_000),
                     output_tokens: Some(200),
@@ -5032,12 +6120,8 @@ raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={
                 StageExecutionResult {
                     status: "PASSED".to_owned(),
                     summary: "pr-review ok".to_owned(),
-                    review_markdown: Some(
-                        "| AC | Criterion | Code (file:line) | Test | Status |\n\
-                         |---|---|---|---|---|\n\
-                         | AC-1 | Works | src/v2/router.rs:1 | test_router | PASS |\n"
-                            .to_owned(),
-                    ),
+                    review_markdown: None,
+                    review_output: Some(approved_verdict_json("AC-1", "src/v2/router.rs:1")),
                     invocation_id: Some("inv-rev".to_owned()),
                     input_tokens: Some(500),
                     output_tokens: Some(100),

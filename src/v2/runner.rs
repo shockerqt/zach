@@ -37,6 +37,8 @@ pub struct StageCommandSpec {
     pub prompt: String,
     #[serde(default)]
     pub stdin_payload: String,
+    #[serde(default)]
+    pub output_schema_json: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +46,8 @@ pub struct StageExecutionResult {
     pub status: String,
     pub summary: String,
     pub review_markdown: Option<String>,
+    #[serde(default)]
+    pub review_output: Option<String>,
     pub invocation_id: Option<String>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
@@ -51,6 +55,28 @@ pub struct StageExecutionResult {
     pub sha_before: Option<String>,
     pub sha_after: Option<String>,
     pub diff_files: Vec<DiffFileEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineRange {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl LineRange {
+    pub fn contains(&self, line: usize) -> bool {
+        line >= self.start && line <= self.end
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ReviewedDiffContext {
+    pub merge_base_sha: String,
+    pub reviewed_sha: String,
+    pub commit_range: String,
+    pub files: BTreeMap<String, Vec<LineRange>>,
+    #[serde(default)]
+    pub diff_excerpt: String,
 }
 
 pub trait StageExecutor {
@@ -73,6 +99,13 @@ pub trait StageExecutor {
         worktree_path: &str,
         reviewed_sha: &str,
     ) -> Result<i64, String>;
+
+    fn collect_reviewed_diff(
+        &mut self,
+        task: &TaskRecord,
+        worktree_path: &str,
+        reviewed_sha: &str,
+    ) -> Result<ReviewedDiffContext, String>;
 }
 
 /// Builds a strict allowlisted environment map for worker execution, explicitly
@@ -265,6 +298,9 @@ pub fn build_systemd_stage_command_with_env(
         }
     };
 
+    let output_schema_json =
+        (route.stage == "pr-review").then(crate::v2::pipeline::review_verdict_json_schema_string);
+
     Ok(StageCommandSpec {
         unit_name,
         program: "systemd-run".to_owned(),
@@ -275,7 +311,33 @@ pub fn build_systemd_stage_command_with_env(
         stall_timeout_secs: route.stall_timeout_secs,
         prompt: prompt.to_owned(),
         stdin_payload,
+        output_schema_json,
     })
+}
+
+/// Inserts `--output-schema <schema_path>` before the trailing positional prompt/`"-"`
+/// argument of a `codex exec` invocation.
+pub fn inject_codex_output_schema_args(
+    args: &[String],
+    schema_path: &std::path::Path,
+) -> Vec<String> {
+    let Some(codex_idx) = args.iter().position(|a| a == "codex") else {
+        return args.to_vec();
+    };
+    let Some(rel_exec) = args[codex_idx + 1..].iter().position(|a| a == "exec") else {
+        return args.to_vec();
+    };
+    let exec_idx = codex_idx + 1 + rel_exec;
+    let last_idx = args.len().saturating_sub(1);
+    if last_idx <= exec_idx {
+        return args.to_vec();
+    }
+    let mut updated = Vec::with_capacity(args.len() + 2);
+    updated.extend_from_slice(&args[..last_idx]);
+    updated.push("--output-schema".to_owned());
+    updated.push(schema_path.to_string_lossy().into_owned());
+    updated.push(args[last_idx].clone());
+    updated
 }
 
 /// Parses `systemctl --user list-units 'zach-stage-*' --no-legend --plain` output
@@ -549,6 +611,7 @@ pub struct ParsedCodexOutput {
     pub status: String,
     pub summary: String,
     pub review_markdown: Option<String>,
+    pub review_output: Option<String>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
@@ -666,6 +729,7 @@ pub fn parse_codex_jsonl_output(
     };
     let summary = truncate_utf8_bytes(&raw_summary, MAX_SUMMARY_BYTES);
 
+    let review_output = last_agent_message.clone();
     let review_markdown = last_agent_message
         .filter(|msg| msg.contains('|'))
         .or_else(|| (parsed_json_events == 0 && stdout.contains('|')).then(|| stdout.to_owned()));
@@ -674,6 +738,7 @@ pub fn parse_codex_jsonl_output(
         status,
         summary,
         review_markdown,
+        review_output,
         input_tokens,
         output_tokens,
         total_tokens,
@@ -723,9 +788,18 @@ impl StageExecutor for SystemdStageExecutor {
 
         write_secure_file(&attempt_dir.join("prompt.md"), spec.prompt.as_bytes())?;
 
+        let mut effective_args = spec.args.clone();
+        if let Some(ref schema_json) = spec.output_schema_json {
+            let schema_path = attempt_dir.join("review-schema.json");
+            write_secure_file(&schema_path, schema_json.as_bytes())?;
+            if route.family == ModelFamily::OpenAiSol {
+                effective_args = inject_codex_output_schema_args(&effective_args, &schema_path);
+            }
+        }
+
         let sha_before = git_head_sha(&spec.worktree_path);
         let mut child = match Command::new(&spec.program)
-            .args(&spec.args)
+            .args(&effective_args)
             .env_clear()
             .envs(&spec.env)
             .stdin(Stdio::piped())
@@ -886,6 +960,7 @@ impl StageExecutor for SystemdStageExecutor {
                     status: parsed.status,
                     summary: parsed.summary,
                     review_markdown: parsed.review_markdown,
+                    review_output: parsed.review_output,
                     invocation_id: None,
                     input_tokens: parsed.input_tokens,
                     output_tokens: parsed.output_tokens,
@@ -1098,6 +1173,354 @@ impl StageExecutor for SystemdStageExecutor {
                 )
             })
     }
+
+    fn collect_reviewed_diff(
+        &mut self,
+        task: &TaskRecord,
+        worktree_path: &str,
+        reviewed_sha: &str,
+    ) -> Result<ReviewedDiffContext, String> {
+        let base_hint = task
+            .plan_base_sha
+            .as_deref()
+            .or(task.context_pack.base_sha.as_deref());
+        collect_reviewed_diff_ranges(worktree_path, base_hint, reviewed_sha)
+    }
+}
+
+/// Normalizes a cited diff path relative to `worktree_path`, rejecting empty,
+/// escaping (`..`), or foreign absolute paths.
+pub fn normalize_cited_diff_path(raw: &str, worktree_path: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.contains('\0') {
+        return Err("cited file path is empty or contains NUL".to_owned());
+    }
+    let normalized_slashes = trimmed.replace('\\', "/");
+    let wt_trimmed = worktree_path.trim().trim_end_matches('/');
+    let mut rel = normalized_slashes.as_str();
+    if !wt_trimmed.is_empty() && wt_trimmed != "none" {
+        let wt_prefix = format!("{wt_trimmed}/");
+        if let Some(stripped) = rel.strip_prefix(&wt_prefix) {
+            rel = stripped;
+        } else if let Ok(canon_wt) = std::fs::canonicalize(wt_trimmed)
+            && let Some(canon_str) = canon_wt.to_str()
+        {
+            let canon_prefix = format!("{}/", canon_str.trim_end_matches('/'));
+            if let Some(stripped) = rel.strip_prefix(&canon_prefix) {
+                rel = stripped;
+            }
+        }
+    }
+    while let Some(stripped) = rel.strip_prefix("./") {
+        rel = stripped;
+    }
+    if rel.starts_with('/') {
+        return Err(format!(
+            "cited file path '{raw}' is outside governed worktree '{worktree_path}'"
+        ));
+    }
+    let path = std::path::Path::new(rel);
+    if path.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir | std::path::Component::RootDir
+        )
+    }) {
+        return Err(format!(
+            "cited file path '{raw}' contains escaping traversal"
+        ));
+    }
+    let clean = rel.trim_start_matches('/').to_owned();
+    if clean.is_empty() {
+        return Err(format!("cited file path '{raw}' normalized to empty"));
+    }
+    Ok(clean)
+}
+
+fn resolve_merge_base_for_reviewed_sha(
+    worktree_path: &str,
+    plan_base_sha: Option<&str>,
+    reviewed_sha: &str,
+) -> Result<(String, String), String> {
+    let trimmed_rev = reviewed_sha.trim();
+    if trimmed_rev.is_empty() || trimmed_rev == "head-sha" {
+        return Err("cannot collect reviewed diff without valid reviewed_sha".to_owned());
+    }
+    let rev_verify = Command::new("git")
+        .args([
+            "-C",
+            worktree_path,
+            "rev-parse",
+            "--verify",
+            &format!("{trimmed_rev}^{{commit}}"),
+        ])
+        .output()
+        .map_err(|e| format!("failed to verify reviewed_sha '{trimmed_rev}': {e}"))?;
+    if !rev_verify.status.success() {
+        return Err(format!(
+            "failed to resolve reviewed_sha '{trimmed_rev}' in '{worktree_path}': {}",
+            String::from_utf8_lossy(&rev_verify.stderr).trim()
+        ));
+    }
+    let reviewed_oid = String::from_utf8_lossy(&rev_verify.stdout)
+        .trim()
+        .to_owned();
+
+    let mut candidates = Vec::new();
+    if let Ok(sym) = Command::new("git")
+        .args([
+            "-C",
+            worktree_path,
+            "symbolic-ref",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ])
+        .output()
+        && sym.status.success()
+    {
+        let sym_str = String::from_utf8_lossy(&sym.stdout);
+        if let Some(branch) = crate::v2::merge_queue::parse_default_branch(&sym_str, "") {
+            candidates.push(format!("origin/{branch}"));
+        }
+    }
+    for fallback in ["origin/main", "origin/master"] {
+        if !candidates.iter().any(|c| c == fallback) {
+            candidates.push(fallback.to_owned());
+        }
+    }
+    if let Some(base_hint) = plan_base_sha.map(str::trim).filter(|s| !s.is_empty())
+        && !candidates.iter().any(|c| c == base_hint)
+    {
+        candidates.push(base_hint.to_owned());
+    }
+
+    for base_ref in candidates {
+        if let Ok(out) = Command::new("git")
+            .args(["-C", worktree_path, "merge-base", &base_ref, &reviewed_oid])
+            .output()
+            && out.status.success()
+        {
+            let sha = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            if !sha.is_empty() {
+                return Ok((sha, reviewed_oid));
+            }
+        }
+    }
+
+    if let Ok(parent_out) = Command::new("git")
+        .args([
+            "-C",
+            worktree_path,
+            "rev-parse",
+            "--verify",
+            &format!("{reviewed_oid}^"),
+        ])
+        .output()
+        && parent_out.status.success()
+    {
+        let sha = String::from_utf8_lossy(&parent_out.stdout)
+            .trim()
+            .to_owned();
+        if !sha.is_empty() {
+            return Ok((sha, reviewed_oid));
+        }
+    }
+
+    Err(format!(
+        "unable to resolve merge-base for reviewed_sha '{reviewed_oid}' in '{worktree_path}'"
+    ))
+}
+
+fn parse_hunk_span(spec: &str) -> Option<(usize, usize)> {
+    let trimmed = spec.trim();
+    if let Some((start_s, count_s)) = trimmed.split_once(',') {
+        let start = start_s.parse::<usize>().ok()?;
+        let count = count_s.parse::<usize>().ok()?;
+        Some((start, count))
+    } else {
+        let start = trimmed.parse::<usize>().ok()?;
+        Some((start, 1))
+    }
+}
+
+fn parse_hunk_header(line: &str) -> Option<((usize, usize), (usize, usize))> {
+    let rest = line.strip_prefix("@@ -")?;
+    let (old_part, after_old) = rest.split_once(" +")?;
+    let (new_part, _) = after_old.split_once(" @@")?;
+    let old_span = parse_hunk_span(old_part)?;
+    let new_span = parse_hunk_span(new_part)?;
+    Some((old_span, new_span))
+}
+
+/// Parses `git diff --unified=0 --no-ext-diff -M` output into per-file changed
+/// 1-based line ranges, handling omitted counts, empty added/deleted files,
+/// pure deletions, pure renames, and binary files.
+pub fn parse_unified_zero_diff(diff_text: &str) -> BTreeMap<String, Vec<LineRange>> {
+    #[derive(Default)]
+    struct FileState {
+        old_path: Option<String>,
+        new_path: Option<String>,
+        is_deleted: bool,
+        ranges: Vec<LineRange>,
+    }
+
+    fn flush_file(out: &mut BTreeMap<String, Vec<LineRange>>, state: Option<FileState>) {
+        let Some(mut st) = state else {
+            return;
+        };
+        let target = if st.is_deleted {
+            st.old_path.or(st.new_path)
+        } else {
+            st.new_path.or(st.old_path)
+        };
+        let Some(raw_path) = target else {
+            return;
+        };
+        let clean = raw_path.trim().trim_start_matches("./").to_owned();
+        if clean.is_empty() || clean == "/dev/null" {
+            return;
+        }
+        if st.ranges.is_empty() {
+            st.ranges.push(LineRange { start: 1, end: 1 });
+        }
+        out.entry(clean).or_default().extend(st.ranges);
+    }
+
+    let mut out: BTreeMap<String, Vec<LineRange>> = BTreeMap::new();
+    let mut current: Option<FileState> = None;
+
+    for raw_line in diff_text.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            flush_file(&mut out, current.take());
+            let mut st = FileState::default();
+            if let Some(after_a) = rest.strip_prefix("a/") {
+                let bytes = after_a.as_bytes();
+                let mut exact_pair = None;
+                if bytes.len() >= 3 && (bytes.len() - 3).is_multiple_of(2) {
+                    let mid = (bytes.len() - 3) / 2;
+                    if after_a.is_char_boundary(mid)
+                        && after_a[mid..].starts_with(" b/")
+                        && after_a[..mid] == after_a[mid + 3..]
+                    {
+                        exact_pair =
+                            Some((after_a[..mid].to_owned(), after_a[mid + 3..].to_owned()));
+                    }
+                }
+                if let Some((old_p, new_p)) = exact_pair {
+                    st.old_path = Some(old_p);
+                    st.new_path = Some(new_p);
+                } else if let Some((old_p, new_p)) = after_a.split_once(" b/") {
+                    st.old_path = Some(old_p.to_owned());
+                    st.new_path = Some(new_p.to_owned());
+                }
+            }
+            current = Some(st);
+            continue;
+        }
+
+        let Some(st) = current.as_mut() else {
+            continue;
+        };
+
+        if line.starts_with("deleted file mode ") || line == "+++ /dev/null" {
+            st.is_deleted = true;
+            if line == "+++ /dev/null" {
+                st.new_path = None;
+            }
+        } else if let Some(p) = line.strip_prefix("rename from ") {
+            st.old_path = Some(p.to_owned());
+        } else if let Some(p) = line.strip_prefix("rename to ") {
+            st.new_path = Some(p.to_owned());
+        } else if let Some(p) = line.strip_prefix("copy to ") {
+            st.new_path = Some(p.to_owned());
+        } else if let Some(p) = line.strip_prefix("--- a/") {
+            st.old_path = Some(p.to_owned());
+        } else if let Some(p) = line.strip_prefix("+++ b/") {
+            st.new_path = Some(p.to_owned());
+        } else if line.starts_with("Binary files ") && line.ends_with(" differ") {
+            if line.ends_with(" and /dev/null differ") {
+                st.is_deleted = true;
+                if let Some(after_a) = line.strip_prefix("Binary files a/")
+                    && let Some((old_p, _)) = after_a.split_once(" and /dev/null differ")
+                {
+                    st.old_path = Some(old_p.to_owned());
+                }
+            } else if let Some((_, rhs)) = line.rsplit_once(" and b/")
+                && let Some(new_p) = rhs.strip_suffix(" differ")
+            {
+                st.new_path = Some(new_p.to_owned());
+            }
+        } else if line.starts_with("@@ ")
+            && let Some(((old_start, old_count), (new_start, new_count))) = parse_hunk_header(line)
+        {
+            if st.is_deleted {
+                let start = old_start.max(1);
+                let end = start.saturating_add(old_count.max(1) - 1);
+                st.ranges.push(LineRange { start, end });
+            } else if new_count == 0 {
+                let anchor = new_start.max(1);
+                st.ranges.push(LineRange {
+                    start: anchor,
+                    end: anchor,
+                });
+            } else {
+                let start = new_start.max(1);
+                let end = start.saturating_add(new_count - 1);
+                st.ranges.push(LineRange { start, end });
+            }
+        }
+    }
+
+    flush_file(&mut out, current.take());
+    out
+}
+
+/// Collects per-file changed line ranges over `<merge-base>..<reviewed_sha>`.
+pub fn collect_reviewed_diff_ranges(
+    worktree_path: &str,
+    plan_base_sha: Option<&str>,
+    reviewed_sha: &str,
+) -> Result<ReviewedDiffContext, String> {
+    let trimmed_wt = worktree_path.trim();
+    if trimmed_wt.is_empty() || trimmed_wt == "none" {
+        return Err("cannot collect reviewed diff without governed worktree_path".to_owned());
+    }
+    let (merge_base_sha, reviewed_oid) =
+        resolve_merge_base_for_reviewed_sha(trimmed_wt, plan_base_sha, reviewed_sha)?;
+    let commit_range = format!("{merge_base_sha}..{reviewed_oid}");
+    let out = Command::new("git")
+        .args([
+            "-C",
+            trimmed_wt,
+            "-c",
+            "diff.noprefix=false",
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--unified=0",
+            "--no-ext-diff",
+            "-M",
+            &commit_range,
+        ])
+        .output()
+        .map_err(|e| format!("failed to run git diff for '{commit_range}': {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git diff '{commit_range}' failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let diff_text = String::from_utf8_lossy(&out.stdout);
+    let files = parse_unified_zero_diff(&diff_text);
+    let diff_excerpt = truncate_utf8_bytes(&diff_text, 4096);
+    Ok(ReviewedDiffContext {
+        merge_base_sha,
+        reviewed_sha: reviewed_oid,
+        commit_range,
+        files,
+        diff_excerpt,
+    })
 }
 
 fn git_head_sha(worktree_path: &str) -> Option<String> {
@@ -1351,6 +1774,8 @@ pub struct MockStageExecutor {
     pub committed_sha_to_return: Option<String>,
     pub finalized_sha: Option<String>,
     pub pr_number_to_return: Option<i64>,
+    pub reviewed_diff: Option<ReviewedDiffContext>,
+    pub last_impl_diff_files: Vec<DiffFileEntry>,
 }
 
 impl Default for MockStageExecutor {
@@ -1365,6 +1790,8 @@ impl Default for MockStageExecutor {
             committed_sha_to_return: Some("mock-committed-sha".to_owned()),
             finalized_sha: None,
             pr_number_to_return: Some(42),
+            reviewed_diff: None,
+            last_impl_diff_files: Vec::new(),
         }
     }
 }
@@ -1384,7 +1811,11 @@ impl StageExecutor for MockStageExecutor {
         if self.staged_results.is_empty() {
             return Err("MockStageExecutor had no staged_results left".to_owned());
         }
-        Ok(self.staged_results.remove(0))
+        let res = self.staged_results.remove(0);
+        if route.stage == "impl" && !res.diff_files.is_empty() {
+            self.last_impl_diff_files = res.diff_files.clone();
+        }
+        Ok(res)
     }
 
     fn run_checks(&mut self, _worktree_path: &str, commands: &[String]) -> Result<(), String> {
@@ -1421,6 +1852,52 @@ impl StageExecutor for MockStageExecutor {
             .filter(|&p| p > 0)
             .or_else(|| self.pr_number_to_return.filter(|&p| p > 0))
             .ok_or_else(|| format!("missing pr_number for task {}", task.task_id))
+    }
+
+    fn collect_reviewed_diff(
+        &mut self,
+        task: &TaskRecord,
+        _worktree_path: &str,
+        reviewed_sha: &str,
+    ) -> Result<ReviewedDiffContext, String> {
+        if let Some(ref ctx) = self.reviewed_diff {
+            return Ok(ctx.clone());
+        }
+        let merge_base_sha = task
+            .plan_base_sha
+            .clone()
+            .or_else(|| task.context_pack.base_sha.clone())
+            .unwrap_or_else(|| "mock-base".to_owned());
+        let mut files = BTreeMap::new();
+        if !self.last_impl_diff_files.is_empty() {
+            for entry in &self.last_impl_diff_files {
+                files.insert(
+                    entry.path.trim_start_matches("./").to_owned(),
+                    vec![LineRange {
+                        start: 1,
+                        end: 10_000,
+                    }],
+                );
+            }
+        } else {
+            for tf in &task.context_pack.target_files {
+                files.insert(
+                    tf.path.trim_start_matches("./").to_owned(),
+                    vec![LineRange {
+                        start: 1,
+                        end: 10_000,
+                    }],
+                );
+            }
+        }
+        let commit_range = format!("{merge_base_sha}..{reviewed_sha}");
+        Ok(ReviewedDiffContext {
+            merge_base_sha,
+            reviewed_sha: reviewed_sha.to_owned(),
+            commit_range,
+            files,
+            diff_excerpt: String::new(),
+        })
     }
 }
 
@@ -2269,5 +2746,249 @@ print(json.dumps({
         assert_eq!(gemini_res.input_tokens, Some(9_967));
         assert_eq!(gemini_res.output_tokens, Some(43));
         assert_eq!(gemini_res.total_tokens, Some(10_010));
+    }
+
+    #[test]
+    fn pr_review_spec_inserts_output_schema_before_trailing_dash_and_writes_0600_schema_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let task = sample_task();
+        let review_route = resolve_stage_route("S", "pr-review", 0, Some(ModelFamily::GeminiAgy))
+            .unwrap()
+            .unwrap();
+        assert_eq!(review_route.family, ModelFamily::OpenAiSol);
+
+        let spec = build_systemd_stage_command_with_env(
+            &task,
+            "att-rev-schema",
+            &review_route,
+            "review prompt",
+            &build_clean_env_from_process(),
+        )
+        .expect("build pr-review spec");
+        assert!(spec.output_schema_json.is_some());
+        assert_eq!(spec.args.last().map(String::as_str), Some("-"));
+
+        let schema_path = std::path::Path::new("/tmp/att-rev/review-schema.json");
+        let injected = inject_codex_output_schema_args(&spec.args, schema_path);
+        let schema_flag_idx = injected
+            .iter()
+            .position(|a| a == "--output-schema")
+            .expect("--output-schema flag present");
+        let dash_idx = injected
+            .iter()
+            .rposition(|a| a == "-")
+            .expect("trailing - present");
+        let double_dash_idx = injected
+            .iter()
+            .position(|a| a == "--")
+            .expect("-- separator present");
+        assert!(schema_flag_idx > double_dash_idx);
+        assert_eq!(
+            injected[schema_flag_idx + 1],
+            "/tmp/att-rev/review-schema.json"
+        );
+        assert_eq!(dash_idx, injected.len() - 1);
+        assert!(schema_flag_idx + 1 < dash_idx);
+
+        // Execute with SystemdStageExecutor using a fake wrapper script that captures argv
+        let state_dir = TempTestDir::new("zach-026-schema-state");
+        let work_dir = TempTestDir::new("zach-026-schema-work");
+        let mut exec = SystemdStageExecutor::with_state_dir(state_dir.path());
+        let mut run_spec = spec.clone();
+        run_spec.worktree_path = work_dir.path_str().to_owned();
+        // Keep "codex exec ... -" after "--" in args so inject_codex_output_schema_args triggers,
+        // using `/usr/bin/env` as program? No, `/bin/echo` prints all args! Let's use a tiny script.
+        let echo_script = state_dir.path().join("capture_args.sh");
+        std::fs::write(
+            &echo_script,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/captured_argv.txt\"\nprintf '{\"type\":\"item.completed\",\"item\":{\"id\":\"item_0\",\"type\":\"agent_message\",\"text\":\"{\\\"verdict\\\":\\\"APPROVED\\\",\\\"ac_results\\\":[],\\\"findings\\\":[],\\\"summary\\\":\\\"ok\\\"}\"}}\\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&echo_script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        run_spec.program = echo_script.to_string_lossy().into_owned();
+
+        let res = exec
+            .execute_stage(&task, "att-rev-schema", &review_route, &run_spec)
+            .expect("execute with schema");
+        assert_eq!(res.status, "PASSED");
+        assert!(
+            res.review_output
+                .as_deref()
+                .is_some_and(|s| s.contains("\"verdict\":\"APPROVED\""))
+        );
+
+        let schema_on_disk = state_dir
+            .path()
+            .join("attempts/att-rev-schema/review-schema.json");
+        assert!(schema_on_disk.exists());
+        assert_eq!(
+            std::fs::metadata(&schema_on_disk)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let captured = std::fs::read_to_string(state_dir.path().join("captured_argv.txt")).unwrap();
+        let argv_lines: Vec<&str> = captured.lines().collect();
+        let out_idx = argv_lines
+            .iter()
+            .position(|l| *l == "--output-schema")
+            .expect("captured --output-schema");
+        assert_eq!(argv_lines[out_idx + 1], schema_on_disk.to_string_lossy());
+        assert_eq!(argv_lines.last().copied(), Some("-"));
+    }
+
+    #[test]
+    fn parse_codex_jsonl_output_preserves_untruncated_json_verdict_in_review_output() {
+        let large_summary = "S".repeat(1400);
+        let verdict_json = format!(
+            r#"{{"verdict":"APPROVED","ac_results":[{{"id":"AC-1","status":"PASS","file":"src/v2/router.rs","line":10,"evidence":"ok"}}],"findings":[],"summary":"{large_summary}"}}"#
+        );
+        let line1 = serde_json::json!({
+            "type": "item.completed",
+            "item": { "id": "item_0", "type": "agent_message", "text": verdict_json }
+        });
+        let line2 = serde_json::json!({
+            "type": "turn.completed",
+            "usage": { "input_tokens": 500, "output_tokens": 200 }
+        });
+        let jsonl = format!("{line1}\n{line2}\n");
+        let parsed = parse_codex_jsonl_output(&jsonl, "", Some(0)).expect("parse codex verdict");
+        assert_eq!(parsed.status, "PASSED");
+        assert!(parsed.summary.len() <= MAX_SUMMARY_BYTES);
+        assert_eq!(parsed.review_output.as_deref(), Some(verdict_json.as_str()));
+    }
+
+    #[test]
+    fn collect_reviewed_diff_ranges_handles_all_hunk_and_special_file_edge_cases() {
+        // 1. Unit test parse_unified_zero_diff across all git diff edge cases
+        let synthetic_diff = "\
+diff --git a/src/omitted.rs b/src/omitted.rs
+--- a/src/omitted.rs
++++ b/src/omitted.rs
+@@ -4 +4 @@ fn one() {}
+diff --git a/src/added.rs b/src/added.rs
+new file mode 100644
+--- /dev/null
++++ b/src/added.rs
+@@ -0,0 +1,5 @@
+diff --git a/src/empty_added.rs b/src/empty_added.rs
+new file mode 100644
+index 0000000..e69de29
+diff --git a/src/deleted_all.rs b/src/deleted_all.rs
+deleted file mode 100644
+--- a/src/deleted_all.rs
++++ /dev/null
+@@ -1,4 +0,0 @@
+diff --git a/src/empty_deleted.rs b/src/empty_deleted.rs
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/src/pure_del_hunk.rs b/src/pure_del_hunk.rs
+--- a/src/pure_del_hunk.rs
++++ b/src/pure_del_hunk.rs
+@@ -10,3 +9,0 @@ fn keep() {}
+diff --git a/src/old_name.rs b/src/new_name.rs
+similarity index 100%
+rename from src/old_name.rs
+rename to src/new_name.rs
+diff --git a/src/old_edit.rs b/src/new_edit.rs
+similarity index 80%
+rename from src/old_edit.rs
+rename to src/new_edit.rs
+--- a/src/old_edit.rs
++++ b/src/new_edit.rs
+@@ -2 +2,3 @@
+diff --git a/assets/logo.bin b/assets/logo.bin
+new file mode 100644
+Binary files /dev/null and b/assets/logo.bin differ
+";
+        let parsed = parse_unified_zero_diff(synthetic_diff);
+        assert_eq!(
+            parsed.get("src/omitted.rs"),
+            Some(&vec![LineRange { start: 4, end: 4 }])
+        );
+        assert_eq!(
+            parsed.get("src/added.rs"),
+            Some(&vec![LineRange { start: 1, end: 5 }])
+        );
+        assert_eq!(
+            parsed.get("src/empty_added.rs"),
+            Some(&vec![LineRange { start: 1, end: 1 }])
+        );
+        assert_eq!(
+            parsed.get("src/deleted_all.rs"),
+            Some(&vec![LineRange { start: 1, end: 4 }])
+        );
+        assert_eq!(
+            parsed.get("src/empty_deleted.rs"),
+            Some(&vec![LineRange { start: 1, end: 1 }])
+        );
+        assert_eq!(
+            parsed.get("src/pure_del_hunk.rs"),
+            Some(&vec![LineRange { start: 9, end: 9 }])
+        );
+        assert_eq!(
+            parsed.get("src/new_name.rs"),
+            Some(&vec![LineRange { start: 1, end: 1 }])
+        );
+        assert_eq!(
+            parsed.get("src/new_edit.rs"),
+            Some(&vec![LineRange { start: 2, end: 4 }])
+        );
+        assert_eq!(
+            parsed.get("assets/logo.bin"),
+            Some(&vec![LineRange { start: 1, end: 1 }])
+        );
+
+        // 2. Real git repo without remotes (uses plan_base_sha so merge-base..reviewed_sha is never sha..sha)
+        let repo = TempTestDir::new("zach-026-diff-noremote");
+        git(repo.path(), &["init", "-b", "main"]);
+        init_git_identity(repo.path());
+        write_rel(repo.path(), "src/lib.rs", "line1\nline2\nline3\nline4\n");
+        write_rel(repo.path(), "src/remove.rs", "a\nb\nc\n");
+        write_rel(repo.path(), "src/move_me.rs", "same\n");
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-m", "base"]);
+        let base_sha = git(repo.path(), &["rev-parse", "HEAD"]).trim().to_owned();
+
+        git(repo.path(), &["checkout", "-b", "task/ZACH-026-DIFF"]);
+        write_rel(
+            repo.path(),
+            "src/lib.rs",
+            "line1\nchanged2\nline3\nline4\nadded5\n",
+        );
+        std::fs::remove_file(repo.path().join("src/remove.rs")).unwrap();
+        git(repo.path(), &["mv", "src/move_me.rs", "src/moved_here.rs"]);
+        write_rel(repo.path(), "src/empty.rs", "");
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-m", "task change"]);
+        let reviewed_sha = git(repo.path(), &["rev-parse", "HEAD"]).trim().to_owned();
+
+        let ctx = collect_reviewed_diff_ranges(repo.path_str(), Some(&base_sha), &reviewed_sha)
+            .expect("collect diff ranges without remotes");
+        assert_eq!(ctx.merge_base_sha, base_sha);
+        assert_eq!(ctx.reviewed_sha, reviewed_sha);
+        assert_eq!(ctx.commit_range, format!("{base_sha}..{reviewed_sha}"));
+        assert!(ctx.files["src/lib.rs"].iter().any(|r| r.contains(2)));
+        assert!(ctx.files["src/lib.rs"].iter().any(|r| r.contains(5)));
+        assert!(!ctx.files["src/lib.rs"].iter().any(|r| r.contains(3)));
+        assert!(ctx.files["src/remove.rs"].iter().any(|r| r.contains(1)));
+        assert!(ctx.files["src/moved_here.rs"].iter().any(|r| r.contains(1)));
+        assert!(ctx.files["src/empty.rs"].iter().any(|r| r.contains(1)));
+
+        // 3. Path normalization checks
+        assert_eq!(
+            normalize_cited_diff_path("./src/lib.rs", repo.path_str()).unwrap(),
+            "src/lib.rs"
+        );
+        assert_eq!(
+            normalize_cited_diff_path(&format!("{}/src/lib.rs", repo.path_str()), repo.path_str())
+                .unwrap(),
+            "src/lib.rs"
+        );
+        assert!(normalize_cited_diff_path("../secret.rs", repo.path_str()).is_err());
+        assert!(normalize_cited_diff_path("/etc/passwd", repo.path_str()).is_err());
     }
 }
