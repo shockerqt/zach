@@ -669,7 +669,7 @@ pub fn execute_xs_s_pipeline_with_executor(
     task.status = "In Progress".to_owned();
     task.current_stage = Some("impl".to_owned());
     task.active_attempt_id = Some(impl_attempt_id.clone());
-    task.executor = Some(impl_route.model.clone());
+    task.executor = Some("zach".to_owned());
     task = store.upsert_task(&task).map_err(|e| e.to_string())?;
 
     let started_epoch = now_epoch();
@@ -1017,7 +1017,7 @@ pub fn execute_m_l_pipeline_with_executor(
         task.status = "Planning".to_owned();
         task.current_stage = Some("plan".to_owned());
         task.active_attempt_id = Some(plan_attempt_id.clone());
-        task.executor = Some(plan_route.model.clone());
+        task.executor = Some("zach".to_owned());
         task = store.upsert_task(&task).map_err(|e| e.to_string())?;
 
         let plan_started = now_epoch();
@@ -1175,7 +1175,7 @@ pub fn execute_m_l_pipeline_with_executor(
         task.status = "Plan Review".to_owned();
         task.current_stage = Some("plan-review".to_owned());
         task.active_attempt_id = Some(rev_attempt_id.clone());
-        task.executor = Some(rev_route.model.clone());
+        task.executor = Some("zach".to_owned());
         task = store.upsert_task(&task).map_err(|e| e.to_string())?;
 
         let rev_started = now_epoch();
@@ -1397,7 +1397,7 @@ pub fn execute_m_l_pipeline_with_executor(
         task.status = "In Progress".to_owned();
         task.current_stage = Some("impl".to_owned());
         task.active_attempt_id = Some(impl_attempt_id.clone());
-        task.executor = Some(impl_route.model.clone());
+        task.executor = Some("zach".to_owned());
         task = store.upsert_task(&task).map_err(|e| e.to_string())?;
 
         let started_epoch = now_epoch();
@@ -2453,5 +2453,193 @@ mod tests {
         let nested_json = r#"{"run_id":"test-123","review_markdown":"{\"status\":\"completed\",\"summary\":\"| AC | Criterion | Code (file:line) | Test | Status |\\n|---|---|---|---|---|\\n| AC-1 | Works | src/main.rs:1 | test_main | PASS |\\n\"}"}"#;
         let expected = vec!["AC-1".to_owned()];
         assert!(validate_pr_review_table(nested_json, &expected).is_ok());
+    }
+
+    #[test]
+    fn pipeline_retains_zach_executor_and_preserves_state_across_sync() {
+        // 1. XS/S pipeline stopping in In Progress retains executor = Some("zach") across sync
+        let mut store = V2Store::open_in_memory().expect("open store");
+        let s_task = TaskRecord {
+            task_id: "ZACH-021-S".to_owned(),
+            task_group: "zach".to_owned(),
+            title: "S pipeline preserve test".to_owned(),
+            repository: "zach".to_owned(),
+            github_repo: Some("shockerqt/zach".to_owned()),
+            issue_number: Some(21),
+            weight: "S".to_owned(),
+            status: "Ready".to_owned(),
+            worktree_path: Some("/tmp/zach--ZACH-021-S".to_owned()),
+            branch: Some("task/ZACH-021-S".to_owned()),
+            context_pack: sample_context_pack("S"),
+            depends_on: Vec::new(),
+            required_stages: vec!["impl".to_owned(), "pr-review".to_owned()],
+            stages_completed: Vec::new(),
+            current_stage: None,
+            active_attempt_id: None,
+            plan_base_sha: Some("abc1234".to_owned()),
+            reviewed_sha: None,
+            pr_number: None,
+            executor: None,
+            autonomous_consent: true,
+            retry_count: 0,
+            memory: TaskMemory::default(),
+            version: 1,
+            updated_epoch: 1000,
+        };
+        store.upsert_task(&s_task).unwrap();
+
+        let mut fail_mock = MockStageExecutor {
+            staged_results: vec![StageExecutionResult {
+                status: "FAILED".to_owned(),
+                summary: "transient failure".to_owned(),
+                review_markdown: None,
+                invocation_id: Some("inv-fail".to_owned()),
+                input_tokens: 100,
+                output_tokens: 50,
+                total_tokens: 150,
+                sha_before: None,
+                sha_after: None,
+                diff_files: Vec::new(),
+            }],
+            ..MockStageExecutor::default()
+        };
+        assert!(
+            execute_xs_s_pipeline_with_executor(&mut store, "ZACH-021-S", &mut fail_mock).is_err()
+        );
+
+        let driven_s = store.get_task("ZACH-021-S").unwrap().unwrap();
+        assert_eq!(driven_s.status, "In Progress");
+        assert_eq!(driven_s.executor.as_deref(), Some("zach"));
+        assert_eq!(driven_s.retry_count, 1);
+
+        let mut board_ready_s = s_task.clone();
+        board_ready_s.title = "Updated S title".to_owned();
+        board_ready_s.status = "Ready".to_owned();
+        board_ready_s.executor = None;
+        let synced_s = store.sync_task(&board_ready_s).unwrap();
+        assert_eq!(synced_s.status, "In Progress");
+        assert_eq!(synced_s.current_stage.as_deref(), Some("impl"));
+        assert_eq!(synced_s.executor.as_deref(), Some("zach"));
+        assert_eq!(synced_s.retry_count, 1);
+        assert_eq!(synced_s.title, "Updated S title");
+
+        // 2. M pipeline reaching Queued for Merge retains executor = Some("zach") across sync
+        let m_task = TaskRecord {
+            task_id: "ZACH-021-M".to_owned(),
+            task_group: "zach".to_owned(),
+            title: "M pipeline preserve test".to_owned(),
+            repository: "zach".to_owned(),
+            github_repo: Some("shockerqt/zach".to_owned()),
+            issue_number: Some(22),
+            weight: "M".to_owned(),
+            status: "Ready".to_owned(),
+            worktree_path: Some("/tmp/zach--ZACH-021-M".to_owned()),
+            branch: Some("task/ZACH-021-M".to_owned()),
+            context_pack: sample_context_pack("M"),
+            depends_on: Vec::new(),
+            required_stages: vec![
+                "plan".to_owned(),
+                "plan-review".to_owned(),
+                "impl".to_owned(),
+                "pr-review".to_owned(),
+            ],
+            stages_completed: Vec::new(),
+            current_stage: None,
+            active_attempt_id: None,
+            plan_base_sha: Some("base123".to_owned()),
+            reviewed_sha: None,
+            pr_number: None,
+            executor: None,
+            autonomous_consent: true,
+            retry_count: 0,
+            memory: TaskMemory::default(),
+            version: 1,
+            updated_epoch: 1000,
+        };
+        store.upsert_task(&m_task).unwrap();
+
+        let mut ok_mock = MockStageExecutor {
+            staged_results: vec![
+                StageExecutionResult {
+                    status: "PASSED".to_owned(),
+                    summary: "Plan ok".to_owned(),
+                    review_markdown: None,
+                    invocation_id: Some("inv-plan".to_owned()),
+                    input_tokens: 1_000,
+                    output_tokens: 200,
+                    total_tokens: 1_200,
+                    sha_before: None,
+                    sha_after: None,
+                    diff_files: Vec::new(),
+                },
+                StageExecutionResult {
+                    status: "PASSED".to_owned(),
+                    summary: "Plan review ok".to_owned(),
+                    review_markdown: None,
+                    invocation_id: Some("inv-plan-rev".to_owned()),
+                    input_tokens: 800,
+                    output_tokens: 100,
+                    total_tokens: 900,
+                    sha_before: None,
+                    sha_after: None,
+                    diff_files: Vec::new(),
+                },
+                StageExecutionResult {
+                    status: "PASSED".to_owned(),
+                    summary: "Impl ok".to_owned(),
+                    review_markdown: None,
+                    invocation_id: Some("inv-impl".to_owned()),
+                    input_tokens: 1_500,
+                    output_tokens: 300,
+                    total_tokens: 1_800,
+                    sha_before: Some("base123".to_owned()),
+                    sha_after: Some("sha-m-impl".to_owned()),
+                    diff_files: vec![DiffFileEntry {
+                        path: "src/v2/router.rs".to_owned(),
+                        status: "M".to_owned(),
+                        added_lines: 5,
+                        deleted_lines: 1,
+                    }],
+                },
+                StageExecutionResult {
+                    status: "PASSED".to_owned(),
+                    summary: "PR review ok".to_owned(),
+                    review_markdown: Some(
+                        "| AC | Criterion | Code (file:line) | Test | Status |\n\
+                         |---|---|---|---|---|\n\
+                         | AC-1 | Works | src/v2/router.rs:102 | test_router | PASS |\n"
+                            .to_owned(),
+                    ),
+                    invocation_id: Some("inv-pr-rev".to_owned()),
+                    input_tokens: 900,
+                    output_tokens: 150,
+                    total_tokens: 1_050,
+                    sha_before: Some("sha-m-impl".to_owned()),
+                    sha_after: Some("sha-m-impl".to_owned()),
+                    diff_files: Vec::new(),
+                },
+            ],
+            ..MockStageExecutor::default()
+        };
+
+        let queued = execute_m_l_pipeline_with_executor(&mut store, "ZACH-021-M", &mut ok_mock)
+            .expect("M pipeline should queue for merge");
+        assert_eq!(queued.status, "Queued for Merge");
+        assert_eq!(queued.executor.as_deref(), Some("zach"));
+
+        let mut board_ready_m = m_task.clone();
+        board_ready_m.title = "Updated M title".to_owned();
+        board_ready_m.status = "Ready".to_owned();
+        board_ready_m.executor = None;
+        let synced_m = store.sync_task(&board_ready_m).unwrap();
+        assert_eq!(synced_m.status, "Queued for Merge");
+        assert_eq!(synced_m.current_stage.as_deref(), Some("merge_queue"));
+        assert_eq!(
+            synced_m.stages_completed,
+            vec!["plan", "plan-review", "impl", "pr-review"]
+        );
+        assert_eq!(synced_m.reviewed_sha.as_deref(), Some("sha-m-impl"));
+        assert_eq!(synced_m.executor.as_deref(), Some("zach"));
+        assert_eq!(synced_m.title, "Updated M title");
     }
 }

@@ -592,24 +592,7 @@ impl V2Store {
         let result = match Self::get_task_tx(&tx, &task.task_id)? {
             Some(old) => {
                 let mut next = task.clone();
-                if next.current_stage.is_none() {
-                    next.current_stage = old.current_stage.clone();
-                }
-                if next.active_attempt_id.is_none() {
-                    next.active_attempt_id = old.active_attempt_id.clone();
-                }
-                if next.plan_base_sha.is_none() {
-                    next.plan_base_sha = old.plan_base_sha.clone();
-                }
-                if next.reviewed_sha.is_none() {
-                    next.reviewed_sha = old.reviewed_sha.clone();
-                }
-                if next.pr_number.is_none() {
-                    next.pr_number = old.pr_number;
-                }
-                if next.memory == TaskMemory::default() {
-                    next.memory = old.memory.clone();
-                }
+                coalesce_runtime_fields(&old, &mut next);
                 Self::update_task_tx(&tx, &old, &next, now)?
             }
             None => Self::insert_task_tx(&tx, task, now)?,
@@ -643,8 +626,9 @@ impl V2Store {
                     next.executor = old.executor.clone();
                     next.retry_count = old.retry_count;
                     next.memory = old.memory.clone();
-                } else if next.memory == TaskMemory::default() {
-                    next.memory = old.memory.clone();
+                } else {
+                    coalesce_runtime_fields(&old, &mut next);
+                    next.retry_count = old.retry_count.max(next.retry_count);
                 }
                 Self::update_task_tx(&tx, &old, &next, now)?
             }
@@ -1461,6 +1445,27 @@ fn is_terminal_task_status(status: &str) -> bool {
     status.eq_ignore_ascii_case("Done") || status.eq_ignore_ascii_case("Cancelled")
 }
 
+fn coalesce_runtime_fields(old: &TaskRecord, next: &mut TaskRecord) {
+    if next.current_stage.is_none() {
+        next.current_stage = old.current_stage.clone();
+    }
+    if next.active_attempt_id.is_none() {
+        next.active_attempt_id = old.active_attempt_id.clone();
+    }
+    if next.plan_base_sha.is_none() {
+        next.plan_base_sha = old.plan_base_sha.clone();
+    }
+    if next.reviewed_sha.is_none() {
+        next.reviewed_sha = old.reviewed_sha.clone();
+    }
+    if next.pr_number.is_none() {
+        next.pr_number = old.pr_number;
+    }
+    if next.memory == TaskMemory::default() {
+        next.memory = old.memory.clone();
+    }
+}
+
 fn is_zach_executor(executor: Option<&str>) -> bool {
     executor.is_some_and(|e| e.trim().eq_ignore_ascii_case("zach"))
 }
@@ -1806,20 +1811,34 @@ mod tests {
                 .any(|e| e.task_id == "ZACH-101" && e.event_type == "TASK_DONE")
         );
 
-        // 4. Non-Zach task does not preserve runtime state on sync
+        // 4. Non-Zach task refreshes status/stages_completed/executor from board while
+        // preserving COALESCE runtime fields and monotonic retry_count when incoming omits them.
+        let mut other_mem = TaskMemory::default();
+        other_mem.recent_attempts.push("agy-attempt-1".to_owned());
+
         let mut other_task = sample_task("ZACH-102", "In Progress", Vec::new());
         other_task.executor = Some("agy".to_owned());
         other_task.current_stage = Some("impl".to_owned());
+        other_task.active_attempt_id = Some("agy-att-1".to_owned());
+        other_task.plan_base_sha = Some("agy-base-sha".to_owned());
+        other_task.reviewed_sha = Some("agy-reviewed-sha".to_owned());
+        other_task.pr_number = Some(88);
         other_task.stages_completed = vec!["plan".to_owned()];
         other_task.retry_count = 3;
+        other_task.memory = other_mem.clone();
         store.upsert_task(&other_task).unwrap();
 
         let board_reset = sample_task("ZACH-102", "Ready", Vec::new());
         let res_other = store.sync_task(&board_reset).unwrap();
         assert_eq!(res_other.status, "Ready");
-        assert_eq!(res_other.current_stage, None);
         assert!(res_other.stages_completed.is_empty());
         assert_eq!(res_other.executor, None);
-        assert_eq!(res_other.retry_count, 0);
+        assert_eq!(res_other.current_stage.as_deref(), Some("impl"));
+        assert_eq!(res_other.active_attempt_id.as_deref(), Some("agy-att-1"));
+        assert_eq!(res_other.plan_base_sha.as_deref(), Some("agy-base-sha"));
+        assert_eq!(res_other.reviewed_sha.as_deref(), Some("agy-reviewed-sha"));
+        assert_eq!(res_other.pr_number, Some(88));
+        assert_eq!(res_other.retry_count, 3);
+        assert_eq!(res_other.memory, other_mem);
     }
 }
