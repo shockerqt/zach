@@ -1060,6 +1060,41 @@ impl V2Store {
         Ok(())
     }
 
+    /// Reads a single `stage_attempts` row by `attempt_id`.
+    pub fn get_stage_attempt(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Option<StageAttemptRecord>, V2StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT attempt_id, task_id, stage, model, effort, systemd_unit, invocation_id,
+                    started_epoch, ended_epoch, status, failure_class, summary,
+                    input_tokens, output_tokens, total_tokens, sha_before, sha_after
+             FROM stage_attempts WHERE attempt_id = ?1",
+        )?;
+        stmt.query_row(params![attempt_id], Self::map_stage_attempt_row)
+            .optional()
+            .map_err(V2StoreError::from)
+    }
+
+    /// Lists all `stage_attempts` rows for `task_id` in insertion order.
+    pub fn list_stage_attempts(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<StageAttemptRecord>, V2StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT attempt_id, task_id, stage, model, effort, systemd_unit, invocation_id,
+                    started_epoch, ended_epoch, status, failure_class, summary,
+                    input_tokens, output_tokens, total_tokens, sha_before, sha_after
+             FROM stage_attempts WHERE task_id = ?1 ORDER BY rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![task_id], Self::map_stage_attempt_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     pub fn acquire_path_locks(
         &mut self,
         repo: &str,
@@ -1437,6 +1472,31 @@ impl V2Store {
             resolved_epoch: row.get(12)?,
             choice: row.get(13)?,
             note: row.get(14)?,
+        })
+    }
+
+    fn map_stage_attempt_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StageAttemptRecord> {
+        let input_tokens: i64 = row.get(12)?;
+        let output_tokens: i64 = row.get(13)?;
+        let total_tokens: i64 = row.get(14)?;
+        Ok(StageAttemptRecord {
+            attempt_id: row.get(0)?,
+            task_id: row.get(1)?,
+            stage: row.get(2)?,
+            model: row.get(3)?,
+            effort: row.get(4)?,
+            systemd_unit: row.get(5)?,
+            invocation_id: row.get(6)?,
+            started_epoch: row.get(7)?,
+            ended_epoch: row.get(8)?,
+            status: row.get(9)?,
+            failure_class: row.get(10)?,
+            summary: row.get(11)?,
+            input_tokens: u64::try_from(input_tokens).unwrap_or(0),
+            output_tokens: u64::try_from(output_tokens).unwrap_or(0),
+            total_tokens: u64::try_from(total_tokens).unwrap_or(0),
+            sha_before: row.get(15)?,
+            sha_after: row.get(16)?,
         })
     }
 }
@@ -1840,5 +1900,93 @@ mod tests {
         assert_eq!(res_other.pr_number, Some(88));
         assert_eq!(res_other.retry_count, 3);
         assert_eq!(res_other.memory, other_mem);
+    }
+
+    #[test]
+    fn sqlite_store_persists_retry_count_and_stage_attempt_failure_class() {
+        let mut db_path = std::env::temp_dir();
+        db_path.push(format!(
+            "zach_v2_retry_failure_class_{}_{}.sqlite3",
+            std::process::id(),
+            now_epoch()
+        ));
+        let _ = std::fs::remove_file(&db_path);
+
+        let mut store = V2Store::open(&db_path).expect("open file-backed sqlite store");
+        let mut task = sample_task("ZACH-015", "Ready", Vec::new());
+        store.upsert_task(&task).expect("insert task");
+        assert_eq!(store.get_task("ZACH-015").unwrap().unwrap().retry_count, 0);
+
+        task.retry_count += 1;
+        store.upsert_task(&task).expect("update retry_count");
+
+        let failed_attempt = StageAttemptRecord {
+            attempt_id: "zach-015-impl-1".to_owned(),
+            task_id: "ZACH-015".to_owned(),
+            stage: "impl".to_owned(),
+            model: "gpt-6.1-sol".to_owned(),
+            effort: "medium".to_owned(),
+            systemd_unit: Some("zach-stage-zach-015-impl-1".to_owned()),
+            invocation_id: Some("inv-1".to_owned()),
+            started_epoch: 1000,
+            ended_epoch: Some(1010),
+            status: "FAILED".to_owned(),
+            failure_class: Some("infra".to_owned()),
+            summary: Some("worker timed out".to_owned()),
+            input_tokens: 100,
+            output_tokens: 20,
+            total_tokens: 120,
+            sha_before: Some("abc".to_owned()),
+            sha_after: None,
+        };
+        store
+            .record_stage_attempt(&failed_attempt)
+            .expect("record failed attempt");
+
+        let passed_attempt = StageAttemptRecord {
+            attempt_id: "zach-015-impl-2".to_owned(),
+            task_id: "ZACH-015".to_owned(),
+            stage: "impl".to_owned(),
+            model: "gpt-6.1-sol".to_owned(),
+            effort: "high".to_owned(),
+            systemd_unit: Some("zach-stage-zach-015-impl-2".to_owned()),
+            invocation_id: Some("inv-2".to_owned()),
+            started_epoch: 1020,
+            ended_epoch: Some(1030),
+            status: "PASSED".to_owned(),
+            failure_class: None,
+            summary: Some("implemented".to_owned()),
+            input_tokens: 200,
+            output_tokens: 50,
+            total_tokens: 250,
+            sha_before: Some("abc".to_owned()),
+            sha_after: Some("def".to_owned()),
+        };
+        store
+            .record_stage_attempt(&passed_attempt)
+            .expect("record passed attempt");
+
+        drop(store);
+        let reopened = V2Store::open(&db_path).expect("reopen file-backed sqlite store");
+        let reloaded_task = reopened.get_task("ZACH-015").unwrap().unwrap();
+        assert_eq!(reloaded_task.retry_count, 1);
+
+        let attempts = reopened.list_stage_attempts("ZACH-015").unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].attempt_id, "zach-015-impl-1");
+        assert_eq!(attempts[0].status, "FAILED");
+        assert_eq!(attempts[0].failure_class.as_deref(), Some("infra"));
+        assert_eq!(attempts[1].attempt_id, "zach-015-impl-2");
+        assert_eq!(attempts[1].status, "PASSED");
+        assert_eq!(attempts[1].failure_class, None);
+
+        let single = reopened
+            .get_stage_attempt("zach-015-impl-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(single.failure_class.as_deref(), Some("infra"));
+
+        drop(reopened);
+        let _ = std::fs::remove_file(&db_path);
     }
 }

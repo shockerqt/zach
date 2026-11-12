@@ -595,6 +595,125 @@ pub fn parse_agy_cli_response(
     })
 }
 
+pub const FAILURE_CLASS_INFRA: &str = "infra";
+pub const FAILURE_CLASS_SEMANTIC: &str = "semantic";
+pub const FAILURE_CLASS_POLICY: &str = "policy";
+
+/// Maps a failed stage, execution error, or gate violation to `"infra"`, `"semantic"`, or `"policy"`.
+pub fn classify_failure_class(stage: &str, status: &str, message: &str) -> &'static str {
+    let lower_msg = message.to_ascii_lowercase();
+    let lower_status = status.trim().to_ascii_lowercase();
+    let lower_stage = stage.trim().to_ascii_lowercase();
+
+    if lower_msg.contains("forbidden")
+        || lower_msg.contains("out-of-scope")
+        || lower_msg.contains("scope_violation")
+        || lower_msg.contains("outside target_files")
+        || lower_msg.contains("token budget")
+        || lower_msg.contains("budget exhausted")
+        || lower_msg.contains("size policy")
+        || lower_msg.contains("policy")
+        || lower_msg.contains("exceeds xs ceiling")
+        || lower_msg.contains("exceeds s ceiling")
+        || lower_msg.contains("verdict gate")
+        || lower_msg.contains("approval rejected")
+        || lower_msg.contains("autonomous_consent")
+    {
+        return FAILURE_CLASS_POLICY;
+    }
+
+    if lower_status == "timeout"
+        || lower_status == "lost"
+        || lower_status == "error"
+        || lower_msg.contains("agy_spawn")
+        || lower_msg.contains("agy_timeout")
+        || lower_msg.contains("agy_exit")
+        || lower_msg.contains("agy_status")
+        || lower_msg.contains("agy_infra")
+        || lower_msg.contains("orphan_lost")
+        || lower_msg.contains("timed out")
+        || lower_msg.contains("timeout")
+        || lower_msg.contains("runtimemaxsec")
+        || lower_msg.contains("failed to spawn")
+        || lower_msg.contains("failed to run check")
+        || lower_msg.contains("non-json")
+        || lower_msg.contains("empty stdout")
+        || lower_msg.contains("parse error")
+        || lower_msg.contains("transient")
+        || lower_msg.contains("no staged_results")
+    {
+        return FAILURE_CLASS_INFRA;
+    }
+
+    if lower_msg.contains("changes_requested")
+        || lower_msg.contains("changes requested")
+        || lower_msg.contains("check '")
+        || lower_msg.contains("verification")
+        || lower_msg.contains("validation")
+        || lower_msg.contains("pr review")
+        || lower_msg.contains("file:line")
+        || lower_msg.contains("test evidence")
+        || lower_msg.contains("did not pass")
+        || lower_msg.contains("missing pass")
+        || lower_msg.contains("cargo test")
+        || lower_msg.contains("cargo clippy")
+        || lower_msg.contains("test failed")
+        || lower_msg.contains("tests failed")
+        || lower_msg.contains("clippy")
+        || lower_msg.contains("semantic")
+        || matches!(lower_stage.as_str(), "plan-review" | "pr-review")
+    {
+        return FAILURE_CLASS_SEMANTIC;
+    }
+
+    FAILURE_CLASS_INFRA
+}
+
+fn fail_stage_attempt(
+    store: &mut V2Store,
+    task: &mut TaskRecord,
+    attempt: &mut StageAttemptRecord,
+    failure_class: &str,
+    summary: String,
+    release_locks: bool,
+) -> Result<(), String> {
+    attempt.ended_epoch = Some(now_epoch());
+    if attempt.status == "RUNNING" || attempt.status == "PASSED" {
+        attempt.status = "FAILED".to_owned();
+    }
+    attempt.failure_class = Some(failure_class.to_owned());
+    attempt.summary = Some(summary);
+    store
+        .record_stage_attempt(attempt)
+        .map_err(|e| e.to_string())?;
+    task.retry_count += 1;
+    *task = store.upsert_task(task).map_err(|e| e.to_string())?;
+    if release_locks {
+        let _ = store.release_path_locks(&task.task_id);
+    }
+    Ok(())
+}
+
+fn run_stage_checks(
+    store: &mut V2Store,
+    task: &mut TaskRecord,
+    attempt: &mut StageAttemptRecord,
+    executor: &mut dyn StageExecutor,
+    worktree_path: &str,
+    commands: &[String],
+) -> Result<(), String> {
+    if commands.is_empty() {
+        return Ok(());
+    }
+    if let Err(err) = executor.run_checks(worktree_path, commands) {
+        task.memory.last_check_failure = Some(err.clone());
+        let class = classify_failure_class(&attempt.stage, "FAILED", &err);
+        fail_stage_attempt(store, task, attempt, class, err.clone(), true)?;
+        return Err(err);
+    }
+    Ok(())
+}
+
 pub fn execute_xs_s_pipeline(store: &mut V2Store, task_id: &str) -> Result<TaskRecord, String> {
     let mut executor = SystemdStageExecutor;
     execute_xs_s_pipeline_with_executor(store, task_id, &mut executor)
@@ -696,7 +815,15 @@ pub fn execute_xs_s_pipeline_with_executor(
         .record_stage_attempt(&attempt_rec)
         .map_err(|e| e.to_string())?;
 
-    let impl_result = executor.execute_stage(&task, &impl_attempt_id, &impl_route, &impl_spec)?;
+    let impl_result = match executor.execute_stage(&task, &impl_attempt_id, &impl_route, &impl_spec)
+    {
+        Ok(res) => res,
+        Err(err) => {
+            let class = classify_failure_class("impl", "FAILED", &err);
+            fail_stage_attempt(store, &mut task, &mut attempt_rec, class, err.clone(), true)?;
+            return Err(format!("impl stage failed for {}: {}", task.task_id, err));
+        }
+    };
     attempt_rec.ended_epoch = Some(now_epoch());
     attempt_rec.status = impl_result.status.clone();
     attempt_rec.summary = Some(impl_result.summary.clone());
@@ -706,9 +833,6 @@ pub fn execute_xs_s_pipeline_with_executor(
     attempt_rec.total_tokens = impl_result.total_tokens;
     attempt_rec.sha_before = impl_result.sha_before.clone();
     attempt_rec.sha_after = impl_result.sha_after.clone();
-    store
-        .record_stage_attempt(&attempt_rec)
-        .map_err(|e| e.to_string())?;
 
     *task
         .memory
@@ -721,19 +845,42 @@ pub fn execute_xs_s_pipeline_with_executor(
     ));
 
     if impl_result.status != "PASSED" {
-        task.retry_count += 1;
-        task = store.upsert_task(&task).map_err(|e| e.to_string())?;
-        let _ = store.release_path_locks(&task.task_id);
+        let class = classify_failure_class("impl", &impl_result.status, &impl_result.summary);
+        fail_stage_attempt(
+            store,
+            &mut task,
+            &mut attempt_rec,
+            class,
+            impl_result.summary.clone(),
+            true,
+        )?;
         return Err(format!(
             "impl stage failed for {}: {}",
             task.task_id, impl_result.summary
         ));
     }
 
+    attempt_rec.failure_class = None;
+    store
+        .record_stage_attempt(&attempt_rec)
+        .map_err(|e| e.to_string())?;
+
     // Mechanical Gate 1: Worktree diff verification (forbidden_paths, target_files, weight ceilings)
     match verify_worktree_diff(&task.weight, &task.context_pack, &impl_result.diff_files) {
         DiffCheckOutcome::Clean => {}
         DiffCheckOutcome::ForbiddenPathViolation { path, pattern } => {
+            let err_msg = format!(
+                "forbidden path violation on {}: {} matches {}",
+                task.task_id, path, pattern
+            );
+            fail_stage_attempt(
+                store,
+                &mut task,
+                &mut attempt_rec,
+                FAILURE_CLASS_POLICY,
+                err_msg.clone(),
+                true,
+            )?;
             let dec_id = format!("dec-{}-forbidden", task.task_id.to_ascii_lowercase());
             let _ = store.open_decision(
                 &dec_id,
@@ -749,13 +896,21 @@ pub fn execute_xs_s_pipeline_with_executor(
                 &impl_result.summary,
                 impl_result.sha_after.as_deref(),
             );
-            let _ = store.release_path_locks(&task.task_id);
-            return Err(format!(
-                "forbidden path violation on {}: {} matches {}",
-                task.task_id, path, pattern
-            ));
+            return Err(err_msg);
         }
         DiffCheckOutcome::OutOfScopeFiles { files } => {
+            let err_msg = format!(
+                "out-of-scope files modified on {}: {:?}",
+                task.task_id, files
+            );
+            fail_stage_attempt(
+                store,
+                &mut task,
+                &mut attempt_rec,
+                FAILURE_CLASS_POLICY,
+                err_msg.clone(),
+                true,
+            )?;
             let dec_id = format!("dec-{}-scope", task.task_id.to_ascii_lowercase());
             let _ = store.open_decision(
                 &dec_id,
@@ -771,11 +926,7 @@ pub fn execute_xs_s_pipeline_with_executor(
                 &impl_result.summary,
                 impl_result.sha_after.as_deref(),
             );
-            let _ = store.release_path_locks(&task.task_id);
-            return Err(format!(
-                "out-of-scope files modified on {}: {:?}",
-                task.task_id, files
-            ));
+            return Err(err_msg);
         }
         DiffCheckOutcome::WeightEscalated {
             from_weight: _,
@@ -797,12 +948,24 @@ pub fn execute_xs_s_pipeline_with_executor(
     }
 
     // Mechanical Gate 2: worker_checks and gate_checks
-    if !task.context_pack.worker_checks.is_empty() {
-        executor.run_checks(&worktree_path, &task.context_pack.worker_checks)?;
-    }
-    if !task.context_pack.gate_checks.is_empty() {
-        executor.run_checks(&worktree_path, &task.context_pack.gate_checks)?;
-    }
+    let worker_checks = task.context_pack.worker_checks.clone();
+    run_stage_checks(
+        store,
+        &mut task,
+        &mut attempt_rec,
+        executor,
+        &worktree_path,
+        &worker_checks,
+    )?;
+    let gate_checks = task.context_pack.gate_checks.clone();
+    run_stage_checks(
+        store,
+        &mut task,
+        &mut attempt_rec,
+        executor,
+        &worktree_path,
+        &gate_checks,
+    )?;
 
     if !task.stages_completed.iter().any(|s| s == "impl") {
         task.stages_completed.push("impl".to_owned());
@@ -861,16 +1024,31 @@ pub fn execute_xs_s_pipeline_with_executor(
             .map_err(|e| e.to_string())?;
 
         let rev_result =
-            executor.execute_stage(&task, &rev_attempt_id, &review_route, &rev_spec)?;
+            match executor.execute_stage(&task, &rev_attempt_id, &review_route, &rev_spec) {
+                Ok(res) => res,
+                Err(err) => {
+                    let class = classify_failure_class("pr-review", "FAILED", &err);
+                    fail_stage_attempt(
+                        store,
+                        &mut task,
+                        &mut rev_attempt,
+                        class,
+                        err.clone(),
+                        true,
+                    )?;
+                    return Err(format!(
+                        "pr-review stage failed for {}: {}",
+                        task.task_id, err
+                    ));
+                }
+            };
         rev_attempt.ended_epoch = Some(now_epoch());
         rev_attempt.status = rev_result.status.clone();
         rev_attempt.summary = Some(rev_result.summary.clone());
+        rev_attempt.invocation_id = rev_result.invocation_id.clone();
         rev_attempt.input_tokens = rev_result.input_tokens;
         rev_attempt.output_tokens = rev_result.output_tokens;
         rev_attempt.total_tokens = rev_result.total_tokens;
-        store
-            .record_stage_attempt(&rev_attempt)
-            .map_err(|e| e.to_string())?;
 
         *task
             .memory
@@ -879,12 +1057,26 @@ pub fn execute_xs_s_pipeline_with_executor(
             .or_insert(0) += rev_result.total_tokens;
 
         if rev_result.status != "PASSED" {
-            let _ = store.release_path_locks(&task.task_id);
+            let class =
+                classify_failure_class("pr-review", &rev_result.status, &rev_result.summary);
+            fail_stage_attempt(
+                store,
+                &mut task,
+                &mut rev_attempt,
+                class,
+                rev_result.summary.clone(),
+                true,
+            )?;
             return Err(format!(
                 "pr-review stage failed for {}: {}",
                 task.task_id, rev_result.summary
             ));
         }
+
+        rev_attempt.failure_class = None;
+        store
+            .record_stage_attempt(&rev_attempt)
+            .map_err(|e| e.to_string())?;
 
         let expected_acs: Vec<String> = task
             .context_pack
@@ -896,7 +1088,11 @@ pub fn execute_xs_s_pipeline_with_executor(
             .review_markdown
             .as_deref()
             .unwrap_or(&rev_result.summary);
-        validate_pr_review_table(review_md, &expected_acs)?;
+        if let Err(err) = validate_pr_review_table(review_md, &expected_acs) {
+            let class = classify_failure_class("pr-review", "FAILED", &err);
+            fail_stage_attempt(store, &mut task, &mut rev_attempt, class, err.clone(), true)?;
+            return Err(err);
+        }
 
         if !task.stages_completed.iter().any(|s| s == "pr-review") {
             task.stages_completed.push("pr-review".to_owned());
@@ -1105,14 +1301,21 @@ pub fn execute_m_l_pipeline_with_executor(
             }
         }
 
-        let plan_result = plan_res?;
+        let plan_result = match plan_res {
+            Ok(res) => res,
+            Err(err) => {
+                let class = classify_failure_class("plan", "FAILED", &err);
+                fail_stage_attempt(store, &mut task, &mut plan_rec, class, err.clone(), false)?;
+                return Err(format!("plan stage failed for {}: {}", task.task_id, err));
+            }
+        };
         plan_rec.ended_epoch = Some(now_epoch());
         plan_rec.status = plan_result.status.clone();
         plan_rec.summary = Some(plan_result.summary.clone());
+        plan_rec.invocation_id = plan_result.invocation_id.clone();
+        plan_rec.input_tokens = plan_result.input_tokens;
+        plan_rec.output_tokens = plan_result.output_tokens;
         plan_rec.total_tokens = plan_result.total_tokens;
-        store
-            .record_stage_attempt(&plan_rec)
-            .map_err(|e| e.to_string())?;
 
         *task
             .memory
@@ -1121,13 +1324,25 @@ pub fn execute_m_l_pipeline_with_executor(
             .or_insert(0) += plan_result.total_tokens;
 
         if plan_result.status != "PASSED" {
-            task.retry_count += 1;
-            let _ = store.upsert_task(&task);
+            let class = classify_failure_class("plan", &plan_result.status, &plan_result.summary);
+            fail_stage_attempt(
+                store,
+                &mut task,
+                &mut plan_rec,
+                class,
+                plan_result.summary.clone(),
+                false,
+            )?;
             return Err(format!(
                 "plan stage failed for {}: {}",
                 task.task_id, plan_result.summary
             ));
         }
+
+        plan_rec.failure_class = None;
+        store
+            .record_stage_attempt(&plan_rec)
+            .map_err(|e| e.to_string())?;
 
         task.stages_completed.push("plan".to_owned());
         task = store.upsert_task(&task).map_err(|e| e.to_string())?;
@@ -1259,14 +1474,24 @@ pub fn execute_m_l_pipeline_with_executor(
             }
         }
 
-        let rev_result = rev_res?;
+        let rev_result = match rev_res {
+            Ok(res) => res,
+            Err(err) => {
+                let class = classify_failure_class("plan-review", "FAILED", &err);
+                fail_stage_attempt(store, &mut task, &mut rev_rec, class, err.clone(), false)?;
+                return Err(format!(
+                    "plan-review stage failed for {}: {}",
+                    task.task_id, err
+                ));
+            }
+        };
         rev_rec.ended_epoch = Some(now_epoch());
         rev_rec.status = rev_result.status.clone();
         rev_rec.summary = Some(rev_result.summary.clone());
+        rev_rec.invocation_id = rev_result.invocation_id.clone();
+        rev_rec.input_tokens = rev_result.input_tokens;
+        rev_rec.output_tokens = rev_result.output_tokens;
         rev_rec.total_tokens = rev_result.total_tokens;
-        store
-            .record_stage_attempt(&rev_rec)
-            .map_err(|e| e.to_string())?;
 
         *task
             .memory
@@ -1275,13 +1500,26 @@ pub fn execute_m_l_pipeline_with_executor(
             .or_insert(0) += rev_result.total_tokens;
 
         if rev_result.status != "PASSED" {
-            task.retry_count += 1;
-            let _ = store.upsert_task(&task);
+            let class =
+                classify_failure_class("plan-review", &rev_result.status, &rev_result.summary);
+            fail_stage_attempt(
+                store,
+                &mut task,
+                &mut rev_rec,
+                class,
+                rev_result.summary.clone(),
+                false,
+            )?;
             return Err(format!(
                 "plan-review stage failed for {}: {}",
                 task.task_id, rev_result.summary
             ));
         }
+
+        rev_rec.failure_class = None;
+        store
+            .record_stage_attempt(&rev_rec)
+            .map_err(|e| e.to_string())?;
 
         task.stages_completed.push("plan-review".to_owned());
         task = store.upsert_task(&task).map_err(|e| e.to_string())?;
@@ -1485,21 +1723,24 @@ pub fn execute_m_l_pipeline_with_executor(
             }
         }
 
-        let impl_result = impl_res.inspect_err(|_| {
-            let _ = store.release_path_locks(&task.task_id);
-        })?;
+        let impl_result = match impl_res {
+            Ok(res) => res,
+            Err(err) => {
+                let class = classify_failure_class("impl", "FAILED", &err);
+                fail_stage_attempt(store, &mut task, &mut attempt_rec, class, err.clone(), true)?;
+                return Err(format!("impl stage failed for {}: {}", task.task_id, err));
+            }
+        };
 
         attempt_rec.ended_epoch = Some(now_epoch());
         attempt_rec.status = impl_result.status.clone();
         attempt_rec.summary = Some(impl_result.summary.clone());
+        attempt_rec.invocation_id = impl_result.invocation_id.clone();
         attempt_rec.input_tokens = impl_result.input_tokens;
         attempt_rec.output_tokens = impl_result.output_tokens;
         attempt_rec.total_tokens = impl_result.total_tokens;
         attempt_rec.sha_before = impl_result.sha_before.clone();
         attempt_rec.sha_after = impl_result.sha_after.clone();
-        store
-            .record_stage_attempt(&attempt_rec)
-            .map_err(|e| e.to_string())?;
 
         *task
             .memory
@@ -1508,31 +1749,58 @@ pub fn execute_m_l_pipeline_with_executor(
             .or_insert(0) += impl_result.total_tokens;
 
         if impl_result.status != "PASSED" {
-            task.retry_count += 1;
-            let _ = store.upsert_task(&task);
-            let _ = store.release_path_locks(&task.task_id);
+            let class = classify_failure_class("impl", &impl_result.status, &impl_result.summary);
+            fail_stage_attempt(
+                store,
+                &mut task,
+                &mut attempt_rec,
+                class,
+                impl_result.summary.clone(),
+                true,
+            )?;
             return Err(format!(
                 "impl stage failed for {}: {}",
                 task.task_id, impl_result.summary
             ));
         }
 
+        attempt_rec.failure_class = None;
+        store
+            .record_stage_attempt(&attempt_rec)
+            .map_err(|e| e.to_string())?;
+
         // Mechanical diff verification
         match verify_worktree_diff(&task.weight, &task.context_pack, &impl_result.diff_files) {
             DiffCheckOutcome::Clean => {}
             DiffCheckOutcome::ForbiddenPathViolation { path, pattern } => {
-                let _ = store.release_path_locks(&task.task_id);
-                return Err(format!(
+                let err_msg = format!(
                     "forbidden path violation on {}: {} matches {}",
                     task.task_id, path, pattern
-                ));
+                );
+                fail_stage_attempt(
+                    store,
+                    &mut task,
+                    &mut attempt_rec,
+                    FAILURE_CLASS_POLICY,
+                    err_msg.clone(),
+                    true,
+                )?;
+                return Err(err_msg);
             }
             DiffCheckOutcome::OutOfScopeFiles { files } => {
-                let _ = store.release_path_locks(&task.task_id);
-                return Err(format!(
+                let err_msg = format!(
                     "out-of-scope files modified on {}: {:?}",
                     task.task_id, files
-                ));
+                );
+                fail_stage_attempt(
+                    store,
+                    &mut task,
+                    &mut attempt_rec,
+                    FAILURE_CLASS_POLICY,
+                    err_msg.clone(),
+                    true,
+                )?;
+                return Err(err_msg);
             }
             DiffCheckOutcome::WeightEscalated { to_weight, .. } => {
                 task.weight = to_weight.clone();
@@ -1540,12 +1808,24 @@ pub fn execute_m_l_pipeline_with_executor(
             }
         }
 
-        if !task.context_pack.worker_checks.is_empty() {
-            executor.run_checks(&worktree_path, &task.context_pack.worker_checks)?;
-        }
-        if !task.context_pack.gate_checks.is_empty() {
-            executor.run_checks(&worktree_path, &task.context_pack.gate_checks)?;
-        }
+        let worker_checks = task.context_pack.worker_checks.clone();
+        run_stage_checks(
+            store,
+            &mut task,
+            &mut attempt_rec,
+            executor,
+            &worktree_path,
+            &worker_checks,
+        )?;
+        let gate_checks = task.context_pack.gate_checks.clone();
+        run_stage_checks(
+            store,
+            &mut task,
+            &mut attempt_rec,
+            executor,
+            &worktree_path,
+            &gate_checks,
+        )?;
 
         task.stages_completed.push("impl".to_owned());
         if let Some(ref sha) = impl_result.sha_after {
@@ -1677,22 +1957,30 @@ pub fn execute_m_l_pipeline_with_executor(
             }
         }
 
-        let rev_result = rev_res.inspect_err(|_| {
-            let _ = store.release_path_locks(&task.task_id);
-        })?;
+        let rev_result = match rev_res {
+            Ok(res) => res,
+            Err(err) => {
+                let class = classify_failure_class("pr-review", "FAILED", &err);
+                fail_stage_attempt(store, &mut task, &mut rev_rec, class, err.clone(), true)?;
+                return Err(format!(
+                    "pr-review stage failed for {}: {}",
+                    task.task_id, err
+                ));
+            }
+        };
 
         rev_rec.ended_epoch = Some(now_epoch());
         rev_rec.status = rev_result.status.clone();
         rev_rec.summary = Some(rev_result.summary.clone());
+        rev_rec.invocation_id = rev_result.invocation_id.clone();
+        rev_rec.input_tokens = rev_result.input_tokens;
+        rev_rec.output_tokens = rev_result.output_tokens;
         rev_rec.total_tokens = rev_result.total_tokens;
         if let Some(ref sha) = rev_result.sha_after
             && !sha.trim().is_empty()
         {
             rev_rec.sha_after = Some(sha.clone());
         }
-        store
-            .record_stage_attempt(&rev_rec)
-            .map_err(|e| e.to_string())?;
 
         *task
             .memory
@@ -1701,12 +1989,26 @@ pub fn execute_m_l_pipeline_with_executor(
             .or_insert(0) += rev_result.total_tokens;
 
         if rev_result.status != "PASSED" {
-            let _ = store.release_path_locks(&task.task_id);
+            let class =
+                classify_failure_class("pr-review", &rev_result.status, &rev_result.summary);
+            fail_stage_attempt(
+                store,
+                &mut task,
+                &mut rev_rec,
+                class,
+                rev_result.summary.clone(),
+                true,
+            )?;
             return Err(format!(
                 "pr-review stage failed for {}: {}",
                 task.task_id, rev_result.summary
             ));
         }
+
+        rev_rec.failure_class = None;
+        store
+            .record_stage_attempt(&rev_rec)
+            .map_err(|e| e.to_string())?;
 
         let expected_acs: Vec<String> = task
             .context_pack
@@ -1719,7 +2021,8 @@ pub fn execute_m_l_pipeline_with_executor(
             .as_deref()
             .unwrap_or(&rev_result.summary);
         if let Err(err) = validate_pr_review_table(review_md, &expected_acs) {
-            let _ = store.release_path_locks(&task.task_id);
+            let class = classify_failure_class("pr-review", "FAILED", &err);
+            fail_stage_attempt(store, &mut task, &mut rev_rec, class, err.clone(), true)?;
             return Err(err);
         }
 
@@ -2726,5 +3029,358 @@ mod tests {
         let mq = store.list_merge_queue(Some("zach")).unwrap();
         assert_eq!(mq.len(), 1);
         assert_eq!(mq[0].reviewed_sha, "new-merged-reviewed-sha");
+    }
+
+    struct FailingChecksExecutor {
+        inner: MockStageExecutor,
+        check_err: String,
+    }
+
+    impl StageExecutor for FailingChecksExecutor {
+        fn execute_stage(
+            &mut self,
+            task: &TaskRecord,
+            attempt_id: &str,
+            route: &StageRoute,
+            spec: &crate::v2::runner::StageCommandSpec,
+        ) -> Result<StageExecutionResult, String> {
+            self.inner.execute_stage(task, attempt_id, route, spec)
+        }
+
+        fn run_checks(&mut self, _worktree_path: &str, _commands: &[String]) -> Result<(), String> {
+            Err(self.check_err.clone())
+        }
+
+        fn finalize_xs_s_delivery(
+            &mut self,
+            task: &TaskRecord,
+            reviewed_sha: &str,
+        ) -> Result<Option<i64>, String> {
+            self.inner.finalize_xs_s_delivery(task, reviewed_sha)
+        }
+    }
+
+    fn temp_sqlite_path(label: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "zach_v2_pipeline_{label}_{}_{}.sqlite3",
+            std::process::id(),
+            now_epoch()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn sample_s_task(id: &str) -> TaskRecord {
+        TaskRecord {
+            task_id: id.to_owned(),
+            task_group: "zach".to_owned(),
+            title: format!("Test {id}"),
+            repository: "zach".to_owned(),
+            github_repo: Some("shockerqt/zach".to_owned()),
+            issue_number: Some(15),
+            weight: "S".to_owned(),
+            status: "Ready".to_owned(),
+            worktree_path: Some(format!("/tmp/zach--{id}")),
+            branch: Some(format!("task/{id}")),
+            context_pack: sample_context_pack("S"),
+            depends_on: Vec::new(),
+            required_stages: vec!["impl".to_owned(), "pr-review".to_owned()],
+            stages_completed: Vec::new(),
+            current_stage: None,
+            active_attempt_id: None,
+            plan_base_sha: Some("abc1234".to_owned()),
+            reviewed_sha: None,
+            pr_number: None,
+            executor: None,
+            autonomous_consent: true,
+            retry_count: 0,
+            memory: TaskMemory::default(),
+            version: 1,
+            updated_epoch: 1000,
+        }
+    }
+
+    #[test]
+    fn classify_failure_class_maps_infra_semantic_and_policy() {
+        assert_eq!(
+            classify_failure_class("impl", "FAILED", "AGY_TIMEOUT: timed out"),
+            "infra"
+        );
+        assert_eq!(
+            classify_failure_class("impl", "FAILED", "failed to spawn systemd-run"),
+            "infra"
+        );
+        assert_eq!(
+            classify_failure_class("impl", "FAILED", "check 'cargo test' failed: 1 failed"),
+            "semantic"
+        );
+        assert_eq!(
+            classify_failure_class(
+                "pr-review",
+                "FAILED",
+                "PR review table is missing PASS verification row for 'AC-1'"
+            ),
+            "semantic"
+        );
+        assert_eq!(
+            classify_failure_class("pr-review", "FAILED", "changes_requested by reviewer"),
+            "semantic"
+        );
+        assert_eq!(
+            classify_failure_class(
+                "impl",
+                "FAILED",
+                "forbidden path violation on ZACH-015: .github/workflows/ci.yml"
+            ),
+            "policy"
+        );
+        assert_eq!(
+            classify_failure_class("impl", "FAILED", "token budget exhausted for task ZACH-015"),
+            "policy"
+        );
+    }
+
+    #[test]
+    fn real_sqlite_store_persists_retry_count_and_failure_class_for_failed_and_passed_stages() {
+        // 1. Infra failure in XS/S impl (execute_stage returns Err) -> retry_count == 1, failure_class == "infra"
+        let db_infra = temp_sqlite_path("infra");
+        {
+            let mut store = V2Store::open(&db_infra).expect("open sqlite store");
+            store.upsert_task(&sample_s_task("ZACH-015-INFRA")).unwrap();
+
+            let mut err_mock = MockStageExecutor::default(); // empty staged_results -> Err
+            assert!(
+                execute_xs_s_pipeline_with_executor(&mut store, "ZACH-015-INFRA", &mut err_mock)
+                    .is_err()
+            );
+        }
+        {
+            let reopened = V2Store::open(&db_infra).expect("reopen sqlite store");
+            let task = reopened.get_task("ZACH-015-INFRA").unwrap().unwrap();
+            assert_eq!(task.retry_count, 1);
+
+            let attempts = reopened.list_stage_attempts("ZACH-015-INFRA").unwrap();
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(attempts[0].status, "FAILED");
+            assert_eq!(attempts[0].failure_class.as_deref(), Some("infra"));
+        }
+        let _ = std::fs::remove_file(&db_infra);
+
+        // 2. Passed impl (failure_class == NULL) followed by failed pr-review semantic gate -> retry_count == 1, failure_class == "semantic"
+        let db_semantic = temp_sqlite_path("semantic");
+        {
+            let mut store = V2Store::open(&db_semantic).expect("open sqlite store");
+            store.upsert_task(&sample_s_task("ZACH-015-SEM")).unwrap();
+
+            let mut sem_mock = MockStageExecutor {
+                staged_results: vec![
+                    StageExecutionResult {
+                        status: "PASSED".to_owned(),
+                        summary: "impl ok".to_owned(),
+                        review_markdown: None,
+                        invocation_id: Some("inv-impl".to_owned()),
+                        input_tokens: 1_000,
+                        output_tokens: 200,
+                        total_tokens: 1_200,
+                        sha_before: Some("abc1234".to_owned()),
+                        sha_after: Some("def5678".to_owned()),
+                        diff_files: vec![DiffFileEntry {
+                            path: "src/v2/router.rs".to_owned(),
+                            status: "M".to_owned(),
+                            added_lines: 10,
+                            deleted_lines: 2,
+                        }],
+                    },
+                    StageExecutionResult {
+                        status: "PASSED".to_owned(),
+                        summary: "missing table".to_owned(),
+                        review_markdown: Some("No AC table here".to_owned()),
+                        invocation_id: Some("inv-rev".to_owned()),
+                        input_tokens: 500,
+                        output_tokens: 100,
+                        total_tokens: 600,
+                        sha_before: Some("def5678".to_owned()),
+                        sha_after: Some("def5678".to_owned()),
+                        diff_files: Vec::new(),
+                    },
+                ],
+                ..MockStageExecutor::default()
+            };
+            assert!(
+                execute_xs_s_pipeline_with_executor(&mut store, "ZACH-015-SEM", &mut sem_mock)
+                    .is_err()
+            );
+        }
+        {
+            let reopened = V2Store::open(&db_semantic).expect("reopen sqlite store");
+            let task = reopened.get_task("ZACH-015-SEM").unwrap().unwrap();
+            assert_eq!(task.retry_count, 1);
+
+            let attempts = reopened.list_stage_attempts("ZACH-015-SEM").unwrap();
+            assert_eq!(attempts.len(), 2);
+            assert_eq!(attempts[0].stage, "impl");
+            assert_eq!(attempts[0].status, "PASSED");
+            assert_eq!(attempts[0].failure_class, None);
+            assert_eq!(attempts[1].stage, "pr-review");
+            assert_eq!(attempts[1].status, "FAILED");
+            assert_eq!(attempts[1].failure_class.as_deref(), Some("semantic"));
+        }
+        let _ = std::fs::remove_file(&db_semantic);
+
+        // 3. Failed worker_checks after impl -> retry_count == 1, failure_class == "semantic"
+        let db_checks = temp_sqlite_path("checks");
+        {
+            let mut store = V2Store::open(&db_checks).expect("open sqlite store");
+            store.upsert_task(&sample_s_task("ZACH-015-CHK")).unwrap();
+
+            let mut chk_exec = FailingChecksExecutor {
+                inner: MockStageExecutor {
+                    staged_results: vec![StageExecutionResult {
+                        status: "PASSED".to_owned(),
+                        summary: "impl ok".to_owned(),
+                        review_markdown: None,
+                        invocation_id: None,
+                        input_tokens: 100,
+                        output_tokens: 50,
+                        total_tokens: 150,
+                        sha_before: Some("abc".to_owned()),
+                        sha_after: Some("def".to_owned()),
+                        diff_files: vec![DiffFileEntry {
+                            path: "src/v2/router.rs".to_owned(),
+                            status: "M".to_owned(),
+                            added_lines: 5,
+                            deleted_lines: 1,
+                        }],
+                    }],
+                    ..MockStageExecutor::default()
+                },
+                check_err: "check 'cargo test' failed: test failure".to_owned(),
+            };
+            assert!(
+                execute_xs_s_pipeline_with_executor(&mut store, "ZACH-015-CHK", &mut chk_exec)
+                    .is_err()
+            );
+        }
+        {
+            let reopened = V2Store::open(&db_checks).expect("reopen sqlite store");
+            let task = reopened.get_task("ZACH-015-CHK").unwrap().unwrap();
+            assert_eq!(task.retry_count, 1);
+
+            let attempts = reopened.list_stage_attempts("ZACH-015-CHK").unwrap();
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(attempts[0].status, "FAILED");
+            assert_eq!(attempts[0].failure_class.as_deref(), Some("semantic"));
+        }
+        let _ = std::fs::remove_file(&db_checks);
+
+        // 4. Policy failure on forbidden_paths -> retry_count == 1, status == "Blocked", failure_class == "policy"
+        let db_policy = temp_sqlite_path("policy");
+        {
+            let mut store = V2Store::open(&db_policy).expect("open sqlite store");
+            store.upsert_task(&sample_s_task("ZACH-015-POL")).unwrap();
+
+            let mut pol_mock = MockStageExecutor {
+                staged_results: vec![StageExecutionResult {
+                    status: "PASSED".to_owned(),
+                    summary: "edited workflow".to_owned(),
+                    review_markdown: None,
+                    invocation_id: None,
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    total_tokens: 150,
+                    sha_before: Some("abc".to_owned()),
+                    sha_after: Some("def".to_owned()),
+                    diff_files: vec![DiffFileEntry {
+                        path: ".github/workflows/ci.yml".to_owned(),
+                        status: "M".to_owned(),
+                        added_lines: 2,
+                        deleted_lines: 1,
+                    }],
+                }],
+                ..MockStageExecutor::default()
+            };
+            assert!(
+                execute_xs_s_pipeline_with_executor(&mut store, "ZACH-015-POL", &mut pol_mock)
+                    .is_err()
+            );
+        }
+        {
+            let reopened = V2Store::open(&db_policy).expect("reopen sqlite store");
+            let task = reopened.get_task("ZACH-015-POL").unwrap().unwrap();
+            assert_eq!(task.retry_count, 1);
+            assert_eq!(task.status, "Blocked");
+
+            let attempts = reopened.list_stage_attempts("ZACH-015-POL").unwrap();
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(attempts[0].status, "FAILED");
+            assert_eq!(attempts[0].failure_class.as_deref(), Some("policy"));
+        }
+        let _ = std::fs::remove_file(&db_policy);
+
+        // 5. M/L pipeline: plan passes (NULL failure_class), plan-review fails -> retry_count == 1, failure_class == "semantic"
+        let db_ml = temp_sqlite_path("ml");
+        {
+            let mut store = V2Store::open(&db_ml).expect("open sqlite store");
+            let mut m_task = sample_s_task("ZACH-015-ML");
+            m_task.weight = "M".to_owned();
+            m_task.context_pack = sample_context_pack("M");
+            m_task.required_stages = vec![
+                "plan".to_owned(),
+                "plan-review".to_owned(),
+                "impl".to_owned(),
+                "pr-review".to_owned(),
+            ];
+            store.upsert_task(&m_task).unwrap();
+
+            let mut ml_mock = MockStageExecutor {
+                staged_results: vec![
+                    StageExecutionResult {
+                        status: "PASSED".to_owned(),
+                        summary: "plan ok".to_owned(),
+                        review_markdown: None,
+                        invocation_id: None,
+                        input_tokens: 100,
+                        output_tokens: 50,
+                        total_tokens: 150,
+                        sha_before: None,
+                        sha_after: None,
+                        diff_files: Vec::new(),
+                    },
+                    StageExecutionResult {
+                        status: "FAILED".to_owned(),
+                        summary: "changes_requested: clarify migration steps".to_owned(),
+                        review_markdown: None,
+                        invocation_id: None,
+                        input_tokens: 100,
+                        output_tokens: 50,
+                        total_tokens: 150,
+                        sha_before: None,
+                        sha_after: None,
+                        diff_files: Vec::new(),
+                    },
+                ],
+                ..MockStageExecutor::default()
+            };
+            assert!(
+                execute_m_l_pipeline_with_executor(&mut store, "ZACH-015-ML", &mut ml_mock)
+                    .is_err()
+            );
+        }
+        {
+            let reopened = V2Store::open(&db_ml).expect("reopen sqlite store");
+            let task = reopened.get_task("ZACH-015-ML").unwrap().unwrap();
+            assert_eq!(task.retry_count, 1);
+
+            let attempts = reopened.list_stage_attempts("ZACH-015-ML").unwrap();
+            assert_eq!(attempts.len(), 2);
+            assert_eq!(attempts[0].stage, "plan");
+            assert_eq!(attempts[0].status, "PASSED");
+            assert_eq!(attempts[0].failure_class, None);
+            assert_eq!(attempts[1].stage, "plan-review");
+            assert_eq!(attempts[1].status, "FAILED");
+            assert_eq!(attempts[1].failure_class.as_deref(), Some("semantic"));
+        }
+        let _ = std::fs::remove_file(&db_ml);
     }
 }
