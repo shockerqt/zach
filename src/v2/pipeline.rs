@@ -1976,6 +1976,11 @@ pub fn execute_m_l_pipeline_with_executor(
         rev_rec.input_tokens = rev_result.input_tokens;
         rev_rec.output_tokens = rev_result.output_tokens;
         rev_rec.total_tokens = rev_result.total_tokens;
+        if let Some(ref sha) = rev_result.sha_after
+            && !sha.trim().is_empty()
+        {
+            rev_rec.sha_after = Some(sha.clone());
+        }
 
         *task
             .memory
@@ -2022,6 +2027,11 @@ pub fn execute_m_l_pipeline_with_executor(
         }
 
         task.stages_completed.push("pr-review".to_owned());
+        if let Some(ref sha) = rev_result.sha_after
+            && !sha.trim().is_empty()
+        {
+            task.reviewed_sha = Some(sha.clone());
+        }
         task = store.upsert_task(&task).map_err(|e| e.to_string())?;
     }
 
@@ -2944,6 +2954,81 @@ mod tests {
         assert_eq!(synced_m.reviewed_sha.as_deref(), Some("sha-m-impl"));
         assert_eq!(synced_m.executor.as_deref(), Some("zach"));
         assert_eq!(synced_m.title, "Updated M title");
+    }
+
+    #[test]
+    fn execute_m_l_pipeline_advances_reviewed_sha_on_pr_review_pass() {
+        let mut store = V2Store::open_in_memory().expect("open store");
+        let task = TaskRecord {
+            task_id: "ZACH-022-REV".to_owned(),
+            task_group: "zach".to_owned(),
+            title: "Advance reviewed_sha on pr-review".to_owned(),
+            repository: "zach".to_owned(),
+            github_repo: Some("shockerqt/zach".to_owned()),
+            issue_number: Some(55),
+            weight: "M".to_owned(),
+            status: "Ready".to_owned(),
+            worktree_path: Some("/tmp/zach--ZACH-022-REV".to_owned()),
+            branch: Some("task/ZACH-022-REV".to_owned()),
+            context_pack: sample_context_pack("M"),
+            depends_on: Vec::new(),
+            required_stages: vec![
+                "plan".to_owned(),
+                "plan-review".to_owned(),
+                "impl".to_owned(),
+                "pr-review".to_owned(),
+            ],
+            stages_completed: vec![
+                "plan".to_owned(),
+                "plan-review".to_owned(),
+                "impl".to_owned(),
+            ],
+            current_stage: Some("pr-review".to_owned()),
+            active_attempt_id: None,
+            plan_base_sha: Some("base123".to_owned()),
+            reviewed_sha: Some("stale-reviewed-sha".to_owned()),
+            pr_number: Some(55),
+            executor: Some("zach".to_owned()),
+            autonomous_consent: true,
+            retry_count: 0,
+            memory: TaskMemory::default(),
+            version: 1,
+            updated_epoch: 1000,
+        };
+        store.upsert_task(&task).unwrap();
+
+        let mut mock = MockStageExecutor {
+            staged_results: vec![StageExecutionResult {
+                status: "PASSED".to_owned(),
+                summary: "Re-review ok".to_owned(),
+                review_markdown: Some(
+                    "| AC | Criterion | Code (file:line) | Test | Status |\n\
+                     |---|---|---|---|---|\n\
+                     | AC-1 | Works | src/v2/router.rs:102 | test_router | PASS |\n"
+                        .to_owned(),
+                ),
+                invocation_id: Some("inv-pr-rerev".to_owned()),
+                input_tokens: 500,
+                output_tokens: 100,
+                total_tokens: 600,
+                sha_before: Some("stale-reviewed-sha".to_owned()),
+                sha_after: Some("new-merged-reviewed-sha".to_owned()),
+                diff_files: Vec::new(),
+            }],
+            ..MockStageExecutor::default()
+        };
+
+        let queued = execute_m_l_pipeline_with_executor(&mut store, "ZACH-022-REV", &mut mock)
+            .expect("re-review should enqueue with updated sha");
+        assert_eq!(queued.status, "Queued for Merge");
+        assert_eq!(
+            queued.reviewed_sha.as_deref(),
+            Some("new-merged-reviewed-sha")
+        );
+
+        let mq = store.list_merge_queue(Some("zach")).unwrap();
+        assert_eq!(mq.len(), 1);
+        assert_eq!(mq[0].reviewed_sha, "new-merged-reviewed-sha");
     }
 
     struct FailingChecksExecutor {
