@@ -184,6 +184,9 @@ pub fn parse_context_pack(raw: Option<&Value>, fallback_weight: &str) -> Context
     }
 }
 
+/// Legacy stage-list fallback used only when an ingested export task omits
+/// `required_stages` (or in unit fixtures); weight floor classification itself
+/// is owned exclusively by `ws-task classify-weight`.
 pub fn default_required_stages(weight: &str) -> Vec<String> {
     match weight.to_ascii_uppercase().as_str() {
         "XS" => vec!["impl".to_owned()],

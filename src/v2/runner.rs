@@ -1749,10 +1749,35 @@ other-user-unit.service loaded active running
 
     #[test]
     fn collect_worktree_diff_entries_enforces_forbidden_out_of_scope_and_s_to_m_escalation() {
-        use crate::v2::pipeline::{DiffCheckOutcome, verify_worktree_diff};
+        use crate::v2::pipeline::{DiffCheckOutcome, verify_worktree_diff_with};
         use crate::v2::store::{ContextPackSpec, TargetFileSpec};
+        use std::os::unix::fs::PermissionsExt;
 
         let root = TempTestDir::new("zach-017-ac");
+        let stub_ws_task = root.path().join("ws-task-stub");
+        std::fs::write(
+            &stub_ws_task,
+            r#"#!/usr/bin/env python3
+import json, sys
+args = sys.argv[1:]
+assert args[0] == "classify-weight", args
+assert "--new-files" in args, args
+new_files = int(args[args.index("--new-files") + 1])
+escalated = new_files > 0
+print(json.dumps({
+    "repository": "zach",
+    "requested_weight": "S",
+    "floor_weight": "M" if escalated else "S",
+    "effective_weight": "M" if escalated else "S",
+    "escalated": escalated,
+    "required_stages": ["plan", "plan-review", "impl", "pr-review"] if escalated else ["impl", "pr-review"],
+    "reasons": [f"[M] adds {new_files} new code/config file(s)"] if escalated else ["[S] ok"],
+}))
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub_ws_task, std::fs::Permissions::from_mode(0o755)).unwrap();
+
         let origin_dir = root.path().join("origin.git");
         let work_dir = root.path().join("work");
         std::fs::create_dir_all(&origin_dir).unwrap();
@@ -1804,7 +1829,7 @@ other-user-unit.service loaded active running
                 .any(|e| e.path == ".github/workflows/ci.yml" && e.status == "A")
         );
         assert_eq!(
-            verify_worktree_diff("S", &pack, &entries),
+            verify_worktree_diff_with("zach", "S", &pack, &entries, &stub_ws_task).unwrap(),
             DiffCheckOutcome::ForbiddenPathViolation {
                 path: ".github/workflows/ci.yml".to_owned(),
                 pattern: ".github/workflows/**".to_owned(),
@@ -1821,7 +1846,7 @@ other-user-unit.service loaded active running
                 .any(|e| e.path == "src/ledger/x.rs" && e.status == "A")
         );
         assert_eq!(
-            verify_worktree_diff("S", &pack, &entries),
+            verify_worktree_diff_with("zach", "S", &pack, &entries, &stub_ws_task).unwrap(),
             DiffCheckOutcome::ForbiddenPathViolation {
                 path: "src/ledger/x.rs".to_owned(),
                 pattern: "src/ledger/**".to_owned(),
@@ -1833,7 +1858,7 @@ other-user-unit.service loaded active running
         write_rel(&work_dir, "src/outside.rs", "pub fn outside() {}\n");
         let entries = collect_worktree_diff_entries(work_dir.to_str().unwrap());
         assert_eq!(
-            verify_worktree_diff("S", &pack, &entries),
+            verify_worktree_diff_with("zach", "S", &pack, &entries, &stub_ws_task).unwrap(),
             DiffCheckOutcome::OutOfScopeFiles {
                 files: vec!["src/outside.rs".to_owned()],
             }
@@ -1856,14 +1881,19 @@ other-user-unit.service loaded active running
                 deleted_lines: 0,
             }]
         );
-        match verify_worktree_diff("S", &pack, &entries) {
+        match verify_worktree_diff_with("zach", "S", &pack, &entries, &stub_ws_task).unwrap() {
             DiffCheckOutcome::WeightEscalated {
                 from_weight,
                 to_weight,
+                required_stages,
                 ..
             } => {
                 assert_eq!(from_weight, "S");
                 assert_eq!(to_weight, "M");
+                assert_eq!(
+                    required_stages,
+                    vec!["plan", "plan-review", "impl", "pr-review"]
+                );
             }
             other => panic!("expected WeightEscalated S -> M, got {other:?}"),
         }

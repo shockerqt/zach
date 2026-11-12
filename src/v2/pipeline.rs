@@ -1,3 +1,4 @@
+use crate::v2::default_ws_task_bin;
 use crate::v2::intake::default_required_stages;
 use crate::v2::now_epoch;
 use crate::v2::router::{ModelFamily, ReasoningEffort, StageRoute, resolve_stage_route};
@@ -8,6 +9,8 @@ use crate::v2::runner::{
 };
 use crate::v2::store::{ContextPackSpec, StageAttemptRecord, TaskRecord, V2Store};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
+use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffFileEntry {
@@ -23,6 +26,7 @@ pub enum DiffCheckOutcome {
     WeightEscalated {
         from_weight: String,
         to_weight: String,
+        required_stages: Vec<String>,
         reason: String,
     },
     ForbiddenPathViolation {
@@ -32,6 +36,66 @@ pub enum DiffCheckOutcome {
     OutOfScopeFiles {
         files: Vec<String>,
     },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ClassifyWeightOutput {
+    effective_weight: String,
+    #[serde(default)]
+    escalated: bool,
+    #[serde(default)]
+    required_stages: Vec<String>,
+    #[serde(default)]
+    reasons: Vec<String>,
+}
+
+const LOCKFILE_SUFFIXES: [&str; 4] = [
+    "Cargo.lock",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+];
+const TEST_DOC_DIR_NAMES: [&str; 5] = ["test", "tests", "__tests__", "doc", "docs"];
+const DOC_EXTENSIONS: [&str; 5] = [".md", ".mdx", ".txt", ".rst", ".adoc"];
+
+fn is_lockfile_path(path: &str) -> bool {
+    LOCKFILE_SUFFIXES.iter().any(|lock| path.ends_with(lock))
+}
+
+fn is_test_or_doc_path(path: &str) -> bool {
+    let norm = path
+        .replace('\\', "/")
+        .trim_matches('/')
+        .to_ascii_lowercase();
+    if norm.is_empty() {
+        return false;
+    }
+    let parts: Vec<&str> = norm
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    let Some((&base, dir_parts)) = parts.split_last() else {
+        return false;
+    };
+    if dir_parts
+        .iter()
+        .any(|part| TEST_DOC_DIR_NAMES.contains(part))
+    {
+        return true;
+    }
+    if DOC_EXTENSIONS
+        .iter()
+        .any(|ext| base.ends_with(ext) && base.len() > ext.len())
+    {
+        return true;
+    }
+    base.contains(".test.")
+        || base.contains(".spec.")
+        || base.contains("_test.")
+        || (base.starts_with("test_") && base["test_".len()..].contains('.'))
+        || base.starts_with("tests.")
+        || base.starts_with("test.")
+        || base.contains("selftest")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,7 +123,7 @@ pub fn weight_rank(weight: &str) -> u8 {
         "S" => 2,
         "M" => 3,
         "L" => 4,
-        _ => 3,
+        _ => 0,
     }
 }
 
@@ -76,25 +140,37 @@ pub fn matches_path_pattern(path: &str, pattern: &str) -> bool {
 }
 
 /// Mechanically verifies a worktree diff against `forbidden_paths`, `target_files`,
-/// and weight ceilings (`XS -> S -> M -> L`).
+/// and Governance weight floor rules by delegating classification to `ws-task classify-weight`.
 pub fn verify_worktree_diff(
+    repository: &str,
     current_weight: &str,
     context_pack: &ContextPackSpec,
     diff_entries: &[DiffFileEntry],
-) -> DiffCheckOutcome {
+) -> Result<DiffCheckOutcome, String> {
+    verify_worktree_diff_with(
+        repository,
+        current_weight,
+        context_pack,
+        diff_entries,
+        &default_ws_task_bin(),
+    )
+}
+
+/// Injectable variant of [`verify_worktree_diff`] accepting an explicit `ws-task` binary path.
+pub fn verify_worktree_diff_with(
+    repository: &str,
+    current_weight: &str,
+    context_pack: &ContextPackSpec,
+    diff_entries: &[DiffFileEntry],
+    ws_task_bin: &Path,
+) -> Result<DiffCheckOutcome, String> {
     for entry in diff_entries {
-        if matches_path_pattern(&entry.path, ".github/workflows/**") {
-            return DiffCheckOutcome::ForbiddenPathViolation {
-                path: entry.path.clone(),
-                pattern: ".github/workflows/**".to_owned(),
-            };
-        }
         for pattern in &context_pack.forbidden_paths {
             if matches_path_pattern(&entry.path, pattern) {
-                return DiffCheckOutcome::ForbiddenPathViolation {
+                return Ok(DiffCheckOutcome::ForbiddenPathViolation {
                     path: entry.path.clone(),
                     pattern: pattern.clone(),
-                };
+                });
             }
         }
     }
@@ -113,65 +189,88 @@ pub fn verify_worktree_diff(
         if !out_of_scope.is_empty() {
             out_of_scope.sort();
             out_of_scope.dedup();
-            return DiffCheckOutcome::OutOfScopeFiles {
+            return Ok(DiffCheckOutcome::OutOfScopeFiles {
                 files: out_of_scope,
-            };
+            });
         }
     }
 
-    let total_files = diff_entries.len();
-    let total_lines: usize = diff_entries
-        .iter()
-        .map(|e| e.added_lines + e.deleted_lines)
-        .sum();
-    let created_files = diff_entries
-        .iter()
-        .filter(|e| {
-            matches!(
-                e.status.trim().to_ascii_uppercase().as_str(),
-                "A" | "CREATE" | "CREATED"
-            )
-        })
-        .count();
-
-    let touches_critical_l = diff_entries.iter().any(|e| {
-        let p = e.path.trim_start_matches("./");
-        p.starts_with("infrastructure/") || p.ends_with(".sql")
-    });
-
-    let (required_weight, reason) = if touches_critical_l {
-        (
-            "L",
-            "diff touches critical infrastructure or SQL migration path".to_owned(),
-        )
-    } else if total_files <= 2 && total_lines <= 30 && created_files == 0 {
-        ("XS", "within XS ceiling".to_owned())
-    } else if total_files <= 4 && total_lines <= 150 && created_files == 0 {
-        (
-            "S",
-            format!(
-                "diff ({total_files} files, {total_lines} lines, {created_files} new) exceeds XS ceiling (<=2 files, <=30 lines, 0 new)"
-            ),
-        )
-    } else {
-        (
-            "M",
-            format!(
-                "diff ({total_files} files, {total_lines} lines, {created_files} new) exceeds S ceiling (<=4 files, <=150 lines, 0 new)"
-            ),
-        )
-    };
+    let mut all_paths = Vec::with_capacity(diff_entries.len());
+    let mut diff_lines = 0usize;
+    let mut new_files = 0usize;
+    for entry in diff_entries {
+        let trimmed_path = entry.path.trim();
+        if !trimmed_path.is_empty() {
+            all_paths.push(trimmed_path.to_owned());
+        }
+        if is_lockfile_path(trimmed_path) || is_test_or_doc_path(trimmed_path) {
+            continue;
+        }
+        diff_lines = diff_lines.saturating_add(entry.added_lines + entry.deleted_lines);
+        if matches!(
+            entry.status.trim().to_ascii_uppercase().as_str(),
+            "A" | "CREATE" | "CREATED"
+        ) {
+            new_files = new_files.saturating_add(1);
+        }
+    }
+    let paths_arg = all_paths.join(",");
 
     let norm_current = current_weight.trim().to_ascii_uppercase();
-    if weight_rank(required_weight) > weight_rank(&norm_current) {
-        return DiffCheckOutcome::WeightEscalated {
-            from_weight: norm_current,
-            to_weight: required_weight.to_owned(),
-            reason,
-        };
+    let mut cmd = Command::new(ws_task_bin);
+    cmd.arg("classify-weight")
+        .arg("--repo")
+        .arg(repository)
+        .arg(format!("--paths={paths_arg}"))
+        .arg("--diff-lines")
+        .arg(diff_lines.to_string())
+        .arg("--new-files")
+        .arg(new_files.to_string());
+    if !norm_current.is_empty() {
+        cmd.arg("--requested").arg(&norm_current);
+    }
+    let output = cmd.output().map_err(|e| {
+        format!(
+            "failed to invoke {} classify-weight: {e}",
+            ws_task_bin.display()
+        )
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "ws-task classify-weight exited with {}: {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|e| format!("ws-task classify-weight stdout was not valid UTF-8: {e}"))?;
+    let response: ClassifyWeightOutput = serde_json::from_str(&stdout)
+        .map_err(|e| format!("failed to parse ws-task classify-weight JSON: {e}"))?;
+
+    let effective = response.effective_weight.trim().to_ascii_uppercase();
+    if !matches!(effective.as_str(), "XS" | "S" | "M" | "L") {
+        return Err(format!(
+            "ws-task classify-weight returned invalid effective_weight '{}'",
+            response.effective_weight
+        ));
     }
 
-    DiffCheckOutcome::Clean
+    if response.escalated || weight_rank(&effective) > weight_rank(&norm_current) {
+        let reason = if response.reasons.is_empty() {
+            format!("escalated by ws-task classify-weight to {effective}")
+        } else {
+            response.reasons.join("; ")
+        };
+        return Ok(DiffCheckOutcome::WeightEscalated {
+            from_weight: norm_current,
+            to_weight: effective,
+            required_stages: response.required_stages,
+            reason,
+        });
+    }
+
+    Ok(DiffCheckOutcome::Clean)
 }
 
 pub fn unwrap_json_markdown(text: &str) -> String {
@@ -879,6 +978,24 @@ fn commit_impl_worktree(
     Ok(committed_sha)
 }
 
+fn apply_weight_escalation(
+    task: &mut TaskRecord,
+    to_weight: String,
+    required_stages: Vec<String>,
+    reason: &str,
+) {
+    task.weight = to_weight.clone();
+    task.context_pack.weight = to_weight.clone();
+    task.required_stages = if required_stages.is_empty() {
+        default_required_stages(&to_weight)
+    } else {
+        required_stages
+    };
+    task.memory
+        .decisions_log
+        .push(format!("weight escalated to {to_weight}: {reason}"));
+}
+
 pub fn execute_xs_s_pipeline(store: &mut V2Store, task_id: &str) -> Result<TaskRecord, String> {
     let mut executor = SystemdStageExecutor::default();
     execute_xs_s_pipeline_with_executor(store, task_id, &mut executor)
@@ -891,6 +1008,21 @@ pub fn execute_xs_s_pipeline_with_executor(
     store: &mut V2Store,
     task_id: &str,
     executor: &mut dyn StageExecutor,
+) -> Result<TaskRecord, String> {
+    execute_xs_s_pipeline_with_executor_and_ws_task(
+        store,
+        task_id,
+        executor,
+        &default_ws_task_bin(),
+    )
+}
+
+/// Injectable variant of [`execute_xs_s_pipeline_with_executor`] accepting an explicit `ws-task` binary path.
+pub fn execute_xs_s_pipeline_with_executor_and_ws_task(
+    store: &mut V2Store,
+    task_id: &str,
+    executor: &mut dyn StageExecutor,
+    ws_task_bin: &Path,
 ) -> Result<TaskRecord, String> {
     let mut task = store
         .get_task(task_id)
@@ -1026,10 +1158,16 @@ pub fn execute_xs_s_pipeline_with_executor(
         .record_stage_attempt(&attempt_rec)
         .map_err(|e| e.to_string())?;
 
-    // Mechanical Gate 1: Worktree diff verification (forbidden_paths, target_files, weight ceilings)
-    match verify_worktree_diff(&task.weight, &task.context_pack, &impl_result.diff_files) {
-        DiffCheckOutcome::Clean => {}
-        DiffCheckOutcome::ForbiddenPathViolation { path, pattern } => {
+    // Mechanical Gate 1: Worktree diff verification (forbidden_paths, target_files, ws-task weight floor)
+    match verify_worktree_diff_with(
+        &task.repository,
+        &task.weight,
+        &task.context_pack,
+        &impl_result.diff_files,
+        ws_task_bin,
+    ) {
+        Ok(DiffCheckOutcome::Clean) => {}
+        Ok(DiffCheckOutcome::ForbiddenPathViolation { path, pattern }) => {
             let err_msg = format!(
                 "forbidden path violation on {}: {} matches {}",
                 task.task_id, path, pattern
@@ -1060,7 +1198,7 @@ pub fn execute_xs_s_pipeline_with_executor(
             );
             return Err(err_msg);
         }
-        DiffCheckOutcome::OutOfScopeFiles { files } => {
+        Ok(DiffCheckOutcome::OutOfScopeFiles { files }) => {
             let err_msg = format!(
                 "out-of-scope files modified on {}: {:?}",
                 task.task_id, files
@@ -1091,22 +1229,29 @@ pub fn execute_xs_s_pipeline_with_executor(
             );
             return Err(err_msg);
         }
-        DiffCheckOutcome::WeightEscalated {
+        Ok(DiffCheckOutcome::WeightEscalated {
             from_weight: _,
             to_weight,
+            required_stages,
             reason,
-        } => {
-            task.weight = to_weight.clone();
-            task.context_pack.weight = to_weight.clone();
-            task.required_stages = default_required_stages(&to_weight);
-            task.memory
-                .decisions_log
-                .push(format!("weight escalated to {to_weight}: {reason}"));
+        }) => {
+            apply_weight_escalation(&mut task, to_weight.clone(), required_stages, &reason);
             task = store.upsert_task(&task).map_err(|e| e.to_string())?;
             if matches!(to_weight.as_str(), "M" | "L") {
                 let _ = store.release_path_locks(&task.task_id);
                 return Ok(task);
             }
+        }
+        Err(err) => {
+            fail_stage_attempt(
+                store,
+                &mut task,
+                &mut attempt_rec,
+                FAILURE_CLASS_INFRA,
+                err.clone(),
+                true,
+            )?;
+            return Err(err);
         }
     }
 
@@ -1289,6 +1434,16 @@ pub fn execute_m_l_pipeline_with_executor(
     store: &mut V2Store,
     task_id: &str,
     executor: &mut dyn StageExecutor,
+) -> Result<TaskRecord, String> {
+    execute_m_l_pipeline_with_executor_and_ws_task(store, task_id, executor, &default_ws_task_bin())
+}
+
+/// Injectable variant of [`execute_m_l_pipeline_with_executor`] accepting an explicit `ws-task` binary path.
+pub fn execute_m_l_pipeline_with_executor_and_ws_task(
+    store: &mut V2Store,
+    task_id: &str,
+    executor: &mut dyn StageExecutor,
+    ws_task_bin: &Path,
 ) -> Result<TaskRecord, String> {
     let mut task = store
         .get_task(task_id)
@@ -1804,9 +1959,15 @@ pub fn execute_m_l_pipeline_with_executor(
             .map_err(|e| e.to_string())?;
 
         // Mechanical diff verification
-        match verify_worktree_diff(&task.weight, &task.context_pack, &impl_result.diff_files) {
-            DiffCheckOutcome::Clean => {}
-            DiffCheckOutcome::ForbiddenPathViolation { path, pattern } => {
+        match verify_worktree_diff_with(
+            &task.repository,
+            &task.weight,
+            &task.context_pack,
+            &impl_result.diff_files,
+            ws_task_bin,
+        ) {
+            Ok(DiffCheckOutcome::Clean) => {}
+            Ok(DiffCheckOutcome::ForbiddenPathViolation { path, pattern }) => {
                 let err_msg = format!(
                     "forbidden path violation on {}: {} matches {}",
                     task.task_id, path, pattern
@@ -1821,7 +1982,7 @@ pub fn execute_m_l_pipeline_with_executor(
                 )?;
                 return Err(err_msg);
             }
-            DiffCheckOutcome::OutOfScopeFiles { files } => {
+            Ok(DiffCheckOutcome::OutOfScopeFiles { files }) => {
                 let err_msg = format!(
                     "out-of-scope files modified on {}: {:?}",
                     task.task_id, files
@@ -1836,9 +1997,25 @@ pub fn execute_m_l_pipeline_with_executor(
                 )?;
                 return Err(err_msg);
             }
-            DiffCheckOutcome::WeightEscalated { to_weight, .. } => {
-                task.weight = to_weight.clone();
-                task.context_pack.weight = to_weight;
+            Ok(DiffCheckOutcome::WeightEscalated {
+                from_weight: _,
+                to_weight,
+                required_stages,
+                reason,
+            }) => {
+                apply_weight_escalation(&mut task, to_weight, required_stages, &reason);
+                task = store.upsert_task(&task).map_err(|e| e.to_string())?;
+            }
+            Err(err) => {
+                fail_stage_attempt(
+                    store,
+                    &mut task,
+                    &mut attempt_rec,
+                    FAILURE_CLASS_INFRA,
+                    err.clone(),
+                    true,
+                )?;
+                return Err(err);
             }
         }
 
@@ -2033,8 +2210,8 @@ pub fn execute_m_l_pipeline_with_executor(
         task = store.upsert_task(&task).map_err(|e| e.to_string())?;
     }
 
-    // Human Gate 2: human-merge-approval for L tasks
-    if norm_weight == "L"
+    // Human Gate 2: human-merge-approval for L tasks (check live task.weight after any M->L escalation)
+    if task.weight.trim().eq_ignore_ascii_case("L")
         && !task
             .stages_completed
             .iter()
@@ -2167,9 +2344,94 @@ mod tests {
         }
     }
 
+    struct StubWsTask {
+        _dir: std::path::PathBuf,
+        bin_path: std::path::PathBuf,
+    }
+
+    impl StubWsTask {
+        fn from_python(label: &str, body: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "zach_ws_task_stub_{label}_{}_{}",
+                std::process::id(),
+                seq
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create stub dir");
+            let bin_path = dir.join("ws-task");
+            std::fs::write(&bin_path, body).expect("write stub script");
+            std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod stub script");
+            Self {
+                _dir: dir,
+                bin_path,
+            }
+        }
+
+        fn passthrough_clean(label: &str) -> Self {
+            Self::from_python(
+                label,
+                r#"#!/usr/bin/env python3
+import json, sys
+args = sys.argv[1:]
+repo = args[args.index("--repo") + 1] if "--repo" in args else "zach"
+req = args[args.index("--requested") + 1] if "--requested" in args else "XS"
+stages = {
+    "XS": ["impl"],
+    "S": ["impl", "pr-review"],
+    "M": ["plan", "plan-review", "impl", "pr-review"],
+    "L": ["plan", "plan-review", "human-plan-approval", "impl", "pr-review", "human-merge-approval"],
+}.get(req, ["impl"])
+print(json.dumps({
+    "repository": repo,
+    "requested_weight": req,
+    "floor_weight": req,
+    "effective_weight": req,
+    "escalated": False,
+    "required_stages": stages,
+    "reasons": ["[stub] clean"],
+}))
+"#,
+            )
+        }
+
+        fn fixed_json(label: &str, json_output: &str) -> Self {
+            let escaped = serde_json::to_string(json_output).unwrap();
+            Self::from_python(
+                label,
+                &format!("#!/usr/bin/env python3\nprint({escaped})\n"),
+            )
+        }
+
+        fn failing(label: &str, exit_code: i32, stderr: &str) -> Self {
+            let escaped = serde_json::to_string(stderr).unwrap();
+            Self::from_python(
+                label,
+                &format!(
+                    "#!/usr/bin/env python3\nimport sys\nsys.stderr.write({escaped})\nsys.exit({exit_code})\n"
+                ),
+            )
+        }
+
+        fn path(&self) -> &Path {
+            &self.bin_path
+        }
+    }
+
+    impl Drop for StubWsTask {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self._dir);
+        }
+    }
+
     #[test]
     fn verify_worktree_diff_enforces_forbidden_paths_target_files_and_weight_escalation() {
         let pack = sample_context_pack("XS");
+        let clean_stub = StubWsTask::passthrough_clean("diff-clean");
 
         // 1. Forbidden path (.github/workflows/ci.yml)
         let forbidden_diff = vec![DiffFileEntry {
@@ -2179,7 +2441,8 @@ mod tests {
             deleted_lines: 1,
         }];
         assert_eq!(
-            verify_worktree_diff("XS", &pack, &forbidden_diff),
+            verify_worktree_diff_with("zach", "XS", &pack, &forbidden_diff, clean_stub.path())
+                .unwrap(),
             DiffCheckOutcome::ForbiddenPathViolation {
                 path: ".github/workflows/ci.yml".to_owned(),
                 pattern: ".github/workflows/**".to_owned(),
@@ -2194,58 +2457,73 @@ mod tests {
             deleted_lines: 0,
         }];
         assert_eq!(
-            verify_worktree_diff("XS", &pack, &oos_diff),
+            verify_worktree_diff_with("zach", "XS", &pack, &oos_diff, clean_stub.path()).unwrap(),
             DiffCheckOutcome::OutOfScopeFiles {
                 files: vec!["src/other.rs".to_owned()],
             }
         );
 
-        // 3. Clean XS diff (<=2 files, <=30 lines, 0 created)
+        // 3. Clean XS diff
         let clean_xs = vec![DiffFileEntry {
             path: "src/v2/router.rs".to_owned(),
             status: "M".to_owned(),
-            added_lines: 15,
-            deleted_lines: 5,
+            added_lines: 10,
+            deleted_lines: 2,
         }];
         assert_eq!(
-            verify_worktree_diff("XS", &pack, &clean_xs),
+            verify_worktree_diff_with("zach", "XS", &pack, &clean_xs, clean_stub.path()).unwrap(),
             DiffCheckOutcome::Clean
         );
 
-        // 4. XS escalates to S when lines > 30 (e.g. 60 lines in 1 modified file)
+        // 4. XS escalates to S when ws-task returns effective_weight = S
+        let s_stub = StubWsTask::fixed_json(
+            "xs-to-s",
+            r#"{"repository":"zach","requested_weight":"XS","floor_weight":"S","effective_weight":"S","escalated":true,"required_stages":["impl","pr-review"],"reasons":["[S] modifies executable code above ceiling"]}"#,
+        );
         let s_diff = vec![DiffFileEntry {
             path: "src/v2/router.rs".to_owned(),
             status: "M".to_owned(),
             added_lines: 45,
             deleted_lines: 15,
         }];
-        match verify_worktree_diff("XS", &pack, &s_diff) {
+        match verify_worktree_diff_with("zach", "XS", &pack, &s_diff, s_stub.path()).unwrap() {
             DiffCheckOutcome::WeightEscalated {
                 from_weight,
                 to_weight,
+                required_stages,
                 ..
             } => {
                 assert_eq!(from_weight, "XS");
                 assert_eq!(to_weight, "S");
+                assert_eq!(required_stages, vec!["impl", "pr-review"]);
             }
             other => panic!("expected WeightEscalated XS -> S, got {other:?}"),
         }
 
-        // 5. S escalates to M when a new file is created ("A")
+        // 5. S escalates to M when ws-task returns effective_weight = M
+        let m_stub = StubWsTask::fixed_json(
+            "s-to-m",
+            r#"{"repository":"zach","requested_weight":"S","floor_weight":"M","effective_weight":"M","escalated":true,"required_stages":["plan","plan-review","impl","pr-review"],"reasons":["[M] adds 1 new code/config file(s)"]}"#,
+        );
         let created_diff = vec![DiffFileEntry {
             path: "src/v2/router.rs".to_owned(),
             status: "A".to_owned(),
             added_lines: 20,
             deleted_lines: 0,
         }];
-        match verify_worktree_diff("S", &pack, &created_diff) {
+        match verify_worktree_diff_with("zach", "S", &pack, &created_diff, m_stub.path()).unwrap() {
             DiffCheckOutcome::WeightEscalated {
                 from_weight,
                 to_weight,
+                required_stages,
                 ..
             } => {
                 assert_eq!(from_weight, "S");
                 assert_eq!(to_weight, "M");
+                assert_eq!(
+                    required_stages,
+                    vec!["plan", "plan-review", "impl", "pr-review"]
+                );
             }
             other => panic!("expected WeightEscalated S -> M, got {other:?}"),
         }
@@ -2364,8 +2642,14 @@ mod tests {
             ..MockStageExecutor::default()
         };
 
-        let queued = execute_xs_s_pipeline_with_executor(&mut store, "ZACH-005", &mut mock)
-            .expect("pipeline should succeed and enqueue for merge");
+        let ws_stub = StubWsTask::passthrough_clean("zach-005");
+        let queued = execute_xs_s_pipeline_with_executor_and_ws_task(
+            &mut store,
+            "ZACH-005",
+            &mut mock,
+            ws_stub.path(),
+        )
+        .expect("pipeline should succeed and enqueue for merge");
 
         assert_eq!(queued.status, "Queued for Merge");
         assert_eq!(queued.current_stage.as_deref(), Some("merge_queue"));
@@ -2453,8 +2737,14 @@ mod tests {
             ..MockStageExecutor::default()
         };
 
-        let queued = execute_xs_s_pipeline_with_executor(&mut store, "ZACH-023-XS", &mut mock)
-            .expect("XS pipeline should enqueue for merge");
+        let ws_stub = StubWsTask::passthrough_clean("zach-023-xs");
+        let queued = execute_xs_s_pipeline_with_executor_and_ws_task(
+            &mut store,
+            "ZACH-023-XS",
+            &mut mock,
+            ws_stub.path(),
+        )
+        .expect("XS pipeline should enqueue for merge");
 
         assert_eq!(queued.status, "Queued for Merge");
         assert_eq!(queued.current_stage.as_deref(), Some("merge_queue"));
@@ -2579,8 +2869,14 @@ mod tests {
             ..MockStageExecutor::default()
         };
 
-        let result = execute_m_l_pipeline_with_executor(&mut store, "ZACH-006", &mut mock)
-            .expect("M pipeline should execute and enqueue");
+        let ws_stub = StubWsTask::passthrough_clean("zach-006");
+        let result = execute_m_l_pipeline_with_executor_and_ws_task(
+            &mut store,
+            "ZACH-006",
+            &mut mock,
+            ws_stub.path(),
+        )
+        .expect("M pipeline should execute and enqueue");
 
         // Verify task state
         assert_eq!(result.status, "Queued for Merge");
@@ -2678,9 +2974,16 @@ mod tests {
             ..MockStageExecutor::default()
         };
 
+        let ws_stub = StubWsTask::passthrough_clean("zach-007-l");
+
         // Run 1: Should execute plan -> plan-review -> pause at human-plan-approval
-        let paused_1 =
-            execute_m_l_pipeline_with_executor(&mut store, "ZACH-007-L", &mut mock).unwrap();
+        let paused_1 = execute_m_l_pipeline_with_executor_and_ws_task(
+            &mut store,
+            "ZACH-007-L",
+            &mut mock,
+            ws_stub.path(),
+        )
+        .unwrap();
         assert_eq!(paused_1.status, "Blocked");
         assert_eq!(
             paused_1.current_stage.as_deref(),
@@ -2735,8 +3038,13 @@ mod tests {
         });
 
         // Run 2: Resumes -> executes impl -> pr-review -> pauses at human-merge-approval
-        let paused_2 =
-            execute_m_l_pipeline_with_executor(&mut store, "ZACH-007-L", &mut mock).unwrap();
+        let paused_2 = execute_m_l_pipeline_with_executor_and_ws_task(
+            &mut store,
+            "ZACH-007-L",
+            &mut mock,
+            ws_stub.path(),
+        )
+        .unwrap();
         assert_eq!(paused_2.status, "Blocked");
         assert_eq!(
             paused_2.current_stage.as_deref(),
@@ -2763,8 +3071,13 @@ mod tests {
             .unwrap();
 
         // Run 3: Resumes and enqueues into merge_queue!
-        let completed =
-            execute_m_l_pipeline_with_executor(&mut store, "ZACH-007-L", &mut mock).unwrap();
+        let completed = execute_m_l_pipeline_with_executor_and_ws_task(
+            &mut store,
+            "ZACH-007-L",
+            &mut mock,
+            ws_stub.path(),
+        )
+        .unwrap();
         assert_eq!(completed.status, "Queued for Merge");
         assert_eq!(completed.current_stage.as_deref(), Some("merge_queue"));
 
@@ -2888,8 +3201,14 @@ mod tests {
             ..MockStageExecutor::default()
         };
 
-        let completed =
-            execute_m_l_pipeline_with_executor(&mut store, "ZACH-008", &mut mock).unwrap();
+        let ws_stub = StubWsTask::passthrough_clean("zach-008");
+        let completed = execute_m_l_pipeline_with_executor_and_ws_task(
+            &mut store,
+            "ZACH-008",
+            &mut mock,
+            ws_stub.path(),
+        )
+        .unwrap();
         assert!(completed.stages_completed.contains(&"plan".to_owned()));
 
         // Verify that route was automatically switched to OpenAiSol (gpt-6.1-sol) instead of GeminiAgy
@@ -2972,8 +3291,15 @@ mod tests {
             }],
             ..MockStageExecutor::default()
         };
+        let ws_stub = StubWsTask::passthrough_clean("zach-021");
         assert!(
-            execute_xs_s_pipeline_with_executor(&mut store, "ZACH-021-S", &mut fail_mock).is_err()
+            execute_xs_s_pipeline_with_executor_and_ws_task(
+                &mut store,
+                "ZACH-021-S",
+                &mut fail_mock,
+                ws_stub.path()
+            )
+            .is_err()
         );
 
         let driven_s = store.get_task("ZACH-021-S").unwrap().unwrap();
@@ -3092,8 +3418,13 @@ mod tests {
             ..MockStageExecutor::default()
         };
 
-        let queued = execute_m_l_pipeline_with_executor(&mut store, "ZACH-021-M", &mut ok_mock)
-            .expect("M pipeline should queue for merge");
+        let queued = execute_m_l_pipeline_with_executor_and_ws_task(
+            &mut store,
+            "ZACH-021-M",
+            &mut ok_mock,
+            ws_stub.path(),
+        )
+        .expect("M pipeline should queue for merge");
         assert_eq!(queued.status, "Queued for Merge");
         assert_eq!(queued.executor.as_deref(), Some("zach"));
 
@@ -3175,8 +3506,14 @@ mod tests {
             ..MockStageExecutor::default()
         };
 
-        let queued = execute_m_l_pipeline_with_executor(&mut store, "ZACH-022-REV", &mut mock)
-            .expect("re-review should enqueue with updated sha");
+        let ws_stub = StubWsTask::passthrough_clean("zach-022-rev");
+        let queued = execute_m_l_pipeline_with_executor_and_ws_task(
+            &mut store,
+            "ZACH-022-REV",
+            &mut mock,
+            ws_stub.path(),
+        )
+        .expect("re-review should enqueue with updated sha");
         assert_eq!(queued.status, "Queued for Merge");
         assert_eq!(
             queued.reviewed_sha.as_deref(),
@@ -3310,6 +3647,7 @@ mod tests {
 
     #[test]
     fn real_sqlite_store_persists_retry_count_and_failure_class_for_failed_and_passed_stages() {
+        let ws_stub = StubWsTask::passthrough_clean("zach-015");
         // 1. Infra failure in XS/S impl (execute_stage returns Err) -> retry_count == 1, failure_class == "infra"
         let db_infra = temp_sqlite_path("infra");
         {
@@ -3318,8 +3656,13 @@ mod tests {
 
             let mut err_mock = MockStageExecutor::default(); // empty staged_results -> Err
             assert!(
-                execute_xs_s_pipeline_with_executor(&mut store, "ZACH-015-INFRA", &mut err_mock)
-                    .is_err()
+                execute_xs_s_pipeline_with_executor_and_ws_task(
+                    &mut store,
+                    "ZACH-015-INFRA",
+                    &mut err_mock,
+                    ws_stub.path(),
+                )
+                .is_err()
             );
         }
         {
@@ -3375,8 +3718,13 @@ mod tests {
                 ..MockStageExecutor::default()
             };
             assert!(
-                execute_xs_s_pipeline_with_executor(&mut store, "ZACH-015-SEM", &mut sem_mock)
-                    .is_err()
+                execute_xs_s_pipeline_with_executor_and_ws_task(
+                    &mut store,
+                    "ZACH-015-SEM",
+                    &mut sem_mock,
+                    ws_stub.path(),
+                )
+                .is_err()
             );
         }
         {
@@ -3425,8 +3773,13 @@ mod tests {
                 check_err: "check 'cargo test' failed: test failure".to_owned(),
             };
             assert!(
-                execute_xs_s_pipeline_with_executor(&mut store, "ZACH-015-CHK", &mut chk_exec)
-                    .is_err()
+                execute_xs_s_pipeline_with_executor_and_ws_task(
+                    &mut store,
+                    "ZACH-015-CHK",
+                    &mut chk_exec,
+                    ws_stub.path(),
+                )
+                .is_err()
             );
         }
         {
@@ -3468,8 +3821,13 @@ mod tests {
                 ..MockStageExecutor::default()
             };
             assert!(
-                execute_xs_s_pipeline_with_executor(&mut store, "ZACH-015-POL", &mut pol_mock)
-                    .is_err()
+                execute_xs_s_pipeline_with_executor_and_ws_task(
+                    &mut store,
+                    "ZACH-015-POL",
+                    &mut pol_mock,
+                    ws_stub.path(),
+                )
+                .is_err()
             );
         }
         {
@@ -3530,8 +3888,13 @@ mod tests {
                 ..MockStageExecutor::default()
             };
             assert!(
-                execute_m_l_pipeline_with_executor(&mut store, "ZACH-015-ML", &mut ml_mock)
-                    .is_err()
+                execute_m_l_pipeline_with_executor_and_ws_task(
+                    &mut store,
+                    "ZACH-015-ML",
+                    &mut ml_mock,
+                    ws_stub.path(),
+                )
+                .is_err()
             );
         }
         {
@@ -3554,6 +3917,7 @@ mod tests {
     #[test]
     fn missing_reviewed_sha_or_pr_number_returns_error_without_fallbacks() {
         let mut store = V2Store::open_in_memory().expect("in-memory store");
+        let ws_stub = StubWsTask::passthrough_clean("zach-016");
 
         let s_impl_ok = || StageExecutionResult {
             status: "PASSED".to_owned(),
@@ -3600,8 +3964,13 @@ mod tests {
             ..MockStageExecutor::default()
         };
         assert!(
-            execute_xs_s_pipeline_with_executor(&mut store, "ZACH-016-NO-SHA", &mut no_sha_mock)
-                .is_err()
+            execute_xs_s_pipeline_with_executor_and_ws_task(
+                &mut store,
+                "ZACH-016-NO-SHA",
+                &mut no_sha_mock,
+                ws_stub.path(),
+            )
+            .is_err()
         );
         assert!(store.list_merge_queue(Some("zach")).unwrap().is_empty());
 
@@ -3615,10 +3984,11 @@ mod tests {
             ..MockStageExecutor::default()
         };
         assert!(
-            execute_xs_s_pipeline_with_executor(
+            execute_xs_s_pipeline_with_executor_and_ws_task(
                 &mut store,
                 "ZACH-016-PLACEHOLDER-SHA",
-                &mut placeholder_mock
+                &mut placeholder_mock,
+                ws_stub.path(),
             )
             .is_err()
         );
@@ -3633,8 +4003,13 @@ mod tests {
             ..MockStageExecutor::default()
         };
         assert!(
-            execute_xs_s_pipeline_with_executor(&mut store, "ZACH-016-NO-PR", &mut no_pr_mock)
-                .is_err()
+            execute_xs_s_pipeline_with_executor_and_ws_task(
+                &mut store,
+                "ZACH-016-NO-PR",
+                &mut no_pr_mock,
+                ws_stub.path(),
+            )
+            .is_err()
         );
         assert!(store.list_merge_queue(Some("zach")).unwrap().is_empty());
 
@@ -3835,8 +4210,14 @@ mod tests {
             pr_review_observed_porcelain: None,
         };
 
-        let queued = execute_xs_s_pipeline_with_executor(&mut store, "ZACH-016-REAL", &mut exec)
-            .expect("pipeline with real git repo should succeed");
+        let ws_stub = StubWsTask::passthrough_clean("zach-016-real");
+        let queued = execute_xs_s_pipeline_with_executor_and_ws_task(
+            &mut store,
+            "ZACH-016-REAL",
+            &mut exec,
+            ws_stub.path(),
+        )
+        .expect("pipeline with real git repo should succeed");
 
         let committed_head = run_git(&work_dir, &["rev-parse", "HEAD"]).trim().to_owned();
         let reviewed_sha = queued.reviewed_sha.as_deref().expect("reviewed_sha set");
@@ -3958,6 +4339,7 @@ mod tests {
     #[test]
     fn pipeline_bounds_attempt_summary_check_failure_decision_context_and_recent_attempts() {
         let mut store = V2Store::open_in_memory().expect("in-memory store");
+        let ws_stub = StubWsTask::passthrough_clean("zach-019-bound");
         let giant_raw = format!("RAW_STDERR_MARKER {}", "z".repeat(4000));
 
         // 1. M pipeline AGY infra failure records bounded pointer (not raw stderr/summary) and truncates summary <= 1024
@@ -3984,8 +4366,13 @@ mod tests {
             ..MockStageExecutor::default()
         };
         assert!(
-            execute_m_l_pipeline_with_executor(&mut store, "ZACH-019-BOUND-ML", &mut agy_fail_mock)
-                .is_err()
+            execute_m_l_pipeline_with_executor_and_ws_task(
+                &mut store,
+                "ZACH-019-BOUND-ML",
+                &mut agy_fail_mock,
+                ws_stub.path(),
+            )
+            .is_err()
         );
 
         let updated_ml = store.get_task("ZACH-019-BOUND-ML").unwrap().unwrap();
@@ -4027,8 +4414,13 @@ mod tests {
             ..MockStageExecutor::default()
         };
         assert!(
-            execute_xs_s_pipeline_with_executor(&mut store, "ZACH-019-BOUND-POL", &mut pol_mock)
-                .is_err()
+            execute_xs_s_pipeline_with_executor_and_ws_task(
+                &mut store,
+                "ZACH-019-BOUND-POL",
+                &mut pol_mock,
+                ws_stub.path(),
+            )
+            .is_err()
         );
         let decs = store.list_decisions(true, None).unwrap();
         assert_eq!(decs.len(), 1);
@@ -4063,8 +4455,13 @@ mod tests {
             check_err: giant_raw,
         };
         assert!(
-            execute_xs_s_pipeline_with_executor(&mut store, "ZACH-019-BOUND-CHK", &mut chk_exec)
-                .is_err()
+            execute_xs_s_pipeline_with_executor_and_ws_task(
+                &mut store,
+                "ZACH-019-BOUND-CHK",
+                &mut chk_exec,
+                ws_stub.path(),
+            )
+            .is_err()
         );
         let chk_task = store.get_task("ZACH-019-BOUND-CHK").unwrap().unwrap();
         let last_chk = chk_task.memory.last_check_failure.as_deref().unwrap();
@@ -4164,6 +4561,7 @@ mod tests {
     #[test]
     fn pipeline_accumulates_token_usage_enforces_budget_and_records_null_on_unknown() {
         let mut store = V2Store::open_in_memory().expect("open store");
+        let ws_stub = StubWsTask::passthrough_clean("zach-020-acc");
         let mut task = sample_s_task("ZACH-020-ACC");
         task.context_pack.target_files = vec![TargetFileSpec {
             path: "src/v2/**".to_owned(),
@@ -4192,8 +4590,13 @@ mod tests {
             ..MockStageExecutor::default()
         };
         assert!(
-            execute_xs_s_pipeline_with_executor(&mut store, "ZACH-020-ACC", &mut fail_exec)
-                .is_err()
+            execute_xs_s_pipeline_with_executor_and_ws_task(
+                &mut store,
+                "ZACH-020-ACC",
+                &mut fail_exec,
+                ws_stub.path(),
+            )
+            .is_err()
         );
         let after_fail = store.get_task("ZACH-020-ACC").unwrap().unwrap();
         assert_eq!(
@@ -4242,9 +4645,13 @@ mod tests {
             ],
             ..MockStageExecutor::default()
         };
-        let completed =
-            execute_xs_s_pipeline_with_executor(&mut store, "ZACH-020-ACC", &mut pass_exec)
-                .expect("pipeline succeeds before exceeding budget on next stage");
+        let completed = execute_xs_s_pipeline_with_executor_and_ws_task(
+            &mut store,
+            "ZACH-020-ACC",
+            &mut pass_exec,
+            ws_stub.path(),
+        )
+        .expect("pipeline succeeds before exceeding budget on next stage");
         assert_eq!(
             completed.memory.token_usage_by_stage.get("impl").copied(),
             Some(350_000)
@@ -4288,8 +4695,13 @@ mod tests {
             ..MockStageExecutor::default()
         };
         assert!(
-            execute_xs_s_pipeline_with_executor(&mut store, "ZACH-020-NULL", &mut null_exec)
-                .is_err()
+            execute_xs_s_pipeline_with_executor_and_ws_task(
+                &mut store,
+                "ZACH-020-NULL",
+                &mut null_exec,
+                ws_stub.path(),
+            )
+            .is_err()
         );
         null_task = store.get_task("ZACH-020-NULL").unwrap().unwrap();
         assert!(null_task.memory.token_usage_by_stage.is_empty());
@@ -4312,5 +4724,360 @@ mod tests {
         assert!(raw_in.is_none());
         assert!(raw_out.is_none());
         assert!(raw_tot.is_none());
+    }
+
+    #[test]
+    fn is_test_or_doc_path_and_lockfile_parity_with_governance() {
+        assert!(is_lockfile_path("Cargo.lock"));
+        assert!(is_lockfile_path("web/package-lock.json"));
+        assert!(is_lockfile_path("pnpm-lock.yaml"));
+        assert!(is_lockfile_path("yarn.lock"));
+        assert!(!is_lockfile_path("Cargo.toml"));
+        assert!(!is_lockfile_path("src/lock.rs"));
+
+        assert!(is_test_or_doc_path("README.md"));
+        assert!(is_test_or_doc_path("docs/architecture/v2.rst"));
+        assert!(is_test_or_doc_path("tests/audit_cases.rs"));
+        assert!(is_test_or_doc_path("src/__tests__/app.ts"));
+        assert!(is_test_or_doc_path("src/router.test.ts"));
+        assert!(is_test_or_doc_path("src/router.spec.tsx"));
+        assert!(is_test_or_doc_path("src/router_test.rs"));
+        assert!(is_test_or_doc_path("scripts/test_runner.py"));
+        assert!(is_test_or_doc_path("bin/ws-selftest"));
+        assert!(!is_test_or_doc_path("src/v2/router.rs"));
+        assert!(!is_test_or_doc_path(".md"));
+        assert!(!is_test_or_doc_path("Cargo.toml"));
+    }
+
+    #[test]
+    fn verify_worktree_diff_matches_ws_task_classify_weight_fixtures_and_infrastructure_is_l() {
+        #[derive(Deserialize)]
+        struct FixtureCase {
+            name: String,
+            repo: String,
+            requested: String,
+            paths: String,
+            diff_lines: usize,
+            new_files: usize,
+            output: ClassifyWeightOutput,
+        }
+
+        let raw_fixtures =
+            include_str!("../../tests/fixtures/ws_task_classify_weight_fixtures.json");
+        let cases: Vec<FixtureCase> =
+            serde_json::from_str(raw_fixtures).expect("parse golden classify-weight fixtures");
+        assert!(!cases.is_empty());
+
+        let fixture_stub = StubWsTask::from_python(
+            "fixture-parity",
+            &format!(
+                r#"#!/usr/bin/env python3
+import json, sys
+
+FIXTURES = json.loads({escaped_fixtures})
+args = sys.argv[1:]
+assert args[0] == "classify-weight", args
+repo = args[args.index("--repo") + 1]
+paths = ""
+for a in args:
+    if a.startswith("--paths="):
+        paths = a[len("--paths="):]
+diff_lines = int(args[args.index("--diff-lines") + 1])
+new_files = int(args[args.index("--new-files") + 1])
+requested = args[args.index("--requested") + 1] if "--requested" in args else ""
+
+for case in FIXTURES:
+    if (
+        case["repo"] == repo
+        and case["paths"] == paths
+        and case["diff_lines"] == diff_lines
+        and case["new_files"] == new_files
+        and case["requested"] == requested
+    ):
+        print(json.dumps(case["output"]))
+        sys.exit(0)
+
+raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={{diff_lines}} new={{new_files}} req={{requested}}")
+"#,
+                escaped_fixtures = serde_json::to_string(raw_fixtures).unwrap(),
+            ),
+        );
+
+        let real_ws_task = Path::new("/home/ubuntu/workspace/governance/bin/ws-task");
+        let has_real_ws_task = real_ws_task.exists();
+
+        for case in &cases {
+            let diff_entries = match case.name.as_str() {
+                "small_doc_only_xs" => vec![
+                    DiffFileEntry {
+                        path: "README.md".to_owned(),
+                        status: "M".to_owned(),
+                        added_lines: 120,
+                        deleted_lines: 10,
+                    },
+                    DiffFileEntry {
+                        path: "docs/guide.md".to_owned(),
+                        status: "A".to_owned(),
+                        added_lines: 50,
+                        deleted_lines: 0,
+                    },
+                ],
+                "mixed_doc_lockfile_and_small_code_xs" => vec![
+                    DiffFileEntry {
+                        path: "README.md".to_owned(),
+                        status: "M".to_owned(),
+                        added_lines: 200,
+                        deleted_lines: 10,
+                    },
+                    DiffFileEntry {
+                        path: "Cargo.lock".to_owned(),
+                        status: "M".to_owned(),
+                        added_lines: 400,
+                        deleted_lines: 100,
+                    },
+                    DiffFileEntry {
+                        path: "src/v2/router.rs".to_owned(),
+                        status: "M".to_owned(),
+                        added_lines: 8,
+                        deleted_lines: 2,
+                    },
+                ],
+                _ if case.paths.trim().is_empty() => Vec::new(),
+                _ => vec![DiffFileEntry {
+                    path: case.paths.clone(),
+                    status: if case.new_files > 0 { "A" } else { "M" }.to_owned(),
+                    added_lines: case.diff_lines,
+                    deleted_lines: 0,
+                }],
+            };
+
+            let pack = ContextPackSpec::default();
+            let expected = if case.output.escalated {
+                DiffCheckOutcome::WeightEscalated {
+                    from_weight: case.requested.clone(),
+                    to_weight: case.output.effective_weight.clone(),
+                    required_stages: case.output.required_stages.clone(),
+                    reason: case.output.reasons.join("; "),
+                }
+            } else {
+                DiffCheckOutcome::Clean
+            };
+
+            let stub_outcome = verify_worktree_diff_with(
+                &case.repo,
+                &case.requested,
+                &pack,
+                &diff_entries,
+                fixture_stub.path(),
+            )
+            .unwrap_or_else(|e| panic!("fixture {} failed via stub: {e}", case.name));
+            assert_eq!(
+                stub_outcome, expected,
+                "stub mismatch for fixture {}",
+                case.name
+            );
+
+            if case.repo == "infrastructure" {
+                match &stub_outcome {
+                    DiffCheckOutcome::WeightEscalated { to_weight, .. } => {
+                        assert_eq!(to_weight, "L", "AC-3 infrastructure must classify L");
+                    }
+                    other => panic!("expected L escalation for infrastructure, got {other:?}"),
+                }
+            }
+
+            if has_real_ws_task {
+                let real_outcome = verify_worktree_diff_with(
+                    &case.repo,
+                    &case.requested,
+                    &pack,
+                    &diff_entries,
+                    real_ws_task,
+                )
+                .unwrap_or_else(|e| panic!("fixture {} failed via real ws-task: {e}", case.name));
+                assert_eq!(
+                    real_outcome, expected,
+                    "real ws-task mismatch for fixture {}",
+                    case.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn verify_worktree_diff_and_pipelines_fail_closed_on_ws_task_errors_and_release_locks() {
+        let missing_bin = Path::new("/nonexistent/path/to/ws-task");
+        let fail_stub = StubWsTask::failing("fail-exit", 2, "classify-weight boom\n");
+        let pack = sample_context_pack("S");
+        let diff = vec![DiffFileEntry {
+            path: "src/v2/router.rs".to_owned(),
+            status: "M".to_owned(),
+            added_lines: 5,
+            deleted_lines: 1,
+        }];
+
+        assert!(verify_worktree_diff_with("zach", "S", &pack, &diff, missing_bin).is_err());
+        assert!(verify_worktree_diff_with("zach", "S", &pack, &diff, fail_stub.path()).is_err());
+
+        // XS/S pipeline marks attempt FAILED (infra) and releases path_locks on ws-task error
+        let mut store = V2Store::open_in_memory().expect("in-memory store");
+        store
+            .upsert_task(&sample_s_task("ZACH-028-XS-ERR"))
+            .unwrap();
+        let mut xs_mock = MockStageExecutor {
+            staged_results: vec![StageExecutionResult {
+                status: "PASSED".to_owned(),
+                summary: "impl ok".to_owned(),
+                review_markdown: None,
+                invocation_id: None,
+                input_tokens: Some(100),
+                output_tokens: Some(50),
+                total_tokens: Some(150),
+                sha_before: Some("abc".to_owned()),
+                sha_after: Some("def".to_owned()),
+                diff_files: diff.clone(),
+            }],
+            ..MockStageExecutor::default()
+        };
+        let xs_err = execute_xs_s_pipeline_with_executor_and_ws_task(
+            &mut store,
+            "ZACH-028-XS-ERR",
+            &mut xs_mock,
+            fail_stub.path(),
+        )
+        .unwrap_err();
+        assert!(xs_err.contains("ws-task classify-weight exited with"));
+        assert!(store.list_path_locks(Some("zach")).unwrap().is_empty());
+        let xs_attempts = store.list_stage_attempts("ZACH-028-XS-ERR").unwrap();
+        assert_eq!(xs_attempts.len(), 1);
+        assert_eq!(xs_attempts[0].status, "FAILED");
+        assert_eq!(xs_attempts[0].failure_class.as_deref(), Some("infra"));
+
+        // M/L pipeline marks attempt FAILED (infra) and releases path_locks on missing ws-task
+        let mut ml_task = sample_s_task("ZACH-028-ML-ERR");
+        ml_task.weight = "M".to_owned();
+        ml_task.context_pack = sample_context_pack("M");
+        ml_task.required_stages = vec!["impl".to_owned(), "pr-review".to_owned()];
+        ml_task.stages_completed = vec!["plan".to_owned(), "plan-review".to_owned()];
+        store.upsert_task(&ml_task).unwrap();
+        let mut ml_mock = MockStageExecutor {
+            staged_results: vec![StageExecutionResult {
+                status: "PASSED".to_owned(),
+                summary: "impl ok".to_owned(),
+                review_markdown: None,
+                invocation_id: None,
+                input_tokens: Some(100),
+                output_tokens: Some(50),
+                total_tokens: Some(150),
+                sha_before: Some("abc".to_owned()),
+                sha_after: Some("def".to_owned()),
+                diff_files: diff,
+            }],
+            ..MockStageExecutor::default()
+        };
+        let ml_err = execute_m_l_pipeline_with_executor_and_ws_task(
+            &mut store,
+            "ZACH-028-ML-ERR",
+            &mut ml_mock,
+            missing_bin,
+        )
+        .unwrap_err();
+        assert!(ml_err.contains("failed to invoke"));
+        assert!(store.list_path_locks(Some("zach")).unwrap().is_empty());
+        let ml_attempts = store.list_stage_attempts("ZACH-028-ML-ERR").unwrap();
+        assert_eq!(ml_attempts.len(), 1);
+        assert_eq!(ml_attempts[0].status, "FAILED");
+        assert_eq!(ml_attempts[0].failure_class.as_deref(), Some("infra"));
+    }
+
+    #[test]
+    fn execute_m_l_pipeline_honors_m_to_l_escalation_required_stages_and_merge_approval_gate() {
+        let mut store = V2Store::open_in_memory().expect("in-memory store");
+        let mut task = sample_s_task("ZACH-028-M-TO-L");
+        task.weight = "M".to_owned();
+        task.context_pack = sample_context_pack("M");
+        task.required_stages = vec![
+            "plan".to_owned(),
+            "plan-review".to_owned(),
+            "impl".to_owned(),
+            "pr-review".to_owned(),
+        ];
+        task.stages_completed = vec!["plan".to_owned(), "plan-review".to_owned()];
+        store.upsert_task(&task).unwrap();
+
+        let escalate_to_l_stub = StubWsTask::fixed_json(
+            "m-to-l",
+            r#"{"repository":"zach","requested_weight":"M","floor_weight":"L","effective_weight":"L","escalated":true,"required_stages":["plan","plan-review","human-plan-approval","impl","pr-review","human-merge-approval"],"reasons":["[L] critical path"]}"#,
+        );
+
+        let mut mock = MockStageExecutor {
+            staged_results: vec![
+                StageExecutionResult {
+                    status: "PASSED".to_owned(),
+                    summary: "impl touched critical path".to_owned(),
+                    review_markdown: None,
+                    invocation_id: Some("inv-impl".to_owned()),
+                    input_tokens: Some(1_000),
+                    output_tokens: Some(200),
+                    total_tokens: Some(1_200),
+                    sha_before: Some("abc1234".to_owned()),
+                    sha_after: Some("abc1234".to_owned()),
+                    diff_files: vec![DiffFileEntry {
+                        path: "src/v2/router.rs".to_owned(),
+                        status: "M".to_owned(),
+                        added_lines: 5,
+                        deleted_lines: 1,
+                    }],
+                },
+                StageExecutionResult {
+                    status: "PASSED".to_owned(),
+                    summary: "pr-review ok".to_owned(),
+                    review_markdown: Some(
+                        "| AC | Criterion | Code (file:line) | Test | Status |\n\
+                         |---|---|---|---|---|\n\
+                         | AC-1 | Works | src/v2/router.rs:1 | test_router | PASS |\n"
+                            .to_owned(),
+                    ),
+                    invocation_id: Some("inv-rev".to_owned()),
+                    input_tokens: Some(500),
+                    output_tokens: Some(100),
+                    total_tokens: Some(600),
+                    sha_before: Some("mock-committed-sha".to_owned()),
+                    sha_after: Some("mock-committed-sha".to_owned()),
+                    diff_files: Vec::new(),
+                },
+            ],
+            ..MockStageExecutor::default()
+        };
+
+        let paused = execute_m_l_pipeline_with_executor_and_ws_task(
+            &mut store,
+            "ZACH-028-M-TO-L",
+            &mut mock,
+            escalate_to_l_stub.path(),
+        )
+        .expect("M->L escalation should complete pr-review and pause at human-merge-approval");
+
+        assert_eq!(paused.weight, "L");
+        assert_eq!(paused.context_pack.weight, "L");
+        assert_eq!(
+            paused.required_stages,
+            vec![
+                "plan",
+                "plan-review",
+                "human-plan-approval",
+                "impl",
+                "pr-review",
+                "human-merge-approval"
+            ]
+        );
+        assert_eq!(paused.status, "Blocked");
+        assert_eq!(
+            paused.current_stage.as_deref(),
+            Some("human-merge-approval")
+        );
+        let open_decs = store.list_decisions(true, None).unwrap();
+        assert_eq!(open_decs.len(), 1);
+        assert_eq!(open_decs[0].kind, "merge_approval");
     }
 }
