@@ -568,32 +568,234 @@ fn git_head_sha(worktree_path: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
-pub fn collect_worktree_diff_entries(worktree_path: &str) -> Vec<DiffFileEntry> {
-    let numstat = Command::new("git")
-        .args(["-C", worktree_path, "diff", "--numstat", "HEAD"])
-        .output();
-    let Ok(out) = numstat else {
-        return Vec::new();
-    };
-    if !out.status.success() {
-        return Vec::new();
+fn resolve_diff_base(worktree_path: &str) -> Option<String> {
+    let mut candidates = Vec::new();
+    if let Ok(sym) = Command::new("git")
+        .args([
+            "-C",
+            worktree_path,
+            "symbolic-ref",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ])
+        .output()
+        && sym.status.success()
+    {
+        let sym_str = String::from_utf8_lossy(&sym.stdout);
+        if let Some(branch) = crate::v2::merge_queue::parse_default_branch(&sym_str, "") {
+            candidates.push(format!("origin/{branch}"));
+        }
     }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let mut entries = Vec::new();
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() == 3 {
-            let added = parts[0].parse::<usize>().unwrap_or(0);
-            let deleted = parts[1].parse::<usize>().unwrap_or(0);
-            entries.push(DiffFileEntry {
-                path: parts[2].to_owned(),
+    for fallback in ["origin/main", "origin/master"] {
+        if !candidates.iter().any(|c| c == fallback) {
+            candidates.push(fallback.to_owned());
+        }
+    }
+
+    for base_ref in candidates {
+        if let Ok(out) = Command::new("git")
+            .args(["-C", worktree_path, "merge-base", &base_ref, "HEAD"])
+            .output()
+            && out.status.success()
+        {
+            let sha = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            if !sha.is_empty() {
+                return Some(sha);
+            }
+        }
+    }
+
+    let head = Command::new("git")
+        .args(["-C", worktree_path, "rev-parse", "--verify", "HEAD"])
+        .output()
+        .ok()?;
+    if head.status.success() {
+        let sha = String::from_utf8_lossy(&head.stdout).trim().to_owned();
+        if !sha.is_empty() {
+            return Some(sha);
+        }
+    }
+    None
+}
+
+fn normalize_git_diff_status(raw: &str) -> String {
+    match raw.trim().bytes().next() {
+        Some(b'A' | b'C') => "A".to_owned(),
+        Some(b'D') => "D".to_owned(),
+        Some(b'R') => "R".to_owned(),
+        _ => "M".to_owned(),
+    }
+}
+
+fn parse_name_status_z(bytes: &[u8]) -> BTreeMap<String, String> {
+    let tokens: Vec<String> = bytes
+        .split(|&b| b == 0)
+        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+        .collect();
+    let mut statuses = BTreeMap::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let raw_status = tokens[i].trim();
+        i += 1;
+        if raw_status.is_empty() {
+            continue;
+        }
+        let norm = normalize_git_diff_status(raw_status);
+        if raw_status.starts_with('R') || raw_status.starts_with('C') {
+            if i + 1 < tokens.len() {
+                let new_path = tokens[i + 1].clone();
+                if !new_path.is_empty() {
+                    statuses.insert(new_path, norm);
+                }
+                i += 2;
+            } else {
+                break;
+            }
+        } else if i < tokens.len() {
+            let path = tokens[i].clone();
+            if !path.is_empty() {
+                statuses.insert(path, norm);
+            }
+            i += 1;
+        }
+    }
+    statuses
+}
+
+fn parse_numstat_z(bytes: &[u8]) -> BTreeMap<String, (usize, usize)> {
+    let tokens: Vec<String> = bytes
+        .split(|&b| b == 0)
+        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+        .collect();
+    let mut stats = BTreeMap::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = &tokens[i];
+        i += 1;
+        if token.is_empty() {
+            continue;
+        }
+        let mut parts = token.splitn(3, '\t');
+        let (Some(added_s), Some(deleted_s), Some(path_part)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let added = added_s.parse::<usize>().unwrap_or(0);
+        let deleted = deleted_s.parse::<usize>().unwrap_or(0);
+        if path_part.is_empty() {
+            if i + 1 < tokens.len() {
+                let new_path = tokens[i + 1].clone();
+                if !new_path.is_empty() {
+                    stats.insert(new_path, (added, deleted));
+                }
+                i += 2;
+            } else {
+                break;
+            }
+        } else {
+            stats.insert(path_part.to_owned(), (added, deleted));
+        }
+    }
+    stats
+}
+
+fn count_untracked_file_lines(worktree_path: &str, rel_path: &str) -> usize {
+    let full_path = std::path::Path::new(worktree_path).join(rel_path);
+    let Ok(bytes) = std::fs::read(&full_path) else {
+        return 0;
+    };
+    if bytes.contains(&0) {
+        return 0;
+    }
+    String::from_utf8_lossy(&bytes).lines().count()
+}
+
+pub fn collect_worktree_diff_entries(worktree_path: &str) -> Vec<DiffFileEntry> {
+    let mut entries: BTreeMap<String, DiffFileEntry> = BTreeMap::new();
+
+    let diff_target = resolve_diff_base(worktree_path).unwrap_or_else(|| "--cached".to_owned());
+    let name_status_out = Command::new("git")
+        .args([
+            "-C",
+            worktree_path,
+            "diff",
+            "--name-status",
+            "-M",
+            "-z",
+            &diff_target,
+        ])
+        .output();
+    let numstat_out = Command::new("git")
+        .args([
+            "-C",
+            worktree_path,
+            "diff",
+            "--numstat",
+            "-M",
+            "-z",
+            &diff_target,
+        ])
+        .output();
+
+    if let (Ok(ns), Ok(num)) = (name_status_out, numstat_out)
+        && ns.status.success()
+        && num.status.success()
+    {
+        let statuses = parse_name_status_z(&ns.stdout);
+        let stats = parse_numstat_z(&num.stdout);
+        for (path, status) in statuses {
+            let (added_lines, deleted_lines) = stats.get(&path).copied().unwrap_or((0, 0));
+            entries.insert(
+                path.clone(),
+                DiffFileEntry {
+                    path,
+                    status,
+                    added_lines,
+                    deleted_lines,
+                },
+            );
+        }
+        for (path, (added_lines, deleted_lines)) in stats {
+            entries.entry(path.clone()).or_insert(DiffFileEntry {
+                path,
                 status: "M".to_owned(),
-                added_lines: added,
-                deleted_lines: deleted,
+                added_lines,
+                deleted_lines,
             });
         }
     }
-    entries
+
+    if let Ok(untracked) = Command::new("git")
+        .args([
+            "-C",
+            worktree_path,
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ])
+        .output()
+        && untracked.status.success()
+    {
+        for chunk in untracked.stdout.split(|&b| b == 0) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let rel_path = String::from_utf8_lossy(chunk).into_owned();
+            entries.entry(rel_path.clone()).or_insert_with(|| {
+                let added_lines = count_untracked_file_lines(worktree_path, &rel_path);
+                DiffFileEntry {
+                    path: rel_path,
+                    status: "A".to_owned(),
+                    added_lines,
+                    deleted_lines: 0,
+                }
+            });
+        }
+    }
+
+    entries.into_values().collect()
 }
 
 pub struct MockStageExecutor {
@@ -771,5 +973,327 @@ other-user-unit.service loaded active running
             .position(|a| a == "--timeout")
             .expect("timeout flag");
         assert_eq!(spec.args[timeout_idx + 1], "1800");
+    }
+
+    struct TempTestDir(std::path::PathBuf);
+
+    impl TempTestDir {
+        fn new(prefix: &str) -> Self {
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("{prefix}-{}-{id}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create temp test dir");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+
+        fn path_str(&self) -> &str {
+            self.0.to_str().expect("utf-8 temp path")
+        }
+    }
+
+    impl Drop for TempTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("run git command");
+        assert!(
+            out.status.success(),
+            "git {:?} failed in {}: {}",
+            args,
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn init_git_identity(dir: &std::path::Path) {
+        git(dir, &["config", "user.email", "zach-test@example.com"]);
+        git(dir, &["config", "user.name", "Zach Test"]);
+    }
+
+    fn write_rel(dir: &std::path::Path, rel: &str, contents: &str) {
+        let full = dir.join(rel);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).expect("create parent dirs");
+        }
+        std::fs::write(full, contents).expect("write test file");
+    }
+
+    #[test]
+    fn collect_worktree_diff_entries_diffs_against_merge_base_with_real_statuses_and_untracked() {
+        let root = TempTestDir::new("zach-017-merge-base");
+        let origin_dir = root.path().join("origin.git");
+        let seed_dir = root.path().join("seed");
+        let work_dir = root.path().join("work");
+        std::fs::create_dir_all(&origin_dir).unwrap();
+        std::fs::create_dir_all(&seed_dir).unwrap();
+
+        git(&origin_dir, &["init", "--bare", "-b", "main"]);
+        git(&seed_dir, &["init", "-b", "main"]);
+        init_git_identity(&seed_dir);
+        write_rel(&seed_dir, ".gitignore", "*.log\n");
+        write_rel(&seed_dir, "src/keep.rs", "fn keep() {}\n");
+        write_rel(&seed_dir, "src/to_delete.rs", "fn gone() {}\n");
+        write_rel(&seed_dir, "src/to_rename.rs", "fn old_name() {}\n");
+        git(&seed_dir, &["add", "."]);
+        git(&seed_dir, &["commit", "-m", "base commit"]);
+        git(
+            &seed_dir,
+            &["remote", "add", "origin", origin_dir.to_str().unwrap()],
+        );
+        git(&seed_dir, &["push", "-u", "origin", "main"]);
+
+        let clone_out = Command::new("git")
+            .args([
+                "clone",
+                origin_dir.to_str().unwrap(),
+                work_dir.to_str().unwrap(),
+            ])
+            .output()
+            .expect("clone origin");
+        assert!(clone_out.status.success());
+        init_git_identity(&work_dir);
+        git(&work_dir, &["checkout", "-b", "task/zach-017"]);
+
+        // Advance origin/main past the branch point to verify merge-base (not tip) is used.
+        write_rel(&seed_dir, "src/other_on_main.rs", "fn unrelated() {}\n");
+        git(&seed_dir, &["add", "src/other_on_main.rs"]);
+        git(&seed_dir, &["commit", "-m", "advance origin/main"]);
+        git(&seed_dir, &["push", "origin", "main"]);
+        git(&work_dir, &["fetch", "origin"]);
+
+        // Committed changes on the task branch since merge-base.
+        write_rel(
+            &work_dir,
+            "src/keep.rs",
+            "fn keep() {}\nfn committed_1() {}\nfn committed_2() {}\n",
+        );
+        write_rel(&work_dir, "src/committed_new.rs", "a\nb\nc\n");
+        git(&work_dir, &["add", "src/keep.rs", "src/committed_new.rs"]);
+        git(&work_dir, &["commit", "-m", "task progress"]);
+
+        // Working tree edits: modify src/keep.rs again (must deduplicate), delete, rename, untracked, ignored.
+        write_rel(
+            &work_dir,
+            "src/keep.rs",
+            "fn keep() {}\nfn committed_1() {}\nfn committed_2() {}\nfn dirty_3() {}\n",
+        );
+        git(&work_dir, &["rm", "src/to_delete.rs"]);
+        git(&work_dir, &["mv", "src/to_rename.rs", "src/renamed.rs"]);
+        write_rel(&work_dir, "src/untracked_new.rs", "u1\nu2\nu3\nu4\n");
+        write_rel(&work_dir, "ignored.log", "should be ignored\n");
+
+        let entries = collect_worktree_diff_entries(work_dir.to_str().unwrap());
+        assert_eq!(
+            entries,
+            vec![
+                DiffFileEntry {
+                    path: "src/committed_new.rs".to_owned(),
+                    status: "A".to_owned(),
+                    added_lines: 3,
+                    deleted_lines: 0,
+                },
+                DiffFileEntry {
+                    path: "src/keep.rs".to_owned(),
+                    status: "M".to_owned(),
+                    added_lines: 3,
+                    deleted_lines: 0,
+                },
+                DiffFileEntry {
+                    path: "src/renamed.rs".to_owned(),
+                    status: "R".to_owned(),
+                    added_lines: 0,
+                    deleted_lines: 0,
+                },
+                DiffFileEntry {
+                    path: "src/to_delete.rs".to_owned(),
+                    status: "D".to_owned(),
+                    added_lines: 0,
+                    deleted_lines: 1,
+                },
+                DiffFileEntry {
+                    path: "src/untracked_new.rs".to_owned(),
+                    status: "A".to_owned(),
+                    added_lines: 4,
+                    deleted_lines: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_worktree_diff_entries_enforces_forbidden_out_of_scope_and_s_to_m_escalation() {
+        use crate::v2::pipeline::{DiffCheckOutcome, verify_worktree_diff};
+        use crate::v2::store::{ContextPackSpec, TargetFileSpec};
+
+        let root = TempTestDir::new("zach-017-ac");
+        let origin_dir = root.path().join("origin.git");
+        let work_dir = root.path().join("work");
+        std::fs::create_dir_all(&origin_dir).unwrap();
+        std::fs::create_dir_all(&work_dir).unwrap();
+
+        git(&origin_dir, &["init", "--bare", "-b", "main"]);
+        git(&work_dir, &["init", "-b", "main"]);
+        init_git_identity(&work_dir);
+        write_rel(&work_dir, "src/v2/runner.rs", "fn base() {}\n");
+        git(&work_dir, &["add", "."]);
+        git(&work_dir, &["commit", "-m", "initial"]);
+        git(
+            &work_dir,
+            &["remote", "add", "origin", origin_dir.to_str().unwrap()],
+        );
+        git(&work_dir, &["push", "-u", "origin", "main"]);
+        // Ensure origin/HEAD is absent so origin/main fallback is also exercised.
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&work_dir)
+            .args(["remote", "set-head", "origin", "-d"])
+            .output();
+        git(&work_dir, &["checkout", "-b", "task/zach-017"]);
+
+        let pack = ContextPackSpec {
+            weight: "S".to_owned(),
+            target_files: vec![TargetFileSpec {
+                path: "src/v2/**".to_owned(),
+                action: "modify".to_owned(),
+                summary: "runner changes".to_owned(),
+            }],
+            forbidden_paths: vec![
+                "src/ledger/**".to_owned(),
+                ".github/workflows/**".to_owned(),
+            ],
+            ..ContextPackSpec::default()
+        };
+
+        // AC-1a: new untracked file under .github/workflows/** -> status "A" -> ForbiddenPathViolation
+        write_rel(
+            &work_dir,
+            ".github/workflows/ci.yml",
+            "name: CI\non: push\n",
+        );
+        let entries = collect_worktree_diff_entries(work_dir.to_str().unwrap());
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.path == ".github/workflows/ci.yml" && e.status == "A")
+        );
+        assert_eq!(
+            verify_worktree_diff("S", &pack, &entries),
+            DiffCheckOutcome::ForbiddenPathViolation {
+                path: ".github/workflows/ci.yml".to_owned(),
+                pattern: ".github/workflows/**".to_owned(),
+            }
+        );
+        std::fs::remove_file(work_dir.join(".github/workflows/ci.yml")).unwrap();
+
+        // AC-1b: new untracked file under src/ledger/** -> status "A" -> ForbiddenPathViolation
+        write_rel(&work_dir, "src/ledger/x.rs", "pub fn x() {}\n");
+        let entries = collect_worktree_diff_entries(work_dir.to_str().unwrap());
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.path == "src/ledger/x.rs" && e.status == "A")
+        );
+        assert_eq!(
+            verify_worktree_diff("S", &pack, &entries),
+            DiffCheckOutcome::ForbiddenPathViolation {
+                path: "src/ledger/x.rs".to_owned(),
+                pattern: "src/ledger/**".to_owned(),
+            }
+        );
+        std::fs::remove_file(work_dir.join("src/ledger/x.rs")).unwrap();
+
+        // AC-2: new untracked file outside target_files -> OutOfScopeFiles
+        write_rel(&work_dir, "src/outside.rs", "pub fn outside() {}\n");
+        let entries = collect_worktree_diff_entries(work_dir.to_str().unwrap());
+        assert_eq!(
+            verify_worktree_diff("S", &pack, &entries),
+            DiffCheckOutcome::OutOfScopeFiles {
+                files: vec!["src/outside.rs".to_owned()],
+            }
+        );
+        std::fs::remove_file(work_dir.join("src/outside.rs")).unwrap();
+
+        // AC-3: new untracked file inside target_files counts towards created_files -> S escalates to M
+        write_rel(
+            &work_dir,
+            "src/v2/new_helper.rs",
+            "pub fn one() {}\npub fn two() {}\n",
+        );
+        let entries = collect_worktree_diff_entries(work_dir.to_str().unwrap());
+        assert_eq!(
+            entries,
+            vec![DiffFileEntry {
+                path: "src/v2/new_helper.rs".to_owned(),
+                status: "A".to_owned(),
+                added_lines: 2,
+                deleted_lines: 0,
+            }]
+        );
+        match verify_worktree_diff("S", &pack, &entries) {
+            DiffCheckOutcome::WeightEscalated {
+                from_weight,
+                to_weight,
+                ..
+            } => {
+                assert_eq!(from_weight, "S");
+                assert_eq!(to_weight, "M");
+            }
+            other => panic!("expected WeightEscalated S -> M, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collect_worktree_diff_entries_falls_back_to_head_and_parses_copy_rename_z_outputs() {
+        let repo = TempTestDir::new("zach-017-fallback");
+        git(repo.path(), &["init", "-b", "master"]);
+        init_git_identity(repo.path());
+        write_rel(repo.path(), "tracked.txt", "line1\n");
+        git(repo.path(), &["add", "tracked.txt"]);
+        git(repo.path(), &["commit", "-m", "initial"]);
+
+        write_rel(repo.path(), "tracked.txt", "line1\nline2\n");
+        write_rel(repo.path(), "new.txt", "alpha\nbeta");
+
+        let entries = collect_worktree_diff_entries(repo.path_str());
+        assert_eq!(
+            entries,
+            vec![
+                DiffFileEntry {
+                    path: "new.txt".to_owned(),
+                    status: "A".to_owned(),
+                    added_lines: 2,
+                    deleted_lines: 0,
+                },
+                DiffFileEntry {
+                    path: "tracked.txt".to_owned(),
+                    status: "M".to_owned(),
+                    added_lines: 1,
+                    deleted_lines: 0,
+                },
+            ]
+        );
+
+        let ns = b"R085\x00old.rs\x00new.rs\x00C100\x00src.rs\x00copy.rs\x00";
+        let num = b"4\t2\t\x00old.rs\x00new.rs\x0010\t0\t\x00src.rs\x00copy.rs\x00";
+        let statuses = parse_name_status_z(ns);
+        let stats = parse_numstat_z(num);
+        assert_eq!(statuses.get("new.rs").map(String::as_str), Some("R"));
+        assert_eq!(statuses.get("copy.rs").map(String::as_str), Some("A"));
+        assert_eq!(stats.get("new.rs"), Some(&(4, 2)));
+        assert_eq!(stats.get("copy.rs"), Some(&(10, 0)));
     }
 }
