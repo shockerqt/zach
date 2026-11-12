@@ -1159,18 +1159,14 @@ fn valid_execution_id(value: &str) -> bool {
         return false;
     }
     let lower = value.to_ascii_lowercase();
-    if lower.starts_with("ghp_")
+    !(lower.starts_with("ghp_")
         || lower.starts_with("gho_")
         || lower.starts_with("ghu_")
         || lower.starts_with("ghs_")
         || lower.starts_with("ghr_")
         || lower.starts_with("github_pat_")
         || lower.starts_with("bearer")
-        || lower.starts_with("token")
-    {
-        return false;
-    }
-    true
+        || lower.starts_with("token"))
 }
 
 fn valid_terminal_code(value: &str) -> bool {
