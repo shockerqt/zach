@@ -104,9 +104,12 @@ pub struct RouterEnvOverrides {
 
 impl RouterEnvOverrides {
     pub fn from_env() -> Self {
-        let flash_only = std::env::var("ZACH_USE_FLASH_ONLY")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let is_enabled = |name: &str| {
+            std::env::var(name)
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        };
+        let flash_only = is_enabled("ZACH_USE_FLASH_ONLY") || is_enabled("ZACH_USE_HYDROGEN_ONLY");
         let forced_model = std::env::var("ZACH_FORCE_MODEL").ok();
         Self {
             flash_only,
@@ -175,7 +178,7 @@ pub fn resolve_stage_route_with(
                 model: "gpt-6.1-sol".to_owned(),
                 effort,
                 fallback_family: Some(ModelFamily::GeminiAgy),
-                fallback_model: Some("gemini-3.8-flash-medium".to_owned()),
+                fallback_model: Some("gemini-4-hydrogen-medium".to_owned()),
                 fallback_effort: Some(ReasoningEffort::Medium),
                 max_task_tokens,
                 timeout_secs,
@@ -210,7 +213,7 @@ pub fn resolve_stage_route_with(
             norm_stage,
             is_retry,
             author_family.unwrap_or(ModelFamily::OpenAiSol),
-            "gemini-3.8-flash-high",
+            "gemini-4-hydrogen-high",
             "gemini-4-argon-high",
             ReasoningEffort::High,
             ReasoningEffort::Medium,
@@ -353,7 +356,7 @@ pub fn resolve_stage_route_with(
         let target_model = overrides
             .forced_model
             .clone()
-            .unwrap_or_else(|| "gemini-3.8-flash-high".to_owned());
+            .unwrap_or_else(|| "gemini-4-hydrogen-high".to_owned());
         route.family = ModelFamily::GeminiAgy;
         route.model = target_model;
         route.effort = ReasoningEffort::High;
@@ -430,7 +433,8 @@ mod tests {
         assert!(is_forbidden_daemon_model("gpt-6-astra"));
         assert!(is_forbidden_daemon_model("GPT-6-ASTRA-HIGH"));
         assert!(!is_forbidden_daemon_model("gpt-6.1-sol"));
-        assert!(!is_forbidden_daemon_model("gemini-3.8-flash-high"));
+        assert!(!is_forbidden_daemon_model("gemini-4-hydrogen-medium"));
+        assert!(!is_forbidden_daemon_model("gemini-4-hydrogen-high"));
         assert!(!is_forbidden_daemon_model("gemini-4-argon-high"));
         assert!(validate_daemon_model("gpt-6-astra").is_err());
 
@@ -473,7 +477,7 @@ mod tests {
             .unwrap();
         assert_eq!(s_rev_0.family, ModelFamily::GeminiAgy);
         assert_ne!(s_rev_0.family, s_impl_0.family);
-        assert_eq!(s_rev_0.model, "gemini-3.8-flash-high");
+        assert_eq!(s_rev_0.model, "gemini-4-hydrogen-high");
 
         // On retry_count == 1, S pr-review escalates to gemini-4-argon-high while keeping cross-model family
         let s_rev_1 = resolve_stage_route("S", "pr-review", 1, Some(ModelFamily::OpenAiSol))
@@ -503,6 +507,10 @@ mod tests {
         let xs_impl = resolve_stage_route("XS", "impl", 0, None).unwrap().unwrap();
         assert_eq!(xs_impl.effort, ReasoningEffort::Low);
         assert_eq!(xs_impl.max_task_tokens, 150_000);
+        assert_eq!(
+            xs_impl.fallback_model.as_deref(),
+            Some("gemini-4-hydrogen-medium")
+        );
     }
 
     #[test]
@@ -520,7 +528,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(flash_route.family, ModelFamily::GeminiAgy);
-        assert_eq!(flash_route.model, "gemini-3.8-flash-high");
+        assert_eq!(flash_route.model, "gemini-4-hydrogen-high");
         assert!(flash_route.fallback_model.is_none());
 
         let forced_route = resolve_stage_route_with(
