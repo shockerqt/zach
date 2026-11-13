@@ -43,13 +43,46 @@ On explicit gateway startup, its private state directory contains a stable
 `web_session_token` file. The directory must be owned by the operator and private;
 the regular token file must be owned by that operator with owner-only permissions.
 New credentials come from OS entropy and are created with mode `0600`. Insecure
-files, symlinks and generation/persistence failures stop startup. The gateway does
+files, symlinks, empty existing token files and generation/persistence failures stop startup.
+An empty file is preserved; it is never regenerated to bypass configuration failure. The gateway does
 not print credentials, return them through HTTP, or provide a session/token
 endpoint. `ZACH_STATE_DIR` overrides the default `~/.local/state/zach` directory.
 Only the local owner should retrieve the credential; no token belongs in this
 repository, a URL, a log, or shared shell history.
 
-All three endpoints require `Authorization: Bearer TOKEN`:
+All three endpoints require `Authorization: Bearer TOKEN`. URL credentials are
+rejected even alongside a valid bearer, including decoded/case variants of
+`token`, `access_token`, `session_token`, `web_session_token`, `authorization` and
+`bearer`. Cookies and alternate authentication headers do not authenticate.
+The 64-byte comparison uses pinned `subtle` 2.6.1 `ConstantTimeEq` with equal
+public lengths. Its optimization barrier and compiler/platform assumptions
+apply; behavioral release tests do not prove physical timing guarantees.
+See the [primitive contract](https://docs.rs/subtle/2.6.1/subtle/trait.ConstantTimeEq.html).
+
+The exact built-in Origin is `http://` plus the numeric loopback bind authority
+(e.g. `http://127.0.0.1:8096` or `http://[::1]:8096`). GET may omit Origin for
+native clients. POST must supply that exact Origin or an explicitly allowed one;
+a missing, `null`, malformed or disallowed Origin returns 403 before backend work.
+Host and forwarding headers never select an origin. Localhost aliases, other
+ports and schemes require explicit configuration. Both startup forms accept:
+
+```sh
+zach web --web-allow-origin https://zach.shocker.cl
+zach daemon --web --web-allow-origin https://zach.shocker.cl
+```
+
+`--web-allow-origin` is repeatable (16 entries, 512 bytes each); values must be
+exact serialized HTTP(S) origins without credentials, wildcard, path/trailing
+slash, query or fragment. Duplicates and malformed policy fail startup, including
+for library callers. Policy flags on daemon require `--web`. No policy environment
+alias exists. Actual responses and SSE grant only a validated exact Origin with
+`Vary: Origin`, never credentials or a wildcard. OPTIONS alone needs no bearer:
+it requires a matching Origin, known route and matching requested method, with
+a unique subset of `authorization`, `content-type`, `last-event-id` request
+headers, and no body. A valid preflight returns 204 without backend work.
+Actual requests still need the bearer.
+
+Endpoints:
 
 | Endpoint | Behavior |
 |---|---|
@@ -88,17 +121,48 @@ SQLite. Browser clients use authenticated `fetch` streaming and parse SSE frames
 native `EventSource` cannot set the required Authorization header. Never put a
 token into the stream URL as a substitute.
 
+Before forwarding a decision, the gateway reads its authoritative record through
+`GetDecision` on the existing socket, including resolved records. Missing records
+return 404; invalid/mismatched backend records fail closed. The default kind
+allowlist is: `plan_approval`, `human-plan-approval`, `retries_exhausted`,
+`scope_violation`, `plan_rework_limit`, `review_rework_limit`,
+`governance_close_failed`, `governance_publication_failed`,
+`checkpoint_unverifiable`, `repository_ownership_conflict`,
+`cross_family_reviewer_unavailable`, `merge_failed`, `post_merge_failure`,
+`new_apk_required`, `prod_promotion_approval`, `delivery_contract_error`.
+Other kinds return 403, including **both** `merge_approval` and
+`human-merge-approval`, irrespective of ID, choice or resolved status.
+Repeatable `--web-allow-decision-kind KIND` extends this allowlist (32 entries,
+64 lowercase ASCII letter/digit/underscore/hyphen bytes each, no duplicates).
+Enabling a kind delegates its existing coordinator capability. Each merge kind
+requires its exact name; enabling one does not enable the other.
+
+Native POST callers must add an Origin header, for example this synthetic request:
+
+```http
+POST /api/decide HTTP/1.1
+Host: 127.0.0.1:8096
+Origin: http://127.0.0.1:8096
+Authorization: Bearer <LOCAL_PRIVATE_TOKEN>
+Content-Type: application/json
+Content-Length: 51
+
+{"decision_id":"SYNTHETIC-PLAN","choice":"APPROVE"}
+```
+
 A decision returns HTTP 200 only after `RESOLVED` or `ALREADY_RESOLVED` is received;
 missing decisions return 404, malformed payloads 400, and unavailable/timeout
 backends 503/504. A timeout or disconnect after dispatch can mean the decision
 was applied without its acknowledgment reaching the caller. Check the next
 snapshot/events before deciding what to do; do not blindly repeat the request.
 
-Requests, backend frames, active clients, SSE sessions and I/O waits are bounded.
+Requests are bounded to a 4096-byte request line, 16 KiB headers, 64 headers,
+32 query fields and 16 KiB body. Backend frames (4 MiB), active clients (32),
+SSE sessions (8) and operations (5 seconds) are bounded.
 Slow/disconnected clients are released, and shutdown stops and joins gateway
 resources. No wildcard CORS policy is enabled. This task installs no service,
-opens no firewall rule and exposes no public endpoint: authentication/CORS/parser
-hardening remains ZACH-029, the web UI ZACH-030, and host/public exposure INF-020.
+opens no firewall rule and exposes no public endpoint. The web UI belongs to
+ZACH-030, and host/public exposure to INF-020.
 
 The existing binary provides bootstrap commands, the v1 ledger webhook and
 the integration-audit command. The new ordinary-JSON Issue decoder is exposed
