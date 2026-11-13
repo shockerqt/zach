@@ -1,30 +1,292 @@
-use crate::v2::default_state_dir;
-use crate::v2::socket::{ClientCommand, ServerMessage, write_ndjson};
-use crate::v2::store::{
-    DaemonStatusSummary, DecisionResolution, PendingDecisionRecord, TaskRecord, V2Store,
-    V2StoreError,
-};
+//! Bounded, owner-local HTTP adapter. The coordinator socket owns all state.
+use crate::v2::socket::{ClientCommand, ServerMessage, current_euid, verify_peer_uid};
+use crate::v2::store::{DaemonStatusSummary, PendingDecisionRecord, TaskRecord};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::os::unix::fs::PermissionsExt;
+use std::fs::{DirBuilder, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+const HEADER_LIMIT: usize = 16 * 1024;
+const BODY_LIMIT: usize = 16 * 1024;
+const BACKEND_LIMIT: usize = 4 * 1024 * 1024;
+const MAX_CLIENTS: usize = 32;
+const MAX_SSE: usize = 8;
+const WAIT: Duration = Duration::from_secs(5);
+const TICK: Duration = Duration::from_millis(50);
+
+pub struct GatewayConfig {
+    pub bind_addr: SocketAddr,
+    pub socket_path: PathBuf,
+    pub state_dir: PathBuf,
+}
+pub struct WebGateway {
+    listener: TcpListener,
+    socket_path: PathBuf,
+    token: String,
+}
+pub struct GatewayHandle {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<io::Result<()>>>,
+}
+impl GatewayHandle {
+    pub fn request_shutdown(&self) {
+        self.stop.store(true, Ordering::Release);
+    }
+    pub fn is_finished(&self) -> bool {
+        self.thread.as_ref().is_none_or(|t| t.is_finished())
+    }
+    pub fn shutdown_and_join(mut self) -> io::Result<()> {
+        self.join()
+    }
+    fn join(&mut self) -> io::Result<()> {
+        self.request_shutdown();
+        if let Some(t) = self.thread.take() {
+            t.join()
+                .map_err(|_| io::Error::other("gateway worker panicked"))??;
+        }
+        Ok(())
+    }
+}
+impl Drop for GatewayHandle {
+    fn drop(&mut self) {
+        let _ = self.join();
+    }
+}
+impl WebGateway {
+    pub fn bind(config: GatewayConfig) -> io::Result<Self> {
+        if !config.bind_addr.ip().is_loopback() {
+            return Err(invalid("loopback address required"));
+        }
+        let listener = TcpListener::bind(config.bind_addr)?;
+        listener.set_nonblocking(true)?;
+        let token = session_token(&config.state_dir)?;
+        Ok(Self {
+            listener,
+            socket_path: config.socket_path,
+            token,
+        })
+    }
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.listener.local_addr()
+    }
+    pub fn spawn(self) -> io::Result<GatewayHandle> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let child_stop = stop.clone();
+        let thread = thread::Builder::new()
+            .name("web-gateway".into())
+            .spawn(move || self.run(child_stop))?;
+        Ok(GatewayHandle {
+            stop,
+            thread: Some(thread),
+        })
+    }
+    fn run(self, stop: Arc<AtomicBool>) -> io::Result<()> {
+        let mut workers: Vec<JoinHandle<()>> = Vec::new();
+        let sse = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut result = Ok(());
+        while !stop.load(Ordering::Acquire) {
+            let mut i = 0;
+            while i < workers.len() {
+                if workers[i].is_finished() {
+                    let _ = workers.swap_remove(i).join();
+                } else {
+                    i += 1;
+                }
+            }
+            match self.listener.accept() {
+                Ok((mut stream, _)) => {
+                    if workers.len() >= MAX_CLIENTS {
+                        let _ = stream.shutdown(Shutdown::Both);
+                        continue;
+                    }
+                    let path = self.socket_path.clone();
+                    let token = self.token.clone();
+                    let stop = stop.clone();
+                    let sse = sse.clone();
+                    match thread::Builder::new()
+                        .name("web-client".into())
+                        .spawn(move || {
+                            let _ = stream.set_read_timeout(Some(TICK));
+                            let _ = stream.set_write_timeout(Some(TICK));
+                            let _ = serve(&mut stream, &path, &token, &stop, &sse);
+                        }) {
+                        Ok(t) => workers.push(t),
+                        Err(e) => {
+                            result = Err(e);
+                            break;
+                        }
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => thread::sleep(TICK),
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            }
+        }
+        stop.store(true, Ordering::Release);
+        for worker in workers {
+            let _ = worker.join();
+        }
+        result
+    }
+}
+fn invalid(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+fn check(stop: &AtomicBool, deadline: Instant) -> io::Result<()> {
+    if stop.load(Ordering::Acquire) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "gateway stopped",
+        ));
+    }
+    if Instant::now() >= deadline {
+        return Err(io::Error::new(io::ErrorKind::TimedOut, "deadline exceeded"));
+    }
+    Ok(())
+}
+fn retry(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+    )
+}
+fn write_bounded<W: Write>(
+    out: &mut W,
+    mut bytes: &[u8],
+    stop: &AtomicBool,
+    deadline: Instant,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        check(stop, deadline)?;
+        match out.write(bytes) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "closed writer")),
+            Ok(n) => bytes = &bytes[n..],
+            Err(e) if retry(&e) => thread::sleep(Duration::from_millis(1)),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+// Open the directory and token without following symlinks; openat keeps validation
+// and use attached to the same directory even if its pathname is replaced.
+fn session_token(dir: &Path) -> io::Result<String> {
+    session_token_with_entropy(dir, entropy)
+}
+fn session_token_with_entropy(
+    dir: &Path,
+    random_source: impl FnOnce(&mut [u8]) -> io::Result<()>,
+) -> io::Result<String> {
+    match DirBuilder::new().recursive(true).mode(0o700).create(dir) {
+        Ok(()) => (),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (),
+        Err(e) => return Err(e),
+    }
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir)?;
+    let meta = directory.metadata()?;
+    if meta.uid() != current_euid() || meta.mode() & 0o077 != 0 {
+        return Err(invalid("insecure state directory"));
+    }
+    let name = c"web_session_token";
+    let open = |flags| unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            0o600,
+        )
+    };
+    let fd = open(libc::O_RDONLY);
+    if fd >= 0 {
+        return read_token(unsafe { File::from_raw_fd(fd) });
+    }
+    let err = io::Error::last_os_error();
+    if err.kind() != io::ErrorKind::NotFound {
+        return Err(err);
+    }
+    let mut random = [0u8; 32];
+    random_source(&mut random)?;
+    let token = random
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let fd = open(libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL);
+    if fd < 0 {
+        let e = io::Error::last_os_error();
+        if e.kind() == io::ErrorKind::AlreadyExists {
+            let fd = open(libc::O_RDONLY);
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            return read_token(unsafe { File::from_raw_fd(fd) });
+        }
+        return Err(e);
+    }
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    file.write_all(token.as_bytes())?;
+    file.sync_all()?;
+    let meta = file.metadata()?;
+    if meta.uid() != current_euid() || meta.mode() & 0o777 != 0o600 || meta.nlink() != 1 {
+        return Err(invalid("insecure credential file"));
+    }
+    directory.sync_all()?;
+    Ok(token)
+}
+fn entropy(bytes: &mut [u8]) -> io::Result<()> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let n = unsafe {
+            libc::getrandom(bytes[offset..].as_mut_ptr().cast(), bytes.len() - offset, 0)
+        };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        if n == 0 {
+            return Err(io::Error::other("OS entropy unavailable"));
+        }
+        offset += n as usize;
+    }
+    Ok(())
+}
+fn read_token(file: File) -> io::Result<String> {
+    let m = file.metadata()?;
+    if !m.is_file() || m.uid() != current_euid() || m.mode() & 0o777 != 0o600 || m.nlink() != 1 {
+        return Err(invalid("insecure credential file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(66).read_to_end(&mut bytes)?;
+    if bytes.len() != 64 || !bytes.iter().all(u8::is_ascii_hexdigit) {
+        return Err(invalid("invalid credential file"));
+    }
+    String::from_utf8(bytes).map_err(|_| invalid("invalid credential file"))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SnapshotResponse {
     pub tasks: Vec<TaskRecord>,
     pub open_decisions: Vec<PendingDecisionRecord>,
     pub status: DaemonStatusSummary,
     pub as_of_seq: i64,
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DecideRequestBody {
     pub decision_id: String,
     pub choice: String,
@@ -33,1039 +295,1030 @@ pub struct DecideRequestBody {
     #[serde(default)]
     pub note: Option<String>,
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DecideResponse {
-    pub outcome: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub decision: Option<PendingDecisionRecord>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+struct Request {
+    method: String,
+    route: String,
+    query: HashMap<String, String>,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SessionResponse {
-    pub authenticated: bool,
-    pub session_token: String,
-    pub user: String,
-}
-
-#[derive(Clone)]
-pub enum StoreHandle {
-    Path(PathBuf),
-    Shared(Arc<Mutex<V2Store>>),
-}
-
-#[derive(Clone)]
-pub struct WebGateway {
-    pub bind_addr: String,
-    pub store_handle: StoreHandle,
-    pub socket_path: PathBuf,
-    pub session_token: String,
-    pub shutdown: Arc<AtomicBool>,
-}
-
-fn generate_random_token() -> String {
-    let mut bytes = [0u8; 24];
-    if let Ok(mut f) = fs::File::open("/dev/urandom") {
-        if f.read_exact(&mut bytes).is_ok() {
-            return bytes.iter().map(|b| format!("{:02x}", b)).collect();
-        }
-    }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    let rand_val = unsafe { libc::rand() as u32 };
-    format!("{:016x}{:08x}{:08x}", now, pid, rand_val)
-}
-
-pub fn get_or_create_web_session_token() -> String {
-    if let Ok(token) = std::env::var("ZACH_WEB_SESSION_TOKEN")
-        && !token.trim().is_empty()
-    {
-        return token.trim().to_string();
-    }
-    if let Ok(token) = std::env::var("ZACH_AUTH_TOKEN")
-        && !token.trim().is_empty()
-    {
-        return token.trim().to_string();
-    }
-    let state_dir = default_state_dir();
-    let token_path = state_dir.join("web_session_token");
-    if let Ok(content) = fs::read_to_string(&token_path) {
-        let trimmed = content.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    let token = generate_random_token();
-    let _ = fs::create_dir_all(&state_dir);
-    let _ = fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700));
-    if let Ok(mut f) = fs::File::create(&token_path) {
-        let _ = f.write_all(token.as_bytes());
-        let _ = fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600));
-    }
-    token
-}
-
-pub fn check_session_auth(
-    headers: &HashMap<String, String>,
-    query: &HashMap<String, String>,
-    expected_token: &str,
-) -> bool {
-    if expected_token.is_empty() {
-        return true;
-    }
-    if let Some(auth) = headers.get("authorization") {
-        let auth_trimmed = auth.trim();
-        if let Some(token) = auth_trimmed
-            .strip_prefix("Bearer ")
-            .or_else(|| auth_trimmed.strip_prefix("bearer "))
-        {
-            if token.trim() == expected_token {
-                return true;
-            }
-        } else if let Some(token) = auth_trimmed
-            .strip_prefix("Session ")
-            .or_else(|| auth_trimmed.strip_prefix("session "))
-        {
-            if token.trim() == expected_token {
-                return true;
-            }
-        } else if auth_trimmed == expected_token {
-            return true;
-        }
-    }
-    if let Some(cookie) = headers.get("cookie") {
-        for part in cookie.split(';') {
-            let part = part.trim();
-            if let Some((name, val)) = part.split_once('=') {
-                let name = name.trim();
-                let val = val.trim().trim_matches('"');
-                if (name == "session"
-                    || name == "zach_session"
-                    || name == "session_token"
-                    || name == "token")
-                    && val == expected_token
-                {
-                    return true;
-                }
-            }
-        }
-    }
-    if let Some(token) = headers
-        .get("x-session-token")
-        .or_else(|| headers.get("x-auth-token"))
-    {
-        if token.trim() == expected_token {
-            return true;
-        }
-    }
-    if let Some(token) = query.get("token").or_else(|| query.get("session")) {
-        if token.trim() == expected_token {
-            return true;
-        }
-    }
-    false
-}
-
-pub fn url_decode(s: &str) -> String {
-    let mut result = Vec::new();
-    let bytes = s.as_bytes();
+fn decode(s: &str) -> io::Result<String> {
+    let mut bytes = Vec::new();
+    let raw = s.as_bytes();
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                result.push(byte);
-                i += 3;
-                continue;
-            }
-        } else if bytes[i] == b'+' {
-            result.push(b' ');
-            i += 1;
-            continue;
-        }
-        result.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&result).into_owned()
-}
-
-pub fn parse_query_params(query_str: &str) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    for pair in query_str.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        let (k, v) = match pair.split_once('=') {
-            Some((k, v)) => (url_decode(k), url_decode(v)),
-            None => (url_decode(pair), String::new()),
-        };
-        map.insert(k, v);
-    }
-    map
-}
-
-#[derive(Debug)]
-pub struct ParsedHttpRequest {
-    pub method: String,
-    pub path: String,
-    pub route: String,
-    pub query_params: HashMap<String, String>,
-    pub headers: HashMap<String, String>,
-    pub body: Vec<u8>,
-}
-
-pub fn read_http_request(stream: &mut TcpStream) -> std::io::Result<ParsedHttpRequest> {
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 2048];
-    let body_start: usize;
-    let mut header_count: usize = 0;
-
-    loop {
-        let n = stream.read(&mut tmp)?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "connection closed before headers",
-            ));
-        }
-        buf.extend_from_slice(&tmp[..n]);
-        if buf.len() > 65536 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "HTTP headers too large",
-            ));
-        }
-
-        let mut headers = [httparse::EMPTY_HEADER; 64];
-        let mut req = httparse::Request::new(&mut headers);
-        match req.parse(&buf) {
-            Ok(httparse::Status::Complete(offset)) => {
-                body_start = offset;
-                for (i, h) in req.headers.iter().enumerate() {
-                    if h.name.is_empty() {
-                        header_count = i;
-                        break;
-                    }
-                    header_count = i + 1;
+    while i < raw.len() {
+        match raw[i] {
+            b'%' => {
+                if i + 2 >= raw.len() {
+                    return Err(invalid("invalid query"));
                 }
-                break;
+                let hex = std::str::from_utf8(&raw[i + 1..i + 3])
+                    .map_err(|_| invalid("invalid query"))?;
+                bytes.push(u8::from_str_radix(hex, 16).map_err(|_| invalid("invalid query"))?);
+                i += 3;
             }
-            Ok(httparse::Status::Partial) => {
-                continue;
+            b'+' => {
+                bytes.push(b' ');
+                i += 1;
             }
-            Err(e) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("HTTP parse error: {e}"),
-                ));
+            b => {
+                bytes.push(b);
+                i += 1;
             }
         }
     }
-
-    let mut headers_arr = [httparse::EMPTY_HEADER; 64];
-    let mut req = httparse::Request::new(&mut headers_arr);
-    let _ = req.parse(&buf);
-
-    let method = req.method.unwrap_or("GET").to_uppercase();
-    let full_path = req.path.unwrap_or("/").to_string();
-
-    let mut headers_map = HashMap::new();
-    for h in &headers_arr[..header_count] {
-        let name = h.name.to_ascii_lowercase();
-        let value = String::from_utf8_lossy(h.value).trim().to_string();
-        headers_map.insert(name, value);
-    }
-
-    let (route, query_str) = match full_path.find('?') {
-        Some(idx) => (
-            full_path[..idx].to_string(),
-            full_path[idx + 1..].to_string(),
-        ),
-        None => (full_path.clone(), String::new()),
+    String::from_utf8(bytes).map_err(|_| invalid("invalid query"))
+}
+fn read_request(stream: &mut TcpStream, stop: &AtomicBool) -> io::Result<Request> {
+    let deadline = Instant::now() + WAIT;
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 2048];
+    let end = loop {
+        check(stop, deadline)?;
+        if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+            if pos + 4 > HEADER_LIMIT {
+                return Err(invalid("headers too large"));
+            }
+            break pos + 4;
+        }
+        if bytes.len() >= HEADER_LIMIT {
+            return Err(invalid("headers too large"));
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => return Err(invalid("incomplete request")),
+            Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+            Err(e) if retry(&e) => continue,
+            Err(e) => return Err(e),
+        }
     };
-    let query_params = parse_query_params(&query_str);
-
-    let content_len: usize = headers_map
-        .get("content-length")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
-
-    let mut body = buf[body_start..].to_vec();
-    while body.len() < content_len {
-        let needed = content_len - body.len();
-        let to_read = needed.min(tmp.len());
-        let n = stream.read(&mut tmp[..to_read])?;
-        if n == 0 {
-            break;
+    let mut fields = [httparse::EMPTY_HEADER; 64];
+    let mut parsed = httparse::Request::new(&mut fields);
+    if !parsed
+        .parse(&bytes[..end])
+        .map_err(|_| invalid("invalid HTTP"))?
+        .is_complete()
+    {
+        return Err(invalid("invalid HTTP"));
+    }
+    if parsed.version != Some(1) {
+        return Err(invalid("HTTP/1.1 required"));
+    }
+    let method = parsed
+        .method
+        .ok_or_else(|| invalid("missing method"))?
+        .to_owned();
+    let path = parsed.path.ok_or_else(|| invalid("missing path"))?;
+    let (route, query_text) = path.split_once('?').unwrap_or((path, ""));
+    if !route.starts_with('/') {
+        return Err(invalid("invalid target"));
+    }
+    let route = route.to_owned();
+    let mut headers = HashMap::new();
+    for h in parsed.headers.iter() {
+        let key = h.name.to_ascii_lowercase();
+        let value = std::str::from_utf8(h.value)
+            .map_err(|_| invalid("invalid header"))?
+            .trim()
+            .to_owned();
+        if headers.insert(key, value).is_some() {
+            return Err(invalid("duplicate header"));
         }
-        body.extend_from_slice(&tmp[..n]);
     }
-    if body.len() > content_len {
-        body.truncate(content_len);
+    if headers.contains_key("transfer-encoding") {
+        return Err(invalid("unsupported framing"));
     }
-
-    Ok(ParsedHttpRequest {
+    let len = match headers.get("content-length") {
+        Some(v) if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) => {
+            v.parse::<usize>().map_err(|_| invalid("invalid length"))?
+        }
+        Some(_) => return Err(invalid("invalid length")),
+        None => 0,
+    };
+    if len > BODY_LIMIT || bytes.len() - end > len {
+        return Err(invalid("invalid body length"));
+    }
+    let mut query = HashMap::new();
+    for pair in query_text.split('&').filter(|s| !s.is_empty()) {
+        let (key, val) = pair.split_once('=').unwrap_or((pair, ""));
+        if query.insert(decode(key)?, decode(val)?).is_some() {
+            return Err(invalid("duplicate query"));
+        }
+    }
+    while bytes.len() - end < len {
+        check(stop, deadline)?;
+        let remaining = (len - (bytes.len() - end)).min(chunk.len());
+        match stream.read(&mut chunk[..remaining]) {
+            Ok(0) => return Err(invalid("incomplete body")),
+            Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+            Err(e) if retry(&e) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(Request {
         method,
-        path: full_path,
         route,
-        query_params,
-        headers: headers_map,
-        body,
+        headers,
+        query,
+        body: bytes[end..].to_vec(),
     })
 }
-
-pub fn write_cors_preflight(stream: &mut TcpStream) -> std::io::Result<()> {
-    let resp = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, X-Session-Token, X-Auth-Token, Last-Event-ID\r\nAccess-Control-Max-Age: 86400\r\nConnection: close\r\n\r\n";
-    stream.write_all(resp.as_bytes())?;
-    stream.flush()?;
-    Ok(())
-}
-
-pub fn write_json_response<T: Serialize>(
+fn response(
     stream: &mut TcpStream,
-    status_code: u16,
-    reason: &str,
-    data: &T,
-) -> std::io::Result<()> {
-    let json_bytes = serde_json::to_vec(data)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let headers = format!(
-        "HTTP/1.1 {status_code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, X-Session-Token, X-Auth-Token, Last-Event-ID\r\nConnection: close\r\n\r\n",
-        json_bytes.len()
+    code: u16,
+    data: &impl Serialize,
+    stop: &AtomicBool,
+) -> io::Result<()> {
+    let body = serde_json::to_vec(data).map_err(io::Error::other)?;
+    let reason = match code {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        404 => "Not Found",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => "Error",
+    };
+    let head = format!(
+        "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        body.len()
     );
-    stream.write_all(headers.as_bytes())?;
-    stream.write_all(&json_bytes)?;
-    stream.flush()?;
-    Ok(())
+    let deadline = Instant::now() + WAIT;
+    write_bounded(stream, head.as_bytes(), stop, deadline)?;
+    write_bounded(stream, &body, stop, deadline)
 }
-
-pub fn write_error_response(
-    stream: &mut TcpStream,
-    status_code: u16,
-    reason: &str,
-    message: &str,
-) -> std::io::Result<()> {
-    let body = serde_json::json!({
-        "error": reason.to_ascii_lowercase().replace(' ', "_"),
-        "message": message,
-    });
-    write_json_response(stream, status_code, reason, &body)
+fn error(stream: &mut TcpStream, code: u16, message: &str, stop: &AtomicBool) -> io::Result<()> {
+    response(stream, code, &serde_json::json!({"error": message}), stop)
 }
-
-pub fn stream_sse_events(
-    gateway: &WebGateway,
-    stream: &mut TcpStream,
-    since_seq: i64,
-    group: Option<String>,
-) -> std::io::Result<()> {
-    let sse_headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache, no-transform\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, X-Session-Token, X-Auth-Token, Last-Event-ID\r\n\r\n";
-    let _ = stream.set_read_timeout(None);
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
-    stream.write_all(sse_headers.as_bytes())?;
-    stream.flush()?;
-
-    let mut high_watermark = since_seq;
-
-    // 1. Initial replay of missed events from SQLite store
-    let replay_res =
-        gateway.with_store(|store| store.list_events_since(group.as_deref(), high_watermark, 5000));
-    if let Ok(events) = replay_res {
-        for event in events {
-            if event.seq_id > high_watermark {
-                high_watermark = event.seq_id;
-                let payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
-                let chunk = format!(
-                    "id: {}\nevent: {}\ndata: {}\n\n",
-                    event.seq_id, event.event_type, payload
-                );
-                if stream.write_all(chunk.as_bytes()).is_err() {
-                    return Ok(());
-                }
-                let _ = stream.flush();
-            }
+fn cursor(req: &Request) -> io::Result<i64> {
+    // Validate both supplied values even when the header takes precedence.
+    let parse = |v: &str| {
+        if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(invalid("invalid cursor"));
         }
+        v.parse::<i64>().map_err(|_| invalid("invalid cursor"))
+    };
+    let query = req.query.get("since_seq").map(|v| parse(v)).transpose()?;
+    Ok(req
+        .headers
+        .get("last-event-id")
+        .map(|v| parse(v))
+        .transpose()?
+        .or(query)
+        .unwrap_or(0))
+}
+fn authorized(value: Option<&String>, token: &str) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let Some((scheme, supplied)) = value.split_once(' ') else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("Bearer") || supplied.len() != token.len() {
+        return false;
     }
+    supplied
+        .bytes()
+        .zip(token.bytes())
+        .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+        == 0
+}
 
-    // 2. Connect to Unix socket pub/sub or fall back to store polling
-    let mut unix_sub: Option<(UnixStream, BufReader<UnixStream>)> =
-        match UnixStream::connect(&gateway.socket_path) {
-            Ok(sock) => {
-                let mut s = sock;
-                let cmd = ClientCommand::Subscribe {
-                    group: group.clone(),
-                    since_seq: Some(high_watermark),
-                    once: Some(false),
-                };
-                let _ = write_ndjson(&mut s, &cmd);
-                let _ = s.set_read_timeout(Some(Duration::from_millis(250)));
-                if let Ok(cloned) = s.try_clone() {
-                    Some((s, BufReader::new(cloned)))
-                } else {
-                    None
-                }
-            }
-            Err(_) => None,
+struct Backend {
+    stream: UnixStream,
+    bytes: Vec<u8>,
+}
+impl Backend {
+    fn connect(path: &Path, stop: &AtomicBool, deadline: Instant) -> io::Result<Self> {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = path.as_os_str().as_bytes();
+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        if raw.is_empty() || raw.len() >= address.sun_path.len() || raw.contains(&0) {
+            return Err(invalid("invalid socket path"));
+        }
+        address.sun_family = libc::AF_UNIX as _;
+        for (a, b) in address.sun_path.iter_mut().zip(raw) {
+            *a = *b as _;
+        }
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+            )
         };
-
-    let mut last_heartbeat = SystemTime::now();
-
-    while !gateway.shutdown.load(Ordering::Relaxed) {
-        let mut had_activity = false;
-
-        if let Some((_, ref mut reader)) = unix_sub {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
-                Ok(0) => {
-                    unix_sub = None;
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let stream = unsafe { UnixStream::from_raw_fd(fd) };
+        let rc = unsafe {
+            libc::connect(
+                fd,
+                (&address as *const libc::sockaddr_un).cast(),
+                std::mem::size_of_val(&address) as _,
+            )
+        };
+        if rc < 0 {
+            let e = io::Error::last_os_error();
+            if !matches!(e.raw_os_error(), Some(libc::EINPROGRESS)) {
+                return Err(e);
+            }
+            loop {
+                check(stop, deadline)?;
+                let mut pollfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                let n = unsafe { libc::poll(&mut pollfd, 1, TICK.as_millis() as _) };
+                if n < 0 {
+                    let e = io::Error::last_os_error();
+                    if e.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(e);
                 }
-                Ok(_) => {
-                    had_activity = true;
-                    let trimmed = line.trim();
-                    if let Ok(ServerMessage::Event { event }) =
-                        serde_json::from_str::<ServerMessage>(trimmed)
+                if n > 0 {
+                    let mut err: libc::c_int = 0;
+                    let mut len = std::mem::size_of_val(&err) as libc::socklen_t;
+                    if unsafe {
+                        libc::getsockopt(
+                            fd,
+                            libc::SOL_SOCKET,
+                            libc::SO_ERROR,
+                            (&mut err as *mut libc::c_int).cast(),
+                            &mut len,
+                        )
+                    } < 0
                     {
-                        if event.seq_id > high_watermark {
-                            high_watermark = event.seq_id;
-                            let payload =
-                                serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
-                            let chunk = format!(
-                                "id: {}\nevent: {}\ndata: {}\n\n",
-                                event.seq_id, event.event_type, payload
-                            );
-                            if stream.write_all(chunk.as_bytes()).is_err() {
-                                return Ok(());
-                            }
-                            let _ = stream.flush();
-                        }
+                        return Err(io::Error::last_os_error());
                     }
-                }
-                Err(ref e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(_) => {
-                    unix_sub = None;
-                }
-            }
-        } else {
-            let events_res = gateway
-                .with_store(|store| store.list_events_since(group.as_deref(), high_watermark, 200));
-            if let Ok(events) = events_res {
-                if !events.is_empty() {
-                    had_activity = true;
-                    for event in events {
-                        if event.seq_id > high_watermark {
-                            high_watermark = event.seq_id;
-                            let payload =
-                                serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
-                            let chunk = format!(
-                                "id: {}\nevent: {}\ndata: {}\n\n",
-                                event.seq_id, event.event_type, payload
-                            );
-                            if stream.write_all(chunk.as_bytes()).is_err() {
-                                return Ok(());
-                            }
-                            let _ = stream.flush();
-                        }
+                    if err != 0 {
+                        return Err(io::Error::from_raw_os_error(err));
                     }
+                    break;
                 }
             }
-            std::thread::sleep(Duration::from_millis(200));
         }
-
-        if last_heartbeat
-            .elapsed()
-            .map(|d| d.as_secs() >= 15)
-            .unwrap_or(false)
-        {
-            last_heartbeat = SystemTime::now();
-            if stream.write_all(b": ping\n\n").is_err() {
-                return Ok(());
+        verify_peer_uid(&stream, current_euid()).map_err(|_| invalid("backend peer rejected"))?;
+        Ok(Self {
+            stream,
+            bytes: Vec::new(),
+        })
+    }
+    fn send(
+        &mut self,
+        command: &ClientCommand,
+        stop: &AtomicBool,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        let mut bytes = serde_json::to_vec(command).map_err(io::Error::other)?;
+        bytes.push(b'\n');
+        write_bounded(&mut self.stream, &bytes, stop, deadline)
+    }
+    fn receive(
+        &mut self,
+        stop: &AtomicBool,
+        deadline: Instant,
+    ) -> io::Result<Option<ServerMessage>> {
+        loop {
+            check(stop, deadline)?;
+            if let Some(n) = self.bytes.iter().position(|b| *b == b'\n') {
+                let line: Vec<_> = self.bytes.drain(..=n).collect();
+                return serde_json::from_slice(&line)
+                    .map(Some)
+                    .map_err(|_| invalid("invalid backend response"));
             }
-            let _ = stream.flush();
-        }
-
-        if !had_activity && unix_sub.is_some() {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    Ok(())
-}
-
-impl WebGateway {
-    pub fn new(bind_addr: String, db_path: PathBuf, socket_path: PathBuf) -> Self {
-        let session_token = get_or_create_web_session_token();
-        Self {
-            bind_addr,
-            store_handle: StoreHandle::Path(db_path),
-            socket_path,
-            session_token,
-            shutdown: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    pub fn with_shared_store(
-        bind_addr: String,
-        store: Arc<Mutex<V2Store>>,
-        socket_path: PathBuf,
-    ) -> Self {
-        let session_token = get_or_create_web_session_token();
-        Self {
-            bind_addr,
-            store_handle: StoreHandle::Shared(store),
-            socket_path,
-            session_token,
-            shutdown: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    pub fn request_shutdown(&self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-    }
-
-    pub fn with_store<F, R>(&self, f: F) -> Result<R, V2StoreError>
-    where
-        F: FnOnce(&mut V2Store) -> Result<R, V2StoreError>,
-    {
-        match &self.store_handle {
-            StoreHandle::Path(path) => {
-                let mut store = V2Store::open(path)?;
-                f(&mut store)
+            if self.bytes.len() >= BACKEND_LIMIT {
+                return Err(invalid("backend response too large"));
             }
-            StoreHandle::Shared(shared) => {
-                let mut store = shared
-                    .lock()
-                    .map_err(|e| V2StoreError(format!("mutex poisoned: {e}")))?;
-                f(&mut store)
-            }
-        }
-    }
-
-    pub fn run_loop(&self) -> std::io::Result<()> {
-        let listener = TcpListener::bind(&self.bind_addr)?;
-        listener.set_nonblocking(true)?;
-
-        while !self.shutdown.load(Ordering::Relaxed) {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let gateway_clone = self.clone();
-                    std::thread::spawn(move || {
-                        let _ = gateway_clone.handle_client(stream);
-                    });
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(25));
-                }
+            let mut chunk = [0; 8192];
+            let limit = (BACKEND_LIMIT - self.bytes.len()).min(chunk.len());
+            match self.stream.read(&mut chunk[..limit]) {
+                Ok(0) if self.bytes.is_empty() => return Ok(None),
+                Ok(0) => return Err(invalid("incomplete backend response")),
+                Ok(n) => self.bytes.extend_from_slice(&chunk[..n]),
+                Err(e) if retry(&e) => thread::sleep(Duration::from_millis(2)),
                 Err(e) => return Err(e),
             }
         }
-
-        Ok(())
     }
-
-    pub fn handle_client(&self, mut stream: TcpStream) -> std::io::Result<()> {
-        let req = match read_http_request(&mut stream) {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = write_error_response(&mut stream, 400, "Bad Request", &e.to_string());
-                return Ok(());
-            }
-        };
-
-        if req.method == "OPTIONS" {
-            return write_cors_preflight(&mut stream);
-        }
-
-        let normalized_route = req.route.trim_end_matches('/');
-        let route = if normalized_route.is_empty() {
-            "/"
+}
+fn backend_error(
+    stream: &mut TcpStream,
+    e: io::Error,
+    dispatched: bool,
+    stop: &AtomicBool,
+) -> io::Result<()> {
+    let timeout = e.kind() == io::ErrorKind::TimedOut;
+    error(
+        stream,
+        if timeout { 504 } else { 503 },
+        if dispatched {
+            "decision outcome unknown; reconcile before retrying"
+        } else if timeout {
+            "backend timeout"
         } else {
-            normalized_route
-        };
-
-        match (req.method.as_str(), route) {
-            ("GET", "/health") | ("GET", "/api/health") => {
-                let body = serde_json::json!({ "ok": true, "status": "healthy" });
-                write_json_response(&mut stream, 200, "OK", &body)
-            }
-            ("GET", "/api/session") => {
-                let is_auth =
-                    check_session_auth(&req.headers, &req.query_params, &self.session_token);
-                let resp = SessionResponse {
-                    authenticated: is_auth,
-                    session_token: self.session_token.clone(),
-                    user: std::env::var("USER").unwrap_or_else(|_| "operator".to_string()),
-                };
-                write_json_response(&mut stream, 200, "OK", &resp)
-            }
-            ("GET", "/api/snapshot") => {
-                let group = req.query_params.get("group").cloned();
-                let snapshot_res = self.with_store(|store| {
-                    let tasks = store.list_tasks(group.as_deref())?;
-                    let open_decisions = store.list_decisions(true, group.as_deref())?;
-                    let status = store.status_summary()?;
-                    let as_of_seq = store.max_seq_id()?;
-                    Ok(SnapshotResponse {
-                        tasks,
-                        open_decisions,
-                        status,
-                        as_of_seq,
-                    })
-                });
-                match snapshot_res {
-                    Ok(snapshot) => write_json_response(&mut stream, 200, "OK", &snapshot),
-                    Err(e) => write_error_response(
-                        &mut stream,
-                        500,
-                        "Internal Server Error",
-                        &format!("Failed to query snapshot: {e}"),
-                    ),
-                }
-            }
-            ("GET", "/api/events") => {
-                let header_seq = req
-                    .headers
-                    .get("last-event-id")
-                    .and_then(|v| v.parse::<i64>().ok());
-                let query_seq = req
-                    .query_params
-                    .get("since_seq")
-                    .or_else(|| req.query_params.get("seq_id"))
-                    .and_then(|v| v.parse::<i64>().ok());
-                let since_seq = header_seq.or(query_seq).unwrap_or(0);
-                let group = req.query_params.get("group").cloned();
-                stream_sse_events(self, &mut stream, since_seq, group)
-            }
-            ("POST", "/api/decide") => {
-                if !check_session_auth(&req.headers, &req.query_params, &self.session_token) {
-                    return write_error_response(
-                        &mut stream,
-                        401,
-                        "Unauthorized",
-                        "Missing or invalid session token",
-                    );
-                }
-                let body: DecideRequestBody = match serde_json::from_slice(&req.body) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        return write_error_response(
-                            &mut stream,
-                            400,
-                            "Bad Request",
-                            &format!("Invalid decide request JSON: {e}"),
-                        );
+            "backend unavailable"
+        },
+        stop,
+    )
+}
+fn serve(
+    stream: &mut TcpStream,
+    path: &Path,
+    token: &str,
+    stop: &AtomicBool,
+    sse: &std::sync::atomic::AtomicUsize,
+) -> io::Result<()> {
+    let req = match read_request(stream, stop) {
+        Ok(r) => r,
+        Err(_) => return error(stream, 400, "invalid request", stop),
+    };
+    if !authorized(req.headers.get("authorization"), token) {
+        return error(stream, 401, "unauthorized", stop);
+    }
+    let group = req.query.get("group").cloned();
+    match (req.method.as_str(), req.route.as_str()) {
+        ("GET", "/api/snapshot") => {
+            let deadline = Instant::now() + WAIT;
+            let result = (|| {
+                let mut backend = Backend::connect(path, stop, deadline)?;
+                backend.send(
+                    &ClientCommand::Subscribe {
+                        group,
+                        since_seq: Some(0),
+                        once: Some(false),
+                    },
+                    stop,
+                    deadline,
+                )?;
+                backend.send(&ClientCommand::Status, stop, deadline)?;
+                let mut snapshot = None;
+                let mut status = None;
+                while snapshot.is_none() || status.is_none() {
+                    match backend.receive(stop, deadline)? {
+                        Some(ServerMessage::Snapshot {
+                            tasks,
+                            open_decisions,
+                            as_of_seq,
+                        }) => snapshot = Some((tasks, open_decisions, as_of_seq)),
+                        Some(ServerMessage::Status {
+                            ok: true,
+                            status: value,
+                        }) => status = Some(value),
+                        Some(ServerMessage::Event { .. }) => (),
+                        _ => return Err(invalid("backend snapshot unavailable")),
                     }
-                };
-                if body.decision_id.trim().is_empty() || body.choice.trim().is_empty() {
-                    return write_error_response(
-                        &mut stream,
-                        400,
-                        "Bad Request",
-                        "decision_id and choice must not be empty",
-                    );
                 }
-                let actor = body
-                    .by
-                    .clone()
-                    .or_else(|| std::env::var("USER").ok())
-                    .unwrap_or_else(|| "operator".to_string());
-                let resolution = self.with_store(|store| {
-                    store.resolve_decision(
-                        &body.decision_id,
-                        &body.choice,
-                        &actor,
-                        body.note.as_deref(),
-                    )
-                });
-                match resolution {
-                    Ok(DecisionResolution::Resolved(rec)) => {
-                        let resp = DecideResponse {
-                            outcome: "RESOLVED".to_string(),
-                            decision: Some(rec),
-                            error: None,
-                        };
-                        write_json_response(&mut stream, 200, "OK", &resp)
-                    }
-                    Ok(DecisionResolution::AlreadyResolved(rec)) => {
-                        let resp = DecideResponse {
-                            outcome: "ALREADY_RESOLVED".to_string(),
-                            decision: Some(rec),
-                            error: None,
-                        };
-                        write_json_response(&mut stream, 200, "OK", &resp)
-                    }
-                    Ok(DecisionResolution::NotFound) => {
-                        let resp = DecideResponse {
-                            outcome: "NOT_FOUND".to_string(),
-                            decision: None,
-                            error: Some(format!("Decision not found: {}", body.decision_id)),
-                        };
-                        write_json_response(&mut stream, 404, "Not Found", &resp)
-                    }
-                    Err(e) => write_error_response(
-                        &mut stream,
-                        500,
-                        "Internal Server Error",
-                        &format!("Failed to resolve decision: {e}"),
-                    ),
-                }
+                let (tasks, open_decisions, as_of_seq) = snapshot.unwrap();
+                Ok(SnapshotResponse {
+                    tasks,
+                    open_decisions,
+                    as_of_seq,
+                    status: status.unwrap(),
+                })
+            })();
+            match result {
+                Ok(data) => response(stream, 200, &data, stop),
+                Err(e) => backend_error(stream, e, false, stop),
             }
-            _ => write_error_response(
-                &mut stream,
-                404,
-                "Not Found",
-                &format!("No route for {} {}", req.method, req.route),
-            ),
         }
+        ("POST", "/api/decide") => {
+            let body = match serde_json::from_slice::<DecideRequestBody>(&req.body) {
+                Ok(b)
+                    if !b.decision_id.trim().is_empty()
+                        && !b.choice.trim().is_empty()
+                        && b.decision_id.len() <= 256
+                        && b.choice.len() <= 256 =>
+                {
+                    b
+                }
+                _ => return error(stream, 400, "invalid decision request", stop),
+            };
+            let deadline = Instant::now() + WAIT;
+            let mut dispatched = false;
+            let result = (|| {
+                let mut backend = Backend::connect(path, stop, deadline)?;
+                // Once sending starts, any failure may leave an unknown outcome.
+                dispatched = true;
+                backend.send(
+                    &ClientCommand::Decide {
+                        decision_id: body.decision_id,
+                        choice: body.choice,
+                        by: body.by,
+                        note: body.note,
+                    },
+                    stop,
+                    deadline,
+                )?;
+                match backend.receive(stop, deadline)? {
+                    Some(ServerMessage::DecisionResult { outcome, decision }) => {
+                        Ok((outcome, decision))
+                    }
+                    Some(ServerMessage::Error { error })
+                        if error == "invalid decision choice or empty actor" =>
+                    {
+                        Ok(("INVALID_REQUEST".into(), None))
+                    }
+                    _ => Err(invalid("backend decision unavailable")),
+                }
+            })();
+            match result {
+                Ok((outcome, decision))
+                    if matches!(
+                        outcome.as_str(),
+                        "RESOLVED" | "ALREADY_RESOLVED" | "NOT_FOUND"
+                    ) =>
+                {
+                    response(
+                        stream,
+                        if outcome == "NOT_FOUND" { 404 } else { 200 },
+                        &serde_json::json!({"outcome":outcome,"decision":decision}),
+                        stop,
+                    )
+                }
+                Ok((outcome, _)) if outcome == "INVALID_REQUEST" => {
+                    error(stream, 400, "invalid decision request", stop)
+                }
+                Ok(_) => error(stream, 503, "backend decision unavailable", stop),
+                Err(e) => backend_error(stream, e, dispatched, stop),
+            }
+        }
+        ("GET", "/api/events") => {
+            let since = match cursor(&req) {
+                Ok(n) => n,
+                Err(_) => return error(stream, 400, "invalid cursor", stop),
+            };
+            if sse
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    (n < MAX_SSE).then_some(n + 1)
+                })
+                .is_err()
+            {
+                return error(stream, 503, "event capacity reached", stop);
+            }
+            struct Permit<'a>(&'a std::sync::atomic::AtomicUsize);
+            impl Drop for Permit<'_> {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+            let _permit = Permit(sse);
+            let deadline = Instant::now() + WAIT;
+            let mut backend = match Backend::connect(path, stop, deadline).and_then(|mut b| {
+                b.send(
+                    &ClientCommand::Subscribe {
+                        group,
+                        since_seq: Some(since),
+                        once: Some(false),
+                    },
+                    stop,
+                    deadline,
+                )?;
+                Ok(b)
+            }) {
+                Ok(b) => b,
+                Err(e) => return backend_error(stream, e, false, stop),
+            };
+            // Wait for the first backend response before committing HTTP success.
+            let mut next = match backend.receive(stop, deadline) {
+                Ok(Some(m)) if !matches!(m, ServerMessage::Error { .. }) => Some(m),
+                Ok(_) => return error(stream, 503, "backend unavailable", stop),
+                Err(e) => return backend_error(stream, e, false, stop),
+            };
+            write_bounded(stream, b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache, no-transform\r\nConnection: close\r\n\r\n", stop, Instant::now() + WAIT)?;
+            loop {
+                if let Some(message) = next.take() {
+                    let (kind, id, close) = match &message {
+                        ServerMessage::Event { event } => ("task_event", Some(event.seq_id), false),
+                        ServerMessage::Snapshot { .. } => ("snapshot", None, false),
+                        ServerMessage::ResyncRequired { .. } => ("resync_required", None, true),
+                        _ => break,
+                    };
+                    let data = match &message {
+                        ServerMessage::Event { event } => serde_json::to_string(event),
+                        _ => serde_json::to_string(&message),
+                    }
+                    .map_err(io::Error::other)?;
+                    let frame = format!(
+                        "{}event: {kind}\ndata: {data}\n\n",
+                        id.map(|n| format!("id: {n}\n")).unwrap_or_default()
+                    );
+                    write_bounded(stream, frame.as_bytes(), stop, Instant::now() + WAIT)?;
+                    if close {
+                        break;
+                    }
+                }
+                match backend.receive(stop, Instant::now() + Duration::from_secs(1)) {
+                    Ok(Some(m)) => next = Some(m),
+                    Ok(None) => break,
+                    Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                        write_bounded(stream, b": keepalive\n\n", stop, Instant::now() + WAIT)?
+                    }
+                    Err(_) => break,
+                }
+            }
+            Ok(())
+        }
+        _ => error(stream, 404, "not found", stop),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2::store::{ContextPackSpec, TaskRecord};
+    use crate::v2::socket::write_ndjson;
+    use crate::v2::store::TaskEventRecord;
+    use std::fs;
     use std::io::{BufRead, BufReader};
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::AtomicUsize;
 
-    fn setup_test_store() -> (V2Store, String) {
-        let mut store = V2Store::open_in_memory().unwrap();
-        let task = TaskRecord {
-            task_id: "TEST-001".to_string(),
-            task_group: "test".to_string(),
-            title: "Test Task".to_string(),
-            repository: "test-repo".to_string(),
-            github_repo: None,
-            issue_number: None,
-            weight: "XS".to_string(),
-            status: "Ready".to_string(),
-            worktree_path: None,
-            branch: None,
-            context_pack: ContextPackSpec::default(),
-            depends_on: vec![],
-            required_stages: vec!["impl".to_string()],
-            stages_completed: vec![],
-            current_stage: None,
-            active_attempt_id: None,
-            plan_base_sha: None,
-            reviewed_sha: None,
-            pr_number: None,
-            executor: None,
-            autonomous_consent: true,
-            retry_count: 0,
-            memory: Default::default(),
-            version: 1,
-            updated_epoch: 1000,
-        };
-        store.upsert_task(&task).unwrap();
-
-        let dec_id = "DEC-TEST-001".to_string();
-        store
-            .open_decision(
-                &dec_id,
-                "TEST-001",
-                "test",
-                "human-plan-approval",
-                "Approve plan?",
-                &["APPROVE".to_string(), "REJECT".to_string()],
-                Some(0),
-                "test context",
-                None,
-            )
-            .unwrap();
-
-        (store, dec_id)
+    struct Fixture {
+        dir: PathBuf,
+        addr: SocketAddr,
+        token: String,
+        handle: Option<GatewayHandle>,
     }
-
-    fn read_test_response(stream: &mut TcpStream) -> (u16, HashMap<String, String>, Vec<u8>) {
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "zach-web-test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let gateway = WebGateway::bind(GatewayConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                socket_path: dir.join("backend.sock"),
+                state_dir: dir.clone(),
+            })
             .unwrap();
-        let mut buf = Vec::new();
-        let mut tmp = [0u8; 1024];
-        let body_start: usize;
-        let status_code: u16;
-        let mut headers_map = HashMap::new();
-
-        loop {
-            let n = stream.read(&mut tmp).unwrap();
-            if n == 0 {
-                panic!("stream closed before response headers");
-            }
-            buf.extend_from_slice(&tmp[..n]);
-            let mut headers = [httparse::EMPTY_HEADER; 64];
-            let mut resp = httparse::Response::new(&mut headers);
-            match resp.parse(&buf) {
-                Ok(httparse::Status::Complete(offset)) => {
-                    body_start = offset;
-                    status_code = resp.code.unwrap_or(0);
-                    for h in resp.headers.iter() {
-                        if h.name.is_empty() {
-                            break;
-                        }
-                        headers_map.insert(
-                            h.name.to_ascii_lowercase(),
-                            String::from_utf8_lossy(h.value).trim().to_string(),
-                        );
-                    }
-                    break;
-                }
-                Ok(httparse::Status::Partial) => continue,
-                Err(e) => panic!("response parse error: {e}"),
+            let addr = gateway.local_addr().unwrap();
+            let token = gateway.token.clone();
+            Self {
+                dir,
+                addr,
+                token,
+                handle: Some(gateway.spawn().unwrap()),
             }
         }
-
-        let content_len: usize = headers_map
-            .get("content-length")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        let mut body = buf[body_start..].to_vec();
-        while body.len() < content_len {
-            let n = stream.read(&mut tmp).unwrap();
-            if n == 0 {
-                break;
-            }
-            body.extend_from_slice(&tmp[..n]);
+        fn backend(&self, run: impl FnOnce(UnixStream) + Send + 'static) -> JoinHandle<()> {
+            let listener = UnixListener::bind(self.dir.join("backend.sock")).unwrap();
+            thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(WAIT)).unwrap();
+                stream.set_write_timeout(Some(WAIT)).unwrap();
+                run(stream);
+            })
         }
-        (status_code, headers_map, body)
+        fn request(&self, method: &str, target: &str, headers: &str, body: &str) -> TcpStream {
+            let mut stream = TcpStream::connect(self.addr).unwrap();
+            stream.set_read_timeout(Some(WAIT + WAIT)).unwrap();
+            write!(stream, "{method} {target} HTTP/1.1\r\nHost: localhost\r\n{headers}Content-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+            stream
+        }
+        fn auth(&self) -> String {
+            format!("Authorization: Bearer {}\r\n", self.token)
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            if let Some(h) = self.handle.take() {
+                h.shutdown_and_join().unwrap();
+            }
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+    fn read_all(mut stream: TcpStream) -> String {
+        let mut out = String::new();
+        if let Err(e) = stream.read_to_string(&mut out) {
+            assert!(
+                e.kind() == io::ErrorKind::ConnectionReset && !out.is_empty(),
+                "{e}"
+            );
+        }
+        out
+    }
+    fn command(reader: &mut BufReader<UnixStream>) -> ClientCommand {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+    fn snapshot() -> ServerMessage {
+        ServerMessage::Snapshot {
+            tasks: vec![],
+            open_decisions: vec![],
+            as_of_seq: 9000,
+        }
+    }
+    fn event(seq: i64) -> ServerMessage {
+        ServerMessage::Event {
+            event: TaskEventRecord {
+                seq_id: seq,
+                task_id: "SYNTHETIC".into(),
+                task_group: "test".into(),
+                ts_epoch: 1,
+                event_type: "test".into(),
+                payload: serde_json::json!({}),
+            },
+        }
     }
 
     #[test]
-    fn test_web_gateway_snapshot_and_decide_and_events() {
-        let (store, dec_id) = setup_test_store();
-        let store_arc = Arc::new(Mutex::new(store));
-
-        // Find an ephemeral open port
-        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-
-        let bind_addr = format!("127.0.0.1:{port}");
-        let mut gateway = WebGateway::with_shared_store(
-            bind_addr.clone(),
-            store_arc.clone(),
-            PathBuf::from("/tmp/nonexistent-test.sock"),
+    fn web_gateway_auth_all_routes_and_no_disclosure() {
+        let f = Fixture::new();
+        for route in [
+            "/api/snapshot",
+            "/api/events",
+            "/api/decide",
+            "/api/session",
+        ] {
+            for alias in [
+                "".to_string(),
+                format!("Cookie: token={}\r\n", f.token),
+                format!("X-Auth-Token: {}\r\n", f.token),
+                format!("Authorization: Session {}\r\n", f.token),
+            ] {
+                let reply =
+                    read_all(f.request("GET", &format!("{route}?token={}", f.token), &alias, ""));
+                assert!(reply.starts_with("HTTP/1.1 401"));
+                assert!(!reply.contains(&f.token));
+                assert!(!reply.contains("Access-Control"));
+            }
+        }
+        assert!(
+            read_all(f.request("GET", "/api/session", &f.auth(), "")).starts_with("HTTP/1.1 404")
         );
-        gateway.session_token = "secret-test-session".to_string();
-
-        let gw_clone = gateway.clone();
-        let handle = std::thread::spawn(move || {
-            let _ = gw_clone.run_loop();
+        assert!(
+            read_all(f.request("GET", "/api/snapshot", &f.auth(), "")).starts_with("HTTP/1.1 503")
+        );
+    }
+    #[test]
+    fn web_gateway_credentials_secure_stable_and_fail_closed() {
+        let f = Fixture::new();
+        assert_eq!(session_token(&f.dir).unwrap(), f.token);
+        assert_eq!(
+            fs::metadata(f.dir.join("web_session_token"))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        fs::set_permissions(
+            f.dir.join("web_session_token"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(session_token(&f.dir).is_err());
+        fs::remove_file(f.dir.join("web_session_token")).unwrap();
+        symlink("missing", f.dir.join("web_session_token")).unwrap();
+        assert!(session_token(&f.dir).is_err());
+        let bad = f.dir.join("bad");
+        fs::write(&bad, "synthetic").unwrap();
+        assert!(session_token(&bad).is_err());
+        assert!(
+            WebGateway::bind(GatewayConfig {
+                bind_addr: "0.0.0.0:0".parse().unwrap(),
+                socket_path: bad,
+                state_dir: f.dir.clone()
+            })
+            .is_err()
+        );
+    }
+    #[test]
+    fn web_gateway_rejects_malformed_framing_and_cursors() {
+        let f = Fixture::new();
+        for extra in [
+            "Transfer-Encoding: chunked\r\n",
+            "Content-Length: 0\r\n",
+            "Content-Length: 99999999999999999999999\r\n",
+            "Last-Event-ID: 1\r\nLast-Event-ID: 2\r\n",
+            "Last-Event-ID: -1\r\n",
+            "Last-Event-ID: 9223372036854775808\r\n",
+        ] {
+            assert!(
+                read_all(f.request("GET", "/api/events", &(f.auth() + extra), ""))
+                    .starts_with("HTTP/1.1 400")
+            );
+        }
+        for query in [
+            "since_seq=-1",
+            "since_seq=1&since_seq=2",
+            "since_seq=18446744073709551616",
+            "group=%zz",
+        ] {
+            assert!(
+                read_all(f.request("GET", &format!("/api/events?{query}"), &f.auth(), ""))
+                    .starts_with("HTTP/1.1 400")
+            );
+        }
+        assert!(
+            read_all(f.request("POST", "/api/decide", &f.auth(), "{oops"))
+                .starts_with("HTTP/1.1 400")
+        );
+        let oversized = "a".repeat(HEADER_LIMIT + 1);
+        let reply = read_all(f.request(
+            "GET",
+            "/api/events",
+            &format!("{}X-Large: {oversized}\r\n", f.auth()),
+            "",
+        ));
+        assert!(reply.starts_with("HTTP/1.1 400"));
+    }
+    #[test]
+    fn web_gateway_snapshot_uses_socket_status_and_snapshot_watermark() {
+        let f = Fixture::new();
+        let backend = f.backend(|stream| {
+            let mut reader = BufReader::new(stream.try_clone().unwrap()); let mut writer = stream;
+            assert_eq!(command(&mut reader), ClientCommand::Subscribe { group: Some("test".into()), since_seq: Some(0), once: Some(false) });
+            assert_eq!(command(&mut reader), ClientCommand::Status);
+            write_ndjson(&mut writer, &snapshot()).unwrap();
+            let status: DaemonStatusSummary = serde_json::from_value(serde_json::json!({"schema_version":4,"max_parallel_tasks":2,"heartbeat_epoch":1,"max_seq_id":9001,"total_tasks":0,"ready_eligible_count":0,"in_progress_count":0,"open_decisions_count":0,"active_locks_count":0,"merge_queue_count":0})).unwrap();
+            write_ndjson(&mut writer, &ServerMessage::Status { ok: true, status }).unwrap();
         });
-
-        // Give server time to bind
-        std::thread::sleep(Duration::from_millis(100));
-
-        // AC-1: Test GET /api/snapshot
-        {
-            let mut stream = TcpStream::connect(&bind_addr).unwrap();
-            let req = "GET /api/snapshot HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-            stream.write_all(req.as_bytes()).unwrap();
-
-            let (code, _headers, body) = read_test_response(&mut stream);
-            assert_eq!(code, 200);
-            let snap: SnapshotResponse = serde_json::from_slice(&body).unwrap();
-            assert_eq!(snap.tasks.len(), 1);
-            assert_eq!(snap.tasks[0].task_id, "TEST-001");
-            assert_eq!(snap.open_decisions.len(), 1);
-            assert_eq!(snap.open_decisions[0].decision_id, dec_id);
-            assert_eq!(snap.status.schema_version, 2);
-        }
-
-        // AC-3: Test unauthenticated POST /api/decide is rejected with 401
-        {
-            let mut stream = TcpStream::connect(&bind_addr).unwrap();
-            let body = serde_json::json!({
-                "decision_id": dec_id,
-                "choice": "APPROVE"
-            })
-            .to_string();
-            let req = format!(
-                "POST /api/decide HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
+        let reply = read_all(f.request("GET", "/api/snapshot?group=test", &f.auth(), ""));
+        let data: SnapshotResponse =
+            serde_json::from_str(reply.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(data.as_of_seq, 9000);
+        assert_eq!(data.status.max_seq_id, 9001);
+        backend.join().unwrap();
+    }
+    #[test]
+    fn web_gateway_decide_waits_for_ack_and_forwards_exact_command() {
+        for outcome in ["RESOLVED", "ALREADY_RESOLVED", "NOT_FOUND"] {
+            let f = Fixture::new();
+            let outcome = outcome.to_string();
+            let expected = outcome.clone();
+            let (sent, received) = std::sync::mpsc::channel();
+            let backend = f.backend(move |stream| {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut writer = stream;
+                assert_eq!(
+                    command(&mut reader),
+                    ClientCommand::Decide {
+                        decision_id: "synthetic".into(),
+                        choice: "APPROVE".into(),
+                        by: Some("tester".into()),
+                        note: Some("test".into())
+                    }
+                );
+                sent.send(()).unwrap();
+                thread::sleep(Duration::from_millis(150));
+                write_ndjson(
+                    &mut writer,
+                    &ServerMessage::DecisionResult {
+                        outcome,
+                        decision: None,
+                    },
+                )
+                .unwrap();
+            });
+            let mut stream = f.request(
+                "POST",
+                "/api/decide",
+                &f.auth(),
+                r#"{"decision_id":"synthetic","choice":"APPROVE","by":"tester","note":"test"}"#,
             );
-            stream.write_all(req.as_bytes()).unwrap();
-            let (code, _headers, resp_body) = read_test_response(&mut stream);
-            assert_eq!(code, 401);
-            let err_val: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
-            assert_eq!(err_val["error"], "unauthorized");
-        }
-
-        // AC-3: Test authenticated POST /api/decide succeeds
-        {
-            let mut stream = TcpStream::connect(&bind_addr).unwrap();
-            let body = serde_json::json!({
-                "decision_id": dec_id,
-                "choice": "APPROVE",
-                "by": "test-operator",
-                "note": "verified"
-            })
-            .to_string();
-            let req = format!(
-                "POST /api/decide HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer secret-test-session\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
+            received.recv_timeout(WAIT).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .unwrap();
+            let mut byte = [0];
+            assert!(
+                stream.read(&mut byte).is_err(),
+                "no success before actual ACK"
             );
-            stream.write_all(req.as_bytes()).unwrap();
-            let (code, _headers, resp_body) = read_test_response(&mut stream);
-            assert_eq!(code, 200);
-            let res: DecideResponse = serde_json::from_slice(&resp_body).unwrap();
-            assert_eq!(res.outcome, "RESOLVED");
-            assert_eq!(res.decision.unwrap().status, "RESOLVED");
+            stream.set_read_timeout(Some(WAIT)).unwrap();
+            let reply = read_all(stream);
+            assert!(reply.starts_with(if expected == "NOT_FOUND" {
+                "HTTP/1.1 404"
+            } else {
+                "HTTP/1.1 200"
+            }));
+            assert!(reply.contains(&expected));
+            backend.join().unwrap();
         }
-
-        // AC-3: Second resolve returns ALREADY_RESOLVED
-        {
-            let mut stream = TcpStream::connect(&bind_addr).unwrap();
-            let body = serde_json::json!({
-                "decision_id": dec_id,
-                "choice": "APPROVE"
-            })
-            .to_string();
-            let req = format!(
-                "POST /api/decide HTTP/1.1\r\nHost: localhost\r\nCookie: session=secret-test-session\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(req.as_bytes()).unwrap();
-            let (code, _headers, resp_body) = read_test_response(&mut stream);
-            assert_eq!(code, 200);
-            let res: DecideResponse = serde_json::from_slice(&resp_body).unwrap();
-            assert_eq!(res.outcome, "ALREADY_RESOLVED");
-        }
-
-        // AC-2: Test GET /api/events SSE stream replays events
-        {
-            let mut stream = TcpStream::connect(&bind_addr).unwrap();
-            let req = "GET /api/events?since_seq=0 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-            stream.write_all(req.as_bytes()).unwrap();
-
-            let mut reader = BufReader::new(stream);
-            let mut status_line = String::new();
-            reader.read_line(&mut status_line).unwrap();
-            assert!(status_line.contains("200 OK"));
-
-            let mut found_event = false;
-            let mut line = String::new();
-            for _ in 0..20 {
-                line.clear();
-                if reader.read_line(&mut line).unwrap() == 0 {
-                    break;
+    }
+    #[test]
+    fn web_gateway_sse_forwards_5101_events_and_control_without_cursor() {
+        let f = Fixture::new();
+        let backend = f.backend(|stream| {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+            assert_eq!(
+                command(&mut reader),
+                ClientCommand::Subscribe {
+                    group: Some("test".into()),
+                    since_seq: Some(41),
+                    once: Some(false)
                 }
-                if line.starts_with("data:") {
-                    found_event = true;
-                    let event_json = line.strip_prefix("data:").unwrap().trim();
-                    let ev: serde_json::Value = serde_json::from_str(event_json).unwrap();
-                    assert!(ev["seq_id"].as_i64().unwrap() > 0);
+            );
+            write_ndjson(&mut writer, &snapshot()).unwrap();
+            for seq in 42..=5142 {
+                write_ndjson(&mut writer, &event(seq)).unwrap();
+            }
+            write_ndjson(
+                &mut writer,
+                &ServerMessage::ResyncRequired { last_seq_id: 5142 },
+            )
+            .unwrap();
+        });
+        let reply = read_all(f.request(
+            "GET",
+            "/api/events?since_seq=0&group=test",
+            &(f.auth() + "Last-Event-ID: 41\r\n"),
+            "",
+        ));
+        let ids: Vec<i64> = reply
+            .lines()
+            .filter_map(|s| s.strip_prefix("id: ").map(|s| s.parse().unwrap()))
+            .collect();
+        assert_eq!(ids, (42..=5142).collect::<Vec<_>>());
+        assert!(reply.contains("event: task_event"));
+        assert!(reply.contains("event: snapshot"));
+        assert!(reply.contains("event: resync_required"));
+        assert!(!reply.contains("id: 9000"));
+        backend.join().unwrap();
+    }
+    #[test]
+    fn web_gateway_partial_io_and_shutdown_interrupts_clients_and_backend() {
+        let mut f = Fixture::new();
+        let backend = f.backend(|stream| {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            assert!(matches!(
+                command(&mut reader),
+                ClientCommand::Subscribe { .. }
+            ));
+            let mut bytes = Vec::new();
+            let _ = reader.read_to_end(&mut bytes);
+        });
+        let mut partial = TcpStream::connect(f.addr).unwrap();
+        partial.write_all(b"GET /api/snap").unwrap();
+        let _waiting = f.request("GET", "/api/events", &f.auth(), "");
+        thread::sleep(Duration::from_millis(100));
+        let start = Instant::now();
+        f.handle.take().unwrap().shutdown_and_join().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(2));
+        backend.join().unwrap();
+    }
+    #[test]
+    fn web_gateway_entropy_and_persistence_fail_closed() {
+        let f = Fixture::new();
+        let dir = f.dir.join("entropy-failure");
+        assert!(
+            session_token_with_entropy(&dir, |_| Err(io::Error::other(
+                "synthetic entropy failure"
+            )))
+            .is_err()
+        );
+        assert!(!dir.join("web_session_token").exists());
+        let dir = f.dir.join("persist-failure");
+        assert!(
+            session_token_with_entropy(&dir, |bytes| {
+                bytes.fill(1);
+                fs::remove_dir(&dir)?;
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(!dir.exists());
+    }
+    #[test]
+    fn web_gateway_decide_timeout_is_unknown_and_no_retry() {
+        let f = Fixture::new();
+        let backend = f.backend(|stream| {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            assert!(matches!(command(&mut reader), ClientCommand::Decide { .. }));
+            // A withheld ACK is never translated into successful dispatch.
+            let mut rest = String::new();
+            let _ = reader.read_to_string(&mut rest);
+            assert!(rest.is_empty(), "no automatic second command");
+        });
+        let reply = read_all(f.request(
+            "POST",
+            "/api/decide",
+            &f.auth(),
+            r#"{"decision_id":"synthetic","choice":"APPROVE"}"#,
+        ));
+        assert!(reply.starts_with("HTTP/1.1 504"));
+        assert!(reply.contains("outcome unknown"));
+        assert!(!reply.contains(&f.token));
+        backend.join().unwrap();
+    }
+    #[test]
+    fn web_gateway_partial_http_and_backend_frames() {
+        let f = Fixture::new();
+        let backend = f.backend(|stream| {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+            assert!(matches!(
+                command(&mut reader),
+                ClientCommand::Subscribe { .. }
+            ));
+            let mut bytes = serde_json::to_vec(&snapshot()).unwrap();
+            bytes.push(b'\n');
+            for chunk in bytes.chunks(3) {
+                writer.write_all(chunk).unwrap();
+            }
+            let mut bytes = serde_json::to_vec(&event(1)).unwrap();
+            bytes.push(b'\n');
+            for chunk in bytes.chunks(2) {
+                writer.write_all(chunk).unwrap();
+            }
+        });
+        let mut stream = TcpStream::connect(f.addr).unwrap();
+        stream.set_read_timeout(Some(WAIT)).unwrap();
+        let request = format!(
+            "GET /api/events HTTP/1.1\r\nHost: localhost\r\n{}\r\n",
+            f.auth()
+        );
+        for chunk in request.as_bytes().chunks(3) {
+            stream.write_all(chunk).unwrap();
+        }
+        let reply = read_all(stream);
+        assert!(reply.contains("id: 1\nevent: task_event"));
+        backend.join().unwrap();
+    }
+    #[test]
+    fn web_gateway_sse_capacity_and_slow_clients_release_on_shutdown() {
+        let mut f = Fixture::new();
+        let listener = UnixListener::bind(f.dir.join("backend.sock")).unwrap();
+        let (release, released) = std::sync::mpsc::channel();
+        let backend = thread::spawn(move || {
+            let mut streams = Vec::new();
+            for _ in 0..MAX_SSE {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(WAIT)).unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                assert!(matches!(
+                    command(&mut reader),
+                    ClientCommand::Subscribe { .. }
+                ));
+                write_ndjson(&mut stream, &snapshot()).unwrap();
+                streams.push(stream);
+            }
+            released.recv_timeout(WAIT).unwrap();
+        });
+        let mut clients = Vec::new();
+        for _ in 0..MAX_SSE {
+            let stream = f.request("GET", "/api/events", &f.auth(), "");
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.starts_with("HTTP/1.1 200"));
+            clients.push(reader);
+        }
+        let reply = read_all(f.request("GET", "/api/events", &f.auth(), ""));
+        assert!(reply.starts_with("HTTP/1.1 503"));
+        // Clients stop consuming; shutdown must still interrupt backend idle reads.
+        let start = Instant::now();
+        f.handle.take().unwrap().shutdown_and_join().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(2));
+        release.send(()).unwrap();
+        backend.join().unwrap();
+        // Listener and client workers are joined, and the same port is reusable.
+        let listener = TcpListener::bind(f.addr).unwrap();
+        drop(listener);
+        drop(clients);
+    }
+    #[test]
+    fn web_gateway_shutdown_interrupts_backpressured_sse_writer() {
+        let mut f = Fixture::new();
+        let backend = f.backend(|stream| {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+            assert!(matches!(
+                command(&mut reader),
+                ClientCommand::Subscribe { .. }
+            ));
+            write_ndjson(&mut writer, &snapshot()).unwrap();
+            for seq in 1..=20 {
+                let message = ServerMessage::Event {
+                    event: TaskEventRecord {
+                        seq_id: seq,
+                        task_id: "SYNTHETIC".into(),
+                        task_group: "test".into(),
+                        ts_epoch: 1,
+                        event_type: "test".into(),
+                        payload: serde_json::json!({"synthetic": "x".repeat(1024 * 1024)}),
+                    },
+                };
+                if write_ndjson(&mut writer, &message).is_err() {
                     break;
                 }
             }
-            assert!(found_event, "Expected at least one replayed SSE event");
-        }
-
-        // Test GET /api/session
-        {
-            let mut stream = TcpStream::connect(&bind_addr).unwrap();
-            let req = "GET /api/session HTTP/1.1\r\nHost: localhost\r\nX-Session-Token: secret-test-session\r\nConnection: close\r\n\r\n";
-            stream.write_all(req.as_bytes()).unwrap();
-            let (code, _headers, resp_body) = read_test_response(&mut stream);
-            assert_eq!(code, 200);
-            let sess: SessionResponse = serde_json::from_slice(&resp_body).unwrap();
-            assert!(sess.authenticated);
-            assert_eq!(sess.session_token, "secret-test-session");
-        }
-
-        // Test OPTIONS CORS preflight
-        {
-            let mut stream = TcpStream::connect(&bind_addr).unwrap();
-            let req =
-                "OPTIONS /api/decide HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-            stream.write_all(req.as_bytes()).unwrap();
-            let (code, headers, _) = read_test_response(&mut stream);
-            assert_eq!(code, 204);
-            assert!(headers.contains_key("access-control-allow-origin"));
-            assert!(headers.contains_key("access-control-allow-methods"));
-        }
-
-        // Test GET /health
-        {
-            let mut stream = TcpStream::connect(&bind_addr).unwrap();
-            let req = "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-            stream.write_all(req.as_bytes()).unwrap();
-            let (code, _, body) = read_test_response(&mut stream);
-            assert_eq!(code, 200);
-            let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(val["status"], "healthy");
-        }
-
-        // AC-3: Not found decision returns 404
-        {
-            let mut stream = TcpStream::connect(&bind_addr).unwrap();
-            let body = serde_json::json!({
-                "decision_id": "DEC-DOES-NOT-EXIST",
-                "choice": "APPROVE"
-            })
-            .to_string();
-            let req = format!(
-                "POST /api/decide HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer secret-test-session\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(req.as_bytes()).unwrap();
-            let (code, _, resp_body) = read_test_response(&mut stream);
-            assert_eq!(code, 404);
-            let res: DecideResponse = serde_json::from_slice(&resp_body).unwrap();
-            assert_eq!(res.outcome, "NOT_FOUND");
-        }
-
-        // AC-2: Test Last-Event-ID header for SSE replay
-        {
-            let mut stream = TcpStream::connect(&bind_addr).unwrap();
-            let req = "GET /api/events HTTP/1.1\r\nHost: localhost\r\nLast-Event-ID: 1000\r\nConnection: close\r\n\r\n";
-            stream.write_all(req.as_bytes()).unwrap();
-
-            let mut reader = BufReader::new(stream);
-            let mut status_line = String::new();
-            reader.read_line(&mut status_line).unwrap();
-            assert!(status_line.contains("200 OK"));
-        }
-
-        // Test trailing slash normalization: GET /api/snapshot/
-        {
-            let mut stream = TcpStream::connect(&bind_addr).unwrap();
-            let req = "GET /api/snapshot/ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-            stream.write_all(req.as_bytes()).unwrap();
-            let (code, _headers, body) = read_test_response(&mut stream);
-            assert_eq!(code, 200);
-            let snap: SnapshotResponse = serde_json::from_slice(&body).unwrap();
-            assert_eq!(snap.tasks.len(), 1);
-        }
-
-        // AC-3: Test query parameter authentication: ?token=...
-        {
-            let mut stream = TcpStream::connect(&bind_addr).unwrap();
-            let body = serde_json::json!({
-                "decision_id": dec_id,
-                "choice": "APPROVE"
-            })
-            .to_string();
-            let req = format!(
-                "POST /api/decide?token=secret-test-session HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(req.as_bytes()).unwrap();
-            let (code, _headers, resp_body) = read_test_response(&mut stream);
-            assert_eq!(code, 200);
-            let res: DecideResponse = serde_json::from_slice(&resp_body).unwrap();
-            assert_eq!(res.outcome, "ALREADY_RESOLVED");
-        }
-
-        gateway.request_shutdown();
-        let _ = handle.join();
+        });
+        let stream = f.request("GET", "/api/events", &f.auth(), "");
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.starts_with("HTTP/1.1 200"));
+        thread::sleep(Duration::from_millis(200));
+        let start = Instant::now();
+        f.handle.take().unwrap().shutdown_and_join().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(2));
+        backend.join().unwrap();
     }
 }
