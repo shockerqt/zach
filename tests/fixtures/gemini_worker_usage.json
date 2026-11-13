@@ -1,0 +1,41 @@
+{
+  "run_id": "d2c7f23c-308f-4768-a623-53436db49c42",
+  "kind": "code_analysis",
+  "model": "gemini-4-hydrogen-medium",
+  "status": "SUCCESS",
+  "provider_status": "SUCCESS",
+  "process_status": "completed",
+  "exit_code": 0,
+  "response": "OK",
+  "usable_response": true,
+  "conversation_id": "46978b6c-168f-44c2-b3d2-1d7611a777d3",
+  "duration_seconds": 1.759925023,
+  "usage": {
+    "input_tokens": 9967,
+    "output_tokens": 43,
+    "total_tokens": 10010
+  },
+  "execution_succeeded": true,
+  "budget": {
+    "max_model_calls": 2,
+    "model_calls_used": 1,
+    "max_total_tokens": null,
+    "observed_total_tokens": 10010,
+    "unknown_usage_calls": 0
+  },
+  "orchestration_id": "task_d0e234eb4c1343aea395c9de8c5428b0",
+  "task_usage": {
+    "available": true,
+    "found": true,
+    "orchestration_id": "task_d0e234eb4c1343aea395c9de8c5428b0",
+    "model_calls": 1,
+    "completed_model_calls": 1,
+    "unknown_usage_calls": 0,
+    "usage_complete": true,
+    "input_tokens": 9967,
+    "output_tokens": 43,
+    "observed_total_tokens": 10010,
+    "max_task_tokens": null
+  },
+  "summary": "OK"
+}

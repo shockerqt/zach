@@ -4,14 +4,10 @@ use std::path::PathBuf;
 
 use zach::ledger;
 use zach::v2::intake::{ingest_export_json, sync_from_ws_task};
-use zach::v2::merge_queue::{SystemMergeDriver, process_repo_merge_queue};
-use zach::v2::pipeline::{execute_m_l_pipeline, execute_xs_s_pipeline, plan_task_execution};
-use zach::v2::runner::reconcile_orphan_units;
-use zach::v2::scheduler::HeavyCheckSemaphore;
+use zach::v2::pipeline::plan_task_execution;
 use zach::v2::socket::{ClientCommand, DaemonServer, write_ndjson};
 use zach::v2::store::{DecisionResolution, V2Store};
-use zach::v2::web_gateway::WebGateway;
-use zach::v2::{DEFAULT_WEB_PORT, default_db_path, default_socket_path, default_ws_task_bin};
+use zach::v2::{default_db_path, default_socket_path, default_state_dir, default_ws_task_bin};
 use zach::{AuditRequest, GithubConfig, audit_task_integration};
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8090";
@@ -41,6 +37,14 @@ fn main() {
             run_ledger_validator(&config)
         }
         "governance.audit-task-integration" => run_audit(&args[2..]),
+        "doctor" => run_doctor(&args[2..]),
+        "__sandbox-bridge" => match zach::v2::isolation::sandbox_bridge(&args[2..]) {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("sandbox bridge: {error}");
+                std::process::exit(1);
+            }
+        },
         "status" => run_v2_status(&args[2..]),
         "queue" => run_v2_queue(&args[2..]),
         "decisions" => run_v2_decisions(&args[2..]),
@@ -51,13 +55,35 @@ fn main() {
         "daemon" | "zachd" => run_v2_daemon(&args[2..]),
         "attach" => run_v2_attach(&args[2..]),
         "events" => run_v2_events(&args[2..]),
-        "web" => run_v2_web(&args[2..]),
         "--help" | "-h" => print_usage(),
         unknown => {
             eprintln!("unknown option: {unknown}");
             print_usage();
             std::process::exit(2);
         }
+    }
+}
+
+fn run_doctor(args: &[String]) {
+    let worktree = flag_value(args, "--worktree").map(PathBuf::from);
+    let report = zach::v2::isolation::doctor(worktree.as_deref());
+    if has_flag(args, "--json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_default()
+        );
+    } else {
+        for probe in &report.probes {
+            println!(
+                "{} {}: {}",
+                if probe.ok { "PASS" } else { "FAIL" },
+                probe.name,
+                probe.detail
+            );
+        }
+    }
+    if !report.ok {
+        std::process::exit(1);
     }
 }
 
@@ -287,10 +313,60 @@ fn run_v2_config(args: &[String]) {
 }
 
 fn run_v2_run(args: &[String]) {
-    let mut store = open_store(args);
-    let _ = reconcile_orphan_units(&mut store);
-
     let dry_run = has_flag(args, "--dry-run");
+    if !dry_run {
+        // The daemon schedules pipelines and poll_post_merge_deliveries on bounded workers.
+        let socket_path = flag_value(args, "--socket")
+            .map(PathBuf::from)
+            .unwrap_or_else(default_socket_path);
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(&socket_path).unwrap_or_else(|error| {
+                eprintln!("connect to zachd at {}: {error}", socket_path.display());
+                std::process::exit(1)
+            });
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap_or_else(|error| {
+                eprintln!("run socket timeout: {error}");
+                std::process::exit(1)
+            });
+        write_ndjson(
+            &mut stream,
+            &ClientCommand::Run {
+                task: flag_value(args, "--task"),
+                group: flag_value(args, "--group"),
+                once: has_flag(args, "--once"),
+            },
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("submit run: {error}");
+            std::process::exit(1)
+        });
+        use std::io::BufRead;
+        let mut line = String::new();
+        std::io::BufReader::new(stream)
+            .read_line(&mut line)
+            .unwrap_or_else(|error| {
+                eprintln!("run acknowledgment: {error}");
+                std::process::exit(1)
+            });
+        let reply: serde_json::Value = serde_json::from_str(&line).unwrap_or_else(|error| {
+            eprintln!("invalid daemon acknowledgment: {error}");
+            std::process::exit(1)
+        });
+        println!("{}", line.trim());
+        if reply["type"] == "ERROR" {
+            std::process::exit(1);
+        }
+        return;
+    }
+    let db = flag_value(args, "--db")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_db_path);
+    let store = V2Store::open_read_only(&db).unwrap_or_else(|error| {
+        eprintln!("read-only task store: {error}");
+        std::process::exit(1)
+    });
     let once = has_flag(args, "--once");
     let group = flag_value(args, "--group");
 
@@ -342,47 +418,7 @@ fn run_v2_run(args: &[String]) {
             "{}",
             serde_json::to_string_pretty(&plans).unwrap_or_else(|_| "[]".to_owned())
         );
-        return;
     }
-
-    let mut completed = Vec::new();
-    for task in &tasks {
-        let res = match task.weight.to_ascii_uppercase().as_str() {
-            "M" | "L" => execute_m_l_pipeline(&mut store, &task.task_id),
-            _ => execute_xs_s_pipeline(&mut store, &task.task_id),
-        };
-        match res {
-            Ok(updated) => completed.push(updated),
-            Err(error) => {
-                eprintln!("pipeline execution failed for {}: {error}", task.task_id);
-                std::process::exit(1);
-            }
-        }
-        if once {
-            break;
-        }
-    }
-
-    // Process per-repository merge queue
-    let semaphore = HeavyCheckSemaphore::new();
-    let mut driver = SystemMergeDriver;
-    let repos: Vec<String> = store
-        .list_merge_queue(None)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|e| e.repo)
-        .collect();
-    let mut unique_repos = repos;
-    unique_repos.sort();
-    unique_repos.dedup();
-    for repo in unique_repos {
-        let _ = process_repo_merge_queue(&mut store, &repo, &mut driver, &semaphore);
-    }
-
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&completed).unwrap_or_else(|_| "[]".to_owned())
-    );
 }
 
 fn run_ledger_validator(config: &BootstrapConfig) {
@@ -432,7 +468,16 @@ fn usage_error(message: &str) -> ! {
 }
 
 fn run_v2_daemon(args: &[String]) {
-    let mut store = open_store(args);
+    let state_dir = default_state_dir();
+    let _lock = zach::v2::coordinator::DaemonLock::acquire(&state_dir).unwrap_or_else(|error| {
+        eprintln!("daemon lock: {error}");
+        std::process::exit(1)
+    });
+    let state_dir = std::fs::canonicalize(&state_dir).unwrap_or_else(|error| {
+        eprintln!("canonical daemon state directory: {error}");
+        std::process::exit(1)
+    });
+    let store = open_store(args);
     let socket_path = flag_value(args, "--socket")
         .map(PathBuf::from)
         .unwrap_or_else(default_socket_path);
@@ -447,31 +492,6 @@ fn run_v2_daemon(args: &[String]) {
         std::process::exit(1);
     });
 
-    let web_enabled = has_flag(args, "--web")
-        || flag_value(args, "--web-port").is_some()
-        || flag_value(args, "--port").is_some();
-    let web_gateway = if web_enabled {
-        let port = flag_value(args, "--web-port")
-            .or_else(|| flag_value(args, "--port"))
-            .and_then(|v| v.parse::<u16>().ok())
-            .unwrap_or(DEFAULT_WEB_PORT);
-        let db_path = flag_value(args, "--db")
-            .map(PathBuf::from)
-            .unwrap_or_else(default_db_path);
-        let bind_addr = format!("127.0.0.1:{port}");
-        let gateway = WebGateway::new(bind_addr.clone(), db_path, socket_path.clone());
-        let gw_clone = gateway.clone();
-        println!("zachd: web gateway listening on http://{bind_addr}");
-        std::thread::spawn(move || {
-            if let Err(e) = gw_clone.run_loop() {
-                eprintln!("web gateway error: {e}");
-            }
-        });
-        Some(gateway)
-    } else {
-        None
-    };
-
     println!(
         "zachd started · socket={} · initial_seq={} · once={}",
         socket_path.display(),
@@ -479,45 +499,17 @@ fn run_v2_daemon(args: &[String]) {
         once
     );
 
-    if let Err(error) = server.run_loop(&mut store, once) {
+    zach::v2::socket::install_shutdown_signals().unwrap_or_else(|error| {
+        eprintln!("install shutdown signals: {error}");
+        std::process::exit(1)
+    });
+    let coordinator = zach::v2::coordinator::Coordinator::spawn(store, state_dir);
+    if let Err(error) = server.run_coordinated(coordinator, once) {
         eprintln!("daemon error: {error}");
-        if let Some(gw) = web_gateway {
-            gw.request_shutdown();
-        }
         std::process::exit(1);
-    }
-    if let Some(gw) = web_gateway {
-        gw.request_shutdown();
     }
     if once {
         println!("zachd: completed single loop execution");
-    }
-}
-
-fn run_v2_web(args: &[String]) {
-    let db_path = flag_value(args, "--db")
-        .map(PathBuf::from)
-        .unwrap_or_else(default_db_path);
-    let socket_path = flag_value(args, "--socket")
-        .map(PathBuf::from)
-        .unwrap_or_else(default_socket_path);
-    let port = flag_value(args, "--web-port")
-        .or_else(|| flag_value(args, "--port"))
-        .and_then(|v| v.parse::<u16>().ok())
-        .unwrap_or(DEFAULT_WEB_PORT);
-    let bind_addr = flag_value(args, "--bind").unwrap_or_else(|| format!("127.0.0.1:{port}"));
-
-    let gateway = WebGateway::new(bind_addr.clone(), db_path.clone(), socket_path.clone());
-    println!(
-        "zach web gateway listening on http://{} · db={} · socket={}",
-        bind_addr,
-        db_path.display(),
-        socket_path.display()
-    );
-
-    if let Err(error) = gateway.run_loop() {
-        eprintln!("web gateway error: {error}");
-        std::process::exit(1);
     }
 }
 
@@ -640,14 +632,12 @@ fn print_usage() {
     println!(
         "       zach run [--task <TASK_ID>] [--group <GROUP>] [--once] [--dry-run] [--json] [--db <PATH>]"
     );
-    println!(
-        "       zach daemon [--socket <PATH>] [--db <PATH>] [--web] [--web-port <PORT>] [--once]"
-    );
+    println!("       zach doctor [--json] [--worktree <PATH>]");
+    println!("       zach daemon [--socket <PATH>] [--db <PATH>] [--once]");
     println!("       zach attach [--group <GROUP>] [--since-seq <N>] [--once] [--socket <PATH>]");
     println!(
         "       zach events [--group <GROUP>] [--since-seq <N>] [--wait] [--socket <PATH>] [--db <PATH>]"
     );
-    println!("       zach web [--web-port <PORT>] [--bind <ADDR>] [--socket <PATH>] [--db <PATH>]");
 }
 
 #[cfg(test)]
@@ -657,11 +647,6 @@ mod tests {
     #[test]
     fn default_bind_address_is_loopback() {
         assert_eq!(DEFAULT_BIND_ADDR, "127.0.0.1:8090");
-    }
-
-    #[test]
-    fn default_web_port_is_8096() {
-        assert_eq!(DEFAULT_WEB_PORT, 8096);
     }
 
     #[test]

@@ -75,129 +75,88 @@ pub fn determine_next_stage(task: &TaskRecord) -> Option<String> {
         .find(|stage| !task.stages_completed.contains(stage))
 }
 
-/// Evaluates ready tasks in the store and schedules the next eligible dispatches.
-///
-/// Guarantees:
-/// 1. Enforces `store.max_parallel_tasks()`.
-/// 2. Allows read-only stages (`plan`, `plan-review`) to run in parallel without acquiring `path_locks`.
-/// 3. For `impl`, atomically acquires per-repo `path_locks` based on `task.context_pack.target_files`
-///    (defaulting to `["*"]` if empty). Skips conflicting tasks while allowing non-overlapping tasks to proceed.
-/// 4. Preserves `path_locks` from `impl` through `pr-review` and `merge_queue`.
+/// Each task owns the entire repository from preparation through merge/human gates.
+/// Queued merges and human waits reserve a repository but consume no execution slot.
 pub fn schedule_next_dispatches(store: &mut V2Store) -> Result<Vec<ScheduledDispatch>, String> {
+    schedule_scoped_dispatches(store, None, None)
+}
+
+pub fn schedule_scoped_dispatches(
+    store: &mut V2Store,
+    task_id: Option<&str>,
+    group: Option<&str>,
+) -> Result<Vec<ScheduledDispatch>, String> {
     let max_parallel = store.max_parallel_tasks().map_err(|e| e.to_string())?;
     let all_tasks = store.list_tasks(None).map_err(|e| e.to_string())?;
     let active_count = all_tasks
         .iter()
-        .filter(|t| {
-            matches!(
-                t.status.as_str(),
-                "Planning" | "Plan Review" | "In Progress" | "PR Review"
-            )
-        })
+        .map(|task| store.occupies_task_slot(task))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .filter(|occupied| **occupied)
         .count();
-
-    if active_count >= max_parallel {
-        return Ok(Vec::new());
-    }
     let available_slots = max_parallel.saturating_sub(active_count);
-
-    let ready_tasks = store.list_ready_queue(None).map_err(|e| e.to_string())?;
+    let mut occupied = std::collections::BTreeMap::new();
+    for lock in store.list_path_locks(None).map_err(|e| e.to_string())? {
+        occupied.insert(lock.repo, lock.task_id);
+    }
+    for t in &all_tasks {
+        if matches!(
+            t.status.as_str(),
+            "Planning" | "Plan Review" | "In Progress" | "PR Review" | "Queued for Merge"
+        ) {
+            occupied
+                .entry(t.repository.clone())
+                .or_insert_with(|| t.task_id.clone());
+        }
+    }
+    for e in store.list_merge_queue(None).map_err(|e| e.to_string())? {
+        occupied.entry(e.repo).or_insert(e.task_id);
+    }
+    let ready_tasks = store.list_ready_queue(group).map_err(|e| e.to_string())?;
     let mut dispatches = Vec::new();
-
     for mut task in ready_tasks {
         if dispatches.len() >= available_slots {
             break;
         }
-
+        if task_id.is_some_and(|id| id != task.task_id) {
+            continue;
+        }
+        if occupied
+            .get(&task.repository)
+            .is_some_and(|owner| owner != &task.task_id)
+        {
+            continue;
+        }
         let Some(stage) = determine_next_stage(&task) else {
             continue;
         };
-
-        if stage == "human-plan-approval" || stage == "human-merge-approval" {
-            // Human gates are evaluated in the pipeline or decision engine, not dispatched to workers
+        let status = match stage.as_str() {
+            "plan" => "Planning",
+            "plan-review" => "Plan Review",
+            "impl" => "In Progress",
+            "pr-review" => "PR Review",
+            _ => continue,
+        };
+        let paths = vec!["*".to_owned()];
+        if !store
+            .acquire_path_locks(&task.repository, &paths, &task.task_id)
+            .map_err(|e| e.to_string())?
+        {
             continue;
         }
-
-        if stage == "plan" || stage == "plan-review" {
-            // Read-only stages: run concurrently without acquiring path_locks
-            let new_status = if stage == "plan" {
-                "Planning"
-            } else {
-                "Plan Review"
-            };
-            task.status = new_status.to_owned();
-            task.current_stage = Some(stage.clone());
-            store.upsert_task(&task).map_err(|e| e.to_string())?;
-
-            dispatches.push(ScheduledDispatch {
-                task_id: task.task_id,
-                repository: task.repository,
-                stage,
-                acquired_paths: Vec::new(),
-            });
-            continue;
-        }
-
-        if stage == "impl" {
-            let paths: Vec<String> = if task.context_pack.target_files.is_empty() {
-                vec!["*".to_owned()]
-            } else {
-                task.context_pack
-                    .target_files
-                    .iter()
-                    .map(|tf| tf.path.clone())
-                    .collect()
-            };
-
-            let acquired = store
-                .acquire_path_locks(&task.repository, &paths, &task.task_id)
-                .map_err(|e| e.to_string())?;
-
-            if !acquired {
-                // Path conflict: skip this task for now, leaving it in Ready for non-conflicting tasks
-                continue;
-            }
-
-            task.status = "In Progress".to_owned();
-            task.current_stage = Some("impl".to_owned());
-            store.upsert_task(&task).map_err(|e| e.to_string())?;
-
-            dispatches.push(ScheduledDispatch {
-                task_id: task.task_id,
-                repository: task.repository,
-                stage,
-                acquired_paths: paths,
-            });
-            continue;
-        }
-
-        if stage == "pr-review" {
-            // Locks were acquired before impl and must remain held
-            let paths: Vec<String> = if task.context_pack.target_files.is_empty() {
-                vec!["*".to_owned()]
-            } else {
-                task.context_pack
-                    .target_files
-                    .iter()
-                    .map(|tf| tf.path.clone())
-                    .collect()
-            };
-            // Ensure lock remains registered for this task
-            let _ = store.acquire_path_locks(&task.repository, &paths, &task.task_id);
-
-            task.status = "PR Review".to_owned();
-            task.current_stage = Some("pr-review".to_owned());
-            store.upsert_task(&task).map_err(|e| e.to_string())?;
-
-            dispatches.push(ScheduledDispatch {
-                task_id: task.task_id,
-                repository: task.repository,
-                stage,
-                acquired_paths: paths,
-            });
-        }
+        task.status = status.to_owned();
+        task.current_stage = Some(stage.clone());
+        store.upsert_task(&task).map_err(|e| e.to_string())?;
+        occupied.insert(task.repository.clone(), task.task_id.clone());
+        dispatches.push(ScheduledDispatch {
+            task_id: task.task_id,
+            repository: task.repository,
+            stage,
+            acquired_paths: paths,
+        });
     }
-
     Ok(dispatches)
 }
 
@@ -248,6 +207,9 @@ mod tests {
             executor: None,
             autonomous_consent: true,
             retry_count: 0,
+            next_retry_epoch: 0,
+            lease_owner: None,
+            lease_expires_epoch: None,
             memory: TaskMemory::default(),
             version: 1,
             updated_epoch: 1000,
@@ -286,29 +248,29 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_enforces_max_parallel_and_readonly_stages_run_in_parallel() {
+    fn scheduler_serializes_planning_per_repo_and_bounds_parallel_repos() {
         let mut store = V2Store::open_in_memory().expect("open store");
         store.set_max_parallel_tasks(2).unwrap();
 
         // Two M tasks in Ready state (starting at 'plan' stage)
         let t1 = make_test_task("ZACH-001", "zach", "M", "Ready", vec!["src/a.rs"], vec![]);
-        let t2 = make_test_task("ZACH-002", "zach", "M", "Ready", vec!["src/a.rs"], vec![]);
+        let t2 = make_test_task("ZACH-002", "other", "M", "Ready", vec!["src/a.rs"], vec![]);
         let t3 = make_test_task("ZACH-003", "zach", "M", "Ready", vec!["src/b.rs"], vec![]);
 
         store.upsert_task(&t1).unwrap();
         store.upsert_task(&t2).unwrap();
         store.upsert_task(&t3).unwrap();
 
-        // First dispatch: max_parallel = 2, both run read-only 'plan' stage concurrently
-        // even though t1 and t2 touch the same path 'src/a.rs' (read-only stages don't lock paths!)
+        // First dispatch: max_parallel = 2, different repositories run concurrently
+        // Different repositories can plan in parallel; the third task waits for its repository.
         let dispatches = schedule_next_dispatches(&mut store).unwrap();
         assert_eq!(dispatches.len(), 2);
         assert_eq!(dispatches[0].task_id, "ZACH-001");
         assert_eq!(dispatches[0].stage, "plan");
-        assert!(dispatches[0].acquired_paths.is_empty());
+        assert_eq!(dispatches[0].acquired_paths, vec!["*"]);
         assert_eq!(dispatches[1].task_id, "ZACH-002");
         assert_eq!(dispatches[1].stage, "plan");
-        assert!(dispatches[1].acquired_paths.is_empty());
+        assert_eq!(dispatches[1].acquired_paths, vec!["*"]);
 
         // Store now has 2 active tasks ("Planning"), so next schedule tick returns 0 dispatches
         let dispatches2 = schedule_next_dispatches(&mut store).unwrap();
@@ -316,7 +278,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_enforces_path_locks_for_impl_and_allows_non_overlapping_tasks() {
+    fn scheduler_serializes_disjoint_impl_paths_and_reacquires_for_review() {
         let mut store = V2Store::open_in_memory().expect("open store");
         store.set_max_parallel_tasks(4).unwrap();
 
@@ -333,7 +295,7 @@ mod tests {
             vec!["src/router.rs", "src/runner.rs"],
             vec![],
         );
-        let t3 = make_test_task("T-3", "zach", "S", "Ready", vec!["src/intake.rs"], vec![]);
+        let t3 = make_test_task("T-3", "other", "S", "Ready", vec!["src/intake.rs"], vec![]);
 
         store.upsert_task(&t1).unwrap();
         store.upsert_task(&t2).unwrap();
@@ -345,13 +307,13 @@ mod tests {
         // T-3 does not conflict and is scheduled
         assert_eq!(dispatches.len(), 2);
         assert_eq!(dispatches[0].task_id, "T-1");
-        assert_eq!(dispatches[0].acquired_paths, vec!["src/router.rs"]);
+        assert_eq!(dispatches[0].acquired_paths, vec!["*"]);
         assert_eq!(dispatches[1].task_id, "T-3");
-        assert_eq!(dispatches[1].acquired_paths, vec!["src/intake.rs"]);
+        assert_eq!(dispatches[1].acquired_paths, vec!["*"]);
 
         // Verify path locks in store
         let locks = store.list_path_locks(Some("zach")).unwrap();
-        assert_eq!(locks.len(), 2);
+        assert_eq!(locks.len(), 1);
 
         // Path locks are held across pr-review and not released between impl and pr-review
         let mut t1_updated = store.get_task("T-1").unwrap().unwrap();
@@ -366,6 +328,55 @@ mod tests {
 
         // Locks still held!
         let locks_after = store.list_path_locks(Some("zach")).unwrap();
-        assert_eq!(locks_after.len(), 2);
+        assert_eq!(locks_after.len(), 1);
+    }
+    #[test]
+    fn queued_merges_and_human_waits_reserve_repo_without_consuming_task_slots() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        store.set_max_parallel_tasks(1).unwrap();
+        let queued = make_test_task(
+            "QUEUED",
+            "repo-a",
+            "S",
+            "Queued for Merge",
+            vec![],
+            vec!["impl", "pr-review"],
+        );
+        store.upsert_task(&queued).unwrap();
+        let mut human = make_test_task(
+            "HUMAN",
+            "repo-b",
+            "L",
+            "Blocked",
+            vec![],
+            vec!["plan", "plan-review"],
+        );
+        human.current_stage = Some("human-plan-approval".into());
+        store.upsert_task(&human).unwrap();
+        store
+            .acquire_path_locks("repo-b", &["*".into()], "HUMAN")
+            .unwrap();
+        for (id, repo) in [("A", "repo-a"), ("B", "repo-b"), ("C", "repo-c")] {
+            store
+                .upsert_task(&make_test_task(id, repo, "M", "Ready", vec![], vec![]))
+                .unwrap();
+        }
+        let dispatches = schedule_next_dispatches(&mut store).unwrap();
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(dispatches[0].task_id, "C");
+    }
+
+    #[test]
+    fn retry_backoff_releases_slot_and_future_retries_do_not_dispatch() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        store.set_max_parallel_tasks(1).unwrap();
+        let mut delayed = make_test_task("A", "repo-a", "S", "Ready", vec![], vec![]);
+        delayed.next_retry_epoch = crate::v2::now_epoch() + 60;
+        store.upsert_task(&delayed).unwrap();
+        store
+            .upsert_task(&make_test_task("B", "repo-a", "S", "Ready", vec![], vec![]))
+            .unwrap();
+        let dispatches = schedule_next_dispatches(&mut store).unwrap();
+        assert_eq!(dispatches[0].task_id, "B");
     }
 }

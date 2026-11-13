@@ -1,3 +1,6 @@
+use crate::v2::isolation::{
+    self, IsolationChecker, NetworkPolicy, PreparedResources, SandboxLayout,
+};
 use crate::v2::pipeline::DiffFileEntry;
 use crate::v2::router::{ModelFamily, StageRoute, is_forbidden_daemon_model};
 use crate::v2::store::{TaskRecord, V2Store};
@@ -5,7 +8,12 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::process::Command;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+
+pub const MAX_SUMMARY_BYTES: usize = 1024;
+pub const MAX_RECENT_ATTEMPT_BYTES: usize = 256;
+pub const DEFAULT_ATTEMPT_RETENTION_DAYS: u64 = 7;
 
 pub const ALLOWED_ENV_KEYS: &[&str] = &[
     "HOME",
@@ -21,6 +29,10 @@ pub const GEMINI_WORKER_CLI_SCRIPT: &str =
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageCommandSpec {
+    #[serde(default)]
+    pub network: NetworkPolicy,
+    #[serde(default)]
+    pub writable: bool,
     pub unit_name: String,
     pub program: String,
     pub args: Vec<String>,
@@ -28,6 +40,12 @@ pub struct StageCommandSpec {
     pub worktree_path: String,
     pub timeout_secs: u64,
     pub stall_timeout_secs: u64,
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default)]
+    pub stdin_payload: String,
+    #[serde(default)]
+    pub output_schema_json: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,16 +53,64 @@ pub struct StageExecutionResult {
     pub status: String,
     pub summary: String,
     pub review_markdown: Option<String>,
+    #[serde(default)]
+    pub review_output: Option<String>,
+    #[serde(default)]
+    pub stage_output: Option<String>,
     pub invocation_id: Option<String>,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub total_tokens: u64,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
     pub sha_before: Option<String>,
     pub sha_after: Option<String>,
     pub diff_files: Vec<DiffFileEntry>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineRange {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl LineRange {
+    pub fn contains(&self, line: usize) -> bool {
+        line >= self.start && line <= self.end
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ReviewedDiffContext {
+    pub merge_base_sha: String,
+    pub reviewed_sha: String,
+    pub commit_range: String,
+    pub files: BTreeMap<String, Vec<LineRange>>,
+    #[serde(default)]
+    pub diff_excerpt: String,
+}
+
 pub trait StageExecutor {
+    fn persist_plan_artifact(
+        &mut self,
+        _task: &TaskRecord,
+        _artifact_id: &str,
+        _markdown: &str,
+    ) -> Result<PathBuf, String> {
+        Err("plan artifact persistence is unsupported by this executor".to_owned())
+    }
+
+    fn read_plan_artifact(&self, _path: &std::path::Path) -> Result<String, String> {
+        Err("plan artifact reading is unsupported by this executor".to_owned())
+    }
+
+    fn publish_plan_stage(
+        &mut self,
+        _task: &TaskRecord,
+        _plan_artifact_path: &std::path::Path,
+        _plan_markdown: &str,
+    ) -> Result<(), String> {
+        Err("plan publication is unsupported by this executor".to_owned())
+    }
+
     fn execute_stage(
         &mut self,
         task: &TaskRecord,
@@ -55,11 +121,26 @@ pub trait StageExecutor {
 
     fn run_checks(&mut self, worktree_path: &str, commands: &[String]) -> Result<(), String>;
 
-    fn finalize_xs_s_delivery(
+    fn run_gate_checks(&mut self, worktree_path: &str, commands: &[String]) -> Result<(), String> {
+        self.run_checks(worktree_path, commands)
+    }
+
+    fn commit_worktree(&mut self, task: &TaskRecord, worktree_path: &str)
+    -> Result<String, String>;
+
+    fn push_and_ensure_pr(
         &mut self,
         task: &TaskRecord,
+        worktree_path: &str,
         reviewed_sha: &str,
-    ) -> Result<Option<i64>, String>;
+    ) -> Result<i64, String>;
+
+    fn collect_reviewed_diff(
+        &mut self,
+        task: &TaskRecord,
+        worktree_path: &str,
+        reviewed_sha: &str,
+    ) -> Result<ReviewedDiffContext, String>;
 }
 
 /// Builds a strict allowlisted environment map for worker execution, explicitly
@@ -132,7 +213,8 @@ pub fn check_token_budget(task: &TaskRecord, route: &StageRoute) -> Result<u64, 
 }
 
 /// Builds a transient `systemd-run --user` command specification with cgroup resource
-/// limits, credential path isolation (`InaccessiblePaths`), and clean environment.
+/// limits and a declarative bubblewrap namespace wrapper. Runtime filesystem
+/// discovery and resource staging happen only in execute_stage.
 pub fn build_systemd_stage_command(
     task: &TaskRecord,
     attempt_id: &str,
@@ -182,6 +264,8 @@ pub fn build_systemd_stage_command_with_env(
         sanitize_unit_component(attempt_id)
     );
 
+    let network = NetworkPolicy::resolve(task.context_pack.network.as_deref(), route.family)?;
+    let writable = route.stage == "impl";
     let home = clean_env
         .get("HOME")
         .cloned()
@@ -189,10 +273,13 @@ pub fn build_systemd_stage_command_with_env(
 
     let mut args = vec![
         "--user".to_owned(),
-        "--collect".to_owned(),
-        "--wait".to_owned(),
-        "--pipe".to_owned(),
-        format!("--unit={unit_name}"),
+        "--no-block".to_owned(),
+        "--service-type=exec".to_owned(),
+        "-p".to_owned(),
+        "RemainAfterExit=yes".to_owned(),
+        "-p".to_owned(),
+        "CollectMode=inactive".to_owned(),
+        format!("--unit={unit_name}.service"),
         "--slice=zach-workers.slice".to_owned(),
         "-p".to_owned(),
         format!("RuntimeMaxSec={}", route.timeout_secs),
@@ -206,12 +293,6 @@ pub fn build_systemd_stage_command_with_env(
         "KillMode=control-group".to_owned(),
         "-p".to_owned(),
         "TimeoutStopSec=20".to_owned(),
-        "-p".to_owned(),
-        format!("InaccessiblePaths=-{home}/.config/gh"),
-        "-p".to_owned(),
-        format!("InaccessiblePaths=-{worktree_path}/.env"),
-        "-p".to_owned(),
-        format!("InaccessiblePaths=-{worktree_path}/.env.local"),
         format!("--working-directory={worktree_path}"),
     ];
 
@@ -221,7 +302,7 @@ pub fn build_systemd_stage_command_with_env(
 
     args.push("--".to_owned());
 
-    match route.family {
+    let stdin_payload = match route.family {
         ModelFamily::OpenAiSol => {
             args.extend([
                 "codex".to_owned(),
@@ -236,28 +317,41 @@ pub fn build_systemd_stage_command_with_env(
                 "-C".to_owned(),
                 worktree_path.clone(),
                 "--json".to_owned(),
-                prompt.to_owned(),
+                "-".to_owned(),
             ]);
+            prompt.to_owned()
         }
         ModelFamily::GeminiAgy => {
-            let worker_timeout = route.timeout_secs.min(1800);
             args.extend([
                 "node".to_owned(),
                 GEMINI_WORKER_CLI_SCRIPT.to_owned(),
                 "--cli".to_owned(),
-                "--model".to_owned(),
-                route.model.clone(),
-                "--worktree".to_owned(),
-                worktree_path.clone(),
-                "--timeout".to_owned(),
-                worker_timeout.to_string(),
-                "--prompt".to_owned(),
-                prompt.to_owned(),
             ]);
+            let payload = crate::v2::pipeline::build_agy_cli_payload(task, route, prompt);
+            serde_json::to_string(&payload)
+                .map_err(|e| format!("failed to serialize agy cli payload: {e}"))?
         }
-    }
+    };
+
+    let output_schema_json = (matches!(route.stage.as_str(), "plan-review" | "pr-review"))
+        .then(crate::v2::pipeline::review_verdict_json_schema_string);
+
+    let worker_start = args
+        .iter()
+        .position(|a| a == "--")
+        .ok_or("missing worker separator")?
+        + 1;
+    let worker = args.split_off(worker_start);
+    let declared = SandboxLayout::declared(
+        std::path::Path::new(&home),
+        std::path::Path::new(&worktree_path),
+        writable,
+    );
+    args.extend(isolation::bwrap_args(&declared, &worker));
 
     Ok(StageCommandSpec {
+        network,
+        writable,
         unit_name,
         program: "systemd-run".to_owned(),
         args,
@@ -265,7 +359,55 @@ pub fn build_systemd_stage_command_with_env(
         worktree_path,
         timeout_secs: route.timeout_secs,
         stall_timeout_secs: route.stall_timeout_secs,
+        prompt: prompt.to_owned(),
+        stdin_payload,
+        output_schema_json,
     })
+}
+
+fn replace_sandbox_args(args: &[String], layout: &SandboxLayout) -> Result<Vec<String>, String> {
+    let outer = args
+        .iter()
+        .position(|a| a == "--")
+        .ok_or("missing supervisor separator")?;
+    let bwrap = outer + 1;
+    if args.get(bwrap).map(String::as_str) != Some("/usr/bin/bwrap") {
+        return Err("missing bubblewrap wrapper".into());
+    }
+    let worker_start = args[bwrap..]
+        .iter()
+        .position(|a| a == "--")
+        .ok_or("missing sandbox separator")?
+        + bwrap
+        + 1;
+    let mut out = args[..=outer].to_vec();
+    out.extend(isolation::bwrap_args(layout, &args[worker_start..]));
+    Ok(out)
+}
+
+/// Inserts `--output-schema <schema_path>` before the trailing positional prompt/`"-"`
+/// argument of a `codex exec` invocation.
+pub fn inject_codex_output_schema_args(
+    args: &[String],
+    schema_path: &std::path::Path,
+) -> Vec<String> {
+    let Some(codex_idx) = args.iter().position(|a| a == "codex") else {
+        return args.to_vec();
+    };
+    let Some(rel_exec) = args[codex_idx + 1..].iter().position(|a| a == "exec") else {
+        return args.to_vec();
+    };
+    let exec_idx = codex_idx + 1 + rel_exec;
+    let last_idx = args.len().saturating_sub(1);
+    if last_idx <= exec_idx {
+        return args.to_vec();
+    }
+    let mut updated = Vec::with_capacity(args.len() + 2);
+    updated.extend_from_slice(&args[..last_idx]);
+    updated.push("--output-schema".to_owned());
+    updated.push(schema_path.to_string_lossy().into_owned());
+    updated.push(args[last_idx].clone());
+    updated
 }
 
 /// Parses `systemctl --user list-units 'zach-stage-*' --no-legend --plain` output
@@ -360,68 +502,733 @@ pub fn reconcile_orphan_units(store: &mut V2Store) -> Result<Vec<String>, String
     Ok(orphans)
 }
 
-pub struct SystemdStageExecutor;
+/// Truncates `input` so its UTF-8 byte length is `<= max_bytes` without splitting
+/// a multi-byte UTF-8 character. Appends `"..."` when `max_bytes >= 3`.
+pub fn truncate_utf8_bytes(input: &str, max_bytes: usize) -> String {
+    if input.len() <= max_bytes {
+        return input.to_owned();
+    }
+    if max_bytes < 3 {
+        let mut end = max_bytes;
+        while end > 0 && !input.is_char_boundary(end) {
+            end -= 1;
+        }
+        return input[..end].to_owned();
+    }
+    let mut end = max_bytes - 3;
+    while end > 0 && !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &input[..end])
+}
+
+/// Returns attempt directory retention from `ZACH_ATTEMPT_RETENTION_DAYS`
+/// (defaults to `DEFAULT_ATTEMPT_RETENTION_DAYS` = 7 days).
+pub fn attempt_retention_from_env() -> std::time::Duration {
+    let days = env::var("ZACH_ATTEMPT_RETENTION_DAYS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_ATTEMPT_RETENTION_DAYS);
+    std::time::Duration::from_secs(days.saturating_mul(86_400))
+}
+
+/// Prunes `<state_dir>/attempts/<attempt_id>` directories older than `retention`.
+pub fn prune_old_attempts(
+    state_dir: &std::path::Path,
+    retention: std::time::Duration,
+) -> Result<usize, String> {
+    prune_old_attempts_at(state_dir, retention, std::time::SystemTime::now())
+}
+
+/// Prunes `<state_dir>/attempts/<attempt_id>` directories older than `retention`
+/// relative to `now`, skipping symlinks and non-directories without following links.
+pub fn prune_old_attempts_at(
+    state_dir: &std::path::Path,
+    retention: std::time::Duration,
+    now: std::time::SystemTime,
+) -> Result<usize, String> {
+    let attempts_root = state_dir.join("attempts");
+    let root_meta = match std::fs::symlink_metadata(&attempts_root) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(format!("failed to stat {}: {e}", attempts_root.display())),
+    };
+    if root_meta.file_type().is_symlink() || !root_meta.file_type().is_dir() {
+        return Err(format!(
+            "attempts root {} is not a real directory",
+            attempts_root.display()
+        ));
+    }
+
+    let cutoff = now.checked_sub(retention).unwrap_or(std::time::UNIX_EPOCH);
+    let entries = std::fs::read_dir(&attempts_root)
+        .map_err(|e| format!("failed to read {}: {e}", attempts_root.display()))?;
+
+    let mut pruned = 0usize;
+    for entry_res in entries {
+        let Ok(entry) = entry_res else {
+            continue;
+        };
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() || !ft.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        // Detached artifacts can be referenced by live units, post-processing,
+        // or Governance/close receipts. Only the supervisor can release them.
+        if path.join("manifest.json").exists() {
+            continue;
+        }
+        let Ok(dir_meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if dir_meta.file_type().is_symlink() || !dir_meta.file_type().is_dir() {
+            continue;
+        }
+        let Ok(modified) = dir_meta.modified() else {
+            continue;
+        };
+        if modified < cutoff && std::fs::remove_dir_all(&path).is_ok() {
+            pruned += 1;
+        }
+    }
+    Ok(pruned)
+}
+
+pub(crate) fn validate_attempt_id(attempt_id: &str) -> Result<&str, String> {
+    if attempt_id.is_empty()
+        || attempt_id == "."
+        || attempt_id == ".."
+        || attempt_id.contains(['/', '\\', '\0'])
+        || attempt_id.trim() != attempt_id
+    {
+        return Err(format!("invalid attempt_id '{attempt_id}'"));
+    }
+    Ok(attempt_id)
+}
+
+pub(crate) fn ensure_secure_dir(dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    if let Some(parent) = dir.parent() {
+        isolation::reject_symlink_components(parent)?;
+    }
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(format!("refusing symlink directory {}", dir.display()));
+            }
+            if !meta.file_type().is_dir() {
+                return Err(format!("expected directory at {}", dir.display()));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder
+                .create(dir)
+                .map_err(|err| format!("failed to create directory {}: {err}", dir.display()))?;
+        }
+        Err(e) => {
+            return Err(format!("failed to stat directory {}: {e}", dir.display()));
+        }
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)
+        .and_then(|file| file.set_permissions(std::fs::Permissions::from_mode(0o700)))
+        .map_err(|e| format!("failed to secure directory {}: {e}", dir.display()))?;
+    Ok(dir.to_path_buf())
+}
+
+pub(crate) fn write_secure_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if let Some(parent) = path.parent() {
+        isolation::reject_symlink_components(parent)?;
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        return Err(format!("refusing to write to symlink {}", path.display()));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("artifact is not a regular file".to_owned());
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("failed to chmod 0600 {}: {e}", path.display()))?;
+    file.write_all(bytes)
+        .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    file.sync_all()
+        .map_err(|e| format!("failed to flush {}: {e}", path.display()))?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct SystemdStageExecutor {
+    pub state_dir: PathBuf,
+    pub ws_task_bin: PathBuf,
+    pub isolation_checker: IsolationChecker,
+    #[cfg(test)]
+    fixture_transport: bool,
+}
+
+impl Default for SystemdStageExecutor {
+    fn default() -> Self {
+        Self {
+            state_dir: crate::v2::default_state_dir(),
+            ws_task_bin: crate::v2::default_ws_task_bin(),
+            isolation_checker: isolation::verify_host_isolation,
+            #[cfg(test)]
+            fixture_transport: false,
+        }
+    }
+}
+
+impl SystemdStageExecutor {
+    pub fn with_isolation_checker(mut self, checker: IsolationChecker) -> Self {
+        self.isolation_checker = checker;
+        self
+    }
+
+    fn check_isolation(&self) -> Result<(), String> {
+        (self.isolation_checker)()
+            .map_err(|_| "ISOLATION_PREFLIGHT_FAILED: worker dispatch stopped".to_owned())
+    }
+
+    pub fn with_state_dir(state_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            state_dir: state_dir.into(),
+            ws_task_bin: crate::v2::default_ws_task_bin(),
+            isolation_checker: isolation::verify_host_isolation,
+            #[cfg(test)]
+            fixture_transport: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedCodexOutput {
+    pub status: String,
+    pub summary: String,
+    pub review_markdown: Option<String>,
+    pub review_output: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+}
+
+/// Parses `codex exec --json` JSONL events (`ThreadEvent` lines), summing token
+/// usage across `turn.completed` events and extracting the final `agent_message`
+/// or `turn.failed` / `error` summary. Returns `None` token fields when no valid
+/// `turn.completed` usage event is observed.
+pub fn parse_codex_jsonl_output(
+    stdout: &str,
+    stderr: &str,
+    exit_code: Option<i32>,
+) -> Result<ParsedCodexOutput, String> {
+    let mut parsed_json_events = 0usize;
+    let mut agent_messages: Vec<String> = Vec::new();
+    let mut error_messages: Vec<String> = Vec::new();
+    let mut saw_turn_failed = false;
+    let mut sum_input: u64 = 0;
+    let mut sum_output: u64 = 0;
+    let mut sum_total: u64 = 0;
+    let mut saw_valid_turn_usage = false;
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if !val.is_object() {
+            continue;
+        }
+        parsed_json_events += 1;
+
+        match val.get("type").and_then(|v| v.as_str()) {
+            Some("item.completed") => {
+                if val
+                    .get("item")
+                    .and_then(|i| i.get("type"))
+                    .and_then(|v| v.as_str())
+                    == Some("agent_message")
+                    && let Some(text) = val
+                        .get("item")
+                        .and_then(|i| i.get("text"))
+                        .and_then(|v| v.as_str())
+                    && !text.trim().is_empty()
+                {
+                    agent_messages.push(text.to_owned());
+                }
+            }
+            Some("turn.completed") => {
+                if let Some(usage) = val.get("usage").and_then(|v| v.as_object())
+                    && let (Some(inp), Some(out)) = (
+                        usage.get("input_tokens").and_then(|v| v.as_u64()),
+                        usage.get("output_tokens").and_then(|v| v.as_u64()),
+                    )
+                {
+                    // Codex ThreadEvent usage omits `total_tokens`; `input_tokens` already
+                    // includes `cached_input_tokens` and `output_tokens` includes reasoning.
+                    let tot = usage
+                        .get("total_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or_else(|| inp.saturating_add(out));
+                    sum_input = sum_input.saturating_add(inp);
+                    sum_output = sum_output.saturating_add(out);
+                    sum_total = sum_total.saturating_add(tot);
+                    saw_valid_turn_usage = true;
+                }
+            }
+            Some("turn.failed") => {
+                saw_turn_failed = true;
+                if let Some(msg) = val
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|v| v.as_str())
+                    && !msg.trim().is_empty()
+                {
+                    error_messages.push(msg.trim().to_owned());
+                }
+            }
+            Some("error") => {
+                if let Some(msg) = val.get("message").and_then(|v| v.as_str())
+                    && !msg.trim().is_empty()
+                {
+                    error_messages.push(msg.trim().to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let succeeded = exit_code == Some(0) && !saw_turn_failed;
+    let status = if succeeded { "PASSED" } else { "FAILED" }.to_owned();
+    let (input_tokens, output_tokens, total_tokens) = if saw_valid_turn_usage {
+        (Some(sum_input), Some(sum_output), Some(sum_total))
+    } else {
+        (None, None, None)
+    };
+
+    let last_agent_message = agent_messages.last().cloned();
+    let raw_summary = if !succeeded && let Some(err) = error_messages.last() {
+        err.clone()
+    } else if let Some(ref msg) = last_agent_message {
+        msg.clone()
+    } else if let Some(err) = error_messages.last() {
+        err.clone()
+    } else if parsed_json_events == 0 && !stdout.trim().is_empty() {
+        stdout.lines().take(10).collect::<Vec<_>>().join("\n")
+    } else if !stderr.trim().is_empty() {
+        stderr.lines().take(10).collect::<Vec<_>>().join("\n")
+    } else {
+        stdout.lines().take(10).collect::<Vec<_>>().join("\n")
+    };
+    let summary = truncate_utf8_bytes(&raw_summary, MAX_SUMMARY_BYTES);
+
+    let review_output = last_agent_message.clone();
+    let review_markdown = last_agent_message
+        .filter(|msg| msg.contains('|'))
+        .or_else(|| (parsed_json_events == 0 && stdout.contains('|')).then(|| stdout.to_owned()));
+
+    Ok(ParsedCodexOutput {
+        status,
+        summary,
+        review_markdown,
+        review_output,
+        input_tokens,
+        output_tokens,
+        total_tokens,
+    })
+}
+
+fn write_stage_result_json(
+    attempt_dir: &std::path::Path,
+    attempt_id: &str,
+    task_id: &str,
+    stage: &str,
+    exit_code: Option<i32>,
+    result: &StageExecutionResult,
+) -> Result<(), String> {
+    let result_json = serde_json::json!({
+        "attempt_id": attempt_id,
+        "task_id": task_id,
+        "stage": stage,
+        "exit_code": exit_code,
+        "result": result,
+    });
+    write_secure_file(
+        &attempt_dir.join("result.json"),
+        serde_json::to_string_pretty(&result_json)
+            .unwrap_or_default()
+            .as_bytes(),
+    )
+}
 
 impl StageExecutor for SystemdStageExecutor {
+    fn persist_plan_artifact(
+        &mut self,
+        task: &TaskRecord,
+        artifact_id: &str,
+        markdown: &str,
+    ) -> Result<PathBuf, String> {
+        validate_attempt_id(&task.task_id)?;
+        validate_attempt_id(artifact_id)?;
+        ensure_secure_dir(&self.state_dir)?;
+        let dir = ensure_secure_dir(&self.state_dir.join("plans"))?;
+        let path = dir.join(format!("{}-{}.md", task.task_id, artifact_id));
+        write_secure_file(&path, markdown.as_bytes())?;
+        Ok(path)
+    }
+
+    fn read_plan_artifact(&self, path: &std::path::Path) -> Result<String, String> {
+        let dir = self.state_dir.join("plans");
+        if path.parent() != Some(dir.as_path()) {
+            return Err("plan artifact is outside plans directory".to_owned());
+        }
+        ensure_secure_dir(&self.state_dir)?;
+        ensure_secure_dir(&dir)?;
+        let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        if !meta.is_file() || meta.file_type().is_symlink() {
+            return Err("refusing non-file or symlink plan artifact".to_owned());
+        }
+        std::fs::read_to_string(path).map_err(|e| e.to_string())
+    }
+
+    fn publish_plan_stage(
+        &mut self,
+        task: &TaskRecord,
+        path: &std::path::Path,
+        markdown: &str,
+    ) -> Result<(), String> {
+        if self.read_plan_artifact(path)? != markdown {
+            return Err("plan publication body differs from artifact".into());
+        }
+        let artifact_id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or("invalid plan artifact name")?;
+        let op =
+            crate::v2::intake::publish_plan_stage(task, &format!("zach-plan-{artifact_id}"), path);
+        crate::v2::intake::WsTaskClient::execute(
+            &crate::v2::intake::SystemWsTaskClient {
+                bin: self.ws_task_bin.clone(),
+            },
+            &op.args,
+        )
+        .map_err(|error| format!("failed to publish plan: {error}"))?;
+        Ok(())
+    }
+
     fn execute_stage(
         &mut self,
-        _task: &TaskRecord,
-        _attempt_id: &str,
-        _route: &StageRoute,
+        task: &TaskRecord,
+        attempt_id: &str,
+        route: &StageRoute,
         spec: &StageCommandSpec,
     ) -> Result<StageExecutionResult, String> {
+        if !cfg!(test) {
+            return Err(
+                "worker execution is owned by zachd; submit through the daemon socket".into(),
+            );
+        }
+        self.check_isolation()?;
+        let valid_attempt_id = validate_attempt_id(attempt_id)?;
+        isolation::secure_parents(&self.state_dir)?;
+        let attempts_root = ensure_secure_dir(&self.state_dir.join("attempts"))?;
+        let attempt_dir = ensure_secure_dir(&attempts_root.join(valid_attempt_id))?;
+
+        write_secure_file(&attempt_dir.join("prompt.md"), spec.prompt.as_bytes())?;
+
+        let mut effective_args = spec.args.clone();
+        let mut readonly_files = Vec::new();
+        if let Some(ref schema_json) = spec.output_schema_json {
+            let schema_path = attempt_dir.join("review-schema.json");
+            write_secure_file(&schema_path, schema_json.as_bytes())?;
+            if route.family == ModelFamily::OpenAiSol {
+                effective_args = inject_codex_output_schema_args(&effective_args, &schema_path);
+                readonly_files.push(schema_path);
+            }
+        }
+
+        // The checker is injectable, but production can never switch to a host transport.
+        #[cfg(test)]
+        let fixture_transport = self.fixture_transport;
+        #[cfg(not(test))]
+        let fixture_transport = false;
+        let _resources = if fixture_transport {
+            None
+        } else {
+            if spec.program != "systemd-run" {
+                return Err("invalid worker supervisor".into());
+            }
+            let network =
+                NetworkPolicy::resolve(task.context_pack.network.as_deref(), route.family)?;
+            if network != spec.network || spec.writable != (route.stage == "impl") {
+                return Err("stage isolation declaration mismatch".into());
+            }
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".into());
+            let mut resources = PreparedResources::prepare(
+                &attempt_dir,
+                std::path::Path::new(&home),
+                std::path::Path::new(&spec.worktree_path),
+                spec.writable,
+                Some(route.family),
+                network,
+            )?;
+            resources.layout.readonly_files = readonly_files;
+            effective_args = replace_sandbox_args(&effective_args, &resources.layout)?;
+            Some(resources)
+        };
+
         let sha_before = git_head_sha(&spec.worktree_path);
-        let output = Command::new(&spec.program)
-            .args(&spec.args)
+        let mut child = match Command::new(&spec.program)
+            .args(&effective_args)
             .env_clear()
             .envs(&spec.env)
-            .output()
-            .map_err(|e| format!("failed to spawn {}: {e}", spec.program))?;
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) => {
+                let err_msg = truncate_utf8_bytes(
+                    &format!("failed to spawn {}: {e}", spec.program),
+                    MAX_SUMMARY_BYTES,
+                );
+                let _ = write_secure_file(&attempt_dir.join("stdout.jsonl"), b"");
+                let _ = write_secure_file(&attempt_dir.join("stderr.log"), err_msg.as_bytes());
+                let result_json = serde_json::json!({
+                    "attempt_id": valid_attempt_id,
+                    "task_id": task.task_id,
+                    "stage": route.stage,
+                    "status": "FAILED",
+                    "exit_code": serde_json::Value::Null,
+                    "summary": err_msg,
+                });
+                let _ = write_secure_file(
+                    &attempt_dir.join("result.json"),
+                    serde_json::to_string_pretty(&result_json)
+                        .unwrap_or_default()
+                        .as_bytes(),
+                );
+                return Err(err_msg);
+            }
+        };
+
+        let child_stdin = child.stdin.take();
+        let stdin_bytes = spec.stdin_payload.as_bytes();
+        let (writer_join, output_res) = std::thread::scope(|scope| {
+            let writer = scope.spawn(move || -> std::io::Result<()> {
+                use std::io::Write;
+                if let Some(mut stdin) = child_stdin
+                    && !stdin_bytes.is_empty()
+                {
+                    stdin.write_all(stdin_bytes)?;
+                    stdin.flush()?;
+                }
+                // `child_stdin` is dropped here to send EOF while `wait_with_output()` drains stdout/stderr.
+                Ok(())
+            });
+            let output_res = child.wait_with_output();
+            let writer_join = writer.join();
+            (writer_join, output_res)
+        });
+
+        let output = match output_res {
+            Ok(out) => out,
+            Err(e) => {
+                let err_msg = truncate_utf8_bytes(
+                    &format!("failed waiting for {}: {e}", spec.program),
+                    MAX_SUMMARY_BYTES,
+                );
+                let _ = write_secure_file(&attempt_dir.join("stdout.jsonl"), b"");
+                let _ = write_secure_file(&attempt_dir.join("stderr.log"), err_msg.as_bytes());
+                let result_json = serde_json::json!({
+                    "attempt_id": valid_attempt_id,
+                    "task_id": task.task_id,
+                    "stage": route.stage,
+                    "status": "FAILED",
+                    "exit_code": serde_json::Value::Null,
+                    "summary": err_msg,
+                });
+                let _ = write_secure_file(
+                    &attempt_dir.join("result.json"),
+                    serde_json::to_string_pretty(&result_json)
+                        .unwrap_or_default()
+                        .as_bytes(),
+                );
+                return Err(err_msg);
+            }
+        };
+
+        write_secure_file(&attempt_dir.join("stdout.jsonl"), &output.stdout)?;
+        write_secure_file(&attempt_dir.join("stderr.log"), &output.stderr)?;
+
+        if let Ok(Err(e)) = writer_join
+            && e.kind() != std::io::ErrorKind::BrokenPipe
+        {
+            let err_msg = truncate_utf8_bytes(
+                &format!("failed writing stdin to {}: {e}", spec.program),
+                MAX_SUMMARY_BYTES,
+            );
+            let result_json = serde_json::json!({
+                "attempt_id": valid_attempt_id,
+                "task_id": task.task_id,
+                "stage": route.stage,
+                "status": "FAILED",
+                "exit_code": output.status.code(),
+                "summary": err_msg,
+            });
+            let _ = write_secure_file(
+                &attempt_dir.join("result.json"),
+                serde_json::to_string_pretty(&result_json)
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
+            return Err(err_msg);
+        }
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         let sha_after = git_head_sha(&spec.worktree_path);
         let diff_files = collect_worktree_diff_entries(&spec.worktree_path);
 
-        if let Ok(mut parsed) =
-            crate::v2::pipeline::parse_agy_cli_response(&stdout, &stderr, output.status.code())
-        {
-            parsed.sha_before = sha_before;
-            parsed.sha_after = sha_after;
-            parsed.diff_files = diff_files;
-            return Ok(parsed);
+        match route.family {
+            ModelFamily::GeminiAgy => {
+                match crate::v2::pipeline::parse_agy_cli_response(
+                    &stdout,
+                    &stderr,
+                    output.status.code(),
+                ) {
+                    Ok(mut parsed) => {
+                        parsed.sha_before = sha_before;
+                        parsed.sha_after = sha_after;
+                        parsed.diff_files = diff_files;
+                        parsed.summary = truncate_utf8_bytes(&parsed.summary, MAX_SUMMARY_BYTES);
+                        write_stage_result_json(
+                            &attempt_dir,
+                            valid_attempt_id,
+                            &task.task_id,
+                            &route.stage,
+                            output.status.code(),
+                            &parsed,
+                        )?;
+                        Ok(parsed)
+                    }
+                    Err(agy_err) => {
+                        let err_msg = truncate_utf8_bytes(&agy_err.to_string(), MAX_SUMMARY_BYTES);
+                        let result_json = serde_json::json!({
+                            "attempt_id": valid_attempt_id,
+                            "task_id": task.task_id,
+                            "stage": route.stage,
+                            "status": "FAILED",
+                            "failure_class": agy_err.failure_class,
+                            "exit_code": output.status.code(),
+                            "summary": err_msg,
+                        });
+                        write_secure_file(
+                            &attempt_dir.join("result.json"),
+                            serde_json::to_string_pretty(&result_json)
+                                .unwrap_or_default()
+                                .as_bytes(),
+                        )?;
+                        Err(err_msg)
+                    }
+                }
+            }
+            ModelFamily::OpenAiSol => {
+                let parsed = parse_codex_jsonl_output(&stdout, &stderr, output.status.code())?;
+                let result = StageExecutionResult {
+                    status: parsed.status,
+                    summary: parsed.summary,
+                    review_markdown: parsed.review_markdown,
+                    stage_output: parsed.review_output.clone(),
+                    review_output: parsed.review_output,
+                    invocation_id: None,
+                    input_tokens: parsed.input_tokens,
+                    output_tokens: parsed.output_tokens,
+                    total_tokens: parsed.total_tokens,
+                    sha_before,
+                    sha_after,
+                    diff_files,
+                };
+                write_stage_result_json(
+                    &attempt_dir,
+                    valid_attempt_id,
+                    &task.task_id,
+                    &route.stage,
+                    output.status.code(),
+                    &result,
+                )?;
+                Ok(result)
+            }
         }
-
-        let status = if output.status.success() {
-            "PASSED".to_owned()
-        } else {
-            "FAILED".to_owned()
-        };
-        let summary = if stdout.trim().is_empty() {
-            stderr.lines().take(10).collect::<Vec<_>>().join("\n")
-        } else {
-            stdout.lines().take(10).collect::<Vec<_>>().join("\n")
-        };
-
-        Ok(StageExecutionResult {
-            status,
-            summary,
-            review_markdown: if stdout.contains('|') {
-                Some(stdout)
-            } else {
-                None
-            },
-            invocation_id: None,
-            input_tokens: 0,
-            output_tokens: 0,
-            total_tokens: 0,
-            sha_before,
-            sha_after,
-            diff_files,
-        })
     }
 
     fn run_checks(&mut self, worktree_path: &str, commands: &[String]) -> Result<(), String> {
+        self.check_isolation()?;
+        let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".into()));
+        let layout = SandboxLayout::inspect(&home, std::path::Path::new(worktree_path), true)?;
+        for cmd in commands {
+            let worker = vec!["bash".into(), "-c".into(), cmd.clone()];
+            static CHECK_SEQ: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let unit = format!(
+                "--unit=zach-stage-worker-checks-{}-{}",
+                std::process::id(),
+                CHECK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            );
+            let out = Command::new("systemd-run")
+                .arg(unit)
+                .args([
+                    "--user",
+                    "--collect",
+                    "--wait",
+                    "--pipe",
+                    "--slice=zach-workers.slice",
+                    "-p",
+                    "RuntimeMaxSec=1800",
+                    "-p",
+                    "MemoryMax=4G",
+                    "-p",
+                    "CPUWeight=20",
+                    "-p",
+                    "TasksMax=512",
+                    "-p",
+                    "KillMode=control-group",
+                    "--",
+                ])
+                .args(isolation::bwrap_args(&layout, &worker))
+                .stdin(Stdio::null())
+                .output()
+                .map_err(|e| format!("failed to run check '{cmd}': {e}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "check '{cmd}' failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn run_gate_checks(&mut self, worktree_path: &str, commands: &[String]) -> Result<(), String> {
         let clean_env = build_clean_env_from_process();
         for cmd in commands {
             let out = Command::new("bash")
@@ -432,38 +1239,51 @@ impl StageExecutor for SystemdStageExecutor {
                 .output()
                 .map_err(|e| format!("failed to run check '{cmd}': {e}"))?;
             if !out.status.success() {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                return Err(format!("check '{cmd}' failed: {}", stderr.trim()));
+                return Err(format!(
+                    "check '{cmd}' failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
             }
         }
         Ok(())
     }
 
-    fn finalize_xs_s_delivery(
+    fn commit_worktree(
         &mut self,
         task: &TaskRecord,
-        _reviewed_sha: &str,
-    ) -> Result<Option<i64>, String> {
-        let worktree_path = match task.worktree_path.as_deref() {
-            Some(w) if !w.is_empty() => w,
-            _ => return Ok(None),
-        };
+        worktree_path: &str,
+    ) -> Result<String, String> {
+        let trimmed_worktree = worktree_path.trim();
+        if trimmed_worktree.is_empty() || trimmed_worktree == "none" {
+            return Err(format!(
+                "task {} has no governed worktree_path to commit",
+                task.task_id
+            ));
+        }
 
-        // 1. Commit uncommitted changes if worktree is dirty
+        // Commit uncommitted changes if worktree is dirty
         let status_out = Command::new("git")
-            .args(["-C", worktree_path, "status", "--porcelain"])
+            .args(["-C", trimmed_worktree, "status", "--porcelain"])
             .output()
             .map_err(|e| format!("failed to check git status: {e}"))?;
+        if !status_out.status.success() {
+            return Err(format!(
+                "git status failed in '{}': {}",
+                trimmed_worktree,
+                String::from_utf8_lossy(&status_out.stderr).trim()
+            ));
+        }
+
         let status_str = String::from_utf8_lossy(&status_out.stdout);
         if !status_str.trim().is_empty() {
             let add_out = Command::new("git")
-                .args(["-C", worktree_path, "add", "-A"])
+                .args(["-C", trimmed_worktree, "add", "-A"])
                 .output()
                 .map_err(|e| format!("git add failed: {e}"))?;
             if !add_out.status.success() {
                 return Err(format!(
                     "git add failed: {}",
-                    String::from_utf8_lossy(&add_out.stderr)
+                    String::from_utf8_lossy(&add_out.stderr).trim()
                 ));
             }
 
@@ -475,35 +1295,72 @@ impl StageExecutor for SystemdStageExecutor {
                 task.active_attempt_id.as_deref().unwrap_or("none")
             );
             let commit_out = Command::new("git")
-                .args(["-C", worktree_path, "commit", "-m", &commit_msg])
+                .args(["-C", trimmed_worktree, "commit", "-m", &commit_msg])
                 .output()
                 .map_err(|e| format!("git commit failed: {e}"))?;
             if !commit_out.status.success() {
                 return Err(format!(
                     "git commit failed: {}",
-                    String::from_utf8_lossy(&commit_out.stderr)
+                    String::from_utf8_lossy(&commit_out.stderr).trim()
                 ));
             }
         }
 
-        // 2. Push branch
-        let branch = match task.branch.as_deref() {
-            Some(b) if !b.is_empty() && b != "none" => b,
-            _ => return Ok(None),
-        };
+        git_head_sha(trimmed_worktree)
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty() && s != "head-sha")
+            .ok_or_else(|| {
+                format!(
+                    "failed to resolve committed HEAD SHA in worktree '{}'",
+                    trimmed_worktree
+                )
+            })
+    }
+
+    fn push_and_ensure_pr(
+        &mut self,
+        task: &TaskRecord,
+        worktree_path: &str,
+        reviewed_sha: &str,
+    ) -> Result<i64, String> {
+        let trimmed_worktree = worktree_path.trim();
+        if trimmed_worktree.is_empty() || trimmed_worktree == "none" {
+            return Err(format!(
+                "task {} has no governed worktree_path for PR delivery",
+                task.task_id
+            ));
+        }
+
+        let trimmed_sha = reviewed_sha.trim();
+        if trimmed_sha.is_empty() || trimmed_sha == "head-sha" {
+            return Err(format!(
+                "task {} is missing a valid reviewed_sha for PR delivery",
+                task.task_id
+            ));
+        }
+
+        let branch = task
+            .branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty() && *b != "none")
+            .ok_or_else(|| format!("task {} has no branch for PR push", task.task_id))?;
 
         let push_out = Command::new("git")
-            .args(["-C", worktree_path, "push", "-u", "origin", branch])
+            .args(["-C", trimmed_worktree, "push", "-u", "origin", branch])
             .output()
             .map_err(|e| format!("git push failed: {e}"))?;
         if !push_out.status.success() {
             return Err(format!(
                 "git push failed: {}",
-                String::from_utf8_lossy(&push_out.stderr)
+                String::from_utf8_lossy(&push_out.stderr).trim()
             ));
         }
 
-        // 3. Find or create PR
+        if let Some(pr) = task.pr_number.filter(|&p| p > 0) {
+            return Ok(pr);
+        }
+
         let gh_repo = task.github_repo.as_deref().unwrap_or(&task.repository);
         let list_out = Command::new("gh")
             .args([
@@ -520,10 +1377,14 @@ impl StageExecutor for SystemdStageExecutor {
             ])
             .output();
 
-        if let Ok(lo) = list_out {
+        if let Ok(lo) = list_out
+            && lo.status.success()
+        {
             let num_str = String::from_utf8_lossy(&lo.stdout).trim().to_owned();
-            if let Ok(num) = num_str.parse::<i64>() {
-                return Ok(Some(num));
+            if let Ok(num) = num_str.parse::<i64>()
+                && num > 0
+            {
+                return Ok(num);
             }
         }
 
@@ -543,18 +1404,371 @@ impl StageExecutor for SystemdStageExecutor {
 
         if !create_out.status.success() {
             let err = String::from_utf8_lossy(&create_out.stderr);
-            return Err(format!("gh pr create failed: {err}"));
+            return Err(format!("gh pr create failed: {}", err.trim()));
         }
 
         let pr_url = String::from_utf8_lossy(&create_out.stdout);
-        let pr_num = pr_url
+        pr_url
             .trim()
             .rsplit('/')
             .next()
-            .and_then(|s| s.parse::<i64>().ok());
-
-        Ok(pr_num)
+            .and_then(|s| s.parse::<i64>().ok())
+            .filter(|&n| n > 0)
+            .ok_or_else(|| {
+                format!(
+                    "gh pr create did not return a valid PR number in output: '{}'",
+                    pr_url.trim()
+                )
+            })
     }
+
+    fn collect_reviewed_diff(
+        &mut self,
+        task: &TaskRecord,
+        worktree_path: &str,
+        reviewed_sha: &str,
+    ) -> Result<ReviewedDiffContext, String> {
+        let base_hint = task
+            .plan_base_sha
+            .as_deref()
+            .or(task.context_pack.base_sha.as_deref());
+        collect_reviewed_diff_ranges(worktree_path, base_hint, reviewed_sha)
+    }
+}
+
+/// Normalizes a cited diff path relative to `worktree_path`, rejecting empty,
+/// escaping (`..`), or foreign absolute paths.
+pub fn normalize_cited_diff_path(raw: &str, worktree_path: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.contains('\0') {
+        return Err("cited file path is empty or contains NUL".to_owned());
+    }
+    let normalized_slashes = trimmed.replace('\\', "/");
+    let wt_trimmed = worktree_path.trim().trim_end_matches('/');
+    let mut rel = normalized_slashes.as_str();
+    if !wt_trimmed.is_empty() && wt_trimmed != "none" {
+        let wt_prefix = format!("{wt_trimmed}/");
+        if let Some(stripped) = rel.strip_prefix(&wt_prefix) {
+            rel = stripped;
+        } else if let Ok(canon_wt) = std::fs::canonicalize(wt_trimmed)
+            && let Some(canon_str) = canon_wt.to_str()
+        {
+            let canon_prefix = format!("{}/", canon_str.trim_end_matches('/'));
+            if let Some(stripped) = rel.strip_prefix(&canon_prefix) {
+                rel = stripped;
+            }
+        }
+    }
+    while let Some(stripped) = rel.strip_prefix("./") {
+        rel = stripped;
+    }
+    if rel.starts_with('/') {
+        return Err(format!(
+            "cited file path '{raw}' is outside governed worktree '{worktree_path}'"
+        ));
+    }
+    let path = std::path::Path::new(rel);
+    if path.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir | std::path::Component::RootDir
+        )
+    }) {
+        return Err(format!(
+            "cited file path '{raw}' contains escaping traversal"
+        ));
+    }
+    let clean = rel.trim_start_matches('/').to_owned();
+    if clean.is_empty() {
+        return Err(format!("cited file path '{raw}' normalized to empty"));
+    }
+    Ok(clean)
+}
+
+fn resolve_merge_base_for_reviewed_sha(
+    worktree_path: &str,
+    plan_base_sha: Option<&str>,
+    reviewed_sha: &str,
+) -> Result<(String, String), String> {
+    let trimmed_rev = reviewed_sha.trim();
+    if trimmed_rev.is_empty() || trimmed_rev == "head-sha" {
+        return Err("cannot collect reviewed diff without valid reviewed_sha".to_owned());
+    }
+    let rev_verify = Command::new("git")
+        .args([
+            "-C",
+            worktree_path,
+            "rev-parse",
+            "--verify",
+            &format!("{trimmed_rev}^{{commit}}"),
+        ])
+        .output()
+        .map_err(|e| format!("failed to verify reviewed_sha '{trimmed_rev}': {e}"))?;
+    if !rev_verify.status.success() {
+        return Err(format!(
+            "failed to resolve reviewed_sha '{trimmed_rev}' in '{worktree_path}': {}",
+            String::from_utf8_lossy(&rev_verify.stderr).trim()
+        ));
+    }
+    let reviewed_oid = String::from_utf8_lossy(&rev_verify.stdout)
+        .trim()
+        .to_owned();
+
+    let mut candidates = Vec::new();
+    if let Ok(sym) = Command::new("git")
+        .args([
+            "-C",
+            worktree_path,
+            "symbolic-ref",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ])
+        .output()
+        && sym.status.success()
+    {
+        let sym_str = String::from_utf8_lossy(&sym.stdout);
+        if let Some(branch) = crate::v2::merge_queue::parse_default_branch(&sym_str, "") {
+            candidates.push(format!("origin/{branch}"));
+        }
+    }
+    for fallback in ["origin/main", "origin/master"] {
+        if !candidates.iter().any(|c| c == fallback) {
+            candidates.push(fallback.to_owned());
+        }
+    }
+    if let Some(base_hint) = plan_base_sha.map(str::trim).filter(|s| !s.is_empty())
+        && !candidates.iter().any(|c| c == base_hint)
+    {
+        candidates.push(base_hint.to_owned());
+    }
+
+    for base_ref in candidates {
+        if let Ok(out) = Command::new("git")
+            .args(["-C", worktree_path, "merge-base", &base_ref, &reviewed_oid])
+            .output()
+            && out.status.success()
+        {
+            let sha = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            if !sha.is_empty() {
+                return Ok((sha, reviewed_oid));
+            }
+        }
+    }
+
+    if let Ok(parent_out) = Command::new("git")
+        .args([
+            "-C",
+            worktree_path,
+            "rev-parse",
+            "--verify",
+            &format!("{reviewed_oid}^"),
+        ])
+        .output()
+        && parent_out.status.success()
+    {
+        let sha = String::from_utf8_lossy(&parent_out.stdout)
+            .trim()
+            .to_owned();
+        if !sha.is_empty() {
+            return Ok((sha, reviewed_oid));
+        }
+    }
+
+    Err(format!(
+        "unable to resolve merge-base for reviewed_sha '{reviewed_oid}' in '{worktree_path}'"
+    ))
+}
+
+fn parse_hunk_span(spec: &str) -> Option<(usize, usize)> {
+    let trimmed = spec.trim();
+    if let Some((start_s, count_s)) = trimmed.split_once(',') {
+        let start = start_s.parse::<usize>().ok()?;
+        let count = count_s.parse::<usize>().ok()?;
+        Some((start, count))
+    } else {
+        let start = trimmed.parse::<usize>().ok()?;
+        Some((start, 1))
+    }
+}
+
+fn parse_hunk_header(line: &str) -> Option<((usize, usize), (usize, usize))> {
+    let rest = line.strip_prefix("@@ -")?;
+    let (old_part, after_old) = rest.split_once(" +")?;
+    let (new_part, _) = after_old.split_once(" @@")?;
+    let old_span = parse_hunk_span(old_part)?;
+    let new_span = parse_hunk_span(new_part)?;
+    Some((old_span, new_span))
+}
+
+/// Parses `git diff --unified=0 --no-ext-diff -M` output into per-file changed
+/// 1-based line ranges, handling omitted counts, empty added/deleted files,
+/// pure deletions, pure renames, and binary files.
+pub fn parse_unified_zero_diff(diff_text: &str) -> BTreeMap<String, Vec<LineRange>> {
+    #[derive(Default)]
+    struct FileState {
+        old_path: Option<String>,
+        new_path: Option<String>,
+        is_deleted: bool,
+        ranges: Vec<LineRange>,
+    }
+
+    fn flush_file(out: &mut BTreeMap<String, Vec<LineRange>>, state: Option<FileState>) {
+        let Some(mut st) = state else {
+            return;
+        };
+        let target = if st.is_deleted {
+            st.old_path.or(st.new_path)
+        } else {
+            st.new_path.or(st.old_path)
+        };
+        let Some(raw_path) = target else {
+            return;
+        };
+        let clean = raw_path.trim().trim_start_matches("./").to_owned();
+        if clean.is_empty() || clean == "/dev/null" {
+            return;
+        }
+        if st.ranges.is_empty() {
+            st.ranges.push(LineRange { start: 1, end: 1 });
+        }
+        out.entry(clean).or_default().extend(st.ranges);
+    }
+
+    let mut out: BTreeMap<String, Vec<LineRange>> = BTreeMap::new();
+    let mut current: Option<FileState> = None;
+
+    for raw_line in diff_text.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            flush_file(&mut out, current.take());
+            let mut st = FileState::default();
+            if let Some(after_a) = rest.strip_prefix("a/") {
+                let bytes = after_a.as_bytes();
+                let mut exact_pair = None;
+                if bytes.len() >= 3 && (bytes.len() - 3).is_multiple_of(2) {
+                    let mid = (bytes.len() - 3) / 2;
+                    if after_a.is_char_boundary(mid)
+                        && after_a[mid..].starts_with(" b/")
+                        && after_a[..mid] == after_a[mid + 3..]
+                    {
+                        exact_pair =
+                            Some((after_a[..mid].to_owned(), after_a[mid + 3..].to_owned()));
+                    }
+                }
+                if let Some((old_p, new_p)) = exact_pair {
+                    st.old_path = Some(old_p);
+                    st.new_path = Some(new_p);
+                } else if let Some((old_p, new_p)) = after_a.split_once(" b/") {
+                    st.old_path = Some(old_p.to_owned());
+                    st.new_path = Some(new_p.to_owned());
+                }
+            }
+            current = Some(st);
+            continue;
+        }
+
+        let Some(st) = current.as_mut() else {
+            continue;
+        };
+
+        if line.starts_with("deleted file mode ") || line == "+++ /dev/null" {
+            st.is_deleted = true;
+            if line == "+++ /dev/null" {
+                st.new_path = None;
+            }
+        } else if let Some(p) = line.strip_prefix("rename from ") {
+            st.old_path = Some(p.to_owned());
+        } else if let Some(p) = line.strip_prefix("rename to ") {
+            st.new_path = Some(p.to_owned());
+        } else if let Some(p) = line.strip_prefix("copy to ") {
+            st.new_path = Some(p.to_owned());
+        } else if let Some(p) = line.strip_prefix("--- a/") {
+            st.old_path = Some(p.to_owned());
+        } else if let Some(p) = line.strip_prefix("+++ b/") {
+            st.new_path = Some(p.to_owned());
+        } else if line.starts_with("Binary files ") && line.ends_with(" differ") {
+            if line.ends_with(" and /dev/null differ") {
+                st.is_deleted = true;
+                if let Some(after_a) = line.strip_prefix("Binary files a/")
+                    && let Some((old_p, _)) = after_a.split_once(" and /dev/null differ")
+                {
+                    st.old_path = Some(old_p.to_owned());
+                }
+            } else if let Some((_, rhs)) = line.rsplit_once(" and b/")
+                && let Some(new_p) = rhs.strip_suffix(" differ")
+            {
+                st.new_path = Some(new_p.to_owned());
+            }
+        } else if line.starts_with("@@ ")
+            && let Some(((old_start, old_count), (new_start, new_count))) = parse_hunk_header(line)
+        {
+            if st.is_deleted {
+                let start = old_start.max(1);
+                let end = start.saturating_add(old_count.max(1) - 1);
+                st.ranges.push(LineRange { start, end });
+            } else if new_count == 0 {
+                let anchor = new_start.max(1);
+                st.ranges.push(LineRange {
+                    start: anchor,
+                    end: anchor,
+                });
+            } else {
+                let start = new_start.max(1);
+                let end = start.saturating_add(new_count - 1);
+                st.ranges.push(LineRange { start, end });
+            }
+        }
+    }
+
+    flush_file(&mut out, current.take());
+    out
+}
+
+/// Collects per-file changed line ranges over `<merge-base>..<reviewed_sha>`.
+pub fn collect_reviewed_diff_ranges(
+    worktree_path: &str,
+    plan_base_sha: Option<&str>,
+    reviewed_sha: &str,
+) -> Result<ReviewedDiffContext, String> {
+    let trimmed_wt = worktree_path.trim();
+    if trimmed_wt.is_empty() || trimmed_wt == "none" {
+        return Err("cannot collect reviewed diff without governed worktree_path".to_owned());
+    }
+    let (merge_base_sha, reviewed_oid) =
+        resolve_merge_base_for_reviewed_sha(trimmed_wt, plan_base_sha, reviewed_sha)?;
+    let commit_range = format!("{merge_base_sha}..{reviewed_oid}");
+    let out = Command::new("git")
+        .args([
+            "-C",
+            trimmed_wt,
+            "-c",
+            "diff.noprefix=false",
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--unified=0",
+            "--no-ext-diff",
+            "-M",
+            &commit_range,
+        ])
+        .output()
+        .map_err(|e| format!("failed to run git diff for '{commit_range}': {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git diff '{commit_range}' failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let diff_text = String::from_utf8_lossy(&out.stdout);
+    let files = parse_unified_zero_diff(&diff_text);
+    let diff_excerpt = truncate_utf8_bytes(&diff_text, 4096);
+    Ok(ReviewedDiffContext {
+        merge_base_sha,
+        reviewed_sha: reviewed_oid,
+        commit_range,
+        files,
+        diff_excerpt,
+    })
 }
 
 fn git_head_sha(worktree_path: &str) -> Option<String> {
@@ -568,90 +1782,833 @@ fn git_head_sha(worktree_path: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
-pub fn collect_worktree_diff_entries(worktree_path: &str) -> Vec<DiffFileEntry> {
-    let numstat = Command::new("git")
-        .args(["-C", worktree_path, "diff", "--numstat", "HEAD"])
-        .output();
-    let Ok(out) = numstat else {
-        return Vec::new();
-    };
-    if !out.status.success() {
-        return Vec::new();
+fn resolve_diff_base(worktree_path: &str) -> Option<String> {
+    let mut candidates = Vec::new();
+    if let Ok(sym) = Command::new("git")
+        .args([
+            "-C",
+            worktree_path,
+            "symbolic-ref",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ])
+        .output()
+        && sym.status.success()
+    {
+        let sym_str = String::from_utf8_lossy(&sym.stdout);
+        if let Some(branch) = crate::v2::merge_queue::parse_default_branch(&sym_str, "") {
+            candidates.push(format!("origin/{branch}"));
+        }
     }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let mut entries = Vec::new();
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() == 3 {
-            let added = parts[0].parse::<usize>().unwrap_or(0);
-            let deleted = parts[1].parse::<usize>().unwrap_or(0);
-            entries.push(DiffFileEntry {
-                path: parts[2].to_owned(),
+    for fallback in ["origin/main", "origin/master"] {
+        if !candidates.iter().any(|c| c == fallback) {
+            candidates.push(fallback.to_owned());
+        }
+    }
+
+    for base_ref in candidates {
+        if let Ok(out) = Command::new("git")
+            .args(["-C", worktree_path, "merge-base", &base_ref, "HEAD"])
+            .output()
+            && out.status.success()
+        {
+            let sha = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            if !sha.is_empty() {
+                return Some(sha);
+            }
+        }
+    }
+
+    let head = Command::new("git")
+        .args(["-C", worktree_path, "rev-parse", "--verify", "HEAD"])
+        .output()
+        .ok()?;
+    if head.status.success() {
+        let sha = String::from_utf8_lossy(&head.stdout).trim().to_owned();
+        if !sha.is_empty() {
+            return Some(sha);
+        }
+    }
+    None
+}
+
+fn normalize_git_diff_status(raw: &str) -> String {
+    match raw.trim().bytes().next() {
+        Some(b'A' | b'C') => "A".to_owned(),
+        Some(b'D') => "D".to_owned(),
+        Some(b'R') => "R".to_owned(),
+        _ => "M".to_owned(),
+    }
+}
+
+fn parse_name_status_z(bytes: &[u8]) -> BTreeMap<String, String> {
+    let tokens: Vec<String> = bytes
+        .split(|&b| b == 0)
+        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+        .collect();
+    let mut statuses = BTreeMap::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let raw_status = tokens[i].trim();
+        i += 1;
+        if raw_status.is_empty() {
+            continue;
+        }
+        let norm = normalize_git_diff_status(raw_status);
+        if raw_status.starts_with('R') || raw_status.starts_with('C') {
+            if i + 1 < tokens.len() {
+                let new_path = tokens[i + 1].clone();
+                if !new_path.is_empty() {
+                    statuses.insert(new_path, norm);
+                }
+                i += 2;
+            } else {
+                break;
+            }
+        } else if i < tokens.len() {
+            let path = tokens[i].clone();
+            if !path.is_empty() {
+                statuses.insert(path, norm);
+            }
+            i += 1;
+        }
+    }
+    statuses
+}
+
+fn parse_numstat_z(bytes: &[u8]) -> BTreeMap<String, (usize, usize)> {
+    let tokens: Vec<String> = bytes
+        .split(|&b| b == 0)
+        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+        .collect();
+    let mut stats = BTreeMap::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = &tokens[i];
+        i += 1;
+        if token.is_empty() {
+            continue;
+        }
+        let mut parts = token.splitn(3, '\t');
+        let (Some(added_s), Some(deleted_s), Some(path_part)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let added = added_s.parse::<usize>().unwrap_or(0);
+        let deleted = deleted_s.parse::<usize>().unwrap_or(0);
+        if path_part.is_empty() {
+            if i + 1 < tokens.len() {
+                let new_path = tokens[i + 1].clone();
+                if !new_path.is_empty() {
+                    stats.insert(new_path, (added, deleted));
+                }
+                i += 2;
+            } else {
+                break;
+            }
+        } else {
+            stats.insert(path_part.to_owned(), (added, deleted));
+        }
+    }
+    stats
+}
+
+fn count_untracked_file_lines(worktree_path: &str, rel_path: &str) -> usize {
+    let full_path = std::path::Path::new(worktree_path).join(rel_path);
+    let Ok(bytes) = std::fs::read(&full_path) else {
+        return 0;
+    };
+    if bytes.contains(&0) {
+        return 0;
+    }
+    String::from_utf8_lossy(&bytes).lines().count()
+}
+
+pub fn collect_worktree_diff_entries(worktree_path: &str) -> Vec<DiffFileEntry> {
+    let mut entries: BTreeMap<String, DiffFileEntry> = BTreeMap::new();
+
+    let diff_target = resolve_diff_base(worktree_path).unwrap_or_else(|| "--cached".to_owned());
+    let name_status_out = Command::new("git")
+        .args([
+            "-C",
+            worktree_path,
+            "diff",
+            "--name-status",
+            "-M",
+            "-z",
+            &diff_target,
+        ])
+        .output();
+    let numstat_out = Command::new("git")
+        .args([
+            "-C",
+            worktree_path,
+            "diff",
+            "--numstat",
+            "-M",
+            "-z",
+            &diff_target,
+        ])
+        .output();
+
+    if let (Ok(ns), Ok(num)) = (name_status_out, numstat_out)
+        && ns.status.success()
+        && num.status.success()
+    {
+        let statuses = parse_name_status_z(&ns.stdout);
+        let stats = parse_numstat_z(&num.stdout);
+        for (path, status) in statuses {
+            let (added_lines, deleted_lines) = stats.get(&path).copied().unwrap_or((0, 0));
+            entries.insert(
+                path.clone(),
+                DiffFileEntry {
+                    path,
+                    status,
+                    added_lines,
+                    deleted_lines,
+                },
+            );
+        }
+        for (path, (added_lines, deleted_lines)) in stats {
+            entries.entry(path.clone()).or_insert(DiffFileEntry {
+                path,
                 status: "M".to_owned(),
-                added_lines: added,
-                deleted_lines: deleted,
+                added_lines,
+                deleted_lines,
             });
         }
     }
-    entries
+
+    if let Ok(untracked) = Command::new("git")
+        .args([
+            "-C",
+            worktree_path,
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ])
+        .output()
+        && untracked.status.success()
+    {
+        for chunk in untracked.stdout.split(|&b| b == 0) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let rel_path = String::from_utf8_lossy(chunk).into_owned();
+            entries.entry(rel_path.clone()).or_insert_with(|| {
+                let added_lines = count_untracked_file_lines(worktree_path, &rel_path);
+                DiffFileEntry {
+                    path: rel_path,
+                    status: "A".to_owned(),
+                    added_lines,
+                    deleted_lines: 0,
+                }
+            });
+        }
+    }
+
+    entries.into_values().collect()
 }
 
 pub struct MockStageExecutor {
+    pub plan_artifacts: BTreeMap<PathBuf, String>,
+    pub published_plans: Vec<(PathBuf, String)>,
+    pub publish_plan_error: Option<String>,
     pub staged_results: Vec<StageExecutionResult>,
     pub executed_specs: Vec<StageCommandSpec>,
     pub executed_routes: Vec<StageRoute>,
     pub executed_checks: Vec<String>,
+    pub executed_gate_checks: Vec<String>,
+    pub executed_stage_reviewed_shas: Vec<Option<String>>,
+    pub committed_worktrees: Vec<String>,
+    pub committed_sha_to_return: Option<String>,
     pub finalized_sha: Option<String>,
     pub pr_number_to_return: Option<i64>,
+    pub reviewed_diff: Option<ReviewedDiffContext>,
+    pub last_impl_diff_files: Vec<DiffFileEntry>,
 }
 
 impl Default for MockStageExecutor {
     fn default() -> Self {
         Self {
+            plan_artifacts: BTreeMap::new(),
+            published_plans: Vec::new(),
+            publish_plan_error: None,
             staged_results: Vec::new(),
             executed_specs: Vec::new(),
             executed_routes: Vec::new(),
             executed_checks: Vec::new(),
+            executed_gate_checks: Vec::new(),
+            executed_stage_reviewed_shas: Vec::new(),
+            committed_worktrees: Vec::new(),
+            committed_sha_to_return: Some("mock-committed-sha".to_owned()),
             finalized_sha: None,
             pr_number_to_return: Some(42),
+            reviewed_diff: None,
+            last_impl_diff_files: Vec::new(),
         }
     }
 }
 
 impl StageExecutor for MockStageExecutor {
-    fn execute_stage(
+    fn persist_plan_artifact(
+        &mut self,
+        task: &TaskRecord,
+        artifact_id: &str,
+        markdown: &str,
+    ) -> Result<PathBuf, String> {
+        let path = PathBuf::from(format!("/virtual/plans/{}-{artifact_id}.md", task.task_id));
+        self.plan_artifacts
+            .insert(path.clone(), markdown.to_owned());
+        Ok(path)
+    }
+
+    fn read_plan_artifact(&self, path: &std::path::Path) -> Result<String, String> {
+        self.plan_artifacts
+            .get(path)
+            .cloned()
+            .ok_or_else(|| "missing mock plan artifact".to_owned())
+    }
+
+    fn publish_plan_stage(
         &mut self,
         _task: &TaskRecord,
+        path: &std::path::Path,
+        markdown: &str,
+    ) -> Result<(), String> {
+        if let Some(err) = &self.publish_plan_error {
+            return Err(err.clone());
+        }
+        self.published_plans
+            .push((path.to_path_buf(), markdown.to_owned()));
+        Ok(())
+    }
+
+    fn execute_stage(
+        &mut self,
+        task: &TaskRecord,
         _attempt_id: &str,
         route: &StageRoute,
         spec: &StageCommandSpec,
     ) -> Result<StageExecutionResult, String> {
         self.executed_routes.push(route.clone());
         self.executed_specs.push(spec.clone());
+        self.executed_stage_reviewed_shas
+            .push(task.reviewed_sha.clone());
         if self.staged_results.is_empty() {
             return Err("MockStageExecutor had no staged_results left".to_owned());
         }
-        Ok(self.staged_results.remove(0))
+        let res = self.staged_results.remove(0);
+        if route.stage == "impl" && !res.diff_files.is_empty() {
+            self.last_impl_diff_files = res.diff_files.clone();
+        }
+        Ok(res)
     }
 
     fn run_checks(&mut self, _worktree_path: &str, commands: &[String]) -> Result<(), String> {
         self.executed_checks.extend(commands.iter().cloned());
         Ok(())
     }
-
-    fn finalize_xs_s_delivery(
-        &mut self,
-        _task: &TaskRecord,
-        reviewed_sha: &str,
-    ) -> Result<Option<i64>, String> {
-        self.finalized_sha = Some(reviewed_sha.to_owned());
-        Ok(self.pr_number_to_return)
+    fn run_gate_checks(&mut self, worktree_path: &str, commands: &[String]) -> Result<(), String> {
+        self.executed_gate_checks.extend(commands.iter().cloned());
+        self.run_checks(worktree_path, commands)
     }
+
+    fn commit_worktree(
+        &mut self,
+        task: &TaskRecord,
+        worktree_path: &str,
+    ) -> Result<String, String> {
+        self.committed_worktrees.push(worktree_path.to_owned());
+        self.committed_sha_to_return
+            .as_deref()
+            .map(str::trim)
+            .filter(|sha| !sha.is_empty() && *sha != "head-sha")
+            .map(str::to_owned)
+            .ok_or_else(|| format!("missing committed_sha for task {}", task.task_id))
+    }
+
+    fn push_and_ensure_pr(
+        &mut self,
+        task: &TaskRecord,
+        _worktree_path: &str,
+        reviewed_sha: &str,
+    ) -> Result<i64, String> {
+        let trimmed_sha = reviewed_sha.trim();
+        if trimmed_sha.is_empty() || trimmed_sha == "head-sha" {
+            return Err(format!("missing reviewed_sha for task {}", task.task_id));
+        }
+        self.finalized_sha = Some(trimmed_sha.to_owned());
+        task.pr_number
+            .filter(|&p| p > 0)
+            .or_else(|| self.pr_number_to_return.filter(|&p| p > 0))
+            .ok_or_else(|| format!("missing pr_number for task {}", task.task_id))
+    }
+
+    fn collect_reviewed_diff(
+        &mut self,
+        task: &TaskRecord,
+        _worktree_path: &str,
+        reviewed_sha: &str,
+    ) -> Result<ReviewedDiffContext, String> {
+        if let Some(ref ctx) = self.reviewed_diff {
+            return Ok(ctx.clone());
+        }
+        let merge_base_sha = task
+            .plan_base_sha
+            .clone()
+            .or_else(|| task.context_pack.base_sha.clone())
+            .unwrap_or_else(|| "mock-base".to_owned());
+        let mut files = BTreeMap::new();
+        if !self.last_impl_diff_files.is_empty() {
+            for entry in &self.last_impl_diff_files {
+                files.insert(
+                    entry.path.trim_start_matches("./").to_owned(),
+                    vec![LineRange {
+                        start: 1,
+                        end: 10_000,
+                    }],
+                );
+            }
+        } else {
+            for tf in &task.context_pack.target_files {
+                files.insert(
+                    tf.path.trim_start_matches("./").to_owned(),
+                    vec![LineRange {
+                        start: 1,
+                        end: 10_000,
+                    }],
+                );
+            }
+        }
+        let commit_range = format!("{merge_base_sha}..{reviewed_sha}");
+        Ok(ReviewedDiffContext {
+            merge_base_sha,
+            reviewed_sha: reviewed_sha.to_owned(),
+            commit_range,
+            files,
+            diff_excerpt: String::new(),
+        })
+    }
+}
+
+/// Version 1 mounts net/ as a directory; older socket-inode mounts cannot recover.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttemptManifest {
+    pub mount_layout_version: u32,
+    pub attempt_id: String,
+    pub task_id: String,
+    pub route: StageRoute,
+    pub spec: StageCommandSpec,
+    pub sha_before: String,
+    pub attempt_dir: PathBuf,
+}
+
+pub struct PreparedLaunch {
+    pub manifest: AttemptManifest,
+    pub resources: PreparedResources,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnitState {
+    Running,
+    Starting,
+    Exited,
+    Failed,
+    Stopping,
+    Dead,
+    Missing,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UnitObservation {
+    pub load_state: String,
+    pub active_state: String,
+    pub sub_state: String,
+    pub result: String,
+    pub exit_code_kind: String,
+    pub exit_code: Option<i32>,
+    pub invocation_id: String,
+    pub control_group: String,
+    pub output_bytes: u64,
+    pub cpu_usage_usec: Option<u64>,
+}
+
+impl UnitObservation {
+    pub fn parse(raw: &str) -> Self {
+        let fields: BTreeMap<_, _> = raw.lines().filter_map(|l| l.split_once('=')).collect();
+        let field = |k| fields.get(k).copied().unwrap_or("").to_owned();
+        Self {
+            load_state: field("LoadState"),
+            active_state: field("ActiveState"),
+            sub_state: field("SubState"),
+            result: field("Result"),
+            exit_code_kind: field("ExecMainCode"),
+            exit_code: field("ExecMainStatus").parse().ok(),
+            invocation_id: field("InvocationID"),
+            control_group: field("ControlGroup"),
+            ..Self::default()
+        }
+    }
+    pub fn state(&self) -> Result<UnitState, String> {
+        if self.load_state == "not-found" {
+            return Ok(UnitState::Missing);
+        }
+        match (self.active_state.as_str(), self.sub_state.as_str()) {
+            ("failed", _) => Ok(UnitState::Failed),
+            (_, "exited") => Ok(UnitState::Exited),
+            ("active", "running") => Ok(UnitState::Running),
+            ("activating", _) => Ok(UnitState::Starting),
+            ("deactivating", _) => Ok(UnitState::Stopping),
+            ("inactive", "dead") => Ok(UnitState::Dead),
+            _ => Err(format!(
+                "unrecognized unit state {}/{}",
+                self.active_state, self.sub_state
+            )),
+        }
+    }
+    pub fn success(&self) -> bool {
+        self.result == "success"
+            && matches!(self.exit_code_kind.as_str(), "1" | "exited")
+            && self.exit_code == Some(0)
+    }
+}
+
+pub trait UnitController: Send + Sync {
+    fn inspect(&self, unit: &str) -> Result<UnitObservation, String>;
+    fn launch(&self, manifest: &AttemptManifest) -> Result<(), String>;
+    fn stop(&self, unit: &str) -> Result<(), String>;
+    fn reset_failed(&self, unit: &str) -> Result<(), String>;
+    fn list_units(&self) -> Result<Vec<String>, String>;
+}
+
+#[derive(Default)]
+pub struct SystemUnitController;
+
+impl UnitController for SystemUnitController {
+    fn inspect(&self, unit: &str) -> Result<UnitObservation, String> {
+        let out = Command::new("systemctl").args(["--user","show",unit,"--no-pager","--property=LoadState,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,InvocationID,ControlGroup"]).output().map_err(|e| e.to_string())?;
+        let raw = String::from_utf8_lossy(&out.stdout);
+        let observed = UnitObservation::parse(&raw);
+        // A manager error is never evidence that a unit is absent.
+        if !out.status.success() && observed.load_state != "not-found" {
+            return Err(format!(
+                "systemctl inspection failed: {}",
+                truncate_utf8_bytes(&String::from_utf8_lossy(&out.stderr), 1024)
+            ));
+        }
+        observed.state()?;
+        Ok(observed)
+    }
+    fn launch(&self, manifest: &AttemptManifest) -> Result<(), String> {
+        let out = Command::new(&manifest.spec.program)
+            .args(&manifest.spec.args)
+            .env_clear()
+            .envs(&manifest.spec.env)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| e.to_string())?;
+        write_secure_file(
+            &manifest.attempt_dir.join("launcher.log"),
+            &[out.stdout.as_slice(), out.stderr.as_slice()].concat(),
+        )?;
+        if !out.status.success() {
+            return Err(format!(
+                "systemd-run rejected launch: {}",
+                truncate_utf8_bytes(&String::from_utf8_lossy(&out.stderr), 1024)
+            ));
+        }
+        Ok(())
+    }
+    fn stop(&self, unit: &str) -> Result<(), String> {
+        let out = Command::new("systemctl")
+            .args(["--user", "stop", unit])
+            .output()
+            .map_err(|e| e.to_string())?;
+        let observed = self.inspect(unit)?;
+        if !matches!(
+            observed.state()?,
+            UnitState::Missing | UnitState::Dead | UnitState::Failed
+        ) {
+            return Err(format!(
+                "unit {unit} is not confirmed stopped ({})",
+                out.status
+            ));
+        }
+        Ok(())
+    }
+    fn reset_failed(&self, unit: &str) -> Result<(), String> {
+        let out = Command::new("systemctl")
+            .args(["--user", "reset-failed", unit])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() && self.inspect(unit)?.state()? != UnitState::Missing {
+            return Err("reset-failed failed".into());
+        }
+        Ok(())
+    }
+    fn list_units(&self) -> Result<Vec<String>, String> {
+        let out = Command::new("systemctl")
+            .args([
+                "--user",
+                "list-units",
+                "--all",
+                "zach-stage-*",
+                "--no-legend",
+                "--plain",
+                "--no-pager",
+            ])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err("cannot enumerate worker units".into());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                l.split_whitespace()
+                    .find(|p| p.starts_with("zach-stage-"))
+                    .map(str::to_owned)
+            })
+            .collect())
+    }
+}
+
+pub fn prepare_detached_launch(
+    state_dir: &std::path::Path,
+    task: &TaskRecord,
+    attempt_id: &str,
+    route: &StageRoute,
+    mut spec: StageCommandSpec,
+) -> Result<PreparedLaunch, String> {
+    validate_attempt_id(attempt_id)?;
+    isolation::secure_parents(state_dir)?;
+    let state = std::fs::canonicalize(ensure_secure_dir(state_dir)?).map_err(|e| e.to_string())?;
+    let root = ensure_secure_dir(&state.join("attempts"))?;
+    let dir = ensure_secure_dir(&root.join(attempt_id))?;
+    let worktree = std::fs::canonicalize(&spec.worktree_path).map_err(|e| e.to_string())?;
+    if state.starts_with(&worktree) {
+        return Err(
+            "isolation policy: daemon state directory must be outside the worker worktree".into(),
+        );
+    }
+    spec.worktree_path = worktree.to_string_lossy().into_owned();
+    for arg in &mut spec.args {
+        if arg.starts_with("--working-directory=") {
+            *arg = format!("--working-directory={}", spec.worktree_path);
+        }
+    }
+    let sha_before = git_head_sha(&spec.worktree_path).ok_or("cannot resolve sha_before")?;
+    write_secure_file(&dir.join("prompt.md"), spec.prompt.as_bytes())?;
+    write_secure_file(&dir.join("stdin"), spec.stdin_payload.as_bytes())?;
+    for name in ["stdout.jsonl", "stderr.log"] {
+        write_secure_file(&dir.join(name), b"")?;
+    }
+    let home = PathBuf::from(spec.env.get("HOME").ok_or("missing HOME")?);
+    let mut resources = PreparedResources::prepare(
+        &dir,
+        &home,
+        &worktree,
+        spec.writable,
+        Some(route.family),
+        spec.network,
+    )?;
+    if let Some(schema) = &spec.output_schema_json {
+        let path = dir.join("review-schema.json");
+        write_secure_file(&path, schema.as_bytes())?;
+        if route.family == ModelFamily::OpenAiSol {
+            resources.layout.readonly_files.push(path.clone());
+            spec.args = inject_codex_output_schema_args(&spec.args, &path);
+        }
+    }
+    spec.args = replace_sandbox_args(&spec.args, &resources.layout)?;
+    let separator = spec
+        .args
+        .iter()
+        .position(|a| a == "--")
+        .ok_or("missing supervisor separator")?;
+    let mut io = Vec::new();
+    for (property, file) in [
+        ("StandardInput", "stdin"),
+        ("StandardOutput", "stdout.jsonl"),
+        ("StandardError", "stderr.log"),
+    ] {
+        let path = std::fs::canonicalize(dir.join(file)).map_err(|e| e.to_string())?;
+        io.extend([
+            "-p".to_owned(),
+            format!("{property}=file:{}", path.display()),
+        ]);
+    }
+    spec.args.splice(separator..separator, io);
+    spec.prompt.clear();
+    spec.stdin_payload.clear();
+    let manifest = AttemptManifest {
+        mount_layout_version: 1,
+        attempt_id: attempt_id.into(),
+        task_id: task.task_id.clone(),
+        route: route.clone(),
+        spec,
+        sha_before,
+        attempt_dir: dir.clone(),
+    };
+    write_secure_file(
+        &dir.join("manifest.json"),
+        &serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?,
+    )?;
+    // Preparation is not allowed to destroy resources after an uncertain handoff.
+    resources.retain();
+    Ok(PreparedLaunch {
+        manifest,
+        resources,
+    })
+}
+
+pub fn read_attempt_manifest(
+    state_dir: &std::path::Path,
+    attempt_id: &str,
+) -> Result<AttemptManifest, String> {
+    validate_attempt_id(attempt_id)?;
+    let dir = std::fs::canonicalize(state_dir.join("attempts").join(attempt_id))
+        .map_err(|e| e.to_string())?;
+    isolation::reject_symlink_components(&dir)?;
+    let path = dir.join("manifest.json");
+    isolation::reject_symlink_components(&path)?;
+    use std::os::unix::fs::MetadataExt;
+    let directory_meta = std::fs::metadata(&dir).map_err(|e| e.to_string())?;
+    let file_meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+    if !file_meta.is_file()
+        || file_meta.uid() != unsafe { libc::geteuid() }
+        || file_meta.mode() & 0o077 != 0
+        || directory_meta.uid() != unsafe { libc::geteuid() }
+        || directory_meta.mode() & 0o077 != 0
+    {
+        return Err("unsafe attempt manifest ownership or permissions".into());
+    }
+    let manifest: AttemptManifest =
+        serde_json::from_slice(&std::fs::read(&path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    if manifest.attempt_id != attempt_id
+        || manifest.attempt_dir != dir
+        || manifest.mount_layout_version != 1
+    {
+        return Err("incompatible attempt manifest / legacy socket mount".into());
+    }
+    Ok(manifest)
+}
+
+pub fn sample_attempt(
+    manifest: &AttemptManifest,
+    mut observation: UnitObservation,
+) -> UnitObservation {
+    observation.output_bytes = ["stdout.jsonl", "stderr.log"]
+        .iter()
+        .filter_map(|f| std::fs::metadata(manifest.attempt_dir.join(f)).ok())
+        .map(|m| m.len())
+        .sum();
+    if observation.control_group.starts_with('/')
+        && !observation.control_group.split('/').any(|s| s == "..")
+    {
+        let path = format!("/sys/fs/cgroup{}/cpu.stat", observation.control_group);
+        observation.cpu_usage_usec = std::fs::read_to_string(path).ok().and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("usage_usec ").and_then(|n| n.parse().ok()))
+        });
+    }
+    observation
+}
+
+pub fn harvest_detached(
+    manifest: &AttemptManifest,
+    observation: &UnitObservation,
+) -> Result<StageExecutionResult, String> {
+    let stdout = std::fs::read_to_string(manifest.attempt_dir.join("stdout.jsonl"))
+        .map_err(|e| e.to_string())?;
+    let stderr = std::fs::read_to_string(manifest.attempt_dir.join("stderr.log"))
+        .map_err(|e| e.to_string())?;
+    let code = if observation.success() {
+        Some(0)
+    } else {
+        Some(observation.exit_code.unwrap_or(1).max(1))
+    };
+    let mut result = match manifest.route.family {
+        ModelFamily::GeminiAgy => {
+            crate::v2::pipeline::parse_agy_cli_response(&stdout, &stderr, code)
+                .map_err(|e| e.to_string())?
+        }
+        ModelFamily::OpenAiSol => {
+            let p = parse_codex_jsonl_output(&stdout, &stderr, code)?;
+            StageExecutionResult {
+                status: p.status,
+                summary: p.summary,
+                review_markdown: p.review_markdown,
+                review_output: p.review_output.clone(),
+                stage_output: p.review_output,
+                invocation_id: None,
+                input_tokens: p.input_tokens,
+                output_tokens: p.output_tokens,
+                total_tokens: p.total_tokens,
+                sha_before: None,
+                sha_after: None,
+                diff_files: Vec::new(),
+            }
+        }
+    };
+    result.sha_before = Some(manifest.sha_before.clone());
+    result.sha_after = git_head_sha(&manifest.spec.worktree_path);
+    result.invocation_id =
+        (!observation.invocation_id.is_empty()).then(|| observation.invocation_id.clone());
+    result.diff_files = collect_worktree_diff_entries(&manifest.spec.worktree_path);
+    write_secure_file(
+        &manifest.attempt_dir.join("harvest.json"),
+        &serde_json::to_vec(&result).map_err(|e| e.to_string())?,
+    )?;
+    Ok(result)
+}
+
+/// Caller persists HARVESTED before invoking this function. Failure retains files.
+pub fn stop_and_cleanup(
+    controller: &dyn UnitController,
+    unit: &str,
+    dir: &std::path::Path,
+    resources: Option<PreparedResources>,
+    failed: bool,
+) -> Result<(), String> {
+    controller.stop(unit)?;
+    if failed {
+        controller.reset_failed(unit)?;
+    }
+    match controller.inspect(unit)?.state()? {
+        UnitState::Dead | UnitState::Missing | UnitState::Failed => {}
+        _ => return Err("cleanup refused while execution remains".into()),
+    }
+    if let Some(resources) = resources {
+        resources.cleanup_after_stop()?;
+    }
+    for name in ["codex-home", "gemini-home", "net"] {
+        let path = dir.join(name);
+        isolation::reject_symlink_components(&path)?;
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_executor(state: impl Into<PathBuf>) -> SystemdStageExecutor {
+        let mut executor =
+            SystemdStageExecutor::with_state_dir(state).with_isolation_checker(|| Ok(()));
+        executor.fixture_transport = true;
+        executor
+    }
+
     use crate::v2::router::resolve_stage_route;
     use crate::v2::store::{ContextPackSpec, TaskMemory};
 
@@ -679,10 +2636,137 @@ mod tests {
             executor: None,
             autonomous_consent: true,
             retry_count: 0,
+            next_retry_epoch: 0,
+            lease_owner: None,
+            lease_expires_epoch: None,
             memory: TaskMemory::default(),
             version: 1,
             updated_epoch: 1000,
         }
+    }
+
+    #[test]
+    fn isolation_preflight_rejects_stages_and_checks_before_any_side_effects() {
+        let root = TempTestDir::new("isolation-rejected");
+        let state = root.path().join("uncreated");
+        let task = sample_task();
+        let route = resolve_stage_route("S", "impl", 0, None).unwrap().unwrap();
+        let spec =
+            build_systemd_stage_command_with_env(&task, "rejected", &route, "p", &BTreeMap::new())
+                .unwrap();
+        let mut executor = SystemdStageExecutor::with_state_dir(&state)
+            .with_isolation_checker(|| Err("forbidden policy diagnostic".into()));
+        let error = executor
+            .execute_stage(&task, "rejected", &route, &spec)
+            .unwrap_err();
+        assert!(error.starts_with("ISOLATION_PREFLIGHT_FAILED"));
+        assert_eq!(
+            crate::v2::pipeline::classify_failure_class("impl", "FAILED", &error),
+            "infra"
+        );
+        assert_eq!(
+            executor
+                .run_checks("/missing", &["touch marker".into()])
+                .unwrap_err(),
+            error
+        );
+        assert_eq!(executor.run_checks("/missing", &[]).unwrap_err(), error);
+        assert!(!state.exists());
+    }
+
+    #[test]
+    fn production_transport_cannot_be_replaced_with_a_host_subprocess() {
+        let root = TempTestDir::new("isolation-transport");
+        let mut executor =
+            SystemdStageExecutor::with_state_dir(root.path()).with_isolation_checker(|| Ok(()));
+        let task = sample_task();
+        let route = resolve_stage_route("S", "impl", 0, None).unwrap().unwrap();
+        let mut spec =
+            build_systemd_stage_command_with_env(&task, "transport", &route, "p", &BTreeMap::new())
+                .unwrap();
+        spec.program = "/usr/bin/touch".into();
+        let marker = root.path().join("escaped");
+        spec.args = vec![marker.display().to_string()];
+        assert_eq!(
+            executor
+                .execute_stage(&task, "transport", &route, &spec)
+                .unwrap_err(),
+            "invalid worker supervisor"
+        );
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn stage_declarations_are_pure_network_validated_and_readonly_except_impl() {
+        let mut task = sample_task();
+        // This deliberately nonexistent path must never be inspected by planning.
+        task.worktree_path = Some("/does-not-exist/zach-task".into());
+        for stage in ["plan", "plan-review", "impl", "pr-review"] {
+            let route = resolve_stage_route("M", stage, 0, Some(ModelFamily::OpenAiSol))
+                .unwrap()
+                .unwrap();
+            let spec = build_systemd_stage_command_with_env(
+                &task,
+                "pure",
+                &route,
+                "prompt",
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            assert_eq!(spec.writable, stage == "impl");
+            assert_eq!(spec.network, NetworkPolicy::ProviderApi(route.family));
+            task.context_pack.network = Some("none".into());
+            let offline = build_systemd_stage_command_with_env(
+                &task,
+                "offline",
+                &route,
+                "p",
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            assert_eq!(offline.network, NetworkPolicy::None);
+            task.context_pack.network = None;
+        }
+        task.context_pack.network = Some("all".into());
+        let route = resolve_stage_route("S", "impl", 0, None).unwrap().unwrap();
+        assert!(
+            build_systemd_stage_command_with_env(&task, "bad", &route, "p", &BTreeMap::new())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn runtime_schema_injection_keeps_cli_path_and_exact_readonly_mount() {
+        let task = sample_task();
+        let route = resolve_stage_route("S", "impl", 0, None).unwrap().unwrap();
+        let spec =
+            build_systemd_stage_command_with_env(&task, "schema", &route, "p", &BTreeMap::new())
+                .unwrap();
+        let schema = std::path::Path::new("/tmp/state/attempts/schema/review-schema.json");
+        let args = inject_codex_output_schema_args(&spec.args, schema);
+        let mut layout = SandboxLayout::declared(
+            std::path::Path::new("/home/ubuntu"),
+            std::path::Path::new(&spec.worktree_path),
+            false,
+        );
+        layout.readonly_files.push(schema.into());
+        let args = replace_sandbox_args(&args, &layout).unwrap();
+        assert!(
+            args.windows(3).any(|a| a[0] == "--ro-bind"
+                && a[1] == schema.display().to_string()
+                && a[2] == a[1])
+        );
+        assert!(
+            args.windows(2)
+                .any(|a| a[0] == "--output-schema" && a[1] == schema.display().to_string())
+        );
+        assert_eq!(args.last().unwrap(), "-");
+        assert_eq!(
+            args.iter()
+                .filter(|a| a.as_str() == "/usr/bin/bwrap")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -717,17 +2801,15 @@ mod tests {
         assert_eq!(spec.unit_name, "zach-stage-zach-005-impl-att-1");
         assert!(spec.args.contains(&"--slice=zach-workers.slice".to_owned()));
         assert!(spec.args.contains(&"KillMode=control-group".to_owned()));
-        assert!(
-            spec.args
-                .contains(&"InaccessiblePaths=-/home/ubuntu/.config/gh".to_owned())
-        );
-        assert!(
-            spec.args.contains(
-                &"InaccessiblePaths=-/home/ubuntu/workspace/zach--ZACH-005/.env".to_owned()
-            )
-        );
+        assert!(spec.args.contains(&"/usr/bin/bwrap".to_owned()));
+        assert!(spec.args.contains(&"--unshare-all".to_owned()));
+        assert!(spec.args.windows(2).any(|a| a == ["--tmpfs", "/home"]));
         assert!(spec.args.contains(&"codex".to_owned()));
         assert!(spec.args.contains(&"--ignore-user-config".to_owned()));
+        assert_eq!(spec.args.last().map(String::as_str), Some("-"));
+        assert!(!spec.args.iter().any(|a| a.contains("Prompt text")));
+        assert_eq!(spec.prompt, "Prompt text");
+        assert_eq!(spec.stdin_payload, "Prompt text");
     }
 
     #[test]
@@ -757,19 +2839,1239 @@ other-user-unit.service loaded active running
         let task = sample_task();
         let mut route = resolve_stage_route("M", "impl", 0, None).unwrap().unwrap();
         route.family = ModelFamily::GeminiAgy;
-        route.model = "gemini-3.8-flash-high".to_owned();
+        route.model = "gemini-4-hydrogen-high".to_owned();
         route.timeout_secs = 3600;
 
         let clean_env = BTreeMap::new();
-        let spec =
-            build_systemd_stage_command_with_env(&task, "att-gemini", &route, "prompt", &clean_env)
-                .expect("build command");
+        let secret_prompt = "prompt with sensitive instructions";
+        let spec = build_systemd_stage_command_with_env(
+            &task,
+            "att-gemini",
+            &route,
+            secret_prompt,
+            &clean_env,
+        )
+        .expect("build command");
 
-        let timeout_idx = spec
-            .args
+        assert!(spec.args.contains(&"--no-block".to_owned()));
+        assert!(spec.args.contains(&"RemainAfterExit=yes".to_owned()));
+        assert!(spec.args.contains(&"CollectMode=inactive".to_owned()));
+        assert!(spec.args.contains(&"--service-type=exec".to_owned()));
+        assert!(
+            !spec
+                .args
+                .iter()
+                .any(|a| matches!(a.as_str(), "--wait" | "--pipe" | "--collect"))
+        );
+        assert!(!spec.args.iter().any(|a| a.contains(secret_prompt)));
+        for forbidden_flag in ["--model", "--worktree", "--timeout", "--prompt"] {
+            assert!(
+                !spec.args.iter().any(|a| a == forbidden_flag),
+                "unexpected flag {forbidden_flag} in argv: {:?}",
+                spec.args
+            );
+        }
+        assert!(
+            spec.args.ends_with(&[
+                "node".to_owned(),
+                GEMINI_WORKER_CLI_SCRIPT.to_owned(),
+                "--cli".to_owned()
+            ]),
+            "expected trailing node worker.mjs --cli, got {:?}",
+            spec.args
+        );
+        assert_eq!(spec.prompt, secret_prompt);
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&spec.stdin_payload).expect("valid JSON stdin_payload");
+        assert_eq!(payload["action"], "run");
+        assert_eq!(payload["model"], "gemini-4-hydrogen-high");
+        assert_eq!(payload["task"], secret_prompt);
+        assert_eq!(payload["timeout_seconds"], 1800);
+        assert_eq!(payload["orchestration_id"], "zach-005");
+
+        // Also verify lower bound clamp (30)
+        route.timeout_secs = 5;
+        let low_spec =
+            build_systemd_stage_command_with_env(&task, "att-gemini-low", &route, "p", &clean_env)
+                .expect("build low timeout command");
+        let low_payload: serde_json::Value =
+            serde_json::from_str(&low_spec.stdin_payload).expect("valid JSON");
+        assert_eq!(low_payload["timeout_seconds"], 30);
+    }
+
+    #[test]
+    fn zach027_plan_artifacts_are_private_symlink_safe_and_publication_fails_closed() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let temp = TempTestDir::new("zach027-plan-publish");
+        let script = temp.path().join("ws-task");
+        std::fs::write(&script, "#!/usr/bin/env python3\nimport sys,json,pathlib\np=pathlib.Path(__file__)\np.with_suffix('.args').write_text(json.dumps(sys.argv[1:]))\nif p.with_suffix('.fail').exists():\n print('publication rejected',file=sys.stderr)\n sys.exit(37)\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut exec = fixture_executor(temp.path().join("state"));
+        exec.ws_task_bin = script.clone();
+        let mut task = sample_task();
+        let markdown = format!("## [PLAN]\n{}", "full plan é".repeat(500));
+        let path = exec
+            .persist_plan_artifact(&task, "plan-attempt-123", &markdown)
+            .unwrap();
+        assert_eq!(exec.read_plan_artifact(&path).unwrap(), markdown);
+        for (file, mode) in [
+            (&exec.state_dir, 0o700),
+            (&exec.state_dir.join("plans"), 0o700),
+            (&path, 0o600),
+        ] {
+            assert_eq!(
+                std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+        }
+        for sha in [
+            Some("base123"),
+            None,
+            Some(""),
+            Some("  "),
+            Some("head-sha"),
+        ] {
+            task.plan_base_sha = sha.map(str::to_owned);
+            exec.publish_plan_stage(&task, &path, &markdown).unwrap();
+            let args: Vec<String> = serde_json::from_str(
+                &std::fs::read_to_string(script.with_extension("args")).unwrap(),
+            )
+            .unwrap();
+            let mut expected = vec![
+                "stage".to_owned(),
+                task.task_id.clone(),
+                "plan".to_owned(),
+                "--actor".to_owned(),
+                "zach".to_owned(),
+                "--body-file".to_owned(),
+                path.to_string_lossy().into_owned(),
+            ];
+            if sha == Some("base123") {
+                expected.extend(["--sha".to_owned(), "base123".to_owned()]);
+            }
+            expected.extend([
+                "--idempotency-key".to_owned(),
+                format!("zach-plan-{}-plan-attempt-123", task.task_id),
+            ]);
+            assert_eq!(args, expected);
+        }
+        std::fs::write(script.with_extension("fail"), "fail").unwrap();
+        assert!(
+            exec.publish_plan_stage(&task, &path, &markdown)
+                .unwrap_err()
+                .contains("publication rejected")
+        );
+        exec.ws_task_bin = temp.path().join("missing-command");
+        assert!(
+            exec.publish_plan_stage(&task, &path, &markdown)
+                .unwrap_err()
+                .contains("failed to publish plan")
+        );
+        assert!(
+            exec.publish_plan_stage(&task, &path, "different body")
+                .is_err()
+        );
+        assert!(
+            exec.persist_plan_artifact(&task, "../escape", "bad")
+                .is_err()
+        );
+        let outside = temp.path().join("outside.md");
+        std::fs::write(&outside, "original").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        symlink(&outside, &path).unwrap();
+        assert!(exec.read_plan_artifact(&path).is_err());
+        assert!(
+            exec.persist_plan_artifact(&task, "plan-attempt-123", "overwrite")
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "original");
+        let other = TempTestDir::new("zach027-plan-symlink-dir");
+        symlink(temp.path().join("state/plans"), other.path().join("plans")).unwrap();
+        let mut exec = fixture_executor(other.path());
+        assert!(exec.persist_plan_artifact(&task, "other", "bad").is_err());
+    }
+
+    #[test]
+    fn zach027_systemd_preserves_full_stage_output_for_both_families_and_plan_stages() {
+        let temp = TempTestDir::new("zach027-stage-output");
+        let task = sample_task();
+        let mut exec = fixture_executor(temp.path());
+        for family in [ModelFamily::OpenAiSol, ModelFamily::GeminiAgy] {
+            for stage in ["plan", "plan-review"] {
+                let text = if stage == "plan" {
+                    format!("## [PLAN]\n{}", "🦀 useful plan\n".repeat(600))
+                } else {
+                    serde_json::json!({"verdict":"APPROVED","ac_results":[],"findings":[],"summary":"review é".repeat(600)}).to_string()
+                };
+                let stdout = match family {
+                    ModelFamily::OpenAiSol => format!("{}\n{}\n", serde_json::json!({"type":"item.completed","item":{"type":"agent_message","text":"earlier commentary"}}), serde_json::json!({"type":"item.completed","item":{"type":"agent_message","text":text}})),
+                    ModelFamily::GeminiAgy => serde_json::json!({"execution_succeeded":true,"summary":"short worker summary","response":text}).to_string(),
+                };
+                let mut route =
+                    crate::v2::router::resolve_stage_route("M", stage, 0, Some(family.opposite()))
+                        .unwrap()
+                        .unwrap();
+                route.family = family;
+                let attempt = format!("{}-{stage}", family.as_str());
+                let mut spec =
+                    build_systemd_stage_command(&task, &attempt, &route, "read only").unwrap();
+                spec.program = "python3".to_owned();
+                spec.args = vec![
+                    "-c".to_owned(),
+                    "import sys; sys.stdout.write(sys.argv[1])".to_owned(),
+                    stdout,
+                ];
+                spec.worktree_path = temp.path_str().to_owned();
+                let result = exec.execute_stage(&task, &attempt, &route, &spec).unwrap();
+                assert_eq!(result.stage_output.as_deref(), Some(text.as_str()));
+                assert_eq!(result.review_output.as_deref(), Some(text.as_str()));
+                assert!(result.summary.len() <= MAX_SUMMARY_BYTES);
+                let saved: serde_json::Value = serde_json::from_str(
+                    &std::fs::read_to_string(
+                        temp.path()
+                            .join("attempts")
+                            .join(&attempt)
+                            .join("result.json"),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(saved["result"]["stage_output"], text);
+                assert_eq!(spec.output_schema_json.is_some(), stage == "plan-review");
+            }
+        }
+    }
+
+    struct TempTestDir(std::path::PathBuf);
+
+    impl TempTestDir {
+        fn new(prefix: &str) -> Self {
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("{prefix}-{}-{id}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create temp test dir");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+
+        fn path_str(&self) -> &str {
+            self.0.to_str().expect("utf-8 temp path")
+        }
+    }
+
+    impl Drop for TempTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("run git command");
+        assert!(
+            out.status.success(),
+            "git {:?} failed in {}: {}",
+            args,
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn init_git_identity(dir: &std::path::Path) {
+        git(dir, &["config", "user.email", "zach-test@example.com"]);
+        git(dir, &["config", "user.name", "Zach Test"]);
+    }
+
+    fn write_rel(dir: &std::path::Path, rel: &str, contents: &str) {
+        let full = dir.join(rel);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).expect("create parent dirs");
+        }
+        std::fs::write(full, contents).expect("write test file");
+    }
+
+    #[test]
+    fn collect_worktree_diff_entries_diffs_against_merge_base_with_real_statuses_and_untracked() {
+        let root = TempTestDir::new("zach-017-merge-base");
+        let origin_dir = root.path().join("origin.git");
+        let seed_dir = root.path().join("seed");
+        let work_dir = root.path().join("work");
+        std::fs::create_dir_all(&origin_dir).unwrap();
+        std::fs::create_dir_all(&seed_dir).unwrap();
+
+        git(&origin_dir, &["init", "--bare", "-b", "main"]);
+        git(&seed_dir, &["init", "-b", "main"]);
+        init_git_identity(&seed_dir);
+        write_rel(&seed_dir, ".gitignore", "*.log\n");
+        write_rel(&seed_dir, "src/keep.rs", "fn keep() {}\n");
+        write_rel(&seed_dir, "src/to_delete.rs", "fn gone() {}\n");
+        write_rel(&seed_dir, "src/to_rename.rs", "fn old_name() {}\n");
+        git(&seed_dir, &["add", "."]);
+        git(&seed_dir, &["commit", "-m", "base commit"]);
+        git(
+            &seed_dir,
+            &["remote", "add", "origin", origin_dir.to_str().unwrap()],
+        );
+        git(&seed_dir, &["push", "-u", "origin", "main"]);
+
+        let clone_out = Command::new("git")
+            .args([
+                "clone",
+                origin_dir.to_str().unwrap(),
+                work_dir.to_str().unwrap(),
+            ])
+            .output()
+            .expect("clone origin");
+        assert!(clone_out.status.success());
+        init_git_identity(&work_dir);
+        git(&work_dir, &["checkout", "-b", "task/zach-017"]);
+
+        // Advance origin/main past the branch point to verify merge-base (not tip) is used.
+        write_rel(&seed_dir, "src/other_on_main.rs", "fn unrelated() {}\n");
+        git(&seed_dir, &["add", "src/other_on_main.rs"]);
+        git(&seed_dir, &["commit", "-m", "advance origin/main"]);
+        git(&seed_dir, &["push", "origin", "main"]);
+        git(&work_dir, &["fetch", "origin"]);
+
+        // Committed changes on the task branch since merge-base.
+        write_rel(
+            &work_dir,
+            "src/keep.rs",
+            "fn keep() {}\nfn committed_1() {}\nfn committed_2() {}\n",
+        );
+        write_rel(&work_dir, "src/committed_new.rs", "a\nb\nc\n");
+        git(&work_dir, &["add", "src/keep.rs", "src/committed_new.rs"]);
+        git(&work_dir, &["commit", "-m", "task progress"]);
+
+        // Working tree edits: modify src/keep.rs again (must deduplicate), delete, rename, untracked, ignored.
+        write_rel(
+            &work_dir,
+            "src/keep.rs",
+            "fn keep() {}\nfn committed_1() {}\nfn committed_2() {}\nfn dirty_3() {}\n",
+        );
+        git(&work_dir, &["rm", "src/to_delete.rs"]);
+        git(&work_dir, &["mv", "src/to_rename.rs", "src/renamed.rs"]);
+        write_rel(&work_dir, "src/untracked_new.rs", "u1\nu2\nu3\nu4\n");
+        write_rel(&work_dir, "ignored.log", "should be ignored\n");
+
+        let entries = collect_worktree_diff_entries(work_dir.to_str().unwrap());
+        assert_eq!(
+            entries,
+            vec![
+                DiffFileEntry {
+                    path: "src/committed_new.rs".to_owned(),
+                    status: "A".to_owned(),
+                    added_lines: 3,
+                    deleted_lines: 0,
+                },
+                DiffFileEntry {
+                    path: "src/keep.rs".to_owned(),
+                    status: "M".to_owned(),
+                    added_lines: 3,
+                    deleted_lines: 0,
+                },
+                DiffFileEntry {
+                    path: "src/renamed.rs".to_owned(),
+                    status: "R".to_owned(),
+                    added_lines: 0,
+                    deleted_lines: 0,
+                },
+                DiffFileEntry {
+                    path: "src/to_delete.rs".to_owned(),
+                    status: "D".to_owned(),
+                    added_lines: 0,
+                    deleted_lines: 1,
+                },
+                DiffFileEntry {
+                    path: "src/untracked_new.rs".to_owned(),
+                    status: "A".to_owned(),
+                    added_lines: 4,
+                    deleted_lines: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_worktree_diff_entries_enforces_forbidden_out_of_scope_and_s_to_m_escalation() {
+        use crate::v2::pipeline::{DiffCheckOutcome, verify_worktree_diff_with};
+        use crate::v2::store::{ContextPackSpec, TargetFileSpec};
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempTestDir::new("zach-017-ac");
+        let stub_ws_task = root.path().join("ws-task-stub");
+        std::fs::write(
+            &stub_ws_task,
+            r#"#!/usr/bin/env python3
+import json, sys
+args = sys.argv[1:]
+assert args[0] == "classify-weight", args
+assert "--new-files" in args, args
+new_files = int(args[args.index("--new-files") + 1])
+escalated = new_files > 0
+print(json.dumps({
+    "repository": "zach",
+    "requested_weight": "S",
+    "floor_weight": "M" if escalated else "S",
+    "effective_weight": "M" if escalated else "S",
+    "escalated": escalated,
+    "required_stages": ["plan", "plan-review", "impl", "pr-review"] if escalated else ["impl", "pr-review"],
+    "reasons": [f"[M] adds {new_files} new code/config file(s)"] if escalated else ["[S] ok"],
+}))
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub_ws_task, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let origin_dir = root.path().join("origin.git");
+        let work_dir = root.path().join("work");
+        std::fs::create_dir_all(&origin_dir).unwrap();
+        std::fs::create_dir_all(&work_dir).unwrap();
+
+        git(&origin_dir, &["init", "--bare", "-b", "main"]);
+        git(&work_dir, &["init", "-b", "main"]);
+        init_git_identity(&work_dir);
+        write_rel(&work_dir, "src/v2/runner.rs", "fn base() {}\n");
+        git(&work_dir, &["add", "."]);
+        git(&work_dir, &["commit", "-m", "initial"]);
+        git(
+            &work_dir,
+            &["remote", "add", "origin", origin_dir.to_str().unwrap()],
+        );
+        git(&work_dir, &["push", "-u", "origin", "main"]);
+        // Ensure origin/HEAD is absent so origin/main fallback is also exercised.
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&work_dir)
+            .args(["remote", "set-head", "origin", "-d"])
+            .output();
+        git(&work_dir, &["checkout", "-b", "task/zach-017"]);
+
+        let pack = ContextPackSpec {
+            weight: "S".to_owned(),
+            target_files: vec![TargetFileSpec {
+                path: "src/v2/**".to_owned(),
+                action: "modify".to_owned(),
+                summary: "runner changes".to_owned(),
+            }],
+            forbidden_paths: vec![
+                "src/ledger/**".to_owned(),
+                ".github/workflows/**".to_owned(),
+            ],
+            ..ContextPackSpec::default()
+        };
+
+        // AC-1a: new untracked file under .github/workflows/** -> status "A" -> ForbiddenPathViolation
+        write_rel(
+            &work_dir,
+            ".github/workflows/ci.yml",
+            "name: CI\non: push\n",
+        );
+        let entries = collect_worktree_diff_entries(work_dir.to_str().unwrap());
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.path == ".github/workflows/ci.yml" && e.status == "A")
+        );
+        assert_eq!(
+            verify_worktree_diff_with("zach", "S", &pack, &entries, &stub_ws_task).unwrap(),
+            DiffCheckOutcome::ForbiddenPathViolation {
+                path: ".github/workflows/ci.yml".to_owned(),
+                pattern: ".github/workflows/**".to_owned(),
+            }
+        );
+        std::fs::remove_file(work_dir.join(".github/workflows/ci.yml")).unwrap();
+
+        // AC-1b: new untracked file under src/ledger/** -> status "A" -> ForbiddenPathViolation
+        write_rel(&work_dir, "src/ledger/x.rs", "pub fn x() {}\n");
+        let entries = collect_worktree_diff_entries(work_dir.to_str().unwrap());
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.path == "src/ledger/x.rs" && e.status == "A")
+        );
+        assert_eq!(
+            verify_worktree_diff_with("zach", "S", &pack, &entries, &stub_ws_task).unwrap(),
+            DiffCheckOutcome::ForbiddenPathViolation {
+                path: "src/ledger/x.rs".to_owned(),
+                pattern: "src/ledger/**".to_owned(),
+            }
+        );
+        std::fs::remove_file(work_dir.join("src/ledger/x.rs")).unwrap();
+
+        // AC-2: new untracked file outside target_files -> OutOfScopeFiles
+        write_rel(&work_dir, "src/outside.rs", "pub fn outside() {}\n");
+        let entries = collect_worktree_diff_entries(work_dir.to_str().unwrap());
+        assert_eq!(
+            verify_worktree_diff_with("zach", "S", &pack, &entries, &stub_ws_task).unwrap(),
+            DiffCheckOutcome::OutOfScopeFiles {
+                files: vec!["src/outside.rs".to_owned()],
+            }
+        );
+        std::fs::remove_file(work_dir.join("src/outside.rs")).unwrap();
+
+        // AC-3: new untracked file inside target_files counts towards created_files -> S escalates to M
+        write_rel(
+            &work_dir,
+            "src/v2/new_helper.rs",
+            "pub fn one() {}\npub fn two() {}\n",
+        );
+        let entries = collect_worktree_diff_entries(work_dir.to_str().unwrap());
+        assert_eq!(
+            entries,
+            vec![DiffFileEntry {
+                path: "src/v2/new_helper.rs".to_owned(),
+                status: "A".to_owned(),
+                added_lines: 2,
+                deleted_lines: 0,
+            }]
+        );
+        match verify_worktree_diff_with("zach", "S", &pack, &entries, &stub_ws_task).unwrap() {
+            DiffCheckOutcome::WeightEscalated {
+                from_weight,
+                to_weight,
+                required_stages,
+                ..
+            } => {
+                assert_eq!(from_weight, "S");
+                assert_eq!(to_weight, "M");
+                assert_eq!(
+                    required_stages,
+                    vec!["plan", "plan-review", "impl", "pr-review"]
+                );
+            }
+            other => panic!("expected WeightEscalated S -> M, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collect_worktree_diff_entries_falls_back_to_head_and_parses_copy_rename_z_outputs() {
+        let repo = TempTestDir::new("zach-017-fallback");
+        git(repo.path(), &["init", "-b", "master"]);
+        init_git_identity(repo.path());
+        write_rel(repo.path(), "tracked.txt", "line1\n");
+        git(repo.path(), &["add", "tracked.txt"]);
+        git(repo.path(), &["commit", "-m", "initial"]);
+
+        write_rel(repo.path(), "tracked.txt", "line1\nline2\n");
+        write_rel(repo.path(), "new.txt", "alpha\nbeta");
+
+        let entries = collect_worktree_diff_entries(repo.path_str());
+        assert_eq!(
+            entries,
+            vec![
+                DiffFileEntry {
+                    path: "new.txt".to_owned(),
+                    status: "A".to_owned(),
+                    added_lines: 2,
+                    deleted_lines: 0,
+                },
+                DiffFileEntry {
+                    path: "tracked.txt".to_owned(),
+                    status: "M".to_owned(),
+                    added_lines: 1,
+                    deleted_lines: 0,
+                },
+            ]
+        );
+
+        let ns = b"R085\x00old.rs\x00new.rs\x00C100\x00src.rs\x00copy.rs\x00";
+        let num = b"4\t2\t\x00old.rs\x00new.rs\x0010\t0\t\x00src.rs\x00copy.rs\x00";
+        let statuses = parse_name_status_z(ns);
+        let stats = parse_numstat_z(num);
+        assert_eq!(statuses.get("new.rs").map(String::as_str), Some("R"));
+        assert_eq!(statuses.get("copy.rs").map(String::as_str), Some("A"));
+        assert_eq!(stats.get("new.rs"), Some(&(4, 2)));
+        assert_eq!(stats.get("copy.rs"), Some(&(10, 0)));
+    }
+
+    #[test]
+    fn systemd_commit_worktree_commits_dirty_changes_and_handles_clean_tree() {
+        let repo = TempTestDir::new("zach-016-commit-worktree");
+        git(repo.path(), &["init", "-b", "main"]);
+        init_git_identity(repo.path());
+        write_rel(repo.path(), "src/lib.rs", "pub fn base() -> i32 { 1 }\n");
+        git(repo.path(), &["add", "src/lib.rs"]);
+        git(repo.path(), &["commit", "-m", "initial commit"]);
+
+        let sha_before = git(repo.path(), &["rev-parse", "HEAD"]).trim().to_owned();
+
+        // Worker modifies a tracked file and creates an untracked file without committing.
+        write_rel(repo.path(), "src/lib.rs", "pub fn base() -> i32 { 2 }\n");
+        write_rel(repo.path(), "src/added.rs", "pub fn added() -> i32 { 3 }\n");
+
+        let mut task = sample_task();
+        task.task_id = "ZACH-016".to_owned();
+        task.worktree_path = Some(repo.path_str().to_owned());
+        task.active_attempt_id = Some("zach-016-impl-1".to_owned());
+
+        let mut exec = SystemdStageExecutor::default();
+        let committed_sha = exec
+            .commit_worktree(&task, repo.path_str())
+            .expect("commit_worktree should stage and commit dirty changes");
+
+        assert_ne!(committed_sha, sha_before);
+        assert_eq!(
+            committed_sha,
+            git(repo.path(), &["rev-parse", "HEAD"]).trim()
+        );
+        assert!(
+            git(repo.path(), &["status", "--porcelain"])
+                .trim()
+                .is_empty()
+        );
+        let changed = git(
+            repo.path(),
+            &["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+        );
+        assert!(changed.lines().any(|l| l == "src/lib.rs"));
+        assert!(changed.lines().any(|l| l == "src/added.rs"));
+
+        // Second call on a clean tree should succeed without error and return the same HEAD.
+        let second_sha = exec
+            .commit_worktree(&task, repo.path_str())
+            .expect("commit_worktree on clean tree should return HEAD");
+        assert_eq!(second_sha, committed_sha);
+    }
+
+    #[test]
+    fn systemd_push_and_ensure_pr_rejects_missing_sha_or_branch() {
+        let mut exec = SystemdStageExecutor::default();
+        let mut task = sample_task();
+        assert!(
+            exec.push_and_ensure_pr(&task, "/tmp/zach--ZACH-005", "head-sha")
+                .is_err()
+        );
+        assert!(
+            exec.push_and_ensure_pr(&task, "/tmp/zach--ZACH-005", "")
+                .is_err()
+        );
+        task.branch = None;
+        assert!(
+            exec.push_and_ensure_pr(&task, "/tmp/zach--ZACH-005", "abc1234")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn truncate_utf8_bytes_handles_small_limits_and_multibyte_boundaries() {
+        assert_eq!(truncate_utf8_bytes("hello", 10), "hello");
+        assert_eq!(truncate_utf8_bytes("hello", 5), "hello");
+        assert_eq!(truncate_utf8_bytes("hello", 0), "");
+        assert_eq!(truncate_utf8_bytes("€abc", 0), "");
+        assert_eq!(truncate_utf8_bytes("€abc", 1), "");
+        assert_eq!(truncate_utf8_bytes("€abc", 2), "");
+        assert_eq!(truncate_utf8_bytes("abc", 2), "ab");
+        assert_eq!(truncate_utf8_bytes("abcd", 3), "...");
+
+        // 1020 ASCII + 3-byte '€' + 2 ASCII = 1025 bytes; 1024 - 3 = 1021 falls inside '€'.
+        let mut input = "a".repeat(1020);
+        input.push('€');
+        input.push_str("bc");
+        let truncated = truncate_utf8_bytes(&input, MAX_SUMMARY_BYTES);
+        assert!(truncated.len() <= MAX_SUMMARY_BYTES);
+        assert_eq!(truncated.len(), 1023);
+        assert!(truncated.ends_with("..."));
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn systemd_executor_delivers_large_stdin_writes_secure_artifacts_and_bounds_summary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state_dir = TempTestDir::new("zach-019-exec-state");
+        let work_dir = TempTestDir::new("zach-019-exec-work");
+        let mut exec = fixture_executor(state_dir.path());
+
+        let mut task = sample_task();
+        task.worktree_path = Some(work_dir.path_str().to_owned());
+        let route = resolve_stage_route("S", "impl", 0, None).unwrap().unwrap();
+
+        // > 64 KB stdin payload to prove concurrent writer + wait_with_output avoids pipe deadlock.
+        let large_prompt = "P".repeat(96 * 1024);
+        let mut spec = build_systemd_stage_command_with_env(
+            &task,
+            "att-real-1",
+            &route,
+            &large_prompt,
+            &build_clean_env_from_process(),
+        )
+        .expect("build spec");
+
+        // Replace systemd-run with a real subprocess reading all stdin and emitting > 1024B UTF-8 stdout + stderr.
+        spec.program = "/bin/sh".to_owned();
+        spec.args = vec![
+            "-c".to_owned(),
+            "bytes=$(wc -c); printf 'stdin_bytes=%s\\n' \"$bytes\"; printf '€%.0s' $(seq 1 600); echo 'err-line' >&2"
+                .to_owned(),
+        ];
+
+        let res = exec
+            .execute_stage(&task, "att-real-1", &route, &spec)
+            .expect("real subprocess execution should succeed");
+
+        assert_eq!(res.status, "PASSED");
+        assert!(res.summary.len() <= MAX_SUMMARY_BYTES);
+        assert!(res.summary.starts_with("stdin_bytes=98304"));
+        assert!(res.summary.ends_with("..."));
+
+        let attempts_dir = state_dir.path().join("attempts");
+        let attempt_dir = attempts_dir.join("att-real-1");
+        assert_eq!(
+            std::fs::metadata(&attempts_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&attempt_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+
+        for name in ["prompt.md", "stdout.jsonl", "stderr.log", "result.json"] {
+            let p = attempt_dir.join(name);
+            assert!(p.exists(), "missing artifact {name}");
+            assert_eq!(
+                std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "artifact {name} should have 0600 mode"
+            );
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(attempt_dir.join("prompt.md")).unwrap(),
+            large_prompt
+        );
+        let stdout_contents = std::fs::read_to_string(attempt_dir.join("stdout.jsonl")).unwrap();
+        assert!(stdout_contents.starts_with("stdin_bytes=98304\n"));
+        assert_eq!(
+            std::fs::read_to_string(attempt_dir.join("stderr.log")).unwrap(),
+            "err-line\n"
+        );
+        let result_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(attempt_dir.join("result.json")).unwrap(),
+        )
+        .expect("valid result.json");
+        assert_eq!(result_json["attempt_id"], "att-real-1");
+        assert_eq!(result_json["exit_code"], 0);
+        assert_eq!(result_json["result"]["status"], "PASSED");
+    }
+
+    #[test]
+    fn systemd_executor_rejects_invalid_attempt_ids_and_symlinks() {
+        let state_dir = TempTestDir::new("zach-019-sec");
+        let mut exec = fixture_executor(state_dir.path());
+        let task = sample_task();
+        let route = resolve_stage_route("S", "impl", 0, None).unwrap().unwrap();
+        let mut spec = build_systemd_stage_command_with_env(
+            &task,
+            "att-sec",
+            &route,
+            "hello",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        spec.program = "/bin/true".to_owned();
+        spec.args = Vec::new();
+
+        for bad_id in ["", ".", "..", "a/b", "a\\b", " bad "] {
+            assert!(
+                exec.execute_stage(&task, bad_id, &route, &spec).is_err(),
+                "expected invalid attempt_id '{bad_id}' to be rejected"
+            );
+        }
+
+        // Symlink attempt dir is rejected
+        let attempts_dir = state_dir.path().join("attempts");
+        std::fs::create_dir_all(&attempts_dir).unwrap();
+        let outside = TempTestDir::new("zach-019-outside");
+        std::os::unix::fs::symlink(outside.path(), attempts_dir.join("sym-att")).unwrap();
+        assert!(exec.execute_stage(&task, "sym-att", &route, &spec).is_err());
+    }
+
+    #[test]
+    fn prune_old_attempts_at_prunes_expired_dirs_and_skips_symlinks_and_files() {
+        let state_dir = TempTestDir::new("zach-019-prune");
+        let outside = TempTestDir::new("zach-019-prune-outside");
+        write_rel(outside.path(), "keep.txt", "do not delete");
+
+        let attempts_dir = state_dir.path().join("attempts");
+        let old_dir = attempts_dir.join("old-attempt");
+        let fresh_dir = attempts_dir.join("fresh-attempt");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::create_dir_all(&fresh_dir).unwrap();
+        std::fs::write(old_dir.join("prompt.md"), "old").unwrap();
+        std::fs::write(fresh_dir.join("prompt.md"), "fresh").unwrap();
+        std::fs::write(attempts_dir.join("stray-file.txt"), "keep").unwrap();
+        std::os::unix::fs::symlink(outside.path(), attempts_dir.join("sym-attempt")).unwrap();
+
+        // Set old_dir mtime to 10 days ago using `touch`
+        let status = Command::new("touch")
+            .args(["-d", "10 days ago"])
+            .arg(&old_dir)
+            .status()
+            .expect("run touch");
+        assert!(status.success());
+
+        let pruned = prune_old_attempts_at(
+            state_dir.path(),
+            std::time::Duration::from_secs(7 * 86_400),
+            std::time::SystemTime::now(),
+        )
+        .expect("prune succeeds");
+
+        assert_eq!(pruned, 1);
+        assert!(!old_dir.exists());
+        assert!(fresh_dir.exists());
+        assert!(attempts_dir.join("stray-file.txt").exists());
+        assert!(attempts_dir.join("sym-attempt").symlink_metadata().is_ok());
+        assert!(outside.path().join("keep.txt").exists());
+    }
+
+    #[test]
+    fn parse_codex_jsonl_output_sums_turns_and_handles_failures() {
+        let ok_jsonl = include_str!("../../tests/fixtures/codex_exec_usage.jsonl");
+        let parsed = parse_codex_jsonl_output(ok_jsonl, "", Some(0)).expect("parse codex jsonl");
+        assert_eq!(parsed.status, "PASSED");
+        assert_eq!(
+            parsed.summary,
+            "Implemented token parsing and verified tests."
+        );
+        assert_eq!(parsed.input_tokens, Some(44_105));
+        assert_eq!(parsed.output_tokens, Some(132));
+        assert_eq!(parsed.total_tokens, Some(44_237));
+        assert_eq!(parsed.review_markdown, None);
+
+        let failed_jsonl = include_str!("../../tests/fixtures/codex_exec_failed.jsonl");
+        let failed =
+            parse_codex_jsonl_output(failed_jsonl, "", Some(1)).expect("parse failed codex jsonl");
+        assert_eq!(failed.status, "FAILED");
+        assert!(failed.summary.contains("usage limit"));
+        assert_eq!(failed.input_tokens, None);
+        assert_eq!(failed.output_tokens, None);
+        assert_eq!(failed.total_tokens, None);
+    }
+
+    #[test]
+    fn systemd_executor_branches_on_model_family_for_codex_and_gemini() {
+        let state_dir = TempTestDir::new("zach-020-exec-state");
+        let work_dir = TempTestDir::new("zach-020-exec-work");
+        let mut exec = fixture_executor(state_dir.path());
+        let mut task = sample_task();
+        task.worktree_path = Some(work_dir.path_str().to_owned());
+
+        // 1. OpenAiSol executes codex JSONL branch
+        let codex_route = resolve_stage_route("S", "impl", 0, None).unwrap().unwrap();
+        assert_eq!(codex_route.family, ModelFamily::OpenAiSol);
+        let codex_fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/codex_exec_usage.jsonl");
+        let mut codex_spec = build_systemd_stage_command_with_env(
+            &task,
+            "att-codex-ok",
+            &codex_route,
+            "run codex",
+            &build_clean_env_from_process(),
+        )
+        .unwrap();
+        codex_spec.program = "/bin/cat".to_owned();
+        codex_spec.args = vec![codex_fixture.to_string_lossy().into_owned()];
+
+        let codex_res = exec
+            .execute_stage(&task, "att-codex-ok", &codex_route, &codex_spec)
+            .expect("codex fixture execution");
+        assert_eq!(codex_res.status, "PASSED");
+        assert_eq!(codex_res.input_tokens, Some(44_105));
+        assert_eq!(codex_res.output_tokens, Some(132));
+        assert_eq!(codex_res.total_tokens, Some(44_237));
+
+        // 2. GeminiAgy executes gemini-worker JSON branch
+        let mut gemini_route = resolve_stage_route("M", "impl", 0, None).unwrap().unwrap();
+        gemini_route.family = ModelFamily::GeminiAgy;
+        gemini_route.model = "gemini-4-hydrogen-medium".to_owned();
+        let gemini_fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/gemini_worker_usage.json");
+        let mut gemini_spec = build_systemd_stage_command_with_env(
+            &task,
+            "att-gemini-ok",
+            &gemini_route,
+            "run gemini",
+            &build_clean_env_from_process(),
+        )
+        .unwrap();
+        gemini_spec.program = "/bin/cat".to_owned();
+        gemini_spec.args = vec![gemini_fixture.to_string_lossy().into_owned()];
+
+        let gemini_res = exec
+            .execute_stage(&task, "att-gemini-ok", &gemini_route, &gemini_spec)
+            .expect("gemini fixture execution");
+        assert_eq!(gemini_res.status, "PASSED");
+        assert_eq!(gemini_res.input_tokens, Some(9_967));
+        assert_eq!(gemini_res.output_tokens, Some(43));
+        assert_eq!(gemini_res.total_tokens, Some(10_010));
+    }
+
+    #[test]
+    fn pr_review_spec_inserts_output_schema_before_trailing_dash_and_writes_0600_schema_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let task = sample_task();
+        let review_route = resolve_stage_route("S", "pr-review", 0, Some(ModelFamily::GeminiAgy))
+            .unwrap()
+            .unwrap();
+        assert_eq!(review_route.family, ModelFamily::OpenAiSol);
+
+        let spec = build_systemd_stage_command_with_env(
+            &task,
+            "att-rev-schema",
+            &review_route,
+            "review prompt",
+            &build_clean_env_from_process(),
+        )
+        .expect("build pr-review spec");
+        assert!(spec.output_schema_json.is_some());
+        assert_eq!(spec.args.last().map(String::as_str), Some("-"));
+
+        let schema_path = std::path::Path::new("/tmp/att-rev/review-schema.json");
+        let injected = inject_codex_output_schema_args(&spec.args, schema_path);
+        let schema_flag_idx = injected
             .iter()
-            .position(|a| a == "--timeout")
-            .expect("timeout flag");
-        assert_eq!(spec.args[timeout_idx + 1], "1800");
+            .position(|a| a == "--output-schema")
+            .expect("--output-schema flag present");
+        let dash_idx = injected
+            .iter()
+            .rposition(|a| a == "-")
+            .expect("trailing - present");
+        let double_dash_idx = injected
+            .iter()
+            .position(|a| a == "--")
+            .expect("-- separator present");
+        assert!(schema_flag_idx > double_dash_idx);
+        assert_eq!(
+            injected[schema_flag_idx + 1],
+            "/tmp/att-rev/review-schema.json"
+        );
+        assert_eq!(dash_idx, injected.len() - 1);
+        assert!(schema_flag_idx + 1 < dash_idx);
+
+        // Execute with SystemdStageExecutor using a fake wrapper script that captures argv
+        let state_dir = TempTestDir::new("zach-026-schema-state");
+        let work_dir = TempTestDir::new("zach-026-schema-work");
+        let mut exec = fixture_executor(state_dir.path());
+        let mut run_spec = spec.clone();
+        run_spec.worktree_path = work_dir.path_str().to_owned();
+        // Keep "codex exec ... -" after "--" in args so inject_codex_output_schema_args triggers,
+        // using `/usr/bin/env` as program? No, `/bin/echo` prints all args! Let's use a tiny script.
+        let echo_script = state_dir.path().join("capture_args.sh");
+        std::fs::write(
+            &echo_script,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/captured_argv.txt\"\nprintf '{\"type\":\"item.completed\",\"item\":{\"id\":\"item_0\",\"type\":\"agent_message\",\"text\":\"{\\\"verdict\\\":\\\"APPROVED\\\",\\\"ac_results\\\":[],\\\"findings\\\":[],\\\"summary\\\":\\\"ok\\\"}\"}}\\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&echo_script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        run_spec.program = echo_script.to_string_lossy().into_owned();
+
+        let res = exec
+            .execute_stage(&task, "att-rev-schema", &review_route, &run_spec)
+            .expect("execute with schema");
+        assert_eq!(res.status, "PASSED");
+        assert!(
+            res.review_output
+                .as_deref()
+                .is_some_and(|s| s.contains("\"verdict\":\"APPROVED\""))
+        );
+
+        let schema_on_disk = state_dir
+            .path()
+            .join("attempts/att-rev-schema/review-schema.json");
+        assert!(schema_on_disk.exists());
+        assert_eq!(
+            std::fs::metadata(&schema_on_disk)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let captured = std::fs::read_to_string(state_dir.path().join("captured_argv.txt")).unwrap();
+        let argv_lines: Vec<&str> = captured.lines().collect();
+        let out_idx = argv_lines
+            .iter()
+            .position(|l| *l == "--output-schema")
+            .expect("captured --output-schema");
+        assert_eq!(argv_lines[out_idx + 1], schema_on_disk.to_string_lossy());
+        assert_eq!(argv_lines.last().copied(), Some("-"));
+    }
+
+    #[test]
+    fn parse_codex_jsonl_output_preserves_untruncated_json_verdict_in_review_output() {
+        let large_summary = "S".repeat(1400);
+        let verdict_json = format!(
+            r#"{{"verdict":"APPROVED","ac_results":[{{"id":"AC-1","status":"PASS","file":"src/v2/router.rs","line":10,"evidence":"ok"}}],"findings":[],"summary":"{large_summary}"}}"#
+        );
+        let line1 = serde_json::json!({
+            "type": "item.completed",
+            "item": { "id": "item_0", "type": "agent_message", "text": verdict_json }
+        });
+        let line2 = serde_json::json!({
+            "type": "turn.completed",
+            "usage": { "input_tokens": 500, "output_tokens": 200 }
+        });
+        let jsonl = format!("{line1}\n{line2}\n");
+        let parsed = parse_codex_jsonl_output(&jsonl, "", Some(0)).expect("parse codex verdict");
+        assert_eq!(parsed.status, "PASSED");
+        assert!(parsed.summary.len() <= MAX_SUMMARY_BYTES);
+        assert_eq!(parsed.review_output.as_deref(), Some(verdict_json.as_str()));
+    }
+
+    #[test]
+    fn collect_reviewed_diff_ranges_handles_all_hunk_and_special_file_edge_cases() {
+        // 1. Unit test parse_unified_zero_diff across all git diff edge cases
+        let synthetic_diff = "\
+diff --git a/src/omitted.rs b/src/omitted.rs
+--- a/src/omitted.rs
++++ b/src/omitted.rs
+@@ -4 +4 @@ fn one() {}
+diff --git a/src/added.rs b/src/added.rs
+new file mode 100644
+--- /dev/null
++++ b/src/added.rs
+@@ -0,0 +1,5 @@
+diff --git a/src/empty_added.rs b/src/empty_added.rs
+new file mode 100644
+index 0000000..e69de29
+diff --git a/src/deleted_all.rs b/src/deleted_all.rs
+deleted file mode 100644
+--- a/src/deleted_all.rs
++++ /dev/null
+@@ -1,4 +0,0 @@
+diff --git a/src/empty_deleted.rs b/src/empty_deleted.rs
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/src/pure_del_hunk.rs b/src/pure_del_hunk.rs
+--- a/src/pure_del_hunk.rs
++++ b/src/pure_del_hunk.rs
+@@ -10,3 +9,0 @@ fn keep() {}
+diff --git a/src/old_name.rs b/src/new_name.rs
+similarity index 100%
+rename from src/old_name.rs
+rename to src/new_name.rs
+diff --git a/src/old_edit.rs b/src/new_edit.rs
+similarity index 80%
+rename from src/old_edit.rs
+rename to src/new_edit.rs
+--- a/src/old_edit.rs
++++ b/src/new_edit.rs
+@@ -2 +2,3 @@
+diff --git a/assets/logo.bin b/assets/logo.bin
+new file mode 100644
+Binary files /dev/null and b/assets/logo.bin differ
+";
+        let parsed = parse_unified_zero_diff(synthetic_diff);
+        assert_eq!(
+            parsed.get("src/omitted.rs"),
+            Some(&vec![LineRange { start: 4, end: 4 }])
+        );
+        assert_eq!(
+            parsed.get("src/added.rs"),
+            Some(&vec![LineRange { start: 1, end: 5 }])
+        );
+        assert_eq!(
+            parsed.get("src/empty_added.rs"),
+            Some(&vec![LineRange { start: 1, end: 1 }])
+        );
+        assert_eq!(
+            parsed.get("src/deleted_all.rs"),
+            Some(&vec![LineRange { start: 1, end: 4 }])
+        );
+        assert_eq!(
+            parsed.get("src/empty_deleted.rs"),
+            Some(&vec![LineRange { start: 1, end: 1 }])
+        );
+        assert_eq!(
+            parsed.get("src/pure_del_hunk.rs"),
+            Some(&vec![LineRange { start: 9, end: 9 }])
+        );
+        assert_eq!(
+            parsed.get("src/new_name.rs"),
+            Some(&vec![LineRange { start: 1, end: 1 }])
+        );
+        assert_eq!(
+            parsed.get("src/new_edit.rs"),
+            Some(&vec![LineRange { start: 2, end: 4 }])
+        );
+        assert_eq!(
+            parsed.get("assets/logo.bin"),
+            Some(&vec![LineRange { start: 1, end: 1 }])
+        );
+
+        // 2. Real git repo without remotes (uses plan_base_sha so merge-base..reviewed_sha is never sha..sha)
+        let repo = TempTestDir::new("zach-026-diff-noremote");
+        git(repo.path(), &["init", "-b", "main"]);
+        init_git_identity(repo.path());
+        write_rel(repo.path(), "src/lib.rs", "line1\nline2\nline3\nline4\n");
+        write_rel(repo.path(), "src/remove.rs", "a\nb\nc\n");
+        write_rel(repo.path(), "src/move_me.rs", "same\n");
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-m", "base"]);
+        let base_sha = git(repo.path(), &["rev-parse", "HEAD"]).trim().to_owned();
+
+        git(repo.path(), &["checkout", "-b", "task/ZACH-026-DIFF"]);
+        write_rel(
+            repo.path(),
+            "src/lib.rs",
+            "line1\nchanged2\nline3\nline4\nadded5\n",
+        );
+        std::fs::remove_file(repo.path().join("src/remove.rs")).unwrap();
+        git(repo.path(), &["mv", "src/move_me.rs", "src/moved_here.rs"]);
+        write_rel(repo.path(), "src/empty.rs", "");
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-m", "task change"]);
+        let reviewed_sha = git(repo.path(), &["rev-parse", "HEAD"]).trim().to_owned();
+
+        let ctx = collect_reviewed_diff_ranges(repo.path_str(), Some(&base_sha), &reviewed_sha)
+            .expect("collect diff ranges without remotes");
+        assert_eq!(ctx.merge_base_sha, base_sha);
+        assert_eq!(ctx.reviewed_sha, reviewed_sha);
+        assert_eq!(ctx.commit_range, format!("{base_sha}..{reviewed_sha}"));
+        assert!(ctx.files["src/lib.rs"].iter().any(|r| r.contains(2)));
+        assert!(ctx.files["src/lib.rs"].iter().any(|r| r.contains(5)));
+        assert!(!ctx.files["src/lib.rs"].iter().any(|r| r.contains(3)));
+        assert!(ctx.files["src/remove.rs"].iter().any(|r| r.contains(1)));
+        assert!(ctx.files["src/moved_here.rs"].iter().any(|r| r.contains(1)));
+        assert!(ctx.files["src/empty.rs"].iter().any(|r| r.contains(1)));
+
+        // 3. Path normalization checks
+        assert_eq!(
+            normalize_cited_diff_path("./src/lib.rs", repo.path_str()).unwrap(),
+            "src/lib.rs"
+        );
+        assert_eq!(
+            normalize_cited_diff_path(&format!("{}/src/lib.rs", repo.path_str()), repo.path_str())
+                .unwrap(),
+            "src/lib.rs"
+        );
+        assert!(normalize_cited_diff_path("../secret.rs", repo.path_str()).is_err());
+        assert!(normalize_cited_diff_path("/etc/passwd", repo.path_str()).is_err());
+    }
+    #[test]
+    fn detached_unit_observation_distinguishes_retained_exit_failure_and_manager_absence() {
+        for (load, active, sub, expected) in [
+            ("loaded", "active", "running", UnitState::Running),
+            ("loaded", "active", "exited", UnitState::Exited),
+            ("loaded", "failed", "failed", UnitState::Failed),
+            ("loaded", "activating", "start", UnitState::Starting),
+            ("loaded", "deactivating", "stop", UnitState::Stopping),
+            ("loaded", "inactive", "dead", UnitState::Dead),
+            ("not-found", "inactive", "dead", UnitState::Missing),
+        ] {
+            let raw = format!(
+                "LoadState={load}\nActiveState={active}\nSubState={sub}\nResult=success\nExecMainCode=1\nExecMainStatus=0\nInvocationID=\nControlGroup=\n"
+            );
+            let observation = UnitObservation::parse(&raw);
+            assert_eq!(observation.state().unwrap(), expected);
+            assert!(observation.success());
+            assert!(observation.invocation_id.is_empty());
+            assert!(observation.control_group.is_empty());
+        }
+        assert!(UnitObservation::parse("").state().is_err());
+        let signaled = UnitObservation::parse(
+            "LoadState=loaded\nActiveState=failed\nSubState=failed\nResult=signal\nExecMainCode=2\nExecMainStatus=9",
+        );
+        assert!(!signaled.success());
+    }
+
+    #[test]
+    fn detached_preparation_resolves_relative_state_io_and_preserves_schema_mount_without_launch() {
+        let root = PathBuf::from(format!("target/z25-prepare-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("home/.codex")).unwrap();
+        write_secure_file(&root.join("home/.codex/auth.json"), b"{}").unwrap();
+        let mut task = sample_task();
+        let worker = root.join("worker");
+        assert!(
+            Command::new("git")
+                .args([
+                    "clone",
+                    "--quiet",
+                    "--shared",
+                    "--no-checkout",
+                    env!("CARGO_MANIFEST_DIR")
+                ])
+                .arg(&worker)
+                .status()
+                .unwrap()
+                .success()
+        );
+        task.worktree_path = Some(
+            std::fs::canonicalize(&worker)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        task.context_pack.network = Some("none".into());
+        let route = resolve_stage_route("S", "pr-review", 0, Some(ModelFamily::GeminiAgy))
+            .unwrap()
+            .unwrap();
+        let env = BTreeMap::from([(
+            "HOME".into(),
+            std::fs::canonicalize(root.join("home"))
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        )]);
+        let spec =
+            build_systemd_stage_command_with_env(&task, "relative-io", &route, "prompt", &env)
+                .unwrap();
+        assert!(!root.join("state").exists());
+        let PreparedLaunch {
+            manifest,
+            resources,
+        } = prepare_detached_launch(&root.join("state"), &task, "relative-io", &route, spec)
+            .unwrap();
+        assert!(manifest.attempt_dir.is_absolute());
+        assert!(manifest.attempt_dir.join("codex-home/auth.json").exists());
+        for property in [
+            "StandardInput=file:",
+            "StandardOutput=file:",
+            "StandardError=file:",
+        ] {
+            let value = manifest
+                .spec
+                .args
+                .iter()
+                .find_map(|a| a.strip_prefix(property))
+                .unwrap();
+            assert!(std::path::Path::new(value).is_absolute());
+            assert_eq!(std::fs::canonicalize(value).unwrap(), PathBuf::from(value));
+        }
+        let schema = manifest
+            .attempt_dir
+            .join("review-schema.json")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            manifest
+                .spec
+                .args
+                .windows(3)
+                .any(|args| args == ["--ro-bind", schema.as_str(), schema.as_str()])
+        );
+        resources.cleanup_after_stop().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

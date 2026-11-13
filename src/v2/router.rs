@@ -1,5 +1,11 @@
 use serde::{Deserialize, Serialize};
 
+pub const NO_CROSS_FAMILY_REVIEWER_ERR: &str = "NO_CROSS_FAMILY_REVIEWER";
+
+pub fn is_no_cross_family_reviewer_error(err: &str) -> bool {
+    err.contains(NO_CROSS_FAMILY_REVIEWER_ERR)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelFamily {
     OpenAiSol,
@@ -12,6 +18,31 @@ impl ModelFamily {
             Self::OpenAiSol => "openai-sol",
             Self::GeminiAgy => "gemini-agy",
         }
+    }
+
+    pub fn opposite(&self) -> Self {
+        match self {
+            Self::OpenAiSol => Self::GeminiAgy,
+            Self::GeminiAgy => Self::OpenAiSol,
+        }
+    }
+}
+
+/// Infers the [`ModelFamily`] from a model name string.
+pub fn infer_model_family(model: &str) -> ModelFamily {
+    let lower = model.trim().to_ascii_lowercase();
+    if lower.starts_with("gpt-")
+        || lower.starts_with("o1")
+        || lower.starts_with("o3")
+        || lower.starts_with("o4")
+        || lower.contains("openai")
+        || lower.contains("codex")
+        || lower.contains("sol")
+        || lower.contains("astra")
+    {
+        ModelFamily::OpenAiSol
+    } else {
+        ModelFamily::GeminiAgy
     }
 }
 
@@ -96,6 +127,28 @@ pub fn stage_timeout_secs(weight: &str, stage: &str) -> u64 {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RouterEnvOverrides {
+    pub flash_only: bool,
+    pub forced_model: Option<String>,
+}
+
+impl RouterEnvOverrides {
+    pub fn from_env() -> Self {
+        let is_enabled = |name: &str| {
+            std::env::var(name)
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        };
+        let flash_only = is_enabled("ZACH_USE_FLASH_ONLY") || is_enabled("ZACH_USE_HYDROGEN_ONLY");
+        let forced_model = std::env::var("ZACH_FORCE_MODEL").ok();
+        Self {
+            flash_only,
+            forced_model,
+        }
+    }
+}
+
 /// Deterministically resolves the model, reasoning effort, fallback, and budgets
 /// for a given `(weight, stage, retry_count, author_family)`.
 ///
@@ -106,6 +159,23 @@ pub fn resolve_stage_route(
     stage: &str,
     retry_count: i64,
     author_family: Option<ModelFamily>,
+) -> Result<Option<StageRoute>, String> {
+    resolve_stage_route_with(
+        weight,
+        stage,
+        retry_count,
+        author_family,
+        &RouterEnvOverrides::from_env(),
+    )
+}
+
+/// Pure route resolver accepting explicit environment overrides so tests do not mutate process env.
+pub fn resolve_stage_route_with(
+    weight: &str,
+    stage: &str,
+    retry_count: i64,
+    author_family: Option<ModelFamily>,
+    overrides: &RouterEnvOverrides,
 ) -> Result<Option<StageRoute>, String> {
     let norm_weight = weight.trim().to_ascii_uppercase();
     if !matches!(norm_weight.as_str(), "XS" | "S" | "M" | "L") {
@@ -139,7 +209,7 @@ pub fn resolve_stage_route(
                 model: "gpt-6.1-sol".to_owned(),
                 effort,
                 fallback_family: Some(ModelFamily::GeminiAgy),
-                fallback_model: Some("gemini-3.8-flash-medium".to_owned()),
+                fallback_model: Some("gemini-4-hydrogen-medium".to_owned()),
                 fallback_effort: Some(ReasoningEffort::Medium),
                 max_task_tokens,
                 timeout_secs,
@@ -174,7 +244,7 @@ pub fn resolve_stage_route(
             norm_stage,
             is_retry,
             author_family.unwrap_or(ModelFamily::OpenAiSol),
-            "gemini-3.8-flash-high",
+            "gemini-4-hydrogen-high",
             "gemini-4-argon-high",
             ReasoningEffort::High,
             ReasoningEffort::Medium,
@@ -313,14 +383,21 @@ pub fn resolve_stage_route(
     };
 
     let mut route = route;
-    let force_flash = std::env::var("ZACH_USE_FLASH_ONLY")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    let forced_model = std::env::var("ZACH_FORCE_MODEL").ok();
-    if force_flash || forced_model.is_some() {
-        let target_model = forced_model.unwrap_or_else(|| "gemini-3.8-flash-high".to_owned());
+    let forced_non_empty = overrides
+        .forced_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(forced) = forced_non_empty {
+        route.family = infer_model_family(forced);
+        route.model = forced.to_owned();
+        route.effort = ReasoningEffort::High;
+        route.fallback_family = None;
+        route.fallback_model = None;
+        route.fallback_effort = None;
+    } else if overrides.flash_only {
         route.family = ModelFamily::GeminiAgy;
-        route.model = target_model;
+        route.model = "gemini-4-hydrogen-high".to_owned();
         route.effort = ReasoningEffort::High;
         route.fallback_family = None;
         route.fallback_model = None;
@@ -330,6 +407,19 @@ pub fn resolve_stage_route(
     validate_daemon_model(&route.model)?;
     if let Some(ref fb) = route.fallback_model {
         validate_daemon_model(fb)?;
+    }
+
+    if matches!(route.stage.as_str(), "plan-review" | "pr-review")
+        && let Some(author) = author_family
+        && route.family == author
+    {
+        return Err(format!(
+            "{NO_CROSS_FAMILY_REVIEWER_ERR}: cannot run {} with {} ({}) when author used {}; cross-family review is mandatory",
+            route.stage,
+            route.model,
+            route.family.as_str(),
+            author.as_str()
+        ));
     }
 
     Ok(Some(route))
@@ -359,9 +449,9 @@ fn build_cross_model_review_route(
                 gemini_primary.to_owned()
             },
             effort: gemini_effort,
-            fallback_family: Some(ModelFamily::OpenAiSol),
-            fallback_model: Some("gpt-6.1-sol".to_owned()),
-            fallback_effort: Some(sol_base_effort),
+            fallback_family: None,
+            fallback_model: None,
+            fallback_effort: None,
             max_task_tokens,
             timeout_secs,
             stall_timeout_secs: DEFAULT_STALL_TIMEOUT_SECS,
@@ -376,9 +466,9 @@ fn build_cross_model_review_route(
             } else {
                 sol_base_effort
             },
-            fallback_family: Some(ModelFamily::GeminiAgy),
-            fallback_model: Some(gemini_retry.to_owned()),
-            fallback_effort: Some(ReasoningEffort::High),
+            fallback_family: None,
+            fallback_model: None,
+            fallback_effort: None,
             max_task_tokens,
             timeout_secs,
             stall_timeout_secs: DEFAULT_STALL_TIMEOUT_SECS,
@@ -395,7 +485,8 @@ mod tests {
         assert!(is_forbidden_daemon_model("gpt-6-astra"));
         assert!(is_forbidden_daemon_model("GPT-6-ASTRA-HIGH"));
         assert!(!is_forbidden_daemon_model("gpt-6.1-sol"));
-        assert!(!is_forbidden_daemon_model("gemini-3.8-flash-high"));
+        assert!(!is_forbidden_daemon_model("gemini-4-hydrogen-medium"));
+        assert!(!is_forbidden_daemon_model("gemini-4-hydrogen-high"));
         assert!(!is_forbidden_daemon_model("gemini-4-argon-high"));
         assert!(validate_daemon_model("gpt-6-astra").is_err());
 
@@ -438,7 +529,7 @@ mod tests {
             .unwrap();
         assert_eq!(s_rev_0.family, ModelFamily::GeminiAgy);
         assert_ne!(s_rev_0.family, s_impl_0.family);
-        assert_eq!(s_rev_0.model, "gemini-3.8-flash-high");
+        assert_eq!(s_rev_0.model, "gemini-4-hydrogen-high");
 
         // On retry_count == 1, S pr-review escalates to gemini-4-argon-high while keeping cross-model family
         let s_rev_1 = resolve_stage_route("S", "pr-review", 1, Some(ModelFamily::OpenAiSol))
@@ -468,18 +559,135 @@ mod tests {
         let xs_impl = resolve_stage_route("XS", "impl", 0, None).unwrap().unwrap();
         assert_eq!(xs_impl.effort, ReasoningEffort::Low);
         assert_eq!(xs_impl.max_task_tokens, 150_000);
+        assert_eq!(
+            xs_impl.fallback_model.as_deref(),
+            Some("gemini-4-hydrogen-medium")
+        );
     }
 
     #[test]
-    fn router_honors_flash_only_env_override() {
-        unsafe {
-            std::env::set_var("ZACH_USE_FLASH_ONLY", "1");
+    fn router_honors_flash_only_and_forced_model_overrides() {
+        let flash_route = resolve_stage_route_with(
+            "S",
+            "impl",
+            0,
+            None,
+            &RouterEnvOverrides {
+                flash_only: true,
+                forced_model: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(flash_route.family, ModelFamily::GeminiAgy);
+        assert_eq!(flash_route.model, "gemini-4-hydrogen-high");
+        assert!(flash_route.fallback_model.is_none());
+
+        let forced_route = resolve_stage_route_with(
+            "M",
+            "plan",
+            0,
+            None,
+            &RouterEnvOverrides {
+                flash_only: false,
+                forced_model: Some("gemini-4-argon-high".to_owned()),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(forced_route.family, ModelFamily::GeminiAgy);
+        assert_eq!(forced_route.model, "gemini-4-argon-high");
+        assert_eq!(forced_route.effort, ReasoningEffort::High);
+        assert!(forced_route.fallback_model.is_none());
+    }
+
+    #[test]
+    fn router_enforces_mandatory_cross_family_review_under_overrides() {
+        assert_eq!(ModelFamily::OpenAiSol.opposite(), ModelFamily::GeminiAgy);
+        assert_eq!(ModelFamily::GeminiAgy.opposite(), ModelFamily::OpenAiSol);
+        assert_eq!(infer_model_family("gpt-6.1-sol"), ModelFamily::OpenAiSol);
+        assert_eq!(
+            infer_model_family("gemini-4-argon-high"),
+            ModelFamily::GeminiAgy
+        );
+
+        // Default cross-family review routes never expose a same-family fallback
+        for weight in ["S", "M", "L"] {
+            for stage in ["plan-review", "pr-review"] {
+                if let Some(route) =
+                    resolve_stage_route(weight, stage, 0, Some(ModelFamily::OpenAiSol)).unwrap()
+                {
+                    assert_eq!(route.family, ModelFamily::GeminiAgy);
+                    assert!(route.fallback_family.is_none());
+                    assert!(route.fallback_model.is_none());
+                }
+                if let Some(route) =
+                    resolve_stage_route(weight, stage, 0, Some(ModelFamily::GeminiAgy)).unwrap()
+                {
+                    assert_eq!(route.family, ModelFamily::OpenAiSol);
+                    assert!(route.fallback_family.is_none());
+                    assert!(route.fallback_model.is_none());
+                }
+            }
         }
-        let route = resolve_stage_route("S", "impl", 0, None).unwrap().unwrap();
-        assert_eq!(route.family, ModelFamily::GeminiAgy);
-        assert_eq!(route.model, "gemini-3.8-flash-high");
-        unsafe {
-            std::env::remove_var("ZACH_USE_FLASH_ONLY");
-        }
+
+        // flash_only cannot review GeminiAgy author
+        let err_flash = resolve_stage_route_with(
+            "S",
+            "pr-review",
+            0,
+            Some(ModelFamily::GeminiAgy),
+            &RouterEnvOverrides {
+                flash_only: true,
+                forced_model: None,
+            },
+        )
+        .unwrap_err();
+        assert!(is_no_cross_family_reviewer_error(&err_flash));
+
+        // flash_only CAN review OpenAiSol author
+        let ok_flash = resolve_stage_route_with(
+            "S",
+            "pr-review",
+            0,
+            Some(ModelFamily::OpenAiSol),
+            &RouterEnvOverrides {
+                flash_only: true,
+                forced_model: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ok_flash.family, ModelFamily::GeminiAgy);
+
+        // ZACH_FORCE_MODEL=gpt-6.1-sol cannot review OpenAiSol author
+        let err_forced_sol = resolve_stage_route_with(
+            "M",
+            "plan-review",
+            0,
+            Some(ModelFamily::OpenAiSol),
+            &RouterEnvOverrides {
+                flash_only: false,
+                forced_model: Some("gpt-6.1-sol".to_owned()),
+            },
+        )
+        .unwrap_err();
+        assert!(is_no_cross_family_reviewer_error(&err_forced_sol));
+
+        // ZACH_FORCE_MODEL=gpt-6.1-sol CAN review GeminiAgy author
+        let ok_forced_sol = resolve_stage_route_with(
+            "M",
+            "pr-review",
+            0,
+            Some(ModelFamily::GeminiAgy),
+            &RouterEnvOverrides {
+                flash_only: false,
+                forced_model: Some("gpt-6.1-sol".to_owned()),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ok_forced_sol.family, ModelFamily::OpenAiSol);
+        assert_eq!(ok_forced_sol.model, "gpt-6.1-sol");
     }
 }
