@@ -315,6 +315,7 @@ fn run_v2_config(args: &[String]) {
 fn run_v2_run(args: &[String]) {
     let dry_run = has_flag(args, "--dry-run");
     if !dry_run {
+        // The daemon schedules pipelines and poll_post_merge_deliveries on bounded workers.
         let socket_path = flag_value(args, "--socket")
             .map(PathBuf::from)
             .unwrap_or_else(default_socket_path);

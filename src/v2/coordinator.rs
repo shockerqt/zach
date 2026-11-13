@@ -1,5 +1,6 @@
 //! Durable orchestration owner. Workers execute one bounded side effect and return
 //! typed events; only this thread owns the daemon's SQLite connection.
+use crate::v2::delivery::{self, DeliveryStore, SystemDeliveryDriver};
 use crate::v2::intake::{self, WsTaskClient};
 use crate::v2::isolation::{self, PreparedResources};
 use crate::v2::merge_queue::{self, MergePhaseResult, SystemMergeDriver};
@@ -13,7 +14,7 @@ use crate::v2::scheduler::{self, HeavyCheckSemaphore};
 use crate::v2::socket::{ClientCommand, ServerMessage};
 use crate::v2::store::{
     DecisionResolution, LifecycleOperation, MergeCheckpoint, PipelineCheckpoint,
-    StageAttemptRecord, TaskRecord, V2Store,
+    StageAttemptRecord, TaskRecord, V2Store, V2StoreError,
 };
 use crate::v2::{default_ws_task_bin, now_epoch};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -140,9 +141,34 @@ pub enum WorkerResult {
         retired: Vec<StageAttemptRecord>,
     },
     Reconciled,
+    DeliveryPolled,
+}
+
+type DeliveryStoreOperation = Box<dyn FnOnce(&mut V2Store) + Send>;
+
+/// A worker waits only for short store operations; the coordinator never waits
+/// for delivery network I/O. Intent checkpoints commit before remote dispatch.
+struct CoordinatorDeliveryStore {
+    commands: mpsc::SyncSender<CoordinatorEvent>,
+}
+impl DeliveryStore for CoordinatorDeliveryStore {
+    fn access<T: Send + 'static>(
+        &mut self,
+        operation: impl FnOnce(&mut V2Store) -> Result<T, V2StoreError> + Send + 'static,
+    ) -> Result<T, V2StoreError> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.commands
+            .send(CoordinatorEvent::DeliveryStore(Box::new(move |store| {
+                let _ = tx.send(operation(store));
+            })))
+            .map_err(|_| V2StoreError("delivery coordinator stopped".into()))?;
+        rx.recv()
+            .map_err(|_| V2StoreError("delivery coordinator stopped".into()))?
+    }
 }
 
 pub enum CoordinatorEvent {
+    DeliveryStore(DeliveryStoreOperation),
     Socket {
         client_id: usize,
         command: ClientCommand,
@@ -186,6 +212,7 @@ pub struct Coordinator {
     state_dir: PathBuf,
     instance: String,
     rx: mpsc::Receiver<CoordinatorEvent>,
+    commands: mpsc::SyncSender<CoordinatorEvent>,
     socket_tx: mpsc::SyncSender<SocketDelivery>,
     pending_deliveries: VecDeque<SocketDelivery>,
     workers: WorkerPool,
@@ -206,6 +233,7 @@ pub struct Coordinator {
     reconciled: bool,
     synced: bool,
     last_export: Instant,
+    last_delivery_poll: Instant,
     last_heartbeat: Instant,
     last_seq: i64,
     scope: Option<(Option<String>, Option<String>)>,
@@ -235,6 +263,7 @@ impl Coordinator {
             state_dir,
             instance: format!("{}-{}", std::process::id(), now_epoch()),
             rx,
+            commands: tx,
             socket_tx,
             pending_deliveries: VecDeque::new(),
             workers,
@@ -257,6 +286,7 @@ impl Coordinator {
             reconciled: false,
             synced: false,
             last_export: Instant::now() - Duration::from_secs(3600),
+            last_delivery_poll: Instant::now() - Duration::from_secs(10),
             last_heartbeat: Instant::now() - Duration::from_secs(10),
             last_seq: 0,
             scope: None,
@@ -482,6 +512,32 @@ impl Coordinator {
                                 || key.starts_with("cleanup:")
                                 || key.starts_with("launch:")
                             { /* uncertain launch/stop: inspect before retry or cleanup */
+                            } else if key.starts_with("delivery-close:") {
+                                let task = self.task(&task_id)?;
+                                if self.delivery_verified(&task)?
+                                    && task.autonomous_consent
+                                    && !task.memory.halt_requested
+                                {
+                                    self.store
+                                        .open_decision(
+                                            &format!(
+                                                "delivery-close-readback-{}-{}",
+                                                task.task_id, task.memory.merge_retry_generation
+                                            ),
+                                            &task.task_id,
+                                            &task.task_group,
+                                            "governance_close_failed",
+                                            "Delivery close requires merge receipt reconciliation",
+                                            &["Retry close".into(), "Manual reconciliation".into()],
+                                            Some(0),
+                                            &error,
+                                            task.memory
+                                                .merge_checkpoint
+                                                .as_ref()
+                                                .and_then(|cp| cp.merge_sha.as_deref()),
+                                        )
+                                        .map_err(|e| e.to_string())?;
+                                }
                             } else if key.starts_with("merge:") {
                                 self.merge_failed(&task_id, &error)?;
                             } else {
@@ -491,6 +547,7 @@ impl Coordinator {
                     }
                 }
             }
+            CoordinatorEvent::DeliveryStore(operation) => operation(&mut self.store),
             CoordinatorEvent::Shutdown => {}
         }
         Ok(())
@@ -557,6 +614,8 @@ impl Coordinator {
                 once: _,
             } => {
                 self.scope = Some((task, group));
+                // `zach run` wakes delivery follow-up through the daemon owner.
+                self.last_delivery_poll = Instant::now() - Duration::from_secs(10);
                 vec![ServerMessage::RunAccepted { ready: self.ready }]
             }
         })
@@ -648,6 +707,7 @@ impl Coordinator {
             self.evaluate_gates()?;
             self.dispatch()?;
             self.drive_merges()?;
+            self.poll_deliveries()?;
         }
         self.deliver_events()
     }
@@ -689,6 +749,11 @@ impl Coordinator {
                 self.save(&task)?;
             }
             if task.status == "Done"
+                && self
+                    .store
+                    .list_deliveries(Some(&task.task_id))
+                    .map_err(|e| e.to_string())?
+                    .is_empty()
                 && task
                     .memory
                     .merge_checkpoint
@@ -1232,6 +1297,7 @@ impl Coordinator {
                 }
                 self.worker_result(WorkerResult::Reconciled)?;
             }
+            WorkerResult::DeliveryPolled => {}
             WorkerResult::Reconciled => {
                 self.reconciled = true;
                 for lock in self
@@ -1950,6 +2016,17 @@ impl Coordinator {
                 continue;
             }
             let task = self.task(&op.task_id)?;
+            if op.kind == "close"
+                && !self
+                    .store
+                    .list_deliveries(Some(&task.task_id))
+                    .map_err(|e| e.to_string())?
+                    .is_empty()
+                && !self.delivery_verified(&task)?
+            {
+                continue;
+            }
+
             let negative_human = op.kind.starts_with("human-")
                 && op
                     .args
@@ -1957,7 +2034,9 @@ impl Coordinator {
                     .any(|args| args[0] == "--verdict" && args[1] == "CHANGES_REQUESTED");
             if !task.autonomous_consent
                 || (task.memory.halt_requested && !negative_human)
-                || matches!(task.status.as_str(), "Done" | "Cancelled")
+                || task.status == "Cancelled"
+                || (task.status == "Done"
+                    && !(op.kind == "close" && self.delivery_verified(&task)?))
             {
                 self.store
                     .update_lifecycle(
@@ -2052,7 +2131,9 @@ impl Coordinator {
         let current = self.task(&op.task_id)?;
         if !current.autonomous_consent
             || current.memory.halt_requested
-            || matches!(current.status.as_str(), "Done" | "Cancelled")
+            || current.status == "Cancelled"
+            || (current.status == "Done"
+                && !(op.kind == "close" && self.delivery_verified(&current)?))
         {
             self.store
                 .update_lifecycle(id, "FAILED", Some(error), 0)
@@ -2522,6 +2603,16 @@ impl Coordinator {
         {
             return Ok(());
         }
+        if matches!(
+            decision.kind.as_str(),
+            "new_apk_required" | "prod_promotion_approval" | "delivery_contract_error"
+        ) {
+            // resolve_decision already atomically applied the delivery transition.
+            task.memory
+                .applied_decisions
+                .push(decision.decision_id.clone());
+            return self.save(&task);
+        }
         let choice = decision
             .choice
             .as_deref()
@@ -2638,6 +2729,10 @@ impl Coordinator {
                 }
             }
             "Retry close" | "Retry publication" => {
+                if decision.decision_id.starts_with("delivery-close-readback-") {
+                    task.memory.merge_retry_generation += 1;
+                    self.merge_poll.remove(&task.task_id);
+                }
                 for op in self
                     .store
                     .lifecycle_ops()
@@ -2655,7 +2750,9 @@ impl Coordinator {
                         .update_lifecycle(&op.operation_id, "PENDING", None, 0)
                         .map_err(|e| e.to_string())?;
                 }
-                task.status = if task.memory.merge_checkpoint.is_some() {
+                task.status = if choice == "Retry close" && self.delivery_verified(&task)? {
+                    "Done"
+                } else if task.memory.merge_checkpoint.is_some() {
                     "Queued for Merge"
                 } else {
                     "In Progress"
@@ -2711,6 +2808,9 @@ impl Coordinator {
                 task.status = "Blocked".into();
             }
             _ => {
+                if decision.decision_id.starts_with("delivery-close-readback-") {
+                    task.memory.halt_requested = true;
+                }
                 if matches!(choice, "Abort task" | "Reject" | "Cancel / Block") {
                     task.memory.halt_requested = true;
                 }
@@ -2737,6 +2837,141 @@ impl Coordinator {
             .applied_decisions
             .push(decision.decision_id.clone());
         self.save(&task)
+    }
+
+    fn delivery_verified(&self, task: &TaskRecord) -> Result<bool, String> {
+        let rows = self
+            .store
+            .list_deliveries(Some(&task.task_id))
+            .map_err(|e| e.to_string())?;
+        Ok(task.status == "Done"
+            && !rows.is_empty()
+            && rows.iter().all(|r| r.state == "verified")
+            && task.memory.merge_checkpoint.as_ref().is_none_or(|cp| {
+                cp.post_merge_verified
+                    && rows
+                        .iter()
+                        .all(|row| Some(&row.merge_sha) == cp.merge_sha.as_ref())
+            }))
+    }
+
+    fn poll_deliveries(&mut self) -> Result<(), String> {
+        // Recover the small gap between the durable handoff and lane release.
+        for mut task in self.store.list_tasks(None).map_err(|e| e.to_string())? {
+            let rows = self
+                .store
+                .list_deliveries(Some(&task.task_id))
+                .map_err(|e| e.to_string())?;
+            if rows.is_empty() {
+                continue;
+            }
+            self.store
+                .release_path_locks(&task.task_id)
+                .map_err(|e| e.to_string())?;
+            self.store
+                .remove_merge_queue_entry(&task.repository, &task.task_id)
+                .map_err(|e| e.to_string())?;
+            if !self.delivery_verified(&task)?
+                || !task.autonomous_consent
+                || task.memory.halt_requested
+            {
+                continue;
+            }
+            if task.memory.merge_checkpoint.is_none() {
+                let sha = rows[0].merge_sha.clone();
+                if rows.iter().any(|r| r.merge_sha != sha) {
+                    continue;
+                }
+                let Some(pr_number) = task.pr_number else {
+                    continue;
+                };
+                task.memory.merge_checkpoint = Some(MergeCheckpoint {
+                    phase: "DELIVERY_PENDING".into(),
+                    target_sha: task.reviewed_sha.clone().unwrap_or_default(),
+                    pr_number,
+                    merge_sha: Some(sha),
+                    post_merge_verified: true,
+                    phase_started_epoch: now_epoch(),
+                });
+            }
+            let Some(cp) = task.memory.merge_checkpoint.as_mut() else {
+                continue;
+            };
+            if !matches!(cp.phase.as_str(), "DELIVERY_PENDING" | "CLOSE_PENDING")
+                || self
+                    .store
+                    .lifecycle_ops()
+                    .map_err(|e| e.to_string())?
+                    .iter()
+                    .any(|op| op.task_id == task.task_id && op.kind == "close")
+                || self
+                    .store
+                    .list_decisions(true, Some(&task.task_group))
+                    .map_err(|e| e.to_string())?
+                    .iter()
+                    .any(|d| d.task_id == task.task_id && d.kind == "governance_close_failed")
+                || self
+                    .merge_poll
+                    .get(&task.task_id)
+                    .is_some_and(|time| time.elapsed() < Duration::from_secs(2))
+            {
+                continue;
+            }
+            cp.phase = "CLOSE_PENDING".into();
+            self.save(&task)?;
+            let state = self.state_dir.clone();
+            let sem = self.semaphore.clone();
+            let id = task.task_id.clone();
+            if self.submit(
+                format!("delivery-close:{id}"),
+                Some(id.clone()),
+                0,
+                Box::new(move || {
+                    let result =
+                        merge_queue::run_merge_phase(&state, &task, &mut SystemMergeDriver, &sem)?;
+                    match result {
+                        MergePhaseResult::Publication(_) => Ok(WorkerResult::Merge {
+                            task_id: task.task_id,
+                            result,
+                        }),
+                        MergePhaseResult::LaneBlocked(reason) => Err(reason),
+                        _ => Err("delivery close did not verify the saved merge receipt".into()),
+                    }
+                }),
+            ) {
+                self.merge_poll.insert(id, Instant::now());
+            }
+        }
+        if self.last_delivery_poll.elapsed() < Duration::from_secs(2)
+            || self.jobs.contains("post-merge-deliveries")
+            || self
+                .store
+                .list_deliveries(None)
+                .map_err(|e| e.to_string())?
+                .is_empty()
+        {
+            return Ok(());
+        }
+        self.submit_delivery_poll(SystemDeliveryDriver);
+        Ok(())
+    }
+
+    fn submit_delivery_poll(&mut self, mut driver: impl delivery::DeliveryDriver + Send + 'static) {
+        let commands = self.commands.clone();
+        if self.submit(
+            "post-merge-deliveries".into(),
+            None,
+            0,
+            Box::new(move || {
+                delivery::poll_post_merge_deliveries(
+                    &mut CoordinatorDeliveryStore { commands },
+                    &mut driver,
+                )?;
+                Ok(WorkerResult::DeliveryPolled)
+            }),
+        ) {
+            self.last_delivery_poll = Instant::now();
+        }
     }
 
     fn drive_merges(&mut self) -> Result<(), String> {
@@ -2828,7 +3063,42 @@ impl Coordinator {
                 task.memory.merge_checkpoint = Some(checkpoint);
                 self.save(&task)?;
             }
+            MergePhaseResult::DeliveryHandoff {
+                checkpoint,
+                deliveries,
+            } => {
+                task.memory.merge_checkpoint = Some(checkpoint);
+                task.memory.merge_lane_released = true;
+                if !matches!(
+                    task.status.as_str(),
+                    "Done" | "Cancelled" | "Delivery Aborted"
+                ) {
+                    task.status = "Delivery Pending".into();
+                }
+                task.current_stage = None;
+                task.active_attempt_id = None;
+                self.store
+                    .save_deliveries_and_task(&task, &deliveries)
+                    .map_err(|e| e.to_string())?;
+                self.store
+                    .release_path_locks(id)
+                    .map_err(|e| e.to_string())?;
+                self.store
+                    .remove_merge_queue_entry(&task.repository, id)
+                    .map_err(|e| e.to_string())?;
+            }
             MergePhaseResult::Publication(op) => {
+                if op.kind == "close"
+                    && !self
+                        .store
+                        .list_deliveries(Some(id))
+                        .map_err(|e| e.to_string())?
+                        .is_empty()
+                    && !self.delivery_verified(&task)?
+                {
+                    return Ok(());
+                }
+
                 self.store
                     .enqueue_lifecycle(&op)
                     .map_err(|e| e.to_string())?;
@@ -3788,7 +4058,7 @@ mod tests {
             assert_eq!(saved.next_retry_epoch, 500);
             assert_eq!(saved.memory.retry_generation, 7);
             assert_eq!(saved.lease_owner.as_deref(), Some("old-instance"));
-            assert_eq!(store.meta("schema_version").unwrap().as_deref(), Some("3"));
+            assert_eq!(store.meta("schema_version").unwrap().as_deref(), Some("4"));
         }
     }
     #[test]
@@ -4352,5 +4622,303 @@ mod tests {
         assert_eq!(saved.status, "PASSED");
         assert_eq!(saved.phase, "HARVESTED");
         assert_eq!(saved.sha_before, a.sha_before);
+    }
+    fn delivery_rows(t: &TaskRecord) -> Vec<crate::v2::store::PostMergeDelivery> {
+        let contract = delivery::DeliveryContract {
+            schema_version: 1,
+            post_merge_workflows: vec![],
+            promotions: vec![delivery::tests::promotion()],
+        };
+        delivery::seed_deliveries(t, &"a".repeat(40), &contract, &[])
+    }
+
+    #[test]
+    fn delivery_worker_persists_dispatch_intent_and_leaves_coordinator_responsive() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        let mut t = task("delivery-worker");
+        t.status = "Delivery Pending".into();
+        t.github_repo = Some("acme/sample-app".into());
+        t.current_stage = None;
+        let mut rows = delivery_rows(&t);
+        rows[0].state = "plan_dispatch".into();
+        rows[0].build_run_id = Some("123".into());
+        rows[0].artifact_digest = Some("d".repeat(64));
+        rows[0].expected_current = Some("none".into());
+        c.store.save_deliveries_and_task(&t, &rows).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let mut driver = delivery::tests::MockDriver::default();
+        driver.dispatch_barrier = Some((entered_tx, resume_rx));
+        c.submit_delivery_poll(driver);
+        // The worker's store calls are serviced by this owner, with no network
+        // operation ever executing inside an access closure.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while entered_rx.try_recv().is_err() {
+            assert!(Instant::now() < deadline);
+            if let Ok(event) = c.rx.recv_timeout(Duration::from_millis(10)) {
+                c.handle_event(event).unwrap();
+            }
+        }
+        assert_eq!(
+            c.store.list_deliveries(Some(&t.task_id)).unwrap()[0].state,
+            "plan_dispatching"
+        );
+        let started = Instant::now();
+        c.store.record_heartbeat(now_epoch()).unwrap();
+        assert!(matches!(
+            c.socket_command(ClientCommand::Status).unwrap()[0],
+            ServerMessage::Status { .. }
+        ));
+        assert!(started.elapsed() < Duration::from_millis(100));
+        // The already-running poll is deduplicated even while network I/O waits.
+        c.submit_delivery_poll(delivery::tests::MockDriver::default());
+        assert_eq!(
+            c.jobs
+                .iter()
+                .filter(|k| *k == "post-merge-deliveries")
+                .count(),
+            1
+        );
+        resume_tx.send(()).unwrap();
+        while c.jobs.contains("post-merge-deliveries") {
+            let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            c.handle_event(event).unwrap();
+        }
+        assert_eq!(
+            c.store.list_deliveries(Some(&t.task_id)).unwrap()[0].state,
+            "plan_waiting"
+        );
+    }
+
+    #[test]
+    fn delivery_handoff_approval_and_verified_close_preserve_both_lifecycles() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        let ws = Arc::new(RecordingWsTaskClient::default());
+        c.ws = ws.clone();
+        let mut t = task("delivery-close");
+        t.status = "Queued for Merge".into();
+        t.github_repo = Some("acme/sample-app".into());
+        c.save(&t).unwrap();
+        c.store
+            .acquire_path_locks(&t.repository, &["*".into()], &t.task_id)
+            .unwrap();
+        c.store
+            .enqueue_merge_queue(&t.repository, &t.task_id, 9, "head")
+            .unwrap();
+        let cp = MergeCheckpoint {
+            phase: "DELIVERY_PENDING".into(),
+            pr_number: 9,
+            target_sha: "head".into(),
+            merge_sha: Some("a".repeat(40)),
+            post_merge_verified: true,
+            ..Default::default()
+        };
+        c.merge_result(
+            &t.task_id,
+            MergePhaseResult::DeliveryHandoff {
+                checkpoint: cp,
+                deliveries: delivery_rows(&t),
+            },
+        )
+        .unwrap();
+        assert!(c.store.list_path_locks(None).unwrap().is_empty());
+        assert!(c.store.list_merge_queue(None).unwrap().is_empty());
+        assert!(c.store.lifecycle_ops().unwrap().is_empty());
+        let mut row = c.store.list_deliveries(Some(&t.task_id)).unwrap().remove(0);
+        row.state = "waiting".into();
+        row.decision_id = Some("approve-delivery".into());
+        c.store.upsert_delivery(&row).unwrap();
+        c.store
+            .open_decision(
+                "approve-delivery",
+                &t.task_id,
+                &t.task_group,
+                "prod_promotion_approval",
+                "approve?",
+                &["Approve".into(), "Reject".into()],
+                Some(0),
+                "promotion",
+                Some(&"a".repeat(40)),
+            )
+            .unwrap();
+        let DecisionResolution::Resolved(d) = c
+            .store
+            .resolve_decision("approve-delivery", "Approve", "alice", None)
+            .unwrap()
+        else {
+            panic!()
+        };
+        c.apply_decision(&d).unwrap();
+        assert_eq!(c.task(&t.task_id).unwrap().status, "Delivery Pending");
+        assert_eq!(
+            c.store.list_deliveries(Some(&t.task_id)).unwrap()[0].state,
+            "approved"
+        );
+        // Even a replayed close intent cannot run before delivery verification.
+        let close = merge_queue::close_operation(&t, 9);
+        c.store.enqueue_lifecycle(&close).unwrap();
+        c.replay_lifecycle().unwrap();
+        assert!(ws.calls.lock().unwrap().is_empty());
+        let mut done = c.task(&t.task_id).unwrap();
+        done.status = "Done".into();
+        done.memory.merge_checkpoint.as_mut().unwrap().phase = "CLOSE_PENDING".into();
+        row.state = "verified".into();
+        c.store.upsert_delivery(&row).unwrap();
+        c.store.save_delivery_status(&done, Some(&[row])).unwrap();
+        c.reconcile_terminal_tasks().unwrap();
+        assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "PENDING");
+        c.lifecycle_failed(&close.operation_id, "Governance temporarily unavailable")
+            .unwrap();
+        assert_eq!(c.task(&t.task_id).unwrap().status, "Done");
+        let decision = c.store.list_decisions(true, None).unwrap().remove(0);
+        let DecisionResolution::Resolved(decision) = c
+            .store
+            .resolve_decision(&decision.decision_id, "Retry close", "alice", None)
+            .unwrap()
+        else {
+            panic!()
+        };
+        c.apply_decision(&decision).unwrap();
+        assert_eq!(c.task(&t.task_id).unwrap().status, "Done");
+        c.replay_lifecycle().unwrap();
+        let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        c.handle_event(event).unwrap();
+        assert_eq!(
+            ws.calls.lock().unwrap().as_slice(),
+            &[vec!["close", "delivery-close", "--pr", "9"]]
+        );
+        assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "ACKNOWLEDGED");
+        let events = c.store.list_events_since(None, 0, 100).unwrap();
+        assert!(
+            events
+                .iter()
+                .position(|e| e.event_type == "POST_MERGE_DELIVERY_VERIFIED")
+                .unwrap()
+                < events
+                    .iter()
+                    .position(|e| e.event_type == "MERGE_COMPLETED")
+                    .unwrap()
+        );
+    }
+    #[test]
+    fn delivery_dispatch_rechecks_consent_after_network_probe() {
+        for halt in [false, true] {
+            let dir = TestDirectory::new();
+            let mut c = coordinator(&dir.0);
+            let mut t = task("revoked-delivery");
+            t.github_repo = Some("acme/sample-app".into());
+            t.status = "Delivery Pending".into();
+            let mut rows = delivery_rows(&t);
+            rows[0].state = "approved".into();
+            rows[0].build_run_id = Some("123".into());
+            rows[0].artifact_digest = Some("d".repeat(64));
+            rows[0].expected_current = Some("none".into());
+            rows[0].rule_json["current_source_probe"] =
+                serde_json::json!("https://example.invalid/current");
+            c.store.save_deliveries_and_task(&t, &rows).unwrap();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let (dispatch_tx, dispatch_rx) = mpsc::channel();
+            let (_dispatch_resume_tx, dispatch_resume_rx) = mpsc::channel();
+            let mut driver = delivery::tests::MockDriver::default();
+            driver.probe_barrier = Some((entered_tx, resume_rx));
+            driver.dispatch_barrier = Some((dispatch_tx, dispatch_resume_rx));
+            c.submit_delivery_poll(driver);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while entered_rx.try_recv().is_err() {
+                assert!(Instant::now() < deadline);
+                if let Ok(event) = c.rx.recv_timeout(Duration::from_millis(10)) {
+                    c.handle_event(event).unwrap();
+                }
+            }
+            let mut revoked = c.task(&t.task_id).unwrap();
+            if halt {
+                revoked.memory.halt_requested = true;
+            } else {
+                revoked.autonomous_consent = false;
+            }
+            c.save(&revoked).unwrap();
+            resume_tx.send(()).unwrap();
+            while c.jobs.contains("post-merge-deliveries") {
+                let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                c.handle_event(event).unwrap();
+            }
+            assert!(
+                dispatch_rx.try_recv().is_err(),
+                "revoked promotion must not dispatch"
+            );
+            assert_eq!(
+                c.store.list_deliveries(Some(&t.task_id)).unwrap()[0].state,
+                "approved"
+            );
+            assert_eq!(c.task(&t.task_id).unwrap().memory.halt_requested, halt);
+            assert_eq!(c.task(&t.task_id).unwrap().autonomous_consent, halt);
+        }
+    }
+
+    #[test]
+    fn upgraded_delivery_receipt_recovers_close_without_reacquiring_lane() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        let mut t = task("v3-delivery");
+        t.status = "Done".into();
+        t.worktree_path = None;
+        let mut rows = delivery_rows(&t);
+        rows[0].state = "verified".into();
+        c.store.save_deliveries_and_task(&t, &rows).unwrap();
+        c.last_delivery_poll = Instant::now();
+        c.jobs.insert(format!("delivery-close:{}", t.task_id));
+        c.poll_deliveries().unwrap();
+        let saved = c.task(&t.task_id).unwrap();
+        let cp = saved.memory.merge_checkpoint.as_ref().unwrap();
+        assert_eq!(cp.phase, "CLOSE_PENDING");
+        assert_eq!(cp.merge_sha, Some("a".repeat(40)));
+        assert!(c.store.list_path_locks(None).unwrap().is_empty());
+        c.handle_event(CoordinatorEvent::Completed {
+            key: format!("delivery-close:{}", t.task_id),
+            task_id: Some(t.task_id.clone()),
+            result: Box::new(Err(
+                "close readback does not match saved merge receipt".into()
+            )),
+        })
+        .unwrap();
+        let decision = c.store.list_decisions(true, None).unwrap().remove(0);
+        c.poll_deliveries().unwrap();
+        assert!(!c.jobs.contains(&format!("delivery-close:{}", t.task_id)));
+        let DecisionResolution::Resolved(decision) = c
+            .store
+            .resolve_decision(&decision.decision_id, "Retry close", "alice", None)
+            .unwrap()
+        else {
+            panic!()
+        };
+        c.apply_decision(&decision).unwrap();
+        assert_eq!(c.task(&t.task_id).unwrap().status, "Done");
+        assert_eq!(c.task(&t.task_id).unwrap().memory.merge_retry_generation, 1);
+        let mut driver = merge_queue::tests::MockMergeDriver {
+            pr_merge_state: Some(merge_queue::PrMergeState::Merged(Some("a".repeat(40)))),
+            ..Default::default()
+        };
+        let result =
+            merge_queue::run_merge_phase(&dir.0, &saved, &mut driver, &c.semaphore).unwrap();
+        c.merge_result(&t.task_id, result).unwrap();
+        assert_eq!(c.store.lifecycle_ops().unwrap()[0].kind, "close");
+        let mut stale = saved.clone();
+        stale.status = "Ready".into();
+        stale.memory = TaskMemory::default();
+        assert_eq!(c.store.sync_task(&stale).unwrap().status, "Done");
+        let mut terminal = stale;
+        terminal.status = "Done".into();
+        terminal.memory.governance_started = true;
+        assert_eq!(
+            c.store
+                .sync_task(&terminal)
+                .unwrap()
+                .memory
+                .merge_checkpoint,
+            saved.memory.merge_checkpoint
+        );
     }
 }

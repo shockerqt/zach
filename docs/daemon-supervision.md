@@ -6,7 +6,7 @@ its socket and returns an acknowledgment. A run request does not create another
 supervisor. `--dry-run` opens the existing database read-only and builds previews;
 it does not reconcile units, stage credentials, create proxies, or publish stages.
 
-The internal SQLite schema is version 3. The `ws-task export` wire contract stays
+The internal SQLite schema is version 4. The `ws-task export` wire contract stays
 at version 2. Migrations inspect columns before adding them, preserve nullable
 usage counters and existing supervision columns, and reject a newer database.
 Task memory uses defaulted fields so older records remain readable.
@@ -40,6 +40,8 @@ consuming a task execution slot. Confirmed-stop execution failures release their
 lane during backoff. Ordinary abort/rejection remains blocked and releases its
 lane after execution stops. A post-merge receipt or close-pending lane stays
 reserved until close succeeds or an explicit lane resolution authorizes release.
+Contract-owned delivery releases its merge lane and path locks immediately after
+the durable handoff; delivery waits consume no implementation slot.
 
 ## Detached units and isolation resources
 
@@ -148,6 +150,20 @@ opens a close-specific decision and never marks Done or offers Retry merge.
 Only close acknowledgment (or synchronized terminal readback of the saved close
 receipt) releases the lane and emits MERGE_COMPLETED.
 
+Repository delivery contracts are loaded at the immutable merge SHA. Their
+workflow checks are excluded from ordinary post-merge CI and tracked through
+`post_merge_deliveries`. Missing contracts retain ordinary closure; fetch/parse
+errors create durable delivery work rather than silently completing the task.
+
+Delivery polling runs on a bounded general worker. Short store operations return
+through the coordinator channel, so promotion dispatch intent commits on the sole
+SQLite writer before remote I/O. Delivery decisions update their linked rows and
+never restart implementation. Aggregate Done and POST_MERGE_DELIVERY_VERIFIED
+commit together. Only verified delivery can enter the merge-SHA readback and
+Governance close outbox; close failures retain the separate retry-close gate.
+`zach run` wakes this polling through its daemon Run request; dry runs remain
+read-only.
+
 Governance has no `block` command. Supported board transitions use start/stage/
 close with executor=zach. Internal Ready, retry backoff, queued merge and decision
 waits remain durable local supervision states; exact board mirroring would require
@@ -163,7 +179,7 @@ watchdog delivery stays on the responsive socket thread.
 The persistent system service, slice restart policy and host rollout belong to a
 separate INF task. Its service must preserve `zach-workers.slice` across daemon
 restarts. This change installs no service or host policy, adds no Cargo dependency,
-and assumes no ZACH-034 delivery table.
+and migrates both version-3 database lineages additively.
 
 Run the inference-free host contract test explicitly:
 

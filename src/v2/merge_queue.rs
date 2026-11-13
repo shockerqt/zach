@@ -1,3 +1,4 @@
+use crate::v2::delivery::{self, ContractLookup, DeliveryDriver, SystemDeliveryDriver};
 use crate::v2::pipeline::matches_path_pattern;
 use crate::v2::runner::build_clean_env_from_process;
 use crate::v2::scheduler::{HeavyCheckSemaphore, is_heavy_verification_command};
@@ -101,6 +102,11 @@ pub enum MergeQueueOutcome {
         pr_number: i64,
         merge_sha: String,
     },
+    MergedPendingDelivery {
+        task_id: String,
+        pr_number: i64,
+        merge_sha: String,
+    },
     Failed {
         task_id: String,
         reason: String,
@@ -159,6 +165,28 @@ pub trait MergeDriver {
         _pr_number: i64,
     ) -> Result<PrMergeState, String> {
         Err("merge driver does not support PR state recovery".into())
+    }
+
+    /// Defaults preserve compatibility with merge drivers predating delivery contracts.
+    fn delivery_contract(&mut self, _gh_repo: &str, _sha: &str) -> ContractLookup {
+        ContractLookup::ContractNotFound
+    }
+
+    fn delivery_changed_paths(
+        &mut self,
+        _gh_repo: &str,
+        _sha: &str,
+    ) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
+
+    fn query_delivery_aware_post_merge_ci(
+        &mut self,
+        gh_repo: &str,
+        sha: &str,
+        _excluded_workflows: &[String],
+    ) -> Result<CiCheckState, String> {
+        self.query_post_merge_ci(gh_repo, sha)
     }
 
     fn query_post_merge_ci(
@@ -501,6 +529,27 @@ impl MergeDriver for SystemMergeDriver {
             Some("OPEN") => Ok(PrMergeState::Open),
             Some("CLOSED") => Ok(PrMergeState::Closed),
             _ => Err("unknown PR state".into()),
+        }
+    }
+
+    fn delivery_contract(&mut self, gh_repo: &str, sha: &str) -> ContractLookup {
+        SystemDeliveryDriver.contract(gh_repo, sha)
+    }
+
+    fn delivery_changed_paths(&mut self, gh_repo: &str, sha: &str) -> Result<Vec<String>, String> {
+        SystemDeliveryDriver.changed_paths(gh_repo, sha)
+    }
+
+    fn query_delivery_aware_post_merge_ci(
+        &mut self,
+        gh_repo: &str,
+        sha: &str,
+        excluded: &[String],
+    ) -> Result<CiCheckState, String> {
+        if excluded.is_empty() {
+            self.query_post_merge_ci(gh_repo, sha)
+        } else {
+            delivery::query_contract_ci(gh_repo, sha, excluded)
         }
     }
 
@@ -1172,6 +1221,48 @@ where
         .list_merge_queue(Some(repo))
         .map_err(|e| e.to_string())?;
 
+    // A crash after the durable delivery handoff can leave the merge entry
+    // MERGING. Delivery rows prove merge CI already passed; never merge again.
+    for entry in &entries {
+        let deliveries = store
+            .list_deliveries(Some(&entry.task_id))
+            .map_err(|e| e.to_string())?;
+        if let Some(first) = deliveries.first() {
+            if first.repository != repo
+                || deliveries
+                    .iter()
+                    .any(|row| row.merge_sha != first.merge_sha)
+            {
+                return Err("inconsistent persisted merge delivery handoff".into());
+            }
+            let task = store
+                .get_task(&entry.task_id)
+                .map_err(|e| e.to_string())?
+                .ok_or("delivery handoff task missing")?;
+            // Keep the queue entry until lock release succeeds so another crash
+            // still leaves enough durable evidence to finish the handoff.
+            store
+                .release_path_locks(&entry.task_id)
+                .map_err(|e| e.to_string())?;
+            store
+                .remove_merge_queue_entry(repo, &entry.task_id)
+                .map_err(|e| e.to_string())?;
+            return Ok(if task.status == "Done" {
+                MergeQueueOutcome::Merged {
+                    task_id: entry.task_id.clone(),
+                    pr_number: entry.pr_number,
+                    merge_sha: first.merge_sha.clone(),
+                }
+            } else {
+                MergeQueueOutcome::MergedPendingDelivery {
+                    task_id: entry.task_id.clone(),
+                    pr_number: entry.pr_number,
+                    merge_sha: first.merge_sha.clone(),
+                }
+            });
+        }
+    }
+
     if let Some(blocked) = entries.iter().find(|e| e.state == "MERGE_QUEUE_BLOCKED") {
         return Ok(MergeQueueOutcome::Blocked {
             task_id: blocked.task_id.clone(),
@@ -1510,9 +1601,14 @@ where
         }
     };
 
-    // 7. Post-merge CI verification (also polled; failures block repo lane).
+    // Discover the contract at the immutable merge SHA before evaluating push CI.
+    // Contract delivery jobs are observed by the delivery poller, not the repo lane.
+    let contract = driver.delivery_contract(&gh_repo, &merge_sha);
+    let excluded_workflows = delivery_workflows(&contract);
+
+    // 7. Verify merge CI, excluding the contract-owned delivery workflows.
     let post_merge_failure = match poll_exact_sha_ci_with_sleep(
-        || driver.query_post_merge_ci(&gh_repo, &merge_sha),
+        || driver.query_delivery_aware_post_merge_ci(&gh_repo, &merge_sha, &excluded_workflows),
         ci_config,
         &mut sleep_fn,
     ) {
@@ -1563,14 +1659,26 @@ where
         );
     }
 
-    // 8. Success: mark Done, remove merge queue entry, and release path locks
-    task.status = "Done".to_owned();
+    // 8. Persist the delivery handoff BEFORE releasing the merge lane/locks.
+    let deliveries = prepare_deliveries(&task, &gh_repo, &merge_sha, contract, driver);
+    let pending_delivery = !deliveries.is_empty();
+    task.status = if pending_delivery {
+        "Delivery Pending"
+    } else {
+        "Done"
+    }
+    .to_owned();
     task.current_stage = None;
     task.active_attempt_id = None;
-    let _ = store.upsert_task(&task);
-
-    let _ = store.remove_merge_queue_entry(repo, &entry.task_id);
-    let _ = store.release_path_locks(&entry.task_id);
+    store
+        .save_deliveries_and_task(&task, &deliveries)
+        .map_err(|e| e.to_string())?;
+    store
+        .release_path_locks(&entry.task_id)
+        .map_err(|e| e.to_string())?;
+    store
+        .remove_merge_queue_entry(repo, &entry.task_id)
+        .map_err(|e| e.to_string())?;
 
     let _ = store.append_event(
         &entry.task_id,
@@ -1583,11 +1691,67 @@ where
         }),
     );
 
-    Ok(MergeQueueOutcome::Merged {
-        task_id: entry.task_id,
-        pr_number: entry.pr_number,
-        merge_sha,
-    })
+    if pending_delivery {
+        Ok(MergeQueueOutcome::MergedPendingDelivery {
+            task_id: entry.task_id,
+            pr_number: entry.pr_number,
+            merge_sha,
+        })
+    } else {
+        Ok(MergeQueueOutcome::Merged {
+            task_id: entry.task_id,
+            pr_number: entry.pr_number,
+            merge_sha,
+        })
+    }
+}
+
+fn delivery_workflows(contract: &ContractLookup) -> Vec<String> {
+    match contract {
+        ContractLookup::Found(contract) => contract
+            .post_merge_workflows
+            .iter()
+            .map(|rule| rule.workflow.clone())
+            .chain(
+                contract
+                    .promotions
+                    .iter()
+                    .map(|rule| rule.build_workflow.clone()),
+            )
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn prepare_deliveries(
+    task: &TaskRecord,
+    gh_repo: &str,
+    merge_sha: &str,
+    contract: ContractLookup,
+    driver: &mut dyn MergeDriver,
+) -> Vec<crate::v2::store::PostMergeDelivery> {
+    match contract {
+        ContractLookup::ContractNotFound => Vec::new(),
+        ContractLookup::Found(contract) => {
+            let needs_paths = contract
+                .post_merge_workflows
+                .iter()
+                .any(|r| !r.when_paths.is_empty())
+                || contract.promotions.iter().any(|r| !r.when_paths.is_empty());
+            let changed = if needs_paths {
+                driver.delivery_changed_paths(gh_repo, merge_sha)
+            } else {
+                Ok(Vec::new())
+            };
+            match changed {
+                Ok(paths) => delivery::seed_deliveries(task, merge_sha, &contract, &paths),
+                Err(error) => vec![delivery::contract_error_row(task, merge_sha, &error)],
+            }
+        }
+        ContractLookup::FetchError(error) | ContractLookup::ParseError(error) => {
+            vec![delivery::contract_error_row(task, merge_sha, &error)]
+        }
+    }
 }
 
 /// Durable merge phases. A coordinator persists each returned checkpoint before
@@ -1596,6 +1760,10 @@ pub enum MergePhaseResult {
     Advanced(crate::v2::store::MergeCheckpoint),
     Waiting(crate::v2::store::MergeCheckpoint),
     Publication(crate::v2::store::LifecycleOperation),
+    DeliveryHandoff {
+        checkpoint: crate::v2::store::MergeCheckpoint,
+        deliveries: Vec<crate::v2::store::PostMergeDelivery>,
+    },
     Rereview(String),
     LaneBlocked(String),
 }
@@ -1607,13 +1775,36 @@ pub enum PrMergeState {
     Closed,
 }
 
+pub fn close_operation(task: &TaskRecord, pr_number: i64) -> crate::v2::store::LifecycleOperation {
+    use crate::v2::store::LifecycleOperation;
+    LifecycleOperation {
+        attempt_id: None,
+        decision_id: None,
+        operation_id: format!("close-{}-{}", task.task_id, pr_number),
+        task_id: task.task_id.clone(),
+        kind: "close".into(),
+        args: vec![
+            "close".into(),
+            task.task_id.clone(),
+            "--pr".into(),
+            pr_number.to_string(),
+        ],
+        body_path: None,
+        depends_on: None,
+        state: "PENDING".into(),
+        retry_epoch: 0,
+        attempts: 0,
+        last_error: None,
+    }
+}
+
 pub fn run_merge_phase(
     state_dir: &std::path::Path,
     task: &TaskRecord,
     driver: &mut dyn MergeDriver,
     semaphore: &HeavyCheckSemaphore,
 ) -> Result<MergePhaseResult, String> {
-    use crate::v2::store::{LifecycleOperation, MergeCheckpoint};
+    use crate::v2::store::MergeCheckpoint;
     let mut checkpoint = task
         .memory
         .merge_checkpoint
@@ -1626,10 +1817,10 @@ pub fn run_merge_phase(
         });
     let repo = &task.repository;
     let gh = task.github_repo.as_deref().unwrap_or(repo);
-    let wt = task
-        .worktree_path
-        .as_deref()
-        .ok_or("missing merge worktree")?;
+    let wt = task.worktree_path.as_deref().unwrap_or_default();
+    if wt.is_empty() && !matches!(checkpoint.phase.as_str(), "POST_MERGE_CI" | "CLOSE_PENDING") {
+        return Err("missing merge worktree".into());
+    }
     match checkpoint.phase.as_str() {
         "MERGE_DEFAULT" => {
             let branch = driver.default_branch(repo, wt)?;
@@ -1812,10 +2003,24 @@ pub fn run_merge_phase(
                 .as_deref()
                 .filter(|s| !s.is_empty())
                 .ok_or("missing merge receipt SHA")?;
-            match driver.query_post_merge_ci(gh, sha)? {
+            let contract = driver.delivery_contract(gh, sha);
+            let excluded = delivery_workflows(&contract);
+            match driver.query_delivery_aware_post_merge_ci(gh, sha, &excluded)? {
                 CiCheckState::Success { .. } => {
+                    let deliveries = prepare_deliveries(task, gh, sha, contract, driver);
                     checkpoint.post_merge_verified = true;
-                    checkpoint.phase = "CLOSE_PENDING".into();
+                    checkpoint.phase = if deliveries.is_empty() {
+                        "CLOSE_PENDING"
+                    } else {
+                        "DELIVERY_PENDING"
+                    }
+                    .into();
+                    if !deliveries.is_empty() {
+                        return Ok(MergePhaseResult::DeliveryHandoff {
+                            checkpoint,
+                            deliveries,
+                        });
+                    }
                 }
                 CiCheckState::Pending { .. } => return Ok(MergePhaseResult::Waiting(checkpoint)),
                 CiCheckState::Failed { failed_checks } => {
@@ -1838,25 +2043,10 @@ pub fn run_merge_phase(
                     ));
                 }
             }
-            return Ok(MergePhaseResult::Publication(LifecycleOperation {
-                attempt_id: None,
-                decision_id: None,
-                operation_id: format!("close-{}-{}", task.task_id, checkpoint.pr_number),
-                task_id: task.task_id.clone(),
-                kind: "close".into(),
-                args: vec![
-                    "close".into(),
-                    task.task_id.clone(),
-                    "--pr".into(),
-                    checkpoint.pr_number.to_string(),
-                ],
-                body_path: None,
-                depends_on: None,
-                state: "PENDING".into(),
-                retry_epoch: 0,
-                attempts: 0,
-                last_error: None,
-            }));
+            return Ok(MergePhaseResult::Publication(close_operation(
+                task,
+                checkpoint.pr_number,
+            )));
         }
         _ => return Err(format!("unknown merge phase {}", checkpoint.phase)),
     }
@@ -1891,6 +2081,11 @@ pub mod tests {
         pub ci_queries: Vec<(String, String)>,
         pub pushed_branches: Vec<String>,
         pub merged_pr_repos: Vec<String>,
+        pub contract_lookup: Option<ContractLookup>,
+        pub delivery_changed_paths_result: Option<Result<Vec<String>, String>>,
+        pub contract_queries: Vec<(String, String)>,
+        pub delivery_path_queries: Vec<(String, String)>,
+        pub excluded_workflow_queries: Vec<Vec<String>>,
     }
 
     impl MergeDriver for MockMergeDriver {
@@ -1898,6 +2093,38 @@ pub mod tests {
             self.steps.push("query_pr_merge_state".into());
             Ok(self.pr_merge_state.clone().unwrap_or(PrMergeState::Open))
         }
+
+        fn delivery_contract(&mut self, gh_repo: &str, sha: &str) -> ContractLookup {
+            self.contract_queries
+                .push((gh_repo.to_owned(), sha.to_owned()));
+            self.contract_lookup
+                .clone()
+                .unwrap_or(ContractLookup::ContractNotFound)
+        }
+
+        fn delivery_changed_paths(
+            &mut self,
+            gh_repo: &str,
+            sha: &str,
+        ) -> Result<Vec<String>, String> {
+            self.delivery_path_queries
+                .push((gh_repo.to_owned(), sha.to_owned()));
+            self.delivery_changed_paths_result
+                .clone()
+                .unwrap_or_else(|| Ok(Vec::new()))
+        }
+
+        fn query_delivery_aware_post_merge_ci(
+            &mut self,
+            gh_repo: &str,
+            sha: &str,
+            excluded_workflows: &[String],
+        ) -> Result<CiCheckState, String> {
+            self.excluded_workflow_queries
+                .push(excluded_workflows.to_vec());
+            self.query_post_merge_ci(gh_repo, sha)
+        }
+
         fn default_branch(&mut self, _repo: &str, _worktree_path: &str) -> Result<String, String> {
             if let Some(ref err) = self.default_branch_error {
                 return Err(err.clone());
@@ -3026,5 +3253,381 @@ pub mod tests {
             MergePhaseResult::LaneBlocked(_)
         ));
         assert!(!driver.steps.iter().any(|s| s == "merge_pr_match_head"));
+    }
+
+    fn generic_delivery_contract(pattern: &str) -> delivery::DeliveryContract {
+        delivery::parse_contract(&format!(
+            "schema_version: 1\npost_merge_workflows:\n  - workflow: sample-client.yml\n    when_paths:\n      - '{pattern}'\n    artifacts: []\n    failure_states: []\n    health_checks: []\npromotions: []\n"
+        )).unwrap()
+    }
+
+    fn delivery_merge_fixture(contract: ContractLookup) -> (V2Store, TaskRecord, MockMergeDriver) {
+        let mut store = V2Store::open_in_memory().unwrap();
+        let mut task = sample_task("TASK-DELIVERY", "sample-app", vec!["src/main.rs"]);
+        task.github_repo = Some("acme/sample-app".into());
+        task.worktree_path = Some("/tmp/sample-app--TASK-DELIVERY".into());
+        task.reviewed_sha = Some("d".repeat(40));
+        store.upsert_task(&task).unwrap();
+        assert!(
+            store
+                .acquire_path_locks("sample-app", &["src/main.rs".into()], &task.task_id)
+                .unwrap()
+        );
+        enqueue_for_merge(&mut store, "sample-app", &task.task_id, 42, &"d".repeat(40)).unwrap();
+        let driver = MockMergeDriver {
+            origin_default_sha: Some("b".repeat(40)),
+            merge_pr_result: Some("a".repeat(40)),
+            contract_lookup: Some(contract),
+            delivery_changed_paths_result: Some(Ok(vec!["src/main.rs".into()])),
+            ..Default::default()
+        };
+        (store, task, driver)
+    }
+
+    #[test]
+    fn delivery_contract_handoff_seeds_pending_work_and_releases_lane_and_locks() {
+        let contract = generic_delivery_contract("src/**");
+        let (mut store, task, mut driver) = delivery_merge_fixture(ContractLookup::Found(contract));
+        let result = process_repo_merge_queue_with_config(
+            &mut store,
+            "sample-app",
+            &mut driver,
+            &HeavyCheckSemaphore::new(),
+            test_ci_config(),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            MergeQueueOutcome::MergedPendingDelivery {
+                task_id: task.task_id.clone(),
+                pr_number: 42,
+                merge_sha: "a".repeat(40),
+            }
+        );
+        let saved = store.get_task(&task.task_id).unwrap().unwrap();
+        assert_eq!(saved.status, "Delivery Pending");
+        assert_eq!(saved.current_stage, None);
+        assert_eq!(saved.active_attempt_id, None);
+        assert!(
+            store
+                .list_merge_queue(Some("sample-app"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_path_locks(Some("sample-app"))
+                .unwrap()
+                .is_empty()
+        );
+        let rows = store.list_deliveries(Some(&task.task_id)).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, "pending");
+        assert_eq!(rows[0].kind, "workflow");
+        assert_eq!(rows[0].github_repo, "acme/sample-app");
+        assert_eq!(rows[0].merge_sha, "a".repeat(40));
+        assert_eq!(
+            driver.contract_queries,
+            vec![("acme/sample-app".into(), "a".repeat(40))]
+        );
+        assert_eq!(
+            driver.delivery_path_queries,
+            vec![("acme/sample-app".into(), "a".repeat(40))]
+        );
+        assert_eq!(
+            driver.excluded_workflow_queries,
+            vec![vec!["sample-client.yml".to_owned()]]
+        );
+        assert!(store.list_ready_queue(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn delivery_contract_with_no_matching_paths_completes_without_delivery_rows() {
+        let (mut store, task, mut driver) =
+            delivery_merge_fixture(ContractLookup::Found(generic_delivery_contract("docs/**")));
+        let result = process_repo_merge_queue_with_config(
+            &mut store,
+            "sample-app",
+            &mut driver,
+            &HeavyCheckSemaphore::new(),
+            test_ci_config(),
+            |_| {},
+        )
+        .unwrap();
+        assert!(matches!(result, MergeQueueOutcome::Merged { .. }));
+        assert_eq!(
+            store.get_task(&task.task_id).unwrap().unwrap().status,
+            "Done"
+        );
+        assert!(
+            store
+                .list_deliveries(Some(&task.task_id))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_merge_queue(Some("sample-app"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_path_locks(Some("sample-app"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn delivery_contract_absence_differs_from_fetch_parse_and_changed_paths_errors() {
+        let lookups = [
+            ContractLookup::ContractNotFound,
+            ContractLookup::FetchError("contract unavailable".into()),
+            ContractLookup::ParseError("unknown contract field".into()),
+            ContractLookup::Found(generic_delivery_contract("src/**")),
+        ];
+        for lookup in lookups {
+            let absent = matches!(lookup, ContractLookup::ContractNotFound);
+            let paths_error = matches!(lookup, ContractLookup::Found(_));
+            let (mut store, task, mut driver) = delivery_merge_fixture(lookup);
+            if paths_error {
+                driver.delivery_changed_paths_result = Some(Err("commit files unavailable".into()));
+            }
+            let result = process_repo_merge_queue_with_config(
+                &mut store,
+                "sample-app",
+                &mut driver,
+                &HeavyCheckSemaphore::new(),
+                test_ci_config(),
+                |_| {},
+            )
+            .unwrap();
+            let rows = store.list_deliveries(Some(&task.task_id)).unwrap();
+            if absent {
+                assert!(matches!(result, MergeQueueOutcome::Merged { .. }));
+                assert_eq!(
+                    store.get_task(&task.task_id).unwrap().unwrap().status,
+                    "Done"
+                );
+                assert!(rows.is_empty());
+            } else {
+                assert!(matches!(
+                    result,
+                    MergeQueueOutcome::MergedPendingDelivery { .. }
+                ));
+                assert_eq!(
+                    store.get_task(&task.task_id).unwrap().unwrap().status,
+                    "Delivery Pending"
+                );
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].kind, "contract");
+                assert!(
+                    rows[0].evidence_json["error"]
+                        .as_str()
+                        .is_some_and(|s| !s.is_empty())
+                );
+            }
+            assert!(
+                store
+                    .list_merge_queue(Some("sample-app"))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .list_path_locks(Some("sample-app"))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn delivery_contract_does_not_exempt_regular_failed_merge_ci() {
+        let (mut store, task, mut driver) =
+            delivery_merge_fixture(ContractLookup::Found(generic_delivery_contract("src/**")));
+        driver.post_merge_ci_states = VecDeque::from([Ok(CiCheckState::Failed {
+            failed_checks: vec!["sample-lint (failure)".into()],
+        })]);
+        let result = process_repo_merge_queue_with_config(
+            &mut store,
+            "sample-app",
+            &mut driver,
+            &HeavyCheckSemaphore::new(),
+            test_ci_config(),
+            |_| {},
+        )
+        .unwrap();
+        assert!(matches!(result, MergeQueueOutcome::Blocked { .. }));
+        assert_eq!(
+            store
+                .get_merge_queue_entry("sample-app", &task.task_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "MERGE_QUEUE_BLOCKED"
+        );
+        assert_eq!(store.list_path_locks(Some("sample-app")).unwrap().len(), 1);
+        assert!(
+            store
+                .list_deliveries(Some(&task.task_id))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.list_decisions(true, None).unwrap()[0].kind,
+            "post_merge_ci_failed"
+        );
+        assert_eq!(
+            driver.excluded_workflow_queries,
+            vec![vec!["sample-client.yml".to_owned()]]
+        );
+    }
+
+    #[test]
+    fn delivery_handoff_recovers_a_crash_without_merging_again_or_resetting_waiting_state() {
+        for status in ["Delivery Pending", "Waiting New APK", "Done"] {
+            let contract = generic_delivery_contract("src/**");
+            let (mut store, mut task, mut driver) =
+                delivery_merge_fixture(ContractLookup::Found(contract.clone()));
+            let mut rows = delivery::seed_deliveries(
+                &task,
+                &"a".repeat(40),
+                &contract,
+                &["src/main.rs".into()],
+            );
+            task.status = status.into();
+            rows[0].state = if status == "Done" {
+                "verified"
+            } else if status == "Waiting New APK" {
+                "waiting"
+            } else {
+                "pending"
+            }
+            .into();
+            store.save_deliveries_and_task(&task, &rows).unwrap();
+            store
+                .update_merge_queue_state("sample-app", &task.task_id, "MERGING")
+                .unwrap();
+            let result = process_repo_merge_queue_with_config(
+                &mut store,
+                "sample-app",
+                &mut driver,
+                &HeavyCheckSemaphore::new(),
+                test_ci_config(),
+                |_| {},
+            )
+            .unwrap();
+            assert_eq!(
+                store.get_task(&task.task_id).unwrap().unwrap().status,
+                status
+            );
+            if status == "Done" {
+                assert!(matches!(result, MergeQueueOutcome::Merged { .. }));
+            } else {
+                assert!(matches!(
+                    result,
+                    MergeQueueOutcome::MergedPendingDelivery { .. }
+                ));
+            }
+            assert!(
+                store
+                    .list_merge_queue(Some("sample-app"))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .list_path_locks(Some("sample-app"))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                driver.steps.is_empty(),
+                "must not repeat git merge, push, CI, or PR merge"
+            );
+            assert!(
+                driver.contract_queries.is_empty(),
+                "the immutable contract is already persisted"
+            );
+            assert_eq!(store.list_deliveries(Some(&task.task_id)).unwrap(), rows);
+        }
+    }
+    #[test]
+    fn resumable_post_merge_contract_handoff_preserves_ci_and_close_gates() {
+        for lookup in [
+            ContractLookup::ContractNotFound,
+            ContractLookup::Found(generic_delivery_contract("docs/**")),
+            ContractLookup::Found(generic_delivery_contract("src/**")),
+            ContractLookup::FetchError("unavailable".into()),
+            ContractLookup::ParseError("invalid contract".into()),
+        ] {
+            let (_, mut task, mut driver) = delivery_merge_fixture(lookup.clone());
+            task.memory.merge_checkpoint = Some(crate::v2::store::MergeCheckpoint {
+                phase: "POST_MERGE_CI".into(),
+                target_sha: "d".repeat(40),
+                merge_sha: Some("a".repeat(40)),
+                pr_number: 42,
+                ..Default::default()
+            });
+            let sem = HeavyCheckSemaphore::new();
+            let result =
+                run_merge_phase(std::path::Path::new("unused"), &task, &mut driver, &sem).unwrap();
+            let pending = matches!(&lookup, ContractLookup::Found(c) if c.post_merge_workflows[0].when_paths == ["src/**"])
+                || matches!(
+                    lookup,
+                    ContractLookup::FetchError(_) | ContractLookup::ParseError(_)
+                );
+            match result {
+                MergePhaseResult::DeliveryHandoff {
+                    checkpoint,
+                    deliveries,
+                } => {
+                    assert!(pending);
+                    assert_eq!(checkpoint.phase, "DELIVERY_PENDING");
+                    assert!(checkpoint.post_merge_verified);
+                    assert_eq!(deliveries.len(), 1);
+                    assert_eq!(deliveries[0].merge_sha, "a".repeat(40));
+                    assert_eq!(
+                        deliveries[0].kind,
+                        if matches!(lookup, ContractLookup::Found(_)) {
+                            "workflow"
+                        } else {
+                            "contract"
+                        }
+                    );
+                }
+                MergePhaseResult::Advanced(cp) => {
+                    assert!(!pending);
+                    assert_eq!(cp.phase, "CLOSE_PENDING");
+                    task.memory.merge_checkpoint = Some(cp);
+                    driver.pr_merge_state =
+                        Some(PrMergeState::Merged(Some("wrong-receipt".into())));
+                    assert!(matches!(
+                        run_merge_phase(std::path::Path::new("unused"), &task, &mut driver, &sem)
+                            .unwrap(),
+                        MergePhaseResult::LaneBlocked(_)
+                    ));
+                }
+                _ => panic!("unexpected delivery phase result"),
+            }
+            assert!(!driver.steps.iter().any(|s| s == "merge_pr_match_head"));
+            if matches!(lookup, ContractLookup::Found(_)) {
+                assert_eq!(
+                    driver.excluded_workflow_queries,
+                    vec![vec!["sample-client.yml".to_owned()]]
+                );
+            }
+            driver.post_merge_ci_states = VecDeque::from([Ok(CiCheckState::Failed {
+                failed_checks: vec!["regular-ci".into()],
+            })]);
+            task.memory.merge_checkpoint.as_mut().unwrap().phase = "POST_MERGE_CI".into();
+            assert!(matches!(
+                run_merge_phase(std::path::Path::new("unused"), &task, &mut driver, &sem).unwrap(),
+                MergePhaseResult::LaneBlocked(_)
+            ));
+        }
     }
 }
