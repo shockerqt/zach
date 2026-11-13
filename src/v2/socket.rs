@@ -32,6 +32,14 @@ pub enum ClientCommand {
     },
     #[serde(alias = "STATUS", alias = "Status")]
     Status,
+    Run {
+        #[serde(default)]
+        task: Option<String>,
+        #[serde(default)]
+        group: Option<String>,
+        #[serde(default)]
+        once: bool,
+    },
     #[serde(alias = "DECIDE", alias = "Decide")]
     Decide {
         decision_id: String,
@@ -67,6 +75,8 @@ pub enum ServerMessage {
     },
     #[serde(rename = "RESYNC_REQUIRED")]
     ResyncRequired { last_seq_id: i64 },
+    #[serde(rename = "RUN_ACCEPTED")]
+    RunAccepted { ready: bool },
     #[serde(rename = "ERROR")]
     Error { error: String },
 }
@@ -427,6 +437,14 @@ impl DaemonServer {
                     let msg = ServerMessage::DecisionResult { outcome, decision };
                     let _ = write_ndjson(&mut sub.stream, &msg);
                 }
+                Ok(ClientCommand::Run { .. }) => {
+                    let _result = write_ndjson(
+                        &mut sub.stream,
+                        &ServerMessage::Error {
+                            error: "run requires coordinator".into(),
+                        },
+                    );
+                }
                 Err(e) => {
                     let msg = ServerMessage::Error {
                         error: format!("invalid command: {e}"),
@@ -475,6 +493,363 @@ impl Drop for DaemonServer {
     }
 }
 
+static SIGNAL_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+extern "C" fn shutdown_signal(_: libc::c_int) {
+    SIGNAL_SHUTDOWN.store(true, Ordering::Relaxed);
+}
+
+pub fn install_shutdown_signals() -> std::io::Result<()> {
+    SIGNAL_SHUTDOWN.store(false, Ordering::Relaxed);
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = shutdown_signal as *const () as usize;
+        libc::sigemptyset(&mut action.sa_mask);
+        if libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut()) != 0
+            || libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// sd_notify is optional and independent of all worker/coordinator jobs.
+pub fn sd_notify(message: &str) -> std::io::Result<()> {
+    use std::os::linux::net::SocketAddrExt;
+    let Some(path) = std::env::var_os("NOTIFY_SOCKET") else {
+        return Ok(());
+    };
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_bytes();
+    let socket = std::os::unix::net::UnixDatagram::unbound()?;
+    socket.set_nonblocking(true)?;
+    if bytes.first() == Some(&b'@') {
+        let address = std::os::unix::net::SocketAddr::from_abstract_name(&bytes[1..])?;
+        socket.send_to_addr(message.as_bytes(), &address)?;
+    } else {
+        socket.send_to(message.as_bytes(), Path::new(&path))?;
+    }
+    Ok(())
+}
+
+struct ControlConnection {
+    id: usize,
+    stream: UnixStream,
+    input: Vec<u8>,
+    output: VecDeque<Vec<u8>>,
+    offset: usize,
+    queued_bytes: usize,
+    group: Option<String>,
+    subscribed: bool,
+    once: bool,
+    close: bool,
+    last_seq: i64,
+    replaying: bool,
+    replay_in_flight: bool,
+    subscribe_requested: bool,
+}
+impl ControlConnection {
+    fn queue(&mut self, message: &ServerMessage) {
+        if self.close {
+            return;
+        }
+        let Ok(mut bytes) = serde_json::to_vec(message) else {
+            self.close = true;
+            return;
+        };
+        bytes.push(b'\n');
+        if self.queued_bytes + bytes.len() > 1024 * 1024 {
+            self.close = true;
+            return;
+        }
+        self.queued_bytes += bytes.len();
+        self.output.push_back(bytes);
+    }
+    fn flush(&mut self) {
+        let mut budget = 64 * 1024;
+        while budget > 0 {
+            let Some(front) = self.output.front() else {
+                break;
+            };
+            let end = (self.offset + budget).min(front.len());
+            match self.stream.write(&front[self.offset..end]) {
+                Ok(0) => {
+                    self.close = true;
+                    break;
+                }
+                Ok(n) => {
+                    self.offset += n;
+                    self.queued_bytes -= n;
+                    budget -= n;
+                    if self.offset == front.len() {
+                        self.output.pop_front();
+                        self.offset = 0;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => {
+                    self.close = true;
+                    break;
+                }
+            }
+        }
+        if self.once && self.subscribed && !self.replaying && self.output.is_empty() {
+            self.close = true;
+        }
+    }
+}
+
+impl DaemonServer {
+    /// Every read, write, accept, channel drain, and input buffer is bounded. No
+    /// SQLite or subprocess operation executes on this 50ms socket thread.
+    pub fn run_coordinated(
+        &mut self,
+        handle: crate::v2::coordinator::CoordinatorHandle,
+        once: bool,
+    ) -> Result<(), String> {
+        use crate::v2::coordinator::{CoordinatorEvent, SocketDelivery};
+        let mut clients: Vec<ControlConnection> = Vec::new();
+        let mut next_id = 0;
+        let mut watchdog = std::time::Instant::now() - Duration::from_secs(60);
+        let watchdog_period = std::env::var("WATCHDOG_USEC")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|us| Duration::from_micros((us / 2).max(1)))
+            .unwrap_or(Duration::from_secs(5));
+        let mut ready_notified = false;
+        let mut outcome = Ok(());
+        loop {
+            let tick_start = std::time::Instant::now();
+            if SIGNAL_SHUTDOWN.load(Ordering::Relaxed) || self.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            for _ in 0..32 {
+                match self.listener.accept() {
+                    Ok((stream, _)) => {
+                        if clients.len() >= 128 || verify_peer_uid(&stream, current_euid()).is_err()
+                        {
+                            continue;
+                        }
+                        stream.set_nonblocking(true).map_err(|e| e.to_string())?;
+                        next_id += 1;
+                        clients.push(ControlConnection {
+                            id: next_id,
+                            stream,
+                            input: Vec::new(),
+                            output: VecDeque::new(),
+                            offset: 0,
+                            queued_bytes: 0,
+                            group: None,
+                            subscribed: false,
+                            once: false,
+                            close: false,
+                            last_seq: 0,
+                            replaying: false,
+                            replay_in_flight: false,
+                            subscribe_requested: false,
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+            for client in &mut clients {
+                let mut bytes = [0u8; 4096];
+                for _ in 0..16 {
+                    match client.stream.read(&mut bytes) {
+                        Ok(0) => {
+                            client.close = true;
+                            break;
+                        }
+                        Ok(n) => {
+                            client.input.extend_from_slice(&bytes[..n]);
+                            if client.input.len() > 64 * 1024 {
+                                client.close = true;
+                                break;
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(_) => {
+                            client.close = true;
+                            break;
+                        }
+                    }
+                }
+                for _ in 0..16 {
+                    let Some(pos) = client.input.iter().position(|b| *b == b'\n') else {
+                        break;
+                    };
+                    let line = client.input.drain(..=pos).collect::<Vec<_>>();
+                    match serde_json::from_slice::<ClientCommand>(&line) {
+                        Ok(command) => {
+                            if let ClientCommand::Subscribe {
+                                group,
+                                once,
+                                since_seq,
+                            } = &command
+                            {
+                                if client.subscribe_requested {
+                                    client.queue(&ServerMessage::Error{error:"subscribe once per connection; reconnect to change replay scope".into()});
+                                    continue;
+                                }
+                                client.subscribe_requested = true;
+                                client.group = group.clone();
+                                client.once = once.unwrap_or(false);
+                                client.last_seq = since_seq.unwrap_or(0);
+                            }
+                            if handle
+                                .commands
+                                .try_send(CoordinatorEvent::Socket {
+                                    client_id: client.id,
+                                    command,
+                                })
+                                .is_err()
+                            {
+                                client.queue(&ServerMessage::Error {
+                                    error: "coordinator busy; retry request".into(),
+                                });
+                            }
+                        }
+                        Err(error) => client.queue(&ServerMessage::Error {
+                            error: format!("invalid command: {error}"),
+                        }),
+                    }
+                }
+            }
+            for _ in 0..128 {
+                match handle.deliveries.try_recv() {
+                    Ok(SocketDelivery::Reply {
+                        client_id,
+                        messages,
+                    }) => {
+                        if let Some(client) = clients.iter_mut().find(|c| c.id == client_id) {
+                            for message in messages {
+                                if let ServerMessage::Snapshot { .. } = &message {
+                                    client.subscribed = true;
+                                    client.replaying = true;
+                                    client.replay_in_flight = false;
+                                }
+                                if let ServerMessage::RunAccepted { ready: true } = &message {
+                                    ready_notified = true;
+                                }
+                                client.queue(&message);
+                            }
+                        }
+                    }
+                    Ok(SocketDelivery::Events(events)) => {
+                        for event in events {
+                            for client in
+                                clients.iter_mut().filter(|c| c.subscribed && !c.replaying)
+                            {
+                                if event.seq_id > client.last_seq
+                                    && client
+                                        .group
+                                        .as_ref()
+                                        .is_none_or(|g| g.eq_ignore_ascii_case(&event.task_group))
+                                {
+                                    client.queue(&ServerMessage::Event {
+                                        event: event.clone(),
+                                    });
+                                    client.last_seq = event.seq_id;
+                                }
+                            }
+                        }
+                    }
+                    Ok(SocketDelivery::ReplayPage {
+                        client_id,
+                        events,
+                        as_of_seq,
+                    }) => {
+                        if let Some(client) = clients.iter_mut().find(|c| c.id == client_id) {
+                            let complete = events.len() < 128;
+                            for event in events {
+                                if event.seq_id > client.last_seq {
+                                    client.last_seq = event.seq_id;
+                                    client.queue(&ServerMessage::Event { event });
+                                }
+                            }
+                            client.replay_in_flight = false;
+                            if complete {
+                                client.last_seq = client.last_seq.max(as_of_seq);
+                                client.replaying = false;
+                            }
+                        }
+                    }
+                    Ok(SocketDelivery::Ready) => {
+                        ready_notified = true;
+                        if let Err(error) = sd_notify("READY=1") {
+                            eprintln!("sd_notify: {error}");
+                        }
+                    }
+                    Ok(SocketDelivery::Stopped) => {
+                        self.request_shutdown();
+                    }
+                    Ok(SocketDelivery::Fatal(error)) => {
+                        outcome = Err(error);
+                        self.request_shutdown();
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        break;
+                    }
+                    Err(_) => {
+                        outcome = Err("coordinator disconnected".into());
+                        self.request_shutdown();
+                        break;
+                    }
+                }
+            }
+            for client in &mut clients {
+                client.flush();
+                if client.replaying
+                    && !client.replay_in_flight
+                    && client.queued_bytes < 128 * 1024
+                    && handle
+                        .commands
+                        .try_send(CoordinatorEvent::Replay {
+                            client_id: client.id,
+                            group: client.group.clone(),
+                            since_seq: client.last_seq,
+                        })
+                        .is_ok()
+                {
+                    client.replay_in_flight = true;
+                }
+            }
+            clients.retain(|c| !c.close);
+            if watchdog.elapsed() >= watchdog_period {
+                if let Err(error) = sd_notify(if ready_notified {
+                    "READY=1\nWATCHDOG=1"
+                } else {
+                    "WATCHDOG=1"
+                }) {
+                    eprintln!("sd_notify: {error}");
+                }
+                watchdog = std::time::Instant::now();
+            }
+            if once {
+                break;
+            }
+            if let Some(remaining) = Duration::from_millis(50).checked_sub(tick_start.elapsed()) {
+                std::thread::sleep(remaining);
+            }
+        }
+        if let Err(error) = sd_notify("STOPPING=1") {
+            eprintln!("sd_notify: {error}");
+        }
+        let _shutdown = handle.commands.try_send(CoordinatorEvent::Shutdown);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match handle.deliveries.recv_timeout(Duration::from_millis(50)) {
+                Ok(SocketDelivery::Stopped)
+                | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                _ => {}
+            }
+        }
+        outcome
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,7 +859,8 @@ mod tests {
 
     #[test]
     fn test_socket_permissions_0600_inside_0700_dir() {
-        let temp_dir = std::env::temp_dir().join(format!("zach-sock-test-{}", std::process::id()));
+        let temp_dir =
+            PathBuf::from("target").join(format!("zach-sock-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
         let sock_path = temp_dir.join("substate/test.sock");
 
@@ -559,6 +935,9 @@ mod tests {
             executor: None,
             autonomous_consent: true,
             retry_count: 0,
+            next_retry_epoch: 0,
+            lease_owner: None,
+            lease_expires_epoch: None,
             memory: Default::default(),
             version: 1,
             updated_epoch: 100,
@@ -709,7 +1088,8 @@ mod tests {
 
     #[test]
     fn test_bidirectional_subscribe_status_and_decide_commands() {
-        let temp_dir = std::env::temp_dir().join(format!("zach-bidi-test-{}", std::process::id()));
+        let temp_dir =
+            PathBuf::from("target").join(format!("zach-bidi-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
         let sock_path = temp_dir.join("zach.sock");
 
@@ -739,6 +1119,9 @@ mod tests {
             executor: None,
             autonomous_consent: true,
             retry_count: 0,
+            next_retry_epoch: 0,
+            lease_owner: None,
+            lease_expires_epoch: None,
             memory: Default::default(),
             version: 1,
             updated_epoch: 100,

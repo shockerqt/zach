@@ -214,10 +214,7 @@ pub fn default_required_stages(weight: &str) -> Vec<String> {
     }
 }
 
-pub fn ingest_export_json(
-    store: &mut V2Store,
-    json_payload: &str,
-) -> Result<IntakeSummary, V2StoreError> {
+pub fn decode_export_records(json_payload: &str) -> Result<Vec<TaskRecord>, V2StoreError> {
     let contract: ExportContract = serde_json::from_str(json_payload)?;
     if contract.schema_version != 2 {
         return Err(V2StoreError(format!(
@@ -227,7 +224,7 @@ pub fn ingest_export_json(
     }
 
     let now = now_epoch();
-    let mut ingested_count = 0usize;
+    let mut records = Vec::new();
 
     for item in &contract.tasks {
         let weight = if item.weight.trim().is_empty() {
@@ -293,18 +290,50 @@ pub fn ingest_export_json(
             executor: item.executor.clone(),
             autonomous_consent: item.autonomous_consent,
             retry_count: 0,
-            memory: TaskMemory::default(),
+            next_retry_epoch: 0,
+            lease_owner: None,
+            lease_expires_epoch: None,
+            memory: TaskMemory {
+                governance_started: item
+                    .executor
+                    .as_deref()
+                    .is_some_and(|executor| executor.eq_ignore_ascii_case("zach"))
+                    && matches!(
+                        item.status.as_str(),
+                        "Planning" | "Plan Review" | "In Progress" | "PR Review" | "Blocked"
+                    ),
+                ..TaskMemory::default()
+            },
             version: 1,
             updated_epoch: now,
         };
-        store.sync_task(&record)?;
-        ingested_count += 1;
+        records.push(record);
     }
 
-    store.record_heartbeat(now)?;
-    let ready = store.list_ready_queue(None)?;
-    let ready_task_ids: Vec<String> = ready.iter().map(|t| t.task_id.clone()).collect();
+    Ok(records)
+}
 
+pub fn ingest_export_json(
+    store: &mut V2Store,
+    json_payload: &str,
+) -> Result<IntakeSummary, V2StoreError> {
+    ingest_task_records(store, decode_export_records(json_payload)?)
+}
+
+pub fn ingest_task_records(
+    store: &mut V2Store,
+    records: Vec<TaskRecord>,
+) -> Result<IntakeSummary, V2StoreError> {
+    let ingested_count = records.len();
+    for record in records {
+        store.sync_task(&record)?;
+    }
+    store.set_meta("last_sync_epoch", &now_epoch().to_string())?;
+    let ready_task_ids = store
+        .list_ready_queue(None)?
+        .into_iter()
+        .map(|t| t.task_id)
+        .collect::<Vec<_>>();
     Ok(IntakeSummary {
         ingested_count,
         ready_eligible_count: ready_task_ids.len(),
@@ -317,7 +346,7 @@ pub fn sync_from_ws_task(
     ws_task_bin: &Path,
 ) -> Result<IntakeSummary, V2StoreError> {
     let output = Command::new(ws_task_bin)
-        .args(["export", "--json"])
+        .args(["export", "--sync", "--json"])
         .output()
         .map_err(|e| V2StoreError(format!("failed to invoke {}: {e}", ws_task_bin.display())))?;
     if !output.status.success() {
@@ -331,6 +360,99 @@ pub fn sync_from_ws_task(
     let stdout = String::from_utf8(output.stdout)
         .map_err(|e| V2StoreError(format!("ws-task export output was not valid UTF-8: {e}")))?;
     ingest_export_json(store, &stdout)
+}
+
+/// All invocations run on coordinator workers; arguments never pass through a shell.
+pub trait WsTaskClient: Send + Sync {
+    fn execute(&self, args: &[String]) -> Result<String, String>;
+}
+
+pub struct SystemWsTaskClient {
+    pub bin: std::path::PathBuf,
+}
+
+impl WsTaskClient for SystemWsTaskClient {
+    fn execute(&self, args: &[String]) -> Result<String, String> {
+        let out = Command::new(&self.bin)
+            .args(args)
+            .output()
+            .map_err(|e| format!("ws-task spawn: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "ws-task {} failed ({}): {}",
+                args.first().map(String::as_str).unwrap_or(""),
+                out.status,
+                crate::v2::runner::truncate_utf8_bytes(&String::from_utf8_lossy(&out.stderr), 1024)
+            ));
+        }
+        String::from_utf8(out.stdout).map_err(|e| e.to_string())
+    }
+}
+
+pub fn stage_operation(
+    task: &TaskRecord,
+    key: &str,
+    stage: &str,
+    body_path: &Path,
+    verdict: Option<&str>,
+    sha: Option<&str>,
+    actor: &str,
+) -> crate::v2::store::LifecycleOperation {
+    let mut args = vec![
+        "stage".into(),
+        task.task_id.clone(),
+        stage.into(),
+        "--actor".into(),
+        actor.into(),
+        "--body-file".into(),
+        body_path.to_string_lossy().into_owned(),
+    ];
+    if let Some(verdict) = verdict {
+        args.extend(["--verdict".into(), verdict.into()]);
+    }
+    if let Some(sha) = sha {
+        args.extend(["--sha".into(), sha.into()]);
+    }
+    args.extend(["--idempotency-key".into(), key.into()]);
+    crate::v2::store::LifecycleOperation {
+        attempt_id: task.active_attempt_id.clone(),
+        decision_id: key.strip_prefix("decision-").map(str::to_owned),
+        operation_id: key.into(),
+        task_id: task.task_id.clone(),
+        kind: stage.into(),
+        args,
+        body_path: Some(body_path.to_string_lossy().into_owned()),
+        depends_on: None,
+        state: "PENDING".into(),
+        retry_epoch: 0,
+        attempts: 0,
+        last_error: None,
+    }
+}
+
+/// Git provisioning may print diagnostics before ws-task's final JSON receipt.
+pub fn parse_start_receipt(output: &str, task_id: &str) -> Result<Value, String> {
+    for (offset, _) in output.match_indices('{') {
+        if let Ok(value) = serde_json::from_str::<Value>(&output[offset..])
+            && value["task_id"].as_str() == Some(task_id)
+        {
+            return Ok(value);
+        }
+    }
+    Err("ws-task start did not return a matching structured receipt".into())
+}
+
+/// Shared candidate-plan publication contract, used before plan-review dispatch.
+pub fn publish_plan_stage(
+    task: &TaskRecord,
+    key: &str,
+    path: &Path,
+) -> crate::v2::store::LifecycleOperation {
+    let sha = task
+        .plan_base_sha
+        .as_deref()
+        .filter(|s| !s.trim().is_empty() && *s != "head-sha");
+    stage_operation(task, key, "plan", path, None, sha, "zach")
 }
 
 #[cfg(test)]
@@ -492,6 +614,9 @@ mod tests {
             executor: Some("zach".to_owned()),
             autonomous_consent: true,
             retry_count: 2,
+            next_retry_epoch: 0,
+            lease_owner: None,
+            lease_expires_epoch: None,
             memory: memory.clone(),
             version: 1,
             updated_epoch: 1000,
@@ -560,17 +685,20 @@ mod tests {
         assert_eq!(persisted.title, "Updated title from board");
         assert_eq!(persisted.weight, "M");
         assert_eq!(persisted.depends_on, vec!["GOV-001".to_owned()]);
-        assert_eq!(persisted.branch.as_deref(), Some("task/new-branch"));
-        assert_eq!(persisted.worktree_path.as_deref(), Some("/tmp/new-wt"));
+        assert_eq!(persisted.branch, zach_task.branch);
+        assert_eq!(persisted.worktree_path, zach_task.worktree_path);
         assert_eq!(persisted.task_group, "platform");
-        assert_eq!(persisted.repository, "zach-next");
+        assert_eq!(persisted.repository, zach_task.repository);
         assert_eq!(
             persisted.github_repo.as_deref(),
-            Some("shockerqt/zach-next")
+            zach_task.github_repo.as_deref()
         );
-        assert_eq!(persisted.issue_number, Some(77));
+        assert_eq!(persisted.issue_number, zach_task.issue_number);
         assert!(!persisted.autonomous_consent);
-        assert_eq!(persisted.context_pack.target_files.len(), 2);
+        assert_eq!(
+            persisted.context_pack.target_files,
+            zach_task.context_pack.target_files
+        );
 
         // AC-2: Board status of Cancelled wins even when executor == "zach"
         let cancel_payload = r#"{

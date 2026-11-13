@@ -72,6 +72,42 @@ pub struct ContextPackSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct TaskMemory {
+    /// An authoritative Governance export observed a terminal task. Local
+    /// delivery recovery must never reinterpret that as premature completion.
+    #[serde(default)]
+    pub governance_terminal_observed: bool,
+    #[serde(default)]
+    pub halt_requested: bool,
+    #[serde(default)]
+    pub governance_started: bool,
+    #[serde(default)]
+    pub merge_retry_count: u32,
+    #[serde(default)]
+    pub merge_retry_generation: u64,
+    #[serde(default)]
+    pub suspended_impl_attempt_id: Option<String>,
+    #[serde(default)]
+    pub merge_lane_released: bool,
+    #[serde(default)]
+    pub plan_rework_generation: u64,
+    #[serde(default)]
+    pub review_rework_generation: u64,
+    #[serde(default)]
+    pub retry_reset_epoch: i64,
+    #[serde(default)]
+    pub retry_generation: u64,
+    #[serde(default)]
+    pub pipeline_checkpoint: Option<PipelineCheckpoint>,
+    #[serde(default)]
+    pub merge_checkpoint: Option<MergeCheckpoint>,
+    #[serde(default)]
+    pub last_pr_review_evidence: Option<String>,
+    #[serde(default)]
+    pub last_pr_review_evidence_sha: Option<String>,
+    #[serde(default)]
+    pub last_pr_review_evidence_path: Option<String>,
+    #[serde(default)]
+    pub applied_decisions: Vec<String>,
     #[serde(default)]
     pub decisions_log: Vec<String>,
     #[serde(default)]
@@ -94,6 +130,50 @@ pub struct TaskMemory {
     pub last_review_findings: Option<String>,
     #[serde(default)]
     pub review_rework_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct PipelineCheckpoint {
+    pub attempt_id: String,
+    pub operation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct MergeCheckpoint {
+    pub phase: String,
+    pub target_sha: String,
+    pub pr_number: i64,
+    pub merge_sha: Option<String>,
+    pub post_merge_verified: bool,
+    #[serde(default)]
+    pub phase_started_epoch: i64,
+}
+
+pub struct FailureDecision {
+    pub decision_id: String,
+    pub kind: String,
+    pub question: String,
+    pub options: Vec<String>,
+    pub context: String,
+    pub sha: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LifecycleOperation {
+    #[serde(default)]
+    pub attempt_id: Option<String>,
+    #[serde(default)]
+    pub decision_id: Option<String>,
+    pub operation_id: String,
+    pub task_id: String,
+    pub kind: String,
+    pub args: Vec<String>,
+    pub body_path: Option<String>,
+    pub depends_on: Option<String>,
+    pub state: String,
+    pub retry_epoch: i64,
+    pub attempts: u32,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -120,6 +200,12 @@ pub struct TaskRecord {
     pub executor: Option<String>,
     pub autonomous_consent: bool,
     pub retry_count: i64,
+    #[serde(default)]
+    pub next_retry_epoch: i64,
+    #[serde(default)]
+    pub lease_owner: Option<String>,
+    #[serde(default)]
+    pub lease_expires_epoch: Option<i64>,
     pub memory: TaskMemory,
     pub version: i64,
     pub updated_epoch: i64,
@@ -144,6 +230,26 @@ pub struct StageAttemptRecord {
     pub total_tokens: Option<u64>,
     pub sha_before: Option<String>,
     pub sha_after: Option<String>,
+    #[serde(default = "default_attempt_phase")]
+    pub phase: String,
+    #[serde(default)]
+    pub last_liveness_epoch: i64,
+    #[serde(default)]
+    pub last_output_bytes: u64,
+    #[serde(default)]
+    pub last_cpu_usage_usec: Option<u64>,
+    #[serde(default)]
+    pub control_group: Option<String>,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub exit_code_kind: Option<String>,
+    #[serde(default)]
+    pub retry_generation: u64,
+}
+
+fn default_attempt_phase() -> String {
+    "RUNNING".to_owned()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -212,6 +318,20 @@ pub struct DaemonStatusSummary {
     pub open_decisions_count: usize,
     pub active_locks_count: usize,
     pub merge_queue_count: usize,
+    #[serde(default)]
+    pub active_units: usize,
+    #[serde(default)]
+    pub occupied_repositories: usize,
+    #[serde(default)]
+    pub running_task_slots: usize,
+    #[serde(default)]
+    pub backoff_tasks: usize,
+    #[serde(default)]
+    pub pending_write_backs: usize,
+    #[serde(default)]
+    pub reconciliation_errors: u64,
+    #[serde(default)]
+    pub last_sync_epoch: i64,
 }
 
 /// Durable post-merge work. `rule_json` is the immutable contract rule captured
@@ -255,6 +375,11 @@ impl V2Store {
         let mut store = Self { conn };
         store.initialize()?;
         Ok(store)
+    }
+
+    pub fn open_read_only(path: &Path) -> Result<Self, V2StoreError> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Ok(Self { conn })
     }
 
     pub fn open_in_memory() -> Result<Self, V2StoreError> {
@@ -426,6 +551,16 @@ impl V2Store {
              CREATE INDEX IF NOT EXISTS idx_deliveries_task ON post_merge_deliveries(task_id);",
         )?;
 
+        if self
+            .meta("schema_version")?
+            .and_then(|v| v.parse::<u32>().ok())
+            .is_some_and(|version| version > SCHEMA_VERSION)
+        {
+            return Err(V2StoreError(
+                "database schema is newer than this daemon".into(),
+            ));
+        }
+        self.migrate_supervision()?;
         self.migrate_stage_attempts_nullable_tokens()?;
         // These additive fields also tolerate an interrupted pre-release upgrade.
         let delivery_columns: BTreeSet<String> = {
@@ -519,17 +654,21 @@ impl V2Store {
                      total_tokens INTEGER,
                      sha_before TEXT,
                      sha_after TEXT,
+                     phase TEXT NOT NULL DEFAULT 'RUNNING', last_liveness_epoch INTEGER NOT NULL DEFAULT 0,
+                     last_output_bytes INTEGER NOT NULL DEFAULT 0, last_cpu_usage_usec INTEGER,
+                     control_group TEXT, exit_code INTEGER, exit_code_kind TEXT,
+                     retry_generation INTEGER NOT NULL DEFAULT 0,
                      FOREIGN KEY(task_id) REFERENCES tasks(task_id)
                  );
                  INSERT INTO stage_attempts_new (
                      attempt_id, task_id, stage, model, effort, systemd_unit, invocation_id,
                      started_epoch, ended_epoch, status, failure_class, summary,
-                     input_tokens, output_tokens, total_tokens, sha_before, sha_after
+                     input_tokens, output_tokens, total_tokens, sha_before, sha_after, phase, last_liveness_epoch, last_output_bytes, last_cpu_usage_usec, control_group, exit_code, exit_code_kind, retry_generation
                  )
                  SELECT
                      attempt_id, task_id, stage, model, effort, systemd_unit, invocation_id,
                      started_epoch, ended_epoch, status, failure_class, summary,
-                     input_tokens, output_tokens, total_tokens, sha_before, sha_after
+                     input_tokens, output_tokens, total_tokens, sha_before, sha_after, phase, last_liveness_epoch, last_output_bytes, last_cpu_usage_usec, control_group, exit_code, exit_code_kind, retry_generation
                  FROM stage_attempts;
                  DROP TABLE stage_attempts;
                  ALTER TABLE stage_attempts_new RENAME TO stage_attempts;",
@@ -540,6 +679,215 @@ impl V2Store {
         let fk_res = self.conn.execute_batch("PRAGMA foreign_keys=ON;");
         res?;
         fk_res?;
+        Ok(())
+    }
+
+    fn migrate_supervision(&mut self) -> Result<(), V2StoreError> {
+        for (table, columns) in [
+            (
+                "tasks",
+                vec![
+                    ("next_retry_epoch", "INTEGER NOT NULL DEFAULT 0"),
+                    ("lease_owner", "TEXT"),
+                    ("lease_expires_epoch", "INTEGER"),
+                ],
+            ),
+            (
+                "stage_attempts",
+                vec![
+                    ("phase", "TEXT NOT NULL DEFAULT 'RUNNING'"),
+                    ("last_liveness_epoch", "INTEGER NOT NULL DEFAULT 0"),
+                    ("last_output_bytes", "INTEGER NOT NULL DEFAULT 0"),
+                    ("last_cpu_usage_usec", "INTEGER"),
+                    ("control_group", "TEXT"),
+                    ("exit_code", "INTEGER"),
+                    ("exit_code_kind", "TEXT"),
+                    ("retry_generation", "INTEGER NOT NULL DEFAULT 0"),
+                ],
+            ),
+        ] {
+            let present: BTreeSet<String> = self
+                .conn
+                .prepare(&format!("PRAGMA table_info({table})"))?
+                .query_map([], |r| r.get(1))?
+                .collect::<Result<_, _>>()?;
+            for (name, declaration) in columns {
+                if !present.contains(name) {
+                    self.conn.execute_batch(&format!(
+                        "ALTER TABLE {table} ADD COLUMN {name} {declaration}"
+                    ))?;
+                }
+            }
+        }
+        self.conn.execute_batch("UPDATE stage_attempts SET last_liveness_epoch=started_epoch WHERE last_liveness_epoch=0;
+            CREATE TABLE IF NOT EXISTS lifecycle_ops (
+                operation_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id),
+                kind TEXT NOT NULL, args_json TEXT NOT NULL, body_path TEXT, depends_on TEXT, attempt_id TEXT, decision_id TEXT,
+                state TEXT NOT NULL DEFAULT 'PENDING', retry_epoch INTEGER NOT NULL DEFAULT 0,
+                attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT,
+                created_epoch INTEGER NOT NULL, updated_epoch INTEGER NOT NULL
+            );")?;
+        let columns: BTreeSet<String> = self
+            .conn
+            .prepare("PRAGMA table_info(lifecycle_ops)")?
+            .query_map([], |r| r.get(1))?
+            .collect::<Result<_, _>>()?;
+        for name in ["attempt_id", "decision_id"] {
+            if !columns.contains(name) {
+                self.conn
+                    .execute_batch(&format!("ALTER TABLE lifecycle_ops ADD COLUMN {name} TEXT"))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn set_meta(&mut self, key: &str, value: &str) -> Result<(), V2StoreError> {
+        self.conn.execute("INSERT INTO daemon_meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key,value])?;
+        Ok(())
+    }
+
+    pub fn meta(&self, key: &str) -> Result<Option<String>, V2StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM daemon_meta WHERE key=?1", [key], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
+    fn enqueue_lifecycle_tx(
+        tx: &rusqlite::Transaction<'_>,
+        op: &LifecycleOperation,
+    ) -> Result<(), V2StoreError> {
+        tx.execute("INSERT OR IGNORE INTO lifecycle_ops(operation_id,task_id,kind,args_json,body_path,depends_on,state,retry_epoch,attempts,last_error,created_epoch,updated_epoch,attempt_id,decision_id) VALUES(?1,?2,?3,?4,?5,?6,'PENDING',0,0,NULL,?7,?7,?8,?9)",
+            params![op.operation_id, op.task_id, op.kind, serde_json::to_string(&op.args)?, op.body_path, op.depends_on, now_epoch(),op.attempt_id,op.decision_id])?;
+        Ok(())
+    }
+
+    pub fn enqueue_lifecycle(&mut self, op: &LifecycleOperation) -> Result<(), V2StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::enqueue_lifecycle_tx(&tx, op)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn checkpoint_with_lifecycle(
+        &mut self,
+        task: &TaskRecord,
+        op: &LifecycleOperation,
+    ) -> Result<(), V2StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let old = Self::get_task_tx(&tx, &task.task_id)?
+            .ok_or_else(|| V2StoreError("outbox task missing".into()))?;
+        Self::update_task_tx(&tx, &old, task, now_epoch())?;
+        Self::enqueue_lifecycle_tx(&tx, op)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn lifecycle_ops(&self) -> Result<Vec<LifecycleOperation>, V2StoreError> {
+        Ok(self.conn.prepare("SELECT operation_id,task_id,kind,args_json,body_path,depends_on,state,retry_epoch,attempts,last_error,attempt_id,decision_id FROM lifecycle_ops ORDER BY rowid")?.query_map([], |r| {
+            let args: String = r.get(3)?;
+            Ok(LifecycleOperation { attempt_id:r.get(10)?,decision_id:r.get(11)?,operation_id:r.get(0)?,task_id:r.get(1)?,kind:r.get(2)?,args:serde_json::from_str(&args).unwrap_or_default(),body_path:r.get(4)?,depends_on:r.get(5)?,state:r.get(6)?,retry_epoch:r.get(7)?,attempts:r.get(8)?,last_error:r.get(9)? })
+        })?.collect::<Result<_,_>>()?)
+    }
+
+    pub fn has_pending_lifecycle(&self, task_id: &str) -> Result<bool, V2StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM lifecycle_ops WHERE task_id=?1 AND state!='ACKNOWLEDGED')",
+            [task_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn update_lifecycle(
+        &mut self,
+        id: &str,
+        state: &str,
+        error: Option<&str>,
+        retry_epoch: i64,
+    ) -> Result<(), V2StoreError> {
+        let error = error.map(|s| crate::v2::runner::truncate_utf8_bytes(s, 1024));
+        self.conn.execute("UPDATE lifecycle_ops SET state=?2,last_error=?3,retry_epoch=?4,updated_epoch=?5,attempts=attempts+CASE WHEN ?2='IN_FLIGHT' THEN 1 ELSE 0 END WHERE operation_id=?1",params![id,state,error,retry_epoch,now_epoch()])?;
+        Ok(())
+    }
+
+    pub fn acknowledge_lifecycle(
+        &mut self,
+        task: &TaskRecord,
+        op: &LifecycleOperation,
+        attempt_id: Option<&str>,
+    ) -> Result<(), V2StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let old = Self::get_task_tx(&tx, &task.task_id)?
+            .ok_or_else(|| V2StoreError("missing lifecycle task".into()))?;
+        Self::update_task_tx(&tx, &old, task, now_epoch())?;
+        if let Some(id) = attempt_id {
+            tx.execute(
+                "UPDATE stage_attempts SET phase='COMPLETE' WHERE attempt_id=?1",
+                [id],
+            )?;
+        }
+        if op.kind == "merge-parity" {
+            tx.execute(
+                "UPDATE merge_queue SET reviewed_sha=?2 WHERE task_id=?1",
+                params![task.task_id, task.reviewed_sha],
+            )?;
+        }
+        if op.kind == "close" {
+            tx.execute("DELETE FROM merge_queue WHERE task_id=?1", [&task.task_id])?;
+            tx.execute("DELETE FROM path_locks WHERE task_id=?1", [&task.task_id])?;
+            Self::insert_event_tx(
+                &tx,
+                &task.task_id,
+                &task.task_group,
+                now_epoch(),
+                "MERGE_COMPLETED",
+                &serde_json::json!({"receipt":task.memory.merge_checkpoint}),
+            )?;
+        }
+        tx.execute("UPDATE lifecycle_ops SET state='ACKNOWLEDGED',last_error=NULL,updated_epoch=?2 WHERE operation_id=?1",params![op.operation_id,now_epoch()])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Atomically reserves the repository and records the launch intent before a worker can start.
+    pub fn prepare_launch(
+        &mut self,
+        task: &TaskRecord,
+        attempt: &StageAttemptRecord,
+    ) -> Result<(), V2StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let conflict: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM path_locks WHERE repo=?1 AND task_id!=?2)",
+            params![task.repository, task.task_id],
+            |r| r.get(0),
+        )?;
+        if conflict {
+            return Err(V2StoreError("repository already owned".into()));
+        }
+        tx.execute("INSERT OR IGNORE INTO path_locks(repo,path,task_id,acquired_epoch) VALUES(?1,'*',?2,?3)",params![task.repository,task.task_id,now_epoch()])?;
+        let old = Self::get_task_tx(&tx, &task.task_id)?
+            .ok_or_else(|| V2StoreError("task missing".into()))?;
+        Self::update_task_tx(&tx, &old, task, now_epoch())?;
+        tx.execute("INSERT INTO stage_attempts(attempt_id,task_id,stage,model,effort,systemd_unit,started_epoch,status,sha_before,phase,last_liveness_epoch,retry_generation) VALUES(?1,?2,?3,?4,?5,?6,?7,'RUNNING',?8,'LAUNCH_PENDING',?7,?9)",params![attempt.attempt_id,attempt.task_id,attempt.stage,attempt.model,attempt.effort,attempt.systemd_unit,attempt.started_epoch,attempt.sha_before,attempt.retry_generation])?;
+        Self::insert_event_tx(
+            &tx,
+            &task.task_id,
+            &task.task_group,
+            now_epoch(),
+            "STAGE_STARTED",
+            &serde_json::json!({"attempt_id":attempt.attempt_id,"stage":attempt.stage}),
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -599,7 +947,7 @@ impl V2Store {
                     depends_on_json, required_stages_json, stages_completed_json,
                     current_stage, active_attempt_id, plan_base_sha, reviewed_sha,
                     pr_number, executor, autonomous_consent, retry_count, memory_json,
-                    version, updated_epoch
+                    version, updated_epoch, next_retry_epoch, lease_owner, lease_expires_epoch
              FROM tasks WHERE task_id = ?1",
         )?;
         stmt.query_row(params![task_id], Self::map_task_row)
@@ -624,14 +972,14 @@ impl V2Store {
                 depends_on_json, required_stages_json, stages_completed_json,
                 current_stage, active_attempt_id, plan_base_sha, reviewed_sha,
                 pr_number, executor, autonomous_consent, retry_count, memory_json,
-                version, updated_epoch
+                version, updated_epoch, next_retry_epoch, lease_owner, lease_expires_epoch
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6,
                 ?7, ?8, ?9, ?10, ?11,
                 ?12, ?13, ?14,
                 ?15, ?16, ?17, ?18,
                 ?19, ?20, ?21, ?22, ?23,
-                1, ?24
+                1, ?24, ?25, ?26, ?27
              )",
             params![
                 task.task_id,
@@ -658,6 +1006,9 @@ impl V2Store {
                 task.retry_count,
                 memory_json,
                 now,
+                task.next_retry_epoch,
+                task.lease_owner,
+                task.lease_expires_epoch,
             ],
         )?;
         let mut inserted = task.clone();
@@ -704,7 +1055,7 @@ impl V2Store {
                 retry_count = ?22,
                 memory_json = ?23,
                 version = ?24,
-                updated_epoch = ?25
+                updated_epoch = ?25, next_retry_epoch = ?27, lease_owner = ?28, lease_expires_epoch = ?29
              WHERE task_id = ?1 AND version = ?26",
             params![
                 next.task_id,
@@ -732,7 +1083,7 @@ impl V2Store {
                 memory_json,
                 next_ver,
                 now,
-                old.version,
+                old.version, next.next_retry_epoch, next.lease_owner, next.lease_expires_epoch,
             ],
         )?;
 
@@ -777,8 +1128,7 @@ impl V2Store {
         };
         let result = match Self::get_task_tx(&tx, &task.task_id)? {
             Some(old) => {
-                let mut next = task.clone();
-                coalesce_runtime_fields(&old, &mut next);
+                let next = task.clone();
                 Self::update_task_tx(&tx, &old, &next, now)?
             }
             None => Self::insert_task_tx(&tx, task, now)?,
@@ -801,7 +1151,14 @@ impl V2Store {
         let result = match Self::get_task_tx(&tx, &incoming.task_id)? {
             Some(old) => {
                 let mut next = incoming.clone();
-                if should_preserve_zach_state(&old, incoming) {
+                let verified_delivery: bool = old.status == "Done" && tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM post_merge_deliveries WHERE task_id=?1)
+                        AND NOT EXISTS(SELECT 1 FROM post_merge_deliveries WHERE task_id=?1 AND state!='verified')",
+                    [&old.task_id], |row| row.get(0),
+                )?;
+                if should_preserve_zach_state(&old, incoming)
+                    || (verified_delivery && !is_terminal_task_status(&incoming.status))
+                {
                     next.status = old.status.clone();
                     next.stages_completed = old.stages_completed.clone();
                     next.current_stage = old.current_stage.clone();
@@ -810,65 +1167,51 @@ impl V2Store {
                     next.reviewed_sha = old.reviewed_sha.clone();
                     next.pr_number = old.pr_number;
                     next.executor = old.executor.clone();
+                    if incoming.executor.as_deref().is_some_and(|executor| {
+                        !executor.trim().is_empty() && !executor.eq_ignore_ascii_case("zach")
+                    }) {
+                        next.autonomous_consent = false;
+                    }
                     next.retry_count = old.retry_count;
                     next.memory = old.memory.clone();
-                    if crate::v2::pipeline::weight_rank(&old.weight)
-                        > crate::v2::pipeline::weight_rank(&next.weight)
+                    next.memory.governance_started |= incoming.memory.governance_started;
+                    next.weight = if crate::v2::pipeline::weight_rank(&old.weight)
+                        >= crate::v2::pipeline::weight_rank(&incoming.weight)
                     {
-                        next.weight = old.weight.clone();
-                    }
-                    next.context_pack.weight = next.weight.clone();
+                        old.weight.clone()
+                    } else {
+                        incoming.weight.clone()
+                    };
                     next.required_stages = crate::v2::intake::default_required_stages(&next.weight);
-                    for path in &old.context_pack.forbidden_paths {
-                        if !next.context_pack.forbidden_paths.contains(path) {
-                            next.context_pack.forbidden_paths.push(path.clone());
+                    for stage in &old.required_stages {
+                        if !next.required_stages.contains(stage) {
+                            next.required_stages.push(stage.clone());
                         }
                     }
-                    // An exported board snapshot can predate publication of the approved plan.
-                    if old.memory.approved_plan_artifact_path.is_some() {
-                        next.context_pack.target_files = old.context_pack.target_files.clone();
-                        for (required, refreshed) in [
-                            (
-                                &old.context_pack.worker_checks,
-                                &mut next.context_pack.worker_checks,
-                            ),
-                            (
-                                &old.context_pack.gate_checks,
-                                &mut next.context_pack.gate_checks,
-                            ),
-                            (
-                                &old.context_pack.verification_commands,
-                                &mut next.context_pack.verification_commands,
-                            ),
-                            (
-                                &old.context_pack.human_operations,
-                                &mut next.context_pack.human_operations,
-                            ),
-                        ] {
-                            for check in required {
-                                if !refreshed.contains(check) {
-                                    refreshed.push(check.clone());
-                                }
-                            }
-                        }
-                        for ac in &old.context_pack.acceptance_criteria {
-                            if !next
-                                .context_pack
-                                .acceptance_criteria
-                                .iter()
-                                .any(|a| a.id == ac.id)
-                            {
-                                next.context_pack.acceptance_criteria.push(ac.clone());
-                            }
-                        }
-                    }
+                    next.context_pack = old.context_pack.clone();
+                    next.context_pack.weight = next.weight.clone();
+                    next.repository = old.repository.clone();
+                    next.github_repo = old.github_repo.clone();
+                    next.issue_number = old.issue_number;
+                    next.branch = old.branch.clone();
+                    next.worktree_path = old.worktree_path.clone();
+                    next.next_retry_epoch = old.next_retry_epoch;
+                    next.lease_owner = old.lease_owner.clone();
+                    next.lease_expires_epoch = old.lease_expires_epoch;
                 } else {
                     coalesce_runtime_fields(&old, &mut next);
                     next.retry_count = old.retry_count.max(next.retry_count);
                 }
+                next.memory.governance_terminal_observed |= old.memory.governance_terminal_observed
+                    || is_terminal_task_status(&incoming.status);
                 Self::update_task_tx(&tx, &old, &next, now)?
             }
-            None => Self::insert_task_tx(&tx, incoming, now)?,
+            None => {
+                let mut next = incoming.clone();
+                next.memory.governance_terminal_observed |=
+                    is_terminal_task_status(&incoming.status);
+                Self::insert_task_tx(&tx, &next, now)?
+            }
         };
         tx.commit()?;
         Ok(result)
@@ -927,6 +1270,26 @@ impl V2Store {
         task: &TaskRecord,
         deliveries: &[PostMergeDelivery],
     ) -> Result<(), V2StoreError> {
+        self.save_delivery_checkpoint(task, deliveries, None)
+    }
+
+    /// Delivery verification and its receipt commit together; task completion
+    /// remains exclusively owned by the close acknowledgment.
+    pub fn save_delivery_status(
+        &mut self,
+        task: &TaskRecord,
+        verified_rows: Option<&[PostMergeDelivery]>,
+    ) -> Result<(), V2StoreError> {
+        let payload = verified_rows.map(|rows| serde_json::json!({"deliveries": rows}));
+        self.save_delivery_checkpoint(task, &[], payload.as_ref())
+    }
+
+    fn save_delivery_checkpoint(
+        &mut self,
+        task: &TaskRecord,
+        deliveries: &[PostMergeDelivery],
+        verified_event: Option<&serde_json::Value>,
+    ) -> Result<(), V2StoreError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -953,8 +1316,111 @@ impl V2Store {
             }
             Self::upsert_delivery_tx(&tx, delivery)?;
         }
+        if let Some(payload) = verified_event {
+            let rows = payload["deliveries"]
+                .as_array()
+                .filter(|rows| !rows.is_empty())
+                .ok_or_else(|| V2StoreError("verification requires delivery evidence".into()))?;
+            let sha = rows[0]["merge_sha"]
+                .as_str()
+                .ok_or_else(|| V2StoreError("verification requires merge SHA".into()))?;
+            if rows.iter().any(|row| {
+                row["task_id"] != task.task_id
+                    || row["merge_sha"] != sha
+                    || row["state"] != "verified"
+            }) {
+                return Err(V2StoreError(
+                    "inconsistent delivery verification evidence".into(),
+                ));
+            }
+            if !Self::delivery_verification_recorded_on(&tx, &task.task_id, sha)? {
+                Self::insert_event_tx(
+                    &tx,
+                    &task.task_id,
+                    &task.task_group,
+                    now,
+                    "POST_MERGE_DELIVERY_VERIFIED",
+                    payload,
+                )?;
+            }
+        }
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn delivery_verification_recorded(
+        &self,
+        task_id: &str,
+        sha: &str,
+    ) -> Result<bool, V2StoreError> {
+        Self::delivery_verification_recorded_on(&self.conn, task_id, sha)
+    }
+
+    fn delivery_verification_recorded_on(
+        conn: &Connection,
+        task_id: &str,
+        sha: &str,
+    ) -> Result<bool, V2StoreError> {
+        let mut stmt = conn.prepare("SELECT payload_json FROM task_events WHERE task_id=?1 AND event_type='POST_MERGE_DELIVERY_VERIFIED'")?;
+        for payload in stmt.query_map([task_id], |row| row.get::<_, String>(0))? {
+            let payload: serde_json::Value = serde_json::from_str(&payload?)?;
+            if payload["deliveries"].as_array().is_some_and(|rows| {
+                !rows.is_empty()
+                    && rows
+                        .iter()
+                        .all(|row| row["merge_sha"] == sha && row["state"] == "verified")
+            }) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Repair only a Zach-owned, provably unfinished legacy delivery close.
+    /// An authoritative terminal export or an acknowledged close always wins.
+    pub fn recover_unclosed_delivery(
+        &mut self,
+        id: &str,
+    ) -> Result<Option<TaskRecord>, V2StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(old) = Self::get_task_tx(&tx, id)? else {
+            return Ok(None);
+        };
+        if old.status != "Done"
+            || !is_zach_executor(old.executor.as_deref())
+            || old.memory.governance_terminal_observed
+            || old.memory.halt_requested
+            || !old.autonomous_consent
+        {
+            return Ok(None);
+        }
+        let Some(cp) = old.memory.merge_checkpoint.as_ref().filter(|cp| {
+            cp.post_merge_verified
+                && matches!(cp.phase.as_str(), "DELIVERY_PENDING" | "CLOSE_PENDING")
+                && Some(cp.pr_number) == old.pr_number
+        }) else {
+            return Ok(None);
+        };
+        let Some(sha) = cp.merge_sha.as_deref().filter(|sha| !sha.is_empty()) else {
+            return Ok(None);
+        };
+        let matches_receipt: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM post_merge_deliveries WHERE task_id=?1)
+             AND NOT EXISTS(SELECT 1 FROM post_merge_deliveries WHERE task_id=?1 AND (state!='verified' OR merge_sha!=?2))
+             AND NOT EXISTS(SELECT 1 FROM lifecycle_ops WHERE task_id=?1 AND kind='close' AND state='ACKNOWLEDGED')",
+            params![id, sha], |row| row.get(0),
+        )?;
+        if !matches_receipt {
+            return Ok(None);
+        }
+        let mut next = old.clone();
+        next.status = "Delivery Pending".into();
+        next.memory.merge_lane_released = true;
+        let saved = Self::update_task_tx(&tx, &old, &next, now_epoch())?;
+        tx.commit()?;
+        Ok(Some(saved))
     }
 
     /// Record a completed board write without replacing delivery/decision state
@@ -1048,7 +1514,7 @@ impl V2Store {
                     depends_on_json, required_stages_json, stages_completed_json,
                     current_stage, active_attempt_id, plan_base_sha, reviewed_sha,
                     pr_number, executor, autonomous_consent, retry_count, memory_json,
-                    version, updated_epoch
+                    version, updated_epoch, next_retry_epoch, lease_owner, lease_expires_epoch
              FROM tasks WHERE task_id = ?1",
         )?;
         stmt.query_row(params![task_id], Self::map_task_row)
@@ -1065,7 +1531,7 @@ impl V2Store {
                         depends_on_json, required_stages_json, stages_completed_json,
                         current_stage, active_attempt_id, plan_base_sha, reviewed_sha,
                         pr_number, executor, autonomous_consent, retry_count, memory_json,
-                        version, updated_epoch
+                        version, updated_epoch, next_retry_epoch, lease_owner, lease_expires_epoch
                  FROM tasks WHERE LOWER(task_group) = LOWER(?1) ORDER BY task_id ASC",
             )?;
             let rows = stmt.query_map(params![group], Self::map_task_row)?;
@@ -1079,7 +1545,7 @@ impl V2Store {
                         depends_on_json, required_stages_json, stages_completed_json,
                         current_stage, active_attempt_id, plan_base_sha, reviewed_sha,
                         pr_number, executor, autonomous_consent, retry_count, memory_json,
-                        version, updated_epoch
+                        version, updated_epoch, next_retry_epoch, lease_owner, lease_expires_epoch
                  FROM tasks ORDER BY task_id ASC",
             )?;
             let rows = stmt.query_map([], Self::map_task_row)?;
@@ -1111,7 +1577,11 @@ impl V2Store {
             {
                 continue;
             }
-            if task.status != "Ready" || !task.autonomous_consent {
+            if task.status != "Ready"
+                || !task.autonomous_consent
+                || task.next_retry_epoch > now_epoch()
+                || self.has_pending_lifecycle(&task.task_id)?
+            {
                 continue;
             }
             if blocked_by_decision.contains(&task.task_id) {
@@ -1211,6 +1681,9 @@ impl V2Store {
         context_summary: &str,
         sha: Option<&str>,
     ) -> Result<PendingDecisionRecord, V2StoreError> {
+        if let Some(existing) = self.get_decision(decision_id)? {
+            return Ok(existing);
+        }
         let now = now_epoch();
         let bounded_context = crate::v2::runner::truncate_utf8_bytes(
             context_summary,
@@ -1274,6 +1747,42 @@ impl V2Store {
         resolved_by: &str,
         note: Option<&str>,
     ) -> Result<DecisionResolution, V2StoreError> {
+        let choice = if let Some(existing) = self.get_decision(decision_id)? {
+            if existing.status == "RESOLVED" {
+                return Ok(DecisionResolution::AlreadyResolved(existing));
+            }
+            let task = self
+                .get_task(&existing.task_id)?
+                .ok_or_else(|| V2StoreError("decision task missing".into()))?;
+            let delivery = existing.kind != "governance_close_failed"
+                && (is_post_merge_decision(&existing.kind)
+                    || is_post_merge_status(&task.status)
+                    || !self.list_deliveries(Some(&existing.task_id))?.is_empty());
+            let selected = if delivery {
+                choice
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|index| index.checked_sub(1))
+                    .and_then(|index| existing.options.get(index))
+                    .or_else(|| {
+                        existing
+                            .options
+                            .iter()
+                            .find(|o| o.eq_ignore_ascii_case(choice))
+                    })
+            } else {
+                existing.options.iter().find(|o| o.as_str() == choice)
+            };
+            if resolved_by.trim().is_empty() || selected.is_none() {
+                return Err(V2StoreError(
+                    "invalid decision choice or empty actor".into(),
+                ));
+            }
+            selected.cloned().unwrap_or_default()
+        } else {
+            return Ok(DecisionResolution::NotFound);
+        };
+        let choice = choice.as_str();
         let now = now_epoch();
         let tx = self
             .conn
@@ -1307,13 +1816,9 @@ impl V2Store {
             params![task_id],
             |row| row.get(0),
         )?;
-        let post_merge =
-            is_post_merge_decision(&kind) || is_post_merge_status(&task_status) || linked;
-        let mut next_status = if task_status == "Blocked" {
-            "Ready"
-        } else {
-            &task_status
-        };
+        let post_merge = kind != "governance_close_failed"
+            && (is_post_merge_decision(&kind) || is_post_merge_status(&task_status) || linked);
+        let mut next_status = task_status.as_str();
         if post_merge {
             let options_raw: String = tx.query_row(
                 "SELECT options_json FROM pending_decisions WHERE decision_id = ?1",
@@ -1467,22 +1972,38 @@ impl V2Store {
         &mut self,
         attempt: &StageAttemptRecord,
     ) -> Result<(), V2StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::record_stage_attempt_tx(&tx, attempt)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn record_stage_attempt_tx(
+        tx: &rusqlite::Transaction<'_>,
+        attempt: &StageAttemptRecord,
+    ) -> Result<(), V2StoreError> {
         let now = now_epoch();
         let bounded_summary = attempt.summary.as_deref().map(|s| {
             crate::v2::runner::truncate_utf8_bytes(s, crate::v2::runner::MAX_SUMMARY_BYTES)
         });
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous: Option<(String, Option<i64>)> = tx
+            .query_row(
+                "SELECT status,ended_epoch FROM stage_attempts WHERE attempt_id=?1",
+                [&attempt.attempt_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
         tx.execute(
             "INSERT INTO stage_attempts (
                 attempt_id, task_id, stage, model, effort, systemd_unit, invocation_id,
                 started_epoch, ended_epoch, status, failure_class, summary,
-                input_tokens, output_tokens, total_tokens, sha_before, sha_after
+                input_tokens, output_tokens, total_tokens, sha_before, sha_after, phase, last_liveness_epoch, last_output_bytes, last_cpu_usage_usec, control_group, exit_code, exit_code_kind, retry_generation
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7,
                 ?8, ?9, ?10, ?11, ?12,
-                ?13, ?14, ?15, ?16, ?17
+                ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
              )
              ON CONFLICT(attempt_id) DO UPDATE SET
                 systemd_unit = excluded.systemd_unit,
@@ -1495,7 +2016,12 @@ impl V2Store {
                 output_tokens = excluded.output_tokens,
                 total_tokens = excluded.total_tokens,
                 sha_before = excluded.sha_before,
-                sha_after = excluded.sha_after",
+                sha_after = excluded.sha_after, phase = excluded.phase,
+                last_liveness_epoch = excluded.last_liveness_epoch,
+                last_output_bytes = excluded.last_output_bytes,
+                last_cpu_usage_usec = excluded.last_cpu_usage_usec,
+                control_group = excluded.control_group, exit_code = excluded.exit_code,
+                exit_code_kind = excluded.exit_code_kind, retry_generation = excluded.retry_generation",
             params![
                 attempt.attempt_id,
                 attempt.task_id,
@@ -1519,7 +2045,10 @@ impl V2Store {
                     .total_tokens
                     .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
                 attempt.sha_before,
-                attempt.sha_after,
+                attempt.sha_after, attempt.phase,
+                if attempt.last_liveness_epoch == 0 { attempt.started_epoch } else { attempt.last_liveness_epoch },
+                attempt.last_output_bytes, attempt.last_cpu_usage_usec, attempt.control_group,
+                attempt.exit_code, attempt.exit_code_kind, attempt.retry_generation,
             ],
         )?;
 
@@ -1532,26 +2061,84 @@ impl V2Store {
             .optional()?
             .unwrap_or_else(|| "default".to_owned());
 
-        let event_type = if attempt.ended_epoch.is_some() {
-            "STAGE_COMPLETED"
+        let event_type = if previous.is_none() {
+            Some(if attempt.ended_epoch.is_some() {
+                "STAGE_COMPLETED"
+            } else {
+                "STAGE_STARTED"
+            })
+        } else if attempt.ended_epoch.is_some()
+            && previous
+                .as_ref()
+                .is_some_and(|(status, ended)| ended.is_none() || status != &attempt.status)
+        {
+            Some("STAGE_COMPLETED")
         } else {
-            "STAGE_STARTED"
+            None
         };
-        Self::insert_event_tx(
-            &tx,
-            &attempt.task_id,
-            &task_group,
-            now,
-            event_type,
-            &serde_json::json!({
-                "attempt_id": attempt.attempt_id,
-                "stage": attempt.stage,
-                "model": attempt.model,
-                "effort": attempt.effort,
-                "status": attempt.status,
-                "total_tokens": attempt.total_tokens,
-            }),
-        )?;
+        if let Some(event_type) = event_type {
+            Self::insert_event_tx(
+                tx,
+                &attempt.task_id,
+                &task_group,
+                now,
+                event_type,
+                &serde_json::json!({"attempt_id":attempt.attempt_id,"stage":attempt.stage,"model":attempt.model,"effort":attempt.effort,"status":attempt.status,"total_tokens":attempt.total_tokens}),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Checkpoints task and attempt together, optionally releasing an ordinary
+    /// pre-merge lane and opening its failure decision in the same transaction.
+    pub fn transition_attempt(
+        &mut self,
+        task: &TaskRecord,
+        attempt: &StageAttemptRecord,
+        release: bool,
+        decision: Option<&FailureDecision>,
+    ) -> Result<(), V2StoreError> {
+        self.transition_task(task, Some(attempt), release, decision)
+    }
+
+    pub fn transition_task(
+        &mut self,
+        task: &TaskRecord,
+        attempt: Option<&StageAttemptRecord>,
+        release: bool,
+        decision: Option<&FailureDecision>,
+    ) -> Result<(), V2StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let old = Self::get_task_tx(&tx, &task.task_id)?
+            .ok_or_else(|| V2StoreError("transition task missing".into()))?;
+        Self::update_task_tx(&tx, &old, task, now_epoch())?;
+        if let Some(attempt) = attempt {
+            Self::record_stage_attempt_tx(&tx, attempt)?;
+        }
+        if release {
+            tx.execute("DELETE FROM path_locks WHERE task_id=?1", [&task.task_id])?;
+            tx.execute("DELETE FROM merge_queue WHERE task_id=?1", [&task.task_id])?;
+        }
+        if let Some(decision) = decision {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pending_decisions WHERE decision_id=?1)",
+                [&decision.decision_id],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                let seq = Self::insert_event_tx(
+                    &tx,
+                    &task.task_id,
+                    &task.task_group,
+                    now_epoch(),
+                    "DECISION_REQUIRED",
+                    &serde_json::json!({"decision_id":decision.decision_id,"kind":decision.kind,"question":decision.question,"options":decision.options,"sha":decision.sha}),
+                )?;
+                tx.execute("INSERT INTO pending_decisions(decision_id,task_id,task_group,kind,question,options_json,recommended_option,context_summary,sha,status,created_seq) VALUES(?1,?2,?3,?4,?5,?6,0,?7,?8,'OPEN',?9)",params![decision.decision_id,task.task_id,task.task_group,decision.kind,decision.question,serde_json::to_string(&decision.options)?,crate::v2::runner::truncate_utf8_bytes(&decision.context,1024),decision.sha,seq])?;
+            }
+        }
         tx.commit()?;
         Ok(())
     }
@@ -1564,7 +2151,7 @@ impl V2Store {
         let mut stmt = self.conn.prepare(
             "SELECT attempt_id, task_id, stage, model, effort, systemd_unit, invocation_id,
                     started_epoch, ended_epoch, status, failure_class, summary,
-                    input_tokens, output_tokens, total_tokens, sha_before, sha_after
+                    input_tokens, output_tokens, total_tokens, sha_before, sha_after, phase, last_liveness_epoch, last_output_bytes, last_cpu_usage_usec, control_group, exit_code, exit_code_kind, retry_generation
              FROM stage_attempts WHERE attempt_id = ?1",
         )?;
         stmt.query_row(params![attempt_id], Self::map_stage_attempt_row)
@@ -1580,7 +2167,7 @@ impl V2Store {
         let mut stmt = self.conn.prepare(
             "SELECT attempt_id, task_id, stage, model, effort, systemd_unit, invocation_id,
                     started_epoch, ended_epoch, status, failure_class, summary,
-                    input_tokens, output_tokens, total_tokens, sha_before, sha_after
+                    input_tokens, output_tokens, total_tokens, sha_before, sha_after, phase, last_liveness_epoch, last_output_bytes, last_cpu_usage_usec, control_group, exit_code, exit_code_kind, retry_generation
              FROM stage_attempts WHERE task_id = ?1 ORDER BY rowid ASC",
         )?;
         let rows = stmt.query_map(params![task_id], Self::map_stage_attempt_row)?;
@@ -1594,64 +2181,25 @@ impl V2Store {
     pub fn acquire_path_locks(
         &mut self,
         repo: &str,
-        paths: &[String],
+        _paths: &[String],
         task_id: &str,
     ) -> Result<bool, V2StoreError> {
-        let now = now_epoch();
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-
-        // If the repository already has a wildcard lock held by someone else, reject
-        let wildcard_holder: Option<String> = tx
-            .query_row(
-                "SELECT task_id FROM path_locks WHERE repo = ?1 AND path = '*'",
-                params![repo],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(existing) = wildcard_holder
-            && existing != task_id
-        {
+        let conflict: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM path_locks WHERE repo=?1 AND task_id!=?2)",
+            params![repo, task_id],
+            |r| r.get(0),
+        )?;
+        if conflict {
             return Ok(false);
         }
-
-        for path in paths {
-            if path == "*" {
-                let any_holder: Option<String> = tx
-                    .query_row(
-                        "SELECT task_id FROM path_locks WHERE repo = ?1 AND task_id != ?2 LIMIT 1",
-                        params![repo, task_id],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                if any_holder.is_some() {
-                    return Ok(false);
-                }
-            } else {
-                let holder: Option<String> = tx
-                    .query_row(
-                        "SELECT task_id FROM path_locks WHERE repo = ?1 AND path = ?2",
-                        params![repo, path],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                if let Some(existing) = holder
-                    && existing != task_id
-                {
-                    return Ok(false);
-                }
-            }
-        }
-
-        for path in paths {
-            tx.execute(
-                "INSERT INTO path_locks(repo, path, task_id, acquired_epoch)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(repo, path) DO UPDATE SET acquired_epoch = excluded.acquired_epoch",
-                params![repo, path, task_id, now],
-            )?;
-        }
+        tx.execute(
+            "DELETE FROM path_locks WHERE repo=?1 AND task_id=?2 AND path!='*'",
+            params![repo, task_id],
+        )?;
+        tx.execute("INSERT OR IGNORE INTO path_locks(repo,path,task_id,acquired_epoch) VALUES(?1,'*',?2,?3)",params![repo,task_id,now_epoch()])?;
         tx.commit()?;
         Ok(true)
     }
@@ -1854,6 +2402,24 @@ impl V2Store {
         Ok(max_seq.unwrap_or(0))
     }
 
+    pub fn occupies_task_slot(&self, task: &TaskRecord) -> Result<bool, V2StoreError> {
+        if matches!(
+            task.status.as_str(),
+            "Planning" | "Plan Review" | "In Progress" | "PR Review"
+        ) {
+            return Ok(true);
+        }
+        let Some(id) = task.active_attempt_id.as_deref() else {
+            return Ok(false);
+        };
+        Ok(self.get_stage_attempt(id)?.is_some_and(|a| {
+            matches!(
+                a.phase.as_str(),
+                "LAUNCH_PENDING" | "RUNNING" | "EXIT_OBSERVED" | "HARVESTED"
+            )
+        }))
+    }
+
     pub fn status_summary(&self) -> Result<DaemonStatusSummary, V2StoreError> {
         let max_parallel_tasks = self.max_parallel_tasks()?;
         let heartbeat_epoch: i64 = self
@@ -1897,6 +2463,50 @@ impl V2Store {
             open_decisions_count,
             active_locks_count: active_locks_count as usize,
             merge_queue_count: merge_queue_count as usize,
+            active_units: all_tasks
+                .iter()
+                .filter_map(|t| t.active_attempt_id.as_deref())
+                .map(|id| self.get_stage_attempt(id))
+                .collect::<Result<Vec<_>, _>>()?
+                .iter()
+                .flatten()
+                .filter(|a| {
+                    matches!(
+                        a.phase.as_str(),
+                        "LAUNCH_PENDING" | "RUNNING" | "EXIT_OBSERVED" | "HARVESTED"
+                    )
+                })
+                .count(),
+            occupied_repositories: self
+                .list_path_locks(None)?
+                .iter()
+                .map(|l| &l.repo)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            running_task_slots: all_tasks
+                .iter()
+                .map(|t| self.occupies_task_slot(t))
+                .collect::<Result<Vec<_>, _>>()?
+                .iter()
+                .filter(|occupied| **occupied)
+                .count(),
+            backoff_tasks: all_tasks
+                .iter()
+                .filter(|t| t.next_retry_epoch > now_epoch())
+                .count(),
+            pending_write_backs: self
+                .lifecycle_ops()?
+                .iter()
+                .filter(|o| o.state != "ACKNOWLEDGED")
+                .count(),
+            reconciliation_errors: self
+                .meta("reconciliation_errors")?
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+            last_sync_epoch: self
+                .meta("last_sync_epoch")?
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
         })
     }
 
@@ -1934,6 +2544,9 @@ impl V2Store {
             memory: serde_json::from_str(&memory_str).unwrap_or_default(),
             version: row.get(23)?,
             updated_epoch: row.get(24)?,
+            next_retry_epoch: row.get(25)?,
+            lease_owner: row.get(26)?,
+            lease_expires_epoch: row.get(27)?,
         })
     }
 
@@ -1993,6 +2606,14 @@ impl V2Store {
             total_tokens: total_tokens.and_then(|v| u64::try_from(v).ok()),
             sha_before: row.get(15)?,
             sha_after: row.get(16)?,
+            phase: row.get(17)?,
+            last_liveness_epoch: row.get(18)?,
+            last_output_bytes: row.get(19)?,
+            last_cpu_usage_usec: row.get(20)?,
+            control_group: row.get(21)?,
+            exit_code: row.get(22)?,
+            exit_code_kind: row.get(23)?,
+            retry_generation: row.get(24)?,
         })
     }
 }
@@ -2019,6 +2640,10 @@ fn coalesce_runtime_fields(old: &TaskRecord, next: &mut TaskRecord) {
     }
     if next.memory == TaskMemory::default() {
         next.memory = old.memory.clone();
+    } else if next.memory.merge_checkpoint.is_none() {
+        // Board exports cannot replace a durable merge/delivery receipt.
+        next.memory.merge_checkpoint = old.memory.merge_checkpoint.clone();
+        next.memory.merge_lane_released = old.memory.merge_lane_released;
     }
 }
 
@@ -2079,6 +2704,9 @@ mod tests {
             executor: None,
             autonomous_consent: true,
             retry_count: 0,
+            next_retry_epoch: 0,
+            lease_owner: None,
+            lease_expires_epoch: None,
             memory: TaskMemory::default(),
             version: 1,
             updated_epoch: 1000,
@@ -2200,53 +2828,27 @@ mod tests {
 
     #[test]
     fn merge_queue_and_path_locks_work_as_expected() {
-        let mut store = V2Store::open_in_memory().expect("open store");
-
-        // Path locks: acquire specific paths
-        let paths1 = vec!["src/v2/router.rs".to_owned(), "src/v2/runner.rs".to_owned()];
-        assert!(store.acquire_path_locks("zach", &paths1, "TASK-1").unwrap());
-
-        // Same task re-acquiring same paths succeeds
-        assert!(store.acquire_path_locks("zach", &paths1, "TASK-1").unwrap());
-
-        // Different task trying to acquire overlapping path fails
-        let paths2 = vec![
-            "src/v2/runner.rs".to_owned(),
-            "src/v2/pipeline.rs".to_owned(),
-        ];
-        assert!(!store.acquire_path_locks("zach", &paths2, "TASK-2").unwrap());
-
-        // Wildcard conflicts with existing paths
+        let mut store = V2Store::open_in_memory().unwrap();
+        assert!(
+            store
+                .acquire_path_locks("zach", &["src/a.rs".into()], "TASK-1")
+                .unwrap()
+        );
         assert!(
             !store
-                .acquire_path_locks("zach", &[String::from("*")], "TASK-3")
+                .acquire_path_locks("zach", &["src/b.rs".into()], "TASK-2")
                 .unwrap()
         );
-
-        // Non-overlapping paths in same repo succeed
         assert!(
             store
-                .acquire_path_locks("zach", &[String::from("src/v2/intake.rs")], "TASK-2")
+                .acquire_path_locks("governance", &["*".into()], "TASK-2")
                 .unwrap()
         );
-
-        // Overlapping path in different repo succeeds
-        assert!(
-            store
-                .acquire_path_locks("governance", &paths1, "TASK-2")
-                .unwrap()
-        );
-
-        // Check list_path_locks
-        let zach_locks = store.list_path_locks(Some("zach")).unwrap();
-        assert_eq!(zach_locks.len(), 3);
-        let all_locks = store.list_path_locks(None).unwrap();
-        assert_eq!(all_locks.len(), 5);
-
-        // Release TASK-1 locks
-        let released = store.release_path_locks("TASK-1").unwrap();
-        assert_eq!(released, 2);
-        assert_eq!(store.list_path_locks(Some("zach")).unwrap().len(), 1);
+        let locks = store.list_path_locks(Some("zach")).unwrap();
+        assert_eq!(locks.len(), 1);
+        assert_eq!(locks[0].path, "*");
+        assert_eq!(store.release_path_locks("TASK-1").unwrap(), 1);
+        assert!(store.list_path_locks(Some("zach")).unwrap().is_empty());
 
         // Merge queue FIFO operations
         let entry1 = store
@@ -2376,18 +2978,20 @@ mod tests {
 
         // AC-2: Spec fields refreshed
         assert_eq!(stored.title, "Refreshed spec title");
-        assert_eq!(stored.context_pack, incoming.context_pack);
+        let mut expected_context = internal.context_pack.clone();
+        expected_context.weight = stored.weight.clone();
+        assert_eq!(stored.context_pack, expected_context);
         assert_eq!(stored.weight, "M");
         assert_eq!(stored.depends_on, vec!["GOV-050".to_owned()]);
-        assert_eq!(stored.branch.as_deref(), Some("task/ZACH-021-refreshed"));
+        assert_eq!(stored.branch, internal.branch);
         assert_eq!(
             stored.worktree_path.as_deref(),
-            Some("/tmp/zach--ZACH-021-refreshed")
+            internal.worktree_path.as_deref()
         );
         assert_eq!(stored.task_group, "platform");
-        assert_eq!(stored.repository, "zach-core");
-        assert_eq!(stored.github_repo.as_deref(), Some("shockerqt/zach-core"));
-        assert_eq!(stored.issue_number, Some(99));
+        assert_eq!(stored.repository, internal.repository);
+        assert_eq!(stored.github_repo, internal.github_repo);
+        assert_eq!(stored.issue_number, internal.issue_number);
         assert!(!stored.autonomous_consent);
 
         drop(reopened);
@@ -2505,6 +3109,14 @@ mod tests {
             total_tokens: Some(120),
             sha_before: Some("abc".to_owned()),
             sha_after: None,
+            phase: "RUNNING".into(),
+            last_liveness_epoch: 0,
+            last_output_bytes: 0,
+            last_cpu_usage_usec: None,
+            control_group: None,
+            exit_code: None,
+            exit_code_kind: None,
+            retry_generation: 0,
         };
         store
             .record_stage_attempt(&failed_attempt)
@@ -2528,6 +3140,14 @@ mod tests {
             total_tokens: Some(250),
             sha_before: Some("abc".to_owned()),
             sha_after: Some("def".to_owned()),
+            phase: "RUNNING".into(),
+            last_liveness_epoch: 0,
+            last_output_bytes: 0,
+            last_cpu_usage_usec: None,
+            control_group: None,
+            exit_code: None,
+            exit_code_kind: None,
+            retry_generation: 0,
         };
         store
             .record_stage_attempt(&passed_attempt)
@@ -2582,6 +3202,14 @@ mod tests {
             total_tokens: Some(15),
             sha_before: None,
             sha_after: None,
+            phase: "RUNNING".into(),
+            last_liveness_epoch: 0,
+            last_output_bytes: 0,
+            last_cpu_usage_usec: None,
+            control_group: None,
+            exit_code: None,
+            exit_code_kind: None,
+            retry_generation: 0,
         };
         store.record_stage_attempt(&attempt).unwrap();
 
@@ -2685,6 +3313,10 @@ mod tests {
             .expect("seed legacy schema");
         }
 
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("ALTER TABLE stage_attempts ADD COLUMN phase TEXT NOT NULL DEFAULT 'POSTPROCESSING'; ALTER TABLE stage_attempts ADD COLUMN retry_generation INTEGER NOT NULL DEFAULT 7; ALTER TABLE stage_attempts ADD COLUMN last_output_bytes INTEGER NOT NULL DEFAULT 42;").unwrap();
+        }
         let mut store = V2Store::open(&db_path).expect("open and migrate legacy db");
 
         // Verify PRAGMA table_info now reports nullable with no default for all 3 token columns.
@@ -2716,6 +3348,9 @@ mod tests {
         assert_eq!(legacy_row.input_tokens, Some(120));
         assert_eq!(legacy_row.output_tokens, Some(30));
         assert_eq!(legacy_row.total_tokens, Some(150));
+        assert_eq!(legacy_row.phase, "POSTPROCESSING");
+        assert_eq!(legacy_row.retry_generation, 7);
+        assert_eq!(legacy_row.last_output_bytes, 42);
 
         // Recording unknown usage persists SQL NULL (not 0).
         let unknown_attempt = StageAttemptRecord {
@@ -2736,6 +3371,14 @@ mod tests {
             total_tokens: None,
             sha_before: None,
             sha_after: None,
+            phase: "RUNNING".into(),
+            last_liveness_epoch: 0,
+            last_output_bytes: 0,
+            last_cpu_usage_usec: None,
+            control_group: None,
+            exit_code: None,
+            exit_code_kind: None,
+            retry_generation: 0,
         };
         store.record_stage_attempt(&unknown_attempt).unwrap();
 
@@ -3203,5 +3846,144 @@ mod tests {
                 vec![stale_row]
             );
         }
+    }
+    #[test]
+    fn v4_upgrades_both_v3_lineages_and_older_schemas_without_data_loss() {
+        for version in [1, 2, 3] {
+            for delivery_lineage in [false, true] {
+                let mut store = V2Store::open_in_memory().unwrap();
+                let mut task = delivery_task("Delivery Pending");
+                task.next_retry_epoch = 42;
+                task.lease_owner = Some("owner".into());
+                let row = sample_delivery(&task);
+                store
+                    .save_deliveries_and_task(&task, std::slice::from_ref(&row))
+                    .unwrap();
+                store.conn.execute_batch("INSERT INTO stage_attempts(attempt_id,task_id,stage,model,effort,started_epoch,status,input_tokens) VALUES('legacy','TASK-001','impl','model','high',1,'PASSED',NULL);").unwrap();
+                if delivery_lineage {
+                    store.conn.execute_batch("ALTER TABLE tasks DROP COLUMN next_retry_epoch; ALTER TABLE tasks DROP COLUMN lease_owner; ALTER TABLE tasks DROP COLUMN lease_expires_epoch; DROP TABLE lifecycle_ops;").unwrap();
+                    for column in [
+                        "phase",
+                        "last_liveness_epoch",
+                        "last_output_bytes",
+                        "last_cpu_usage_usec",
+                        "control_group",
+                        "exit_code",
+                        "exit_code_kind",
+                        "retry_generation",
+                    ] {
+                        store
+                            .conn
+                            .execute_batch(&format!(
+                                "ALTER TABLE stage_attempts DROP COLUMN {column}"
+                            ))
+                            .unwrap();
+                    }
+                } else {
+                    store
+                        .conn
+                        .execute_batch("DROP TABLE post_merge_deliveries;")
+                        .unwrap();
+                }
+                store
+                    .conn
+                    .execute(
+                        "UPDATE daemon_meta SET value=?1 WHERE key='schema_version'",
+                        [version.to_string()],
+                    )
+                    .unwrap();
+                for _ in 0..2 {
+                    store.initialize().unwrap();
+                    assert_eq!(store.meta("schema_version").unwrap().as_deref(), Some("4"));
+                    let saved = store.get_task(&task.task_id).unwrap().unwrap();
+                    assert_eq!(
+                        saved.next_retry_epoch,
+                        if delivery_lineage { 0 } else { 42 }
+                    );
+                    assert_eq!(
+                        saved.lease_owner.as_deref(),
+                        if delivery_lineage {
+                            None
+                        } else {
+                            Some("owner")
+                        }
+                    );
+                    let attempt = store.get_stage_attempt("legacy").unwrap().unwrap();
+                    assert_eq!(attempt.input_tokens, None);
+                    assert_eq!(attempt.phase, "RUNNING");
+                    let rows = store.list_deliveries(Some(&task.task_id)).unwrap();
+                    assert_eq!(
+                        rows,
+                        if delivery_lineage {
+                            vec![row.clone()]
+                        } else {
+                            vec![]
+                        }
+                    );
+                    assert!(store.lifecycle_ops().unwrap().is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn delivery_verification_receipt_is_atomic_and_idempotent_without_completing_task() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        let mut task = delivery_task("Delivery Pending");
+        store.upsert_task(&task).unwrap();
+        let mut row = sample_delivery(&task);
+        row.state = "verified".into();
+        store.upsert_delivery(&row).unwrap();
+        task.memory.merge_lane_released = true;
+        store.conn.execute_batch("CREATE TRIGGER reject_verified BEFORE INSERT ON task_events WHEN NEW.event_type='POST_MERGE_DELIVERY_VERIFIED' BEGIN SELECT RAISE(ABORT,'injected event failure'); END;").unwrap();
+        assert!(
+            store
+                .save_delivery_status(&task, Some(std::slice::from_ref(&row)))
+                .is_err()
+        );
+        assert_eq!(
+            store.get_task(&task.task_id).unwrap().unwrap().status,
+            "Delivery Pending"
+        );
+        assert!(
+            !store
+                .get_task(&task.task_id)
+                .unwrap()
+                .unwrap()
+                .memory
+                .merge_lane_released
+        );
+        assert!(
+            !store
+                .delivery_verification_recorded(&task.task_id, &row.merge_sha)
+                .unwrap()
+        );
+        store
+            .conn
+            .execute_batch("DROP TRIGGER reject_verified")
+            .unwrap();
+        for _ in 0..2 {
+            store
+                .save_delivery_status(&task, Some(std::slice::from_ref(&row)))
+                .unwrap();
+        }
+        assert_eq!(
+            store.get_task(&task.task_id).unwrap().unwrap().status,
+            "Delivery Pending"
+        );
+        assert!(
+            store
+                .delivery_verification_recorded(&task.task_id, &row.merge_sha)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .list_events_since(None, 0, 100)
+                .unwrap()
+                .iter()
+                .filter(|e| e.event_type == "POST_MERGE_DELIVERY_VERIFIED")
+                .count(),
+            1
+        );
     }
 }

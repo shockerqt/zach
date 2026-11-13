@@ -3,12 +3,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use zach::ledger;
-use zach::v2::delivery::{SystemDeliveryDriver, poll_post_merge_deliveries};
 use zach::v2::intake::{ingest_export_json, sync_from_ws_task};
-use zach::v2::merge_queue::{SystemMergeDriver, process_repo_merge_queue};
-use zach::v2::pipeline::{execute_m_l_pipeline, execute_xs_s_pipeline, plan_task_execution};
-use zach::v2::runner::{attempt_retention_from_env, prune_old_attempts, reconcile_orphan_units};
-use zach::v2::scheduler::HeavyCheckSemaphore;
+use zach::v2::pipeline::plan_task_execution;
 use zach::v2::socket::{ClientCommand, DaemonServer, write_ndjson};
 use zach::v2::store::{DecisionResolution, V2Store};
 use zach::v2::{default_db_path, default_socket_path, default_state_dir, default_ws_task_bin};
@@ -65,19 +61,6 @@ fn main() {
             print_usage();
             std::process::exit(2);
         }
-    }
-}
-
-fn isolation_preflight_or_exit(store: &mut V2Store) {
-    if let Err(error) = zach::v2::isolation::verify_host_isolation() {
-        let _ = store.append_event(
-            "",
-            "system",
-            "ISOLATION_PREFLIGHT_FAILED",
-            &serde_json::json!({"message":error}),
-        );
-        eprintln!("{error}");
-        std::process::exit(1);
     }
 }
 
@@ -330,13 +313,60 @@ fn run_v2_config(args: &[String]) {
 }
 
 fn run_v2_run(args: &[String]) {
-    let mut store = open_store(args);
     let dry_run = has_flag(args, "--dry-run");
     if !dry_run {
-        isolation_preflight_or_exit(&mut store);
-        let _ = reconcile_orphan_units(&mut store);
-        let _ = prune_old_attempts(&default_state_dir(), attempt_retention_from_env());
+        // The daemon schedules pipelines and poll_post_merge_deliveries on bounded workers.
+        let socket_path = flag_value(args, "--socket")
+            .map(PathBuf::from)
+            .unwrap_or_else(default_socket_path);
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(&socket_path).unwrap_or_else(|error| {
+                eprintln!("connect to zachd at {}: {error}", socket_path.display());
+                std::process::exit(1)
+            });
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap_or_else(|error| {
+                eprintln!("run socket timeout: {error}");
+                std::process::exit(1)
+            });
+        write_ndjson(
+            &mut stream,
+            &ClientCommand::Run {
+                task: flag_value(args, "--task"),
+                group: flag_value(args, "--group"),
+                once: has_flag(args, "--once"),
+            },
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("submit run: {error}");
+            std::process::exit(1)
+        });
+        use std::io::BufRead;
+        let mut line = String::new();
+        std::io::BufReader::new(stream)
+            .read_line(&mut line)
+            .unwrap_or_else(|error| {
+                eprintln!("run acknowledgment: {error}");
+                std::process::exit(1)
+            });
+        let reply: serde_json::Value = serde_json::from_str(&line).unwrap_or_else(|error| {
+            eprintln!("invalid daemon acknowledgment: {error}");
+            std::process::exit(1)
+        });
+        println!("{}", line.trim());
+        if reply["type"] == "ERROR" {
+            std::process::exit(1);
+        }
+        return;
     }
+    let db = flag_value(args, "--db")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_db_path);
+    let store = V2Store::open_read_only(&db).unwrap_or_else(|error| {
+        eprintln!("read-only task store: {error}");
+        std::process::exit(1)
+    });
     let once = has_flag(args, "--once");
     let group = flag_value(args, "--group");
 
@@ -388,51 +418,7 @@ fn run_v2_run(args: &[String]) {
             "{}",
             serde_json::to_string_pretty(&plans).unwrap_or_else(|_| "[]".to_owned())
         );
-        return;
     }
-
-    let mut completed = Vec::new();
-    for task in &tasks {
-        let res = match task.weight.to_ascii_uppercase().as_str() {
-            "M" | "L" => execute_m_l_pipeline(&mut store, &task.task_id),
-            _ => execute_xs_s_pipeline(&mut store, &task.task_id),
-        };
-        match res {
-            Ok(updated) => completed.push(updated),
-            Err(error) => {
-                eprintln!("pipeline execution failed for {}: {error}", task.task_id);
-                std::process::exit(1);
-            }
-        }
-        if once {
-            break;
-        }
-    }
-
-    // Process per-repository merge queue
-    let semaphore = HeavyCheckSemaphore::new();
-    let mut driver = SystemMergeDriver;
-    let repos: Vec<String> = store
-        .list_merge_queue(None)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|e| e.repo)
-        .collect();
-    let mut unique_repos = repos;
-    unique_repos.sort();
-    unique_repos.dedup();
-    for repo in unique_repos {
-        let _ = process_repo_merge_queue(&mut store, &repo, &mut driver, &semaphore);
-    }
-
-    if let Err(error) = poll_post_merge_deliveries(&mut store, &mut SystemDeliveryDriver) {
-        eprintln!("post-merge delivery polling failed: {error}");
-    }
-
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&completed).unwrap_or_else(|_| "[]".to_owned())
-    );
 }
 
 fn run_ledger_validator(config: &BootstrapConfig) {
@@ -482,9 +468,16 @@ fn usage_error(message: &str) -> ! {
 }
 
 fn run_v2_daemon(args: &[String]) {
-    let mut store = open_store(args);
-    isolation_preflight_or_exit(&mut store);
-    let _ = prune_old_attempts(&default_state_dir(), attempt_retention_from_env());
+    let state_dir = default_state_dir();
+    let _lock = zach::v2::coordinator::DaemonLock::acquire(&state_dir).unwrap_or_else(|error| {
+        eprintln!("daemon lock: {error}");
+        std::process::exit(1)
+    });
+    let state_dir = std::fs::canonicalize(&state_dir).unwrap_or_else(|error| {
+        eprintln!("canonical daemon state directory: {error}");
+        std::process::exit(1)
+    });
+    let store = open_store(args);
     let socket_path = flag_value(args, "--socket")
         .map(PathBuf::from)
         .unwrap_or_else(default_socket_path);
@@ -506,7 +499,12 @@ fn run_v2_daemon(args: &[String]) {
         once
     );
 
-    if let Err(error) = server.run_loop(&mut store, once) {
+    zach::v2::socket::install_shutdown_signals().unwrap_or_else(|error| {
+        eprintln!("install shutdown signals: {error}");
+        std::process::exit(1)
+    });
+    let coordinator = zach::v2::coordinator::Coordinator::spawn(store, state_dir);
+    if let Err(error) = server.run_coordinated(coordinator, once) {
         eprintln!("daemon error: {error}");
         std::process::exit(1);
     }

@@ -1,3 +1,4 @@
+pub mod coordinator;
 pub mod delivery;
 pub mod intake;
 pub mod isolation;
@@ -13,7 +14,7 @@ use std::env;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 pub fn now_epoch() -> i64 {
     SystemTime::now()

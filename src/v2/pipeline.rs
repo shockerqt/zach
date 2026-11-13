@@ -926,7 +926,7 @@ pub fn extract_and_parse_context_pack_yaml(markdown: &str) -> Result<ContextPack
     serde_json::from_value(Value::Object(map)).map_err(|e| format!("invalid Context Pack: {e}"))
 }
 
-fn merge_plan_context(
+pub(crate) fn merge_plan_context(
     task: &TaskRecord,
     mut proposed: ContextPackSpec,
 ) -> Result<ContextPackSpec, String> {
@@ -1020,7 +1020,7 @@ fn merge_plan_context(
 }
 
 /// Publish the merged pack, since ws-task replaces the board pack with this block.
-fn plan_with_context(markdown: &str, pack: &ContextPackSpec) -> Result<String, String> {
+pub(crate) fn plan_with_context(markdown: &str, pack: &ContextPackSpec) -> Result<String, String> {
     let (_, span) = context_pack_block(markdown)?;
     let value = serde_json::to_value(pack).map_err(|e| e.to_string())?;
     let mut yaml = String::from("```yaml\n");
@@ -1270,7 +1270,7 @@ pub fn build_plan_review_prompt(task: &TaskRecord, worktree_path: &str, plan: &s
     )
 }
 
-fn task_with_full_approved_plan(
+pub(crate) fn task_with_full_approved_plan(
     task: &TaskRecord,
     executor: &dyn StageExecutor,
 ) -> Result<TaskRecord, String> {
@@ -1544,6 +1544,16 @@ pub fn classify_failure_class(stage: &str, status: &str, message: &str) -> &'sta
     let lower_status = status.trim().to_ascii_lowercase();
     let lower_stage = stage.trim().to_ascii_lowercase();
 
+    if lower_status == "stalled" || lower_status == "lost" || lower_status == "timeout" {
+        return FAILURE_CLASS_INFRA;
+    }
+    if matches!(lower_stage.as_str(), "plan-review" | "pr-review")
+        && (lower_msg.contains("schema")
+            || lower_msg.contains("review verdict")
+            || lower_msg.contains("citation"))
+    {
+        return FAILURE_CLASS_SEMANTIC;
+    }
     if lower_msg.contains("forbidden")
         || lower_msg.contains("out-of-scope")
         || lower_msg.contains("scope_violation")
@@ -1557,6 +1567,7 @@ pub fn classify_failure_class(stage: &str, status: &str, message: &str) -> &'sta
         || lower_msg.contains("verdict gate")
         || lower_msg.contains("approval rejected")
         || lower_msg.contains("autonomous_consent")
+        || lower_msg.contains("context_pack.network")
     {
         return FAILURE_CLASS_POLICY;
     }
@@ -1770,7 +1781,7 @@ fn count_agy_infra_for_stage(task: &TaskRecord, stage: &str) -> usize {
         .count()
 }
 
-fn resolve_author_family(
+pub(crate) fn resolve_author_family(
     store: &V2Store,
     task_id: &str,
     stage: &str,
@@ -1947,6 +1958,14 @@ fn execute_pr_review_gate(
         total_tokens: None,
         sha_before: Some(reviewed_sha.clone()),
         sha_after: Some(reviewed_sha),
+        phase: "RUNNING".into(),
+        last_liveness_epoch: 0,
+        last_output_bytes: 0,
+        last_cpu_usage_usec: None,
+        control_group: None,
+        exit_code: None,
+        exit_code_kind: None,
+        retry_generation: 0,
     };
     store
         .record_stage_attempt(&rev_attempt)
@@ -2158,6 +2177,12 @@ pub fn execute_xs_s_pipeline_with_executor_and_ws_task(
     executor: &mut dyn StageExecutor,
     ws_task_bin: &Path,
 ) -> Result<TaskRecord, String> {
+    if !cfg!(test) {
+        return Err(
+            "pipeline execution is owned by zachd; submit through the daemon socket".into(),
+        );
+    }
+
     let mut task = store
         .get_task(task_id)
         .map_err(|e| e.to_string())?
@@ -2254,6 +2279,14 @@ pub fn execute_xs_s_pipeline_with_executor_and_ws_task(
                 total_tokens: None,
                 sha_before: None,
                 sha_after: None,
+                phase: "RUNNING".into(),
+                last_liveness_epoch: 0,
+                last_output_bytes: 0,
+                last_cpu_usage_usec: None,
+                control_group: None,
+                exit_code: None,
+                exit_code_kind: None,
+                retry_generation: 0,
             };
             store
                 .record_stage_attempt(&attempt_rec)
@@ -2502,6 +2535,12 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
     executor: &mut dyn StageExecutor,
     ws_task_bin: &Path,
 ) -> Result<TaskRecord, String> {
+    if !cfg!(test) {
+        return Err(
+            "pipeline execution is owned by zachd; submit through the daemon socket".into(),
+        );
+    }
+
     let mut task = store
         .get_task(task_id)
         .map_err(|e| e.to_string())?
@@ -2605,6 +2644,14 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                 total_tokens: None,
                 sha_before: None,
                 sha_after: None,
+                phase: "RUNNING".into(),
+                last_liveness_epoch: 0,
+                last_output_bytes: 0,
+                last_cpu_usage_usec: None,
+                control_group: None,
+                exit_code: None,
+                exit_code_kind: None,
+                retry_generation: 0,
             };
             store
                 .record_stage_attempt(&plan_rec)
@@ -2819,6 +2866,14 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                 total_tokens: None,
                 sha_before: None,
                 sha_after: None,
+                phase: "RUNNING".into(),
+                last_liveness_epoch: 0,
+                last_output_bytes: 0,
+                last_cpu_usage_usec: None,
+                control_group: None,
+                exit_code: None,
+                exit_code_kind: None,
+                retry_generation: 0,
             };
             store
                 .record_stage_attempt(&rev_rec)
@@ -3141,6 +3196,14 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                 total_tokens: None,
                 sha_before: None,
                 sha_after: None,
+                phase: "RUNNING".into(),
+                last_liveness_epoch: 0,
+                last_output_bytes: 0,
+                last_cpu_usage_usec: None,
+                control_group: None,
+                exit_code: None,
+                exit_code_kind: None,
+                retry_generation: 0,
             };
             store
                 .record_stage_attempt(&attempt_rec)
@@ -3441,6 +3504,356 @@ fn enqueue_pipeline_task_for_merge(
     task = store.upsert_task(&task).map_err(|e| e.to_string())?;
 
     Ok(task)
+}
+
+pub const MAX_INFRA_RETRIES: usize = 2;
+pub const MAX_SEMANTIC_RETRIES: usize = 2;
+pub const MAX_POLICY_RETRIES: usize = 0;
+
+pub fn retry_backoff(failure_index: usize) -> i64 {
+    (15_i64.saturating_mul(
+        1_i64
+            .checked_shl(failure_index.saturating_sub(1).min(10) as u32)
+            .unwrap_or(1024),
+    ))
+    .min(300)
+}
+
+/// A worker result is matched by attempt and retry generation, never intake version.
+pub struct PipelineStepResult {
+    pub task: TaskRecord,
+    pub next_operation: String,
+    pub publication: Option<crate::v2::store::LifecycleOperation>,
+}
+
+pub fn prepare_supervised_stage(
+    state_dir: &Path,
+    task: &TaskRecord,
+    stage: &str,
+    attempt_id: &str,
+    author: Option<ModelFamily>,
+) -> Result<crate::v2::runner::PreparedLaunch, String> {
+    let route = resolve_stage_route(&task.weight, stage, task.retry_count, author)?
+        .ok_or("missing stage route")?;
+    check_token_budget(task, &route)?;
+    let mut executor = SystemdStageExecutor::with_state_dir(state_dir);
+    let worktree = task
+        .worktree_path
+        .as_deref()
+        .ok_or("missing governed worktree")?;
+    let prompt_task = task_with_full_approved_plan(task, &executor)?;
+    let prompt = match stage {
+        "plan" => build_plan_prompt(task, worktree),
+        "plan-review" => {
+            let path = task
+                .memory
+                .candidate_plan_artifact_path
+                .as_deref()
+                .ok_or("missing candidate plan")?;
+            let plan = executor.read_plan_artifact(Path::new(path))?;
+            let proposed = merge_plan_context(task, extract_and_parse_context_pack_yaml(&plan)?)?;
+            build_plan_review_prompt(task, worktree, &plan_with_context(&plan, &proposed)?)
+        }
+        "impl" => build_impl_prompt(&prompt_task, worktree),
+        "pr-review" => {
+            let sha = task.reviewed_sha.as_deref().ok_or("missing reviewed sha")?;
+            let diff = executor.collect_reviewed_diff(task, worktree, sha)?;
+            build_pr_review_prompt(&prompt_task, worktree, &diff)
+        }
+        _ => return Err("cannot dispatch human stage".into()),
+    };
+    let spec = build_systemd_stage_command(task, attempt_id, &route, &prompt)?;
+    crate::v2::runner::prepare_detached_launch(state_dir, task, attempt_id, &route, spec)
+}
+
+fn evidence_cell(value: &str) -> String {
+    value.replace('|', "/").replace(['\r', '\n'], " ")
+}
+
+pub fn format_ac_evidence(task: &TaskRecord, verdict: &ReviewVerdict) -> Result<String, String> {
+    let mut body =
+        String::from("| AC | Criterion | Evidence | Test | Result |\n|---|---|---|---|---|\n");
+    for ac in &task.context_pack.acceptance_criteria {
+        let row = verdict
+            .ac_results
+            .iter()
+            .find(|r| r.id == ac.id)
+            .ok_or_else(|| format!("missing evidence for {}", ac.id))?;
+        if row.line == 0 || row.file.trim().is_empty() || row.evidence.trim().is_empty() {
+            return Err("invalid AC evidence".into());
+        }
+        body.push_str(&format!(
+            "| {} | {} | {}:{} | {} | {} |\n",
+            evidence_cell(&ac.id),
+            evidence_cell(&ac.description),
+            evidence_cell(&row.file),
+            row.line,
+            evidence_cell(&row.evidence),
+            row.status
+        ));
+    }
+    if task.context_pack.acceptance_criteria.is_empty() {
+        return Err("review requires expected acceptance criteria".into());
+    }
+    validate_ac_evidence(task, &body)?;
+    Ok(body)
+}
+
+/// Validate the exact five-column Governance contract before publishing or parity reuse.
+pub fn validate_ac_evidence(task: &TaskRecord, body: &str) -> Result<(), String> {
+    let mut ids = BTreeSet::new();
+    for line in body.lines() {
+        let cells: Vec<_> = line
+            .trim()
+            .trim_matches('|')
+            .split('|')
+            .map(str::trim)
+            .collect();
+        if cells.first().is_some_and(|s| s.starts_with("AC-")) {
+            if cells.len() != 5
+                || !ids.insert(cells[0].to_owned())
+                || cells[1].is_empty()
+                || cells[3].is_empty()
+                || !matches!(cells[4], "PASS" | "FAIL")
+            {
+                return Err("invalid five-column AC evidence table".into());
+            }
+            let (file, line) = cells[2]
+                .rsplit_once(':')
+                .ok_or("AC citation lacks file:line")?;
+            normalize_cited_diff_path(file, task.worktree_path.as_deref().unwrap_or(""))?;
+            if line.parse::<usize>().unwrap_or(0) == 0 {
+                return Err("AC citation has invalid line".into());
+            }
+        }
+    }
+    if task
+        .context_pack
+        .acceptance_criteria
+        .iter()
+        .any(|ac| !ids.contains(&ac.id))
+        || ids.is_empty()
+    {
+        return Err("AC evidence coverage incomplete".into());
+    }
+    Ok(())
+}
+
+/// One resumable operation per worker job. The coordinator persists `next_operation`
+/// before submitting its next job, including before commit and push side effects.
+pub fn run_supervised_pipeline_step(
+    state_dir: &Path,
+    ws_task_bin: &Path,
+    mut task: TaskRecord,
+    attempt: &StageAttemptRecord,
+    operation: &str,
+    semaphore: &crate::v2::scheduler::HeavyCheckSemaphore,
+) -> Result<PipelineStepResult, String> {
+    let mut executor = SystemdStageExecutor::with_state_dir(state_dir);
+    let worktree = task.worktree_path.clone().ok_or("missing worktree")?;
+    let dir = state_dir.join("attempts").join(&attempt.attempt_id);
+    let mut verdict = None;
+    let mut body = String::new();
+    let next = match operation {
+        "VALIDATE" => {
+            let result: StageExecutionResult = serde_json::from_slice(
+                &std::fs::read(dir.join("harvest.json")).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            if result.status != "PASSED" {
+                return Err(result.summary);
+            }
+            match attempt.stage.as_str() {
+                "plan" => {
+                    let text = result
+                        .stage_output
+                        .as_deref()
+                        .or(result.review_output.as_deref())
+                        .ok_or("plan lacks full output")?;
+                    let proposed =
+                        merge_plan_context(&task, extract_and_parse_context_pack_yaml(text)?)?;
+                    let canonical = plan_with_context(text, &proposed)?;
+                    let artifact =
+                        executor.persist_plan_artifact(&task, &attempt.attempt_id, &canonical)?;
+                    task.context_pack = proposed;
+                    task.weight = task.context_pack.weight.clone();
+                    task.required_stages = crate::v2::intake::default_required_stages(&task.weight);
+                    task.memory.candidate_plan_artifact_path =
+                        Some(artifact.to_string_lossy().into_owned());
+                    task.memory.approved_plan = None;
+                    task.memory.approved_plan_artifact_path = None;
+                    body = canonical;
+                    "PUBLISH"
+                }
+                "plan-review" => {
+                    let path = task
+                        .memory
+                        .candidate_plan_artifact_path
+                        .as_deref()
+                        .ok_or("missing candidate")?;
+                    let plan = executor.read_plan_artifact(Path::new(path))?;
+                    let proposed =
+                        merge_plan_context(&task, extract_and_parse_context_pack_yaml(&plan)?)?;
+                    let raw = result
+                        .review_output
+                        .as_deref()
+                        .or(result.stage_output.as_deref())
+                        .ok_or("missing review verdict JSON")?;
+                    let review =
+                        validate_plan_review_verdict(raw, &task, &proposed, path, &worktree)?;
+                    if review.verdict == "APPROVED" {
+                        let plan = plan_with_context(&plan, &proposed)?;
+                        let path = executor.persist_plan_artifact(
+                            &task,
+                            &format!("{}-approved", attempt.attempt_id),
+                            &plan,
+                        )?;
+                        task.memory.approved_plan =
+                            Some(truncate_utf8_bytes(&plan, MAX_APPROVED_PLAN_BYTES));
+                        task.memory.approved_plan_artifact_path =
+                            Some(path.to_string_lossy().into_owned());
+                    } else {
+                        task.memory.last_plan_review_findings =
+                            Some(format_review_findings(&review));
+                    }
+                    body = format!(
+                        "{}\n\n{}",
+                        review.summary,
+                        serde_json::to_string_pretty(&review).map_err(|e| e.to_string())?
+                    );
+                    verdict = Some(review.verdict);
+                    "PUBLISH"
+                }
+                "pr-review" => {
+                    let sha = task.reviewed_sha.as_deref().ok_or("missing reviewed sha")?;
+                    let diff = executor.collect_reviewed_diff(&task, &worktree, sha)?;
+                    let ids = task
+                        .context_pack
+                        .acceptance_criteria
+                        .iter()
+                        .map(|a| a.id.clone())
+                        .collect::<Vec<_>>();
+                    let raw = result
+                        .review_output
+                        .as_deref()
+                        .or(result.stage_output.as_deref())
+                        .ok_or("missing review verdict JSON")?;
+                    let review = validate_review_verdict(raw, &ids, &diff, &worktree)?;
+                    body = format_ac_evidence(&task, &review)?;
+                    task.memory.last_pr_review_evidence = Some(body.clone());
+                    task.memory.last_pr_review_evidence_sha = task.reviewed_sha.clone();
+                    task.memory.last_pr_review_evidence_path =
+                        Some(dir.join("stage-evidence.md").to_string_lossy().into_owned());
+                    if review.verdict == "CHANGES_REQUESTED" {
+                        task.memory.last_review_findings = Some(format_review_findings(&review));
+                    }
+                    verdict = Some(review.verdict);
+                    "PUBLISH"
+                }
+                "impl" => {
+                    match verify_worktree_diff_with(
+                        &task.repository,
+                        &task.weight,
+                        &task.context_pack,
+                        &result.diff_files,
+                        ws_task_bin,
+                    )? {
+                        DiffCheckOutcome::Clean => {}
+                        DiffCheckOutcome::WeightEscalated {
+                            to_weight,
+                            required_stages,
+                            reason,
+                            ..
+                        } => {
+                            apply_weight_escalation(&mut task, to_weight, required_stages, &reason);
+                            return Ok(PipelineStepResult {
+                                task,
+                                next_operation: "PLAN_PREREQUISITES".into(),
+                                publication: None,
+                            });
+                        }
+                        DiffCheckOutcome::ForbiddenPathViolation { path, pattern } => {
+                            return Err(format!(
+                                "scope_violation: {path} matches forbidden {pattern}"
+                            ));
+                        }
+                        DiffCheckOutcome::OutOfScopeFiles { files } => {
+                            return Err(format!("scope_violation: out-of-scope {files:?}"));
+                        }
+                    }
+                    "CHECKS"
+                }
+                _ => return Err("invalid worker stage".into()),
+            }
+        }
+        "CHECKS" => {
+            let _permit = semaphore.acquire();
+            executor.run_checks(&worktree, &task.context_pack.worker_checks)?;
+            executor.run_gate_checks(&worktree, &task.context_pack.gate_checks)?;
+            "COMMIT"
+        }
+        "COMMIT" => {
+            task.reviewed_sha = Some(executor.commit_worktree(&task, &worktree)?);
+            "PUSH"
+        }
+        "PUSH" => {
+            task.pr_number = Some(
+                executor.push_and_ensure_pr(
+                    &task,
+                    &worktree,
+                    task.reviewed_sha
+                        .as_deref()
+                        .ok_or("missing committed sha")?,
+                )?,
+            );
+            body = format!(
+                "Implementation committed at {}.\n\nWorker checks executed successfully:\n{}\n\nGate checks executed successfully:\n{}",
+                task.reviewed_sha.as_deref().unwrap_or(""),
+                task.context_pack.worker_checks.join("\n"),
+                task.context_pack.gate_checks.join("\n")
+            );
+            "PUBLISH"
+        }
+        _ => return Err(format!("unknown pipeline operation {operation}")),
+    };
+    let publication = if next == "PUBLISH" {
+        let path = dir.join("stage-evidence.md");
+        crate::v2::runner::write_secure_file(&path, body.as_bytes())?;
+        let sha = if matches!(attempt.stage.as_str(), "plan" | "plan-review") {
+            task.plan_base_sha.as_deref()
+        } else {
+            task.reviewed_sha.as_deref()
+        };
+        Some(if attempt.stage == "plan" {
+            crate::v2::intake::publish_plan_stage(
+                &task,
+                &format!("zach-stage-{}", attempt.attempt_id),
+                &path,
+            )
+        } else {
+            crate::v2::intake::stage_operation(
+                &task,
+                &format!("zach-stage-{}", attempt.attempt_id),
+                &attempt.stage,
+                &path,
+                verdict.as_deref(),
+                sha,
+                "zach",
+            )
+        })
+    } else {
+        None
+    };
+    let next_operation = if next == "PUBLISH" {
+        format!("PUBLISH_{}", verdict.as_deref().unwrap_or("APPROVED"))
+    } else {
+        next.into()
+    };
+    Ok(PipelineStepResult {
+        task,
+        next_operation,
+        publication,
+    })
 }
 
 #[cfg(test)]
@@ -4013,6 +4426,14 @@ mod tests {
                 total_tokens: None,
                 sha_before: None,
                 sha_after: None,
+                phase: "RUNNING".into(),
+                last_liveness_epoch: 0,
+                last_output_bytes: 0,
+                last_cpu_usage_usec: None,
+                control_group: None,
+                exit_code: None,
+                exit_code_kind: None,
+                retry_generation: 0,
             })
             .unwrap();
         mock.staged_results
@@ -4364,6 +4785,9 @@ print(json.dumps({
             executor: None,
             autonomous_consent: true,
             retry_count: 0,
+            next_retry_epoch: 0,
+            lease_owner: None,
+            lease_expires_epoch: None,
             memory: TaskMemory::default(),
             version: 1,
             updated_epoch: 1000,
@@ -4450,7 +4874,7 @@ print(json.dumps({
         assert_eq!(mq[0].pr_number, 42);
         assert_eq!(mq[0].reviewed_sha, "def5678");
         assert_eq!(mq[0].state, "QUEUED");
-        assert_eq!(store.list_path_locks(Some("zach")).unwrap().len(), 2);
+        assert_eq!(store.list_path_locks(Some("zach")).unwrap().len(), 1);
 
         // Done only occurs after merge_queue succeeds
         assert_merge_queue_completes_task(&mut store, "zach", "ZACH-005", 42, "final-merge-sha");
@@ -4482,6 +4906,9 @@ print(json.dumps({
             executor: None,
             autonomous_consent: true,
             retry_count: 0,
+            next_retry_epoch: 0,
+            lease_owner: None,
+            lease_expires_epoch: None,
             memory: TaskMemory::default(),
             version: 1,
             updated_epoch: 1000,
@@ -4534,7 +4961,7 @@ print(json.dumps({
         assert_eq!(mq[0].pr_number, 77);
         assert_eq!(mq[0].reviewed_sha, "xs-sha-1");
         assert_eq!(mq[0].state, "QUEUED");
-        assert_eq!(store.list_path_locks(Some("zach")).unwrap().len(), 2);
+        assert_eq!(store.list_path_locks(Some("zach")).unwrap().len(), 1);
 
         assert_merge_queue_completes_task(&mut store, "zach", "ZACH-023-XS", 77, "xs-final-sha");
     }
@@ -4570,6 +4997,9 @@ print(json.dumps({
             executor: None,
             autonomous_consent: true,
             retry_count: 0,
+            next_retry_epoch: 0,
+            lease_owner: None,
+            lease_expires_epoch: None,
             memory: TaskMemory::default(),
             version: 1,
             updated_epoch: 1000,
@@ -4678,7 +5108,7 @@ print(json.dumps({
 
         // Verify path locks remain held for merge queue!
         let locks = store.list_path_locks(Some("zach")).unwrap();
-        assert_eq!(locks.len(), 2);
+        assert_eq!(locks.len(), 1);
     }
 
     #[test]
@@ -4714,6 +5144,9 @@ print(json.dumps({
             executor: None,
             autonomous_consent: true,
             retry_count: 0,
+            next_retry_epoch: 0,
+            lease_owner: None,
+            lease_expires_epoch: None,
             memory: TaskMemory::default(),
             version: 1,
             updated_epoch: 1000,
@@ -4895,6 +5328,9 @@ print(json.dumps({
             executor: None,
             autonomous_consent: true,
             retry_count: 0,
+            next_retry_epoch: 0,
+            lease_owner: None,
+            lease_expires_epoch: None,
             memory: TaskMemory::default(),
             version: 1,
             updated_epoch: 1000,
@@ -5654,6 +6090,14 @@ print(json.dumps({
                 total_tokens: None,
                 sha_before: None,
                 sha_after: None,
+                phase: "RUNNING".into(),
+                last_liveness_epoch: 0,
+                last_output_bytes: 0,
+                last_cpu_usage_usec: None,
+                control_group: None,
+                exit_code: None,
+                exit_code_kind: None,
+                retry_generation: 0,
             })
             .unwrap();
         assert_eq!(
@@ -5689,6 +6133,9 @@ print(json.dumps({
             executor: None,
             autonomous_consent: true,
             retry_count: 0,
+            next_retry_epoch: 0,
+            lease_owner: None,
+            lease_expires_epoch: None,
             memory: TaskMemory::default(),
             version: 1,
             updated_epoch: 1000,
@@ -5768,6 +6215,9 @@ print(json.dumps({
             executor: None,
             autonomous_consent: true,
             retry_count: 0,
+            next_retry_epoch: 0,
+            lease_owner: None,
+            lease_expires_epoch: None,
             memory: TaskMemory::default(),
             version: 1,
             updated_epoch: 1000,
@@ -5903,6 +6353,9 @@ print(json.dumps({
             executor: Some("zach".to_owned()),
             autonomous_consent: true,
             retry_count: 0,
+            next_retry_epoch: 0,
+            lease_owner: None,
+            lease_expires_epoch: None,
             memory: TaskMemory::default(),
             version: 1,
             updated_epoch: 1000,
@@ -6030,6 +6483,9 @@ print(json.dumps({
             executor: None,
             autonomous_consent: true,
             retry_count: 0,
+            next_retry_epoch: 0,
+            lease_owner: None,
+            lease_expires_epoch: None,
             memory: TaskMemory::default(),
             version: 1,
             updated_epoch: 1000,
@@ -7125,6 +7581,8 @@ print(json.dumps({
         let budget_err = check_token_budget(&completed, &route).unwrap_err();
         assert!(budget_err.contains("token budget exhausted"));
 
+        // A separate task must wait until the prior repository owner releases its lane.
+        store.release_path_locks("ZACH-020-ACC").unwrap();
         // Unknown usage attempt (from real codex_exec_failed.jsonl) records SQL NULL (not 0).
         let mut null_task = sample_s_task("ZACH-020-NULL");
         null_task.weight = "XS".to_owned();
@@ -7542,5 +8000,40 @@ raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={
         let open_decs = store.list_decisions(true, None).unwrap();
         assert_eq!(open_decs.len(), 1);
         assert_eq!(open_decs[0].kind, "merge_approval");
+    }
+    #[test]
+    fn governance_review_evidence_is_complete_five_column_and_malformed_reviews_are_semantic() {
+        let mut task = sample_s_task("ZACH-025-EVIDENCE");
+        task.context_pack.acceptance_criteria = vec![crate::v2::store::AcceptanceCriterionSpec {
+            id: "AC-1".into(),
+            description: "criterion".into(),
+        }];
+        let verdict: ReviewVerdict =
+            serde_json::from_str(&approved_verdict_json("AC-1", "src/v2/runner.rs:10")).unwrap();
+        let evidence = format_ac_evidence(&task, &verdict).unwrap();
+        assert!(evidence.contains("| AC | Criterion | Evidence | Test | Result |"));
+        validate_ac_evidence(&task, &evidence).unwrap();
+        assert!(
+            validate_ac_evidence(&task, "| AC-1 | criterion | src/example.rs:1 | PASS |").is_err()
+        );
+        assert!(
+            validate_ac_evidence(
+                &task,
+                "| AC-2 | criterion | src/example.rs:1 | test: PASS | PASS |"
+            )
+            .is_err()
+        );
+        assert_eq!(
+            classify_failure_class(
+                "pr-review",
+                "FAILED",
+                "review verdict JSON schema parse error: non-json"
+            ),
+            "semantic"
+        );
+        assert_eq!(
+            classify_failure_class("impl", "STALLED", "no output or CPU"),
+            "infra"
+        );
     }
 }

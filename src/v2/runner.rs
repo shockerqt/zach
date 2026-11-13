@@ -273,10 +273,13 @@ pub fn build_systemd_stage_command_with_env(
 
     let mut args = vec![
         "--user".to_owned(),
-        "--collect".to_owned(),
-        "--wait".to_owned(),
-        "--pipe".to_owned(),
-        format!("--unit={unit_name}"),
+        "--no-block".to_owned(),
+        "--service-type=exec".to_owned(),
+        "-p".to_owned(),
+        "RemainAfterExit=yes".to_owned(),
+        "-p".to_owned(),
+        "CollectMode=inactive".to_owned(),
+        format!("--unit={unit_name}.service"),
         "--slice=zach-workers.slice".to_owned(),
         "-p".to_owned(),
         format!("RuntimeMaxSec={}", route.timeout_secs),
@@ -573,6 +576,11 @@ pub fn prune_old_attempts_at(
             continue;
         }
         let path = entry.path();
+        // Detached artifacts can be referenced by live units, post-processing,
+        // or Governance/close receipts. Only the supervisor can release them.
+        if path.join("manifest.json").exists() {
+            continue;
+        }
         let Ok(dir_meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };
@@ -589,7 +597,7 @@ pub fn prune_old_attempts_at(
     Ok(pruned)
 }
 
-fn validate_attempt_id(attempt_id: &str) -> Result<&str, String> {
+pub(crate) fn validate_attempt_id(attempt_id: &str) -> Result<&str, String> {
     if attempt_id.is_empty()
         || attempt_id == "."
         || attempt_id == ".."
@@ -661,7 +669,7 @@ pub(crate) fn write_secure_file(path: &std::path::Path, bytes: &[u8]) -> Result<
         .map_err(|e| format!("failed to chmod 0600 {}: {e}", path.display()))?;
     file.write_all(bytes)
         .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
-    file.flush()
+    file.sync_all()
         .map_err(|e| format!("failed to flush {}: {e}", path.display()))?;
     Ok(())
 }
@@ -908,42 +916,21 @@ impl StageExecutor for SystemdStageExecutor {
         markdown: &str,
     ) -> Result<(), String> {
         if self.read_plan_artifact(path)? != markdown {
-            return Err("plan publication body differs from artifact".to_owned());
-        }
-        let mut cmd = Command::new(&self.ws_task_bin);
-        cmd.args([
-            "stage",
-            &task.task_id,
-            "plan",
-            "--actor",
-            "zach",
-            "--body-file",
-        ])
-        .arg(path);
-        // Never forward the historical placeholder SHA; let ws-task resolve HEAD.
-        if let Some(sha) = task
-            .plan_base_sha
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && *s != "head-sha")
-        {
-            cmd.args(["--sha", sha]);
+            return Err("plan publication body differs from artifact".into());
         }
         let artifact_id = path
             .file_stem()
             .and_then(|s| s.to_str())
-            .ok_or_else(|| "invalid plan artifact name".to_owned())?;
-        cmd.args(["--idempotency-key", &format!("zach-plan-{artifact_id}")]);
-        let output = cmd
-            .output()
-            .map_err(|e| format!("failed to publish plan: {e}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "ws-task stage plan failed ({}): {}",
-                output.status,
-                truncate_utf8_bytes(&String::from_utf8_lossy(&output.stderr), MAX_SUMMARY_BYTES)
-            ));
-        }
+            .ok_or("invalid plan artifact name")?;
+        let op =
+            crate::v2::intake::publish_plan_stage(task, &format!("zach-plan-{artifact_id}"), path);
+        crate::v2::intake::WsTaskClient::execute(
+            &crate::v2::intake::SystemWsTaskClient {
+                bin: self.ws_task_bin.clone(),
+            },
+            &op.args,
+        )
+        .map_err(|error| format!("failed to publish plan: {error}"))?;
         Ok(())
     }
 
@@ -954,6 +941,11 @@ impl StageExecutor for SystemdStageExecutor {
         route: &StageRoute,
         spec: &StageCommandSpec,
     ) -> Result<StageExecutionResult, String> {
+        if !cfg!(test) {
+            return Err(
+                "worker execution is owned by zachd; submit through the daemon socket".into(),
+            );
+        }
         self.check_isolation()?;
         let valid_attempt_id = validate_attempt_id(attempt_id)?;
         isolation::secure_parents(&self.state_dir)?;
@@ -2202,6 +2194,410 @@ impl StageExecutor for MockStageExecutor {
     }
 }
 
+/// Version 1 mounts net/ as a directory; older socket-inode mounts cannot recover.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttemptManifest {
+    pub mount_layout_version: u32,
+    pub attempt_id: String,
+    pub task_id: String,
+    pub route: StageRoute,
+    pub spec: StageCommandSpec,
+    pub sha_before: String,
+    pub attempt_dir: PathBuf,
+}
+
+pub struct PreparedLaunch {
+    pub manifest: AttemptManifest,
+    pub resources: PreparedResources,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnitState {
+    Running,
+    Starting,
+    Exited,
+    Failed,
+    Stopping,
+    Dead,
+    Missing,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UnitObservation {
+    pub load_state: String,
+    pub active_state: String,
+    pub sub_state: String,
+    pub result: String,
+    pub exit_code_kind: String,
+    pub exit_code: Option<i32>,
+    pub invocation_id: String,
+    pub control_group: String,
+    pub output_bytes: u64,
+    pub cpu_usage_usec: Option<u64>,
+}
+
+impl UnitObservation {
+    pub fn parse(raw: &str) -> Self {
+        let fields: BTreeMap<_, _> = raw.lines().filter_map(|l| l.split_once('=')).collect();
+        let field = |k| fields.get(k).copied().unwrap_or("").to_owned();
+        Self {
+            load_state: field("LoadState"),
+            active_state: field("ActiveState"),
+            sub_state: field("SubState"),
+            result: field("Result"),
+            exit_code_kind: field("ExecMainCode"),
+            exit_code: field("ExecMainStatus").parse().ok(),
+            invocation_id: field("InvocationID"),
+            control_group: field("ControlGroup"),
+            ..Self::default()
+        }
+    }
+    pub fn state(&self) -> Result<UnitState, String> {
+        if self.load_state == "not-found" {
+            return Ok(UnitState::Missing);
+        }
+        match (self.active_state.as_str(), self.sub_state.as_str()) {
+            ("failed", _) => Ok(UnitState::Failed),
+            (_, "exited") => Ok(UnitState::Exited),
+            ("active", "running") => Ok(UnitState::Running),
+            ("activating", _) => Ok(UnitState::Starting),
+            ("deactivating", _) => Ok(UnitState::Stopping),
+            ("inactive", "dead") => Ok(UnitState::Dead),
+            _ => Err(format!(
+                "unrecognized unit state {}/{}",
+                self.active_state, self.sub_state
+            )),
+        }
+    }
+    pub fn success(&self) -> bool {
+        self.result == "success"
+            && matches!(self.exit_code_kind.as_str(), "1" | "exited")
+            && self.exit_code == Some(0)
+    }
+}
+
+pub trait UnitController: Send + Sync {
+    fn inspect(&self, unit: &str) -> Result<UnitObservation, String>;
+    fn launch(&self, manifest: &AttemptManifest) -> Result<(), String>;
+    fn stop(&self, unit: &str) -> Result<(), String>;
+    fn reset_failed(&self, unit: &str) -> Result<(), String>;
+    fn list_units(&self) -> Result<Vec<String>, String>;
+}
+
+#[derive(Default)]
+pub struct SystemUnitController;
+
+impl UnitController for SystemUnitController {
+    fn inspect(&self, unit: &str) -> Result<UnitObservation, String> {
+        let out = Command::new("systemctl").args(["--user","show",unit,"--no-pager","--property=LoadState,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,InvocationID,ControlGroup"]).output().map_err(|e| e.to_string())?;
+        let raw = String::from_utf8_lossy(&out.stdout);
+        let observed = UnitObservation::parse(&raw);
+        // A manager error is never evidence that a unit is absent.
+        if !out.status.success() && observed.load_state != "not-found" {
+            return Err(format!(
+                "systemctl inspection failed: {}",
+                truncate_utf8_bytes(&String::from_utf8_lossy(&out.stderr), 1024)
+            ));
+        }
+        observed.state()?;
+        Ok(observed)
+    }
+    fn launch(&self, manifest: &AttemptManifest) -> Result<(), String> {
+        let out = Command::new(&manifest.spec.program)
+            .args(&manifest.spec.args)
+            .env_clear()
+            .envs(&manifest.spec.env)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| e.to_string())?;
+        write_secure_file(
+            &manifest.attempt_dir.join("launcher.log"),
+            &[out.stdout.as_slice(), out.stderr.as_slice()].concat(),
+        )?;
+        if !out.status.success() {
+            return Err(format!(
+                "systemd-run rejected launch: {}",
+                truncate_utf8_bytes(&String::from_utf8_lossy(&out.stderr), 1024)
+            ));
+        }
+        Ok(())
+    }
+    fn stop(&self, unit: &str) -> Result<(), String> {
+        let out = Command::new("systemctl")
+            .args(["--user", "stop", unit])
+            .output()
+            .map_err(|e| e.to_string())?;
+        let observed = self.inspect(unit)?;
+        if !matches!(
+            observed.state()?,
+            UnitState::Missing | UnitState::Dead | UnitState::Failed
+        ) {
+            return Err(format!(
+                "unit {unit} is not confirmed stopped ({})",
+                out.status
+            ));
+        }
+        Ok(())
+    }
+    fn reset_failed(&self, unit: &str) -> Result<(), String> {
+        let out = Command::new("systemctl")
+            .args(["--user", "reset-failed", unit])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() && self.inspect(unit)?.state()? != UnitState::Missing {
+            return Err("reset-failed failed".into());
+        }
+        Ok(())
+    }
+    fn list_units(&self) -> Result<Vec<String>, String> {
+        let out = Command::new("systemctl")
+            .args([
+                "--user",
+                "list-units",
+                "--all",
+                "zach-stage-*",
+                "--no-legend",
+                "--plain",
+                "--no-pager",
+            ])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err("cannot enumerate worker units".into());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                l.split_whitespace()
+                    .find(|p| p.starts_with("zach-stage-"))
+                    .map(str::to_owned)
+            })
+            .collect())
+    }
+}
+
+pub fn prepare_detached_launch(
+    state_dir: &std::path::Path,
+    task: &TaskRecord,
+    attempt_id: &str,
+    route: &StageRoute,
+    mut spec: StageCommandSpec,
+) -> Result<PreparedLaunch, String> {
+    validate_attempt_id(attempt_id)?;
+    isolation::secure_parents(state_dir)?;
+    let state = std::fs::canonicalize(ensure_secure_dir(state_dir)?).map_err(|e| e.to_string())?;
+    let root = ensure_secure_dir(&state.join("attempts"))?;
+    let dir = ensure_secure_dir(&root.join(attempt_id))?;
+    let worktree = std::fs::canonicalize(&spec.worktree_path).map_err(|e| e.to_string())?;
+    if state.starts_with(&worktree) {
+        return Err(
+            "isolation policy: daemon state directory must be outside the worker worktree".into(),
+        );
+    }
+    spec.worktree_path = worktree.to_string_lossy().into_owned();
+    for arg in &mut spec.args {
+        if arg.starts_with("--working-directory=") {
+            *arg = format!("--working-directory={}", spec.worktree_path);
+        }
+    }
+    let sha_before = git_head_sha(&spec.worktree_path).ok_or("cannot resolve sha_before")?;
+    write_secure_file(&dir.join("prompt.md"), spec.prompt.as_bytes())?;
+    write_secure_file(&dir.join("stdin"), spec.stdin_payload.as_bytes())?;
+    for name in ["stdout.jsonl", "stderr.log"] {
+        write_secure_file(&dir.join(name), b"")?;
+    }
+    let home = PathBuf::from(spec.env.get("HOME").ok_or("missing HOME")?);
+    let mut resources = PreparedResources::prepare(
+        &dir,
+        &home,
+        &worktree,
+        spec.writable,
+        Some(route.family),
+        spec.network,
+    )?;
+    if let Some(schema) = &spec.output_schema_json {
+        let path = dir.join("review-schema.json");
+        write_secure_file(&path, schema.as_bytes())?;
+        if route.family == ModelFamily::OpenAiSol {
+            resources.layout.readonly_files.push(path.clone());
+            spec.args = inject_codex_output_schema_args(&spec.args, &path);
+        }
+    }
+    spec.args = replace_sandbox_args(&spec.args, &resources.layout)?;
+    let separator = spec
+        .args
+        .iter()
+        .position(|a| a == "--")
+        .ok_or("missing supervisor separator")?;
+    let mut io = Vec::new();
+    for (property, file) in [
+        ("StandardInput", "stdin"),
+        ("StandardOutput", "stdout.jsonl"),
+        ("StandardError", "stderr.log"),
+    ] {
+        let path = std::fs::canonicalize(dir.join(file)).map_err(|e| e.to_string())?;
+        io.extend([
+            "-p".to_owned(),
+            format!("{property}=file:{}", path.display()),
+        ]);
+    }
+    spec.args.splice(separator..separator, io);
+    spec.prompt.clear();
+    spec.stdin_payload.clear();
+    let manifest = AttemptManifest {
+        mount_layout_version: 1,
+        attempt_id: attempt_id.into(),
+        task_id: task.task_id.clone(),
+        route: route.clone(),
+        spec,
+        sha_before,
+        attempt_dir: dir.clone(),
+    };
+    write_secure_file(
+        &dir.join("manifest.json"),
+        &serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?,
+    )?;
+    // Preparation is not allowed to destroy resources after an uncertain handoff.
+    resources.retain();
+    Ok(PreparedLaunch {
+        manifest,
+        resources,
+    })
+}
+
+pub fn read_attempt_manifest(
+    state_dir: &std::path::Path,
+    attempt_id: &str,
+) -> Result<AttemptManifest, String> {
+    validate_attempt_id(attempt_id)?;
+    let dir = std::fs::canonicalize(state_dir.join("attempts").join(attempt_id))
+        .map_err(|e| e.to_string())?;
+    isolation::reject_symlink_components(&dir)?;
+    let path = dir.join("manifest.json");
+    isolation::reject_symlink_components(&path)?;
+    use std::os::unix::fs::MetadataExt;
+    let directory_meta = std::fs::metadata(&dir).map_err(|e| e.to_string())?;
+    let file_meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+    if !file_meta.is_file()
+        || file_meta.uid() != unsafe { libc::geteuid() }
+        || file_meta.mode() & 0o077 != 0
+        || directory_meta.uid() != unsafe { libc::geteuid() }
+        || directory_meta.mode() & 0o077 != 0
+    {
+        return Err("unsafe attempt manifest ownership or permissions".into());
+    }
+    let manifest: AttemptManifest =
+        serde_json::from_slice(&std::fs::read(&path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    if manifest.attempt_id != attempt_id
+        || manifest.attempt_dir != dir
+        || manifest.mount_layout_version != 1
+    {
+        return Err("incompatible attempt manifest / legacy socket mount".into());
+    }
+    Ok(manifest)
+}
+
+pub fn sample_attempt(
+    manifest: &AttemptManifest,
+    mut observation: UnitObservation,
+) -> UnitObservation {
+    observation.output_bytes = ["stdout.jsonl", "stderr.log"]
+        .iter()
+        .filter_map(|f| std::fs::metadata(manifest.attempt_dir.join(f)).ok())
+        .map(|m| m.len())
+        .sum();
+    if observation.control_group.starts_with('/')
+        && !observation.control_group.split('/').any(|s| s == "..")
+    {
+        let path = format!("/sys/fs/cgroup{}/cpu.stat", observation.control_group);
+        observation.cpu_usage_usec = std::fs::read_to_string(path).ok().and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("usage_usec ").and_then(|n| n.parse().ok()))
+        });
+    }
+    observation
+}
+
+pub fn harvest_detached(
+    manifest: &AttemptManifest,
+    observation: &UnitObservation,
+) -> Result<StageExecutionResult, String> {
+    let stdout = std::fs::read_to_string(manifest.attempt_dir.join("stdout.jsonl"))
+        .map_err(|e| e.to_string())?;
+    let stderr = std::fs::read_to_string(manifest.attempt_dir.join("stderr.log"))
+        .map_err(|e| e.to_string())?;
+    let code = if observation.success() {
+        Some(0)
+    } else {
+        Some(observation.exit_code.unwrap_or(1).max(1))
+    };
+    let mut result = match manifest.route.family {
+        ModelFamily::GeminiAgy => {
+            crate::v2::pipeline::parse_agy_cli_response(&stdout, &stderr, code)
+                .map_err(|e| e.to_string())?
+        }
+        ModelFamily::OpenAiSol => {
+            let p = parse_codex_jsonl_output(&stdout, &stderr, code)?;
+            StageExecutionResult {
+                status: p.status,
+                summary: p.summary,
+                review_markdown: p.review_markdown,
+                review_output: p.review_output.clone(),
+                stage_output: p.review_output,
+                invocation_id: None,
+                input_tokens: p.input_tokens,
+                output_tokens: p.output_tokens,
+                total_tokens: p.total_tokens,
+                sha_before: None,
+                sha_after: None,
+                diff_files: Vec::new(),
+            }
+        }
+    };
+    result.sha_before = Some(manifest.sha_before.clone());
+    result.sha_after = git_head_sha(&manifest.spec.worktree_path);
+    result.invocation_id =
+        (!observation.invocation_id.is_empty()).then(|| observation.invocation_id.clone());
+    result.diff_files = collect_worktree_diff_entries(&manifest.spec.worktree_path);
+    write_secure_file(
+        &manifest.attempt_dir.join("harvest.json"),
+        &serde_json::to_vec(&result).map_err(|e| e.to_string())?,
+    )?;
+    Ok(result)
+}
+
+/// Caller persists HARVESTED before invoking this function. Failure retains files.
+pub fn stop_and_cleanup(
+    controller: &dyn UnitController,
+    unit: &str,
+    dir: &std::path::Path,
+    resources: Option<PreparedResources>,
+    failed: bool,
+) -> Result<(), String> {
+    controller.stop(unit)?;
+    if failed {
+        controller.reset_failed(unit)?;
+    }
+    match controller.inspect(unit)?.state()? {
+        UnitState::Dead | UnitState::Missing | UnitState::Failed => {}
+        _ => return Err("cleanup refused while execution remains".into()),
+    }
+    if let Some(resources) = resources {
+        resources.cleanup_after_stop()?;
+    }
+    for name in ["codex-home", "gemini-home", "net"] {
+        let path = dir.join(name);
+        isolation::reject_symlink_components(&path)?;
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2240,6 +2636,9 @@ mod tests {
             executor: None,
             autonomous_consent: true,
             retry_count: 0,
+            next_retry_epoch: 0,
+            lease_owner: None,
+            lease_expires_epoch: None,
             memory: TaskMemory::default(),
             version: 1,
             updated_epoch: 1000,
@@ -2454,7 +2853,16 @@ other-user-unit.service loaded active running
         )
         .expect("build command");
 
-        assert!(spec.args.contains(&"--pipe".to_owned()));
+        assert!(spec.args.contains(&"--no-block".to_owned()));
+        assert!(spec.args.contains(&"RemainAfterExit=yes".to_owned()));
+        assert!(spec.args.contains(&"CollectMode=inactive".to_owned()));
+        assert!(spec.args.contains(&"--service-type=exec".to_owned()));
+        assert!(
+            !spec
+                .args
+                .iter()
+                .any(|a| matches!(a.as_str(), "--wait" | "--pipe" | "--collect"))
+        );
         assert!(!spec.args.iter().any(|a| a.contains(secret_prompt)));
         for forbidden_flag in ["--model", "--worktree", "--timeout", "--prompt"] {
             assert!(
@@ -3560,5 +3968,110 @@ Binary files /dev/null and b/assets/logo.bin differ
         );
         assert!(normalize_cited_diff_path("../secret.rs", repo.path_str()).is_err());
         assert!(normalize_cited_diff_path("/etc/passwd", repo.path_str()).is_err());
+    }
+    #[test]
+    fn detached_unit_observation_distinguishes_retained_exit_failure_and_manager_absence() {
+        for (load, active, sub, expected) in [
+            ("loaded", "active", "running", UnitState::Running),
+            ("loaded", "active", "exited", UnitState::Exited),
+            ("loaded", "failed", "failed", UnitState::Failed),
+            ("loaded", "activating", "start", UnitState::Starting),
+            ("loaded", "deactivating", "stop", UnitState::Stopping),
+            ("loaded", "inactive", "dead", UnitState::Dead),
+            ("not-found", "inactive", "dead", UnitState::Missing),
+        ] {
+            let raw = format!(
+                "LoadState={load}\nActiveState={active}\nSubState={sub}\nResult=success\nExecMainCode=1\nExecMainStatus=0\nInvocationID=\nControlGroup=\n"
+            );
+            let observation = UnitObservation::parse(&raw);
+            assert_eq!(observation.state().unwrap(), expected);
+            assert!(observation.success());
+            assert!(observation.invocation_id.is_empty());
+            assert!(observation.control_group.is_empty());
+        }
+        assert!(UnitObservation::parse("").state().is_err());
+        let signaled = UnitObservation::parse(
+            "LoadState=loaded\nActiveState=failed\nSubState=failed\nResult=signal\nExecMainCode=2\nExecMainStatus=9",
+        );
+        assert!(!signaled.success());
+    }
+
+    #[test]
+    fn detached_preparation_resolves_relative_state_io_and_preserves_schema_mount_without_launch() {
+        let root = PathBuf::from(format!("target/z25-prepare-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("home/.codex")).unwrap();
+        write_secure_file(&root.join("home/.codex/auth.json"), b"{}").unwrap();
+        let mut task = sample_task();
+        let worker = root.join("worker");
+        assert!(
+            Command::new("git")
+                .args([
+                    "clone",
+                    "--quiet",
+                    "--shared",
+                    "--no-checkout",
+                    env!("CARGO_MANIFEST_DIR")
+                ])
+                .arg(&worker)
+                .status()
+                .unwrap()
+                .success()
+        );
+        task.worktree_path = Some(
+            std::fs::canonicalize(&worker)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        task.context_pack.network = Some("none".into());
+        let route = resolve_stage_route("S", "pr-review", 0, Some(ModelFamily::GeminiAgy))
+            .unwrap()
+            .unwrap();
+        let env = BTreeMap::from([(
+            "HOME".into(),
+            std::fs::canonicalize(root.join("home"))
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        )]);
+        let spec =
+            build_systemd_stage_command_with_env(&task, "relative-io", &route, "prompt", &env)
+                .unwrap();
+        assert!(!root.join("state").exists());
+        let PreparedLaunch {
+            manifest,
+            resources,
+        } = prepare_detached_launch(&root.join("state"), &task, "relative-io", &route, spec)
+            .unwrap();
+        assert!(manifest.attempt_dir.is_absolute());
+        assert!(manifest.attempt_dir.join("codex-home/auth.json").exists());
+        for property in [
+            "StandardInput=file:",
+            "StandardOutput=file:",
+            "StandardError=file:",
+        ] {
+            let value = manifest
+                .spec
+                .args
+                .iter()
+                .find_map(|a| a.strip_prefix(property))
+                .unwrap();
+            assert!(std::path::Path::new(value).is_absolute());
+            assert_eq!(std::fs::canonicalize(value).unwrap(), PathBuf::from(value));
+        }
+        let schema = manifest
+            .attempt_dir
+            .join("review-schema.json")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            manifest
+                .spec
+                .args
+                .windows(3)
+                .any(|args| args == ["--ro-bind", schema.as_str(), schema.as_str()])
+        );
+        resources.cleanup_after_stop().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

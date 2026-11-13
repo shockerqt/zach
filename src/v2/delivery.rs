@@ -15,7 +15,7 @@
 use crate::v2::merge_queue::{CiCheckState, evaluate_check_runs_json};
 use crate::v2::now_epoch;
 use crate::v2::pipeline::matches_path_pattern;
-use crate::v2::store::{PostMergeDelivery, TaskRecord, V2Store};
+use crate::v2::store::{PostMergeDelivery, TaskRecord, V2Store, V2StoreError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1842,100 +1842,191 @@ fn render(
     Ok(value)
 }
 
-fn checkpoint(store: &mut V2Store, row: &PostMergeDelivery, status: &str) -> Result<(), String> {
-    let mut task = store
-        .get_task(&row.task_id)
-        .map_err(|e| e.to_string())?
-        .ok_or("delivery task missing")?;
-    if matches!(
-        task.status.as_str(),
-        "Done" | "Cancelled" | "Delivery Aborted"
-    ) {
-        return Err("delivery task is already terminal".into());
+/// Store calls are short coordinator operations. Network calls stay on the
+/// polling worker; each durable checkpoint is acknowledged before it continues.
+pub trait DeliveryStore {
+    fn access<T: Send + 'static>(
+        &mut self,
+        operation: impl FnOnce(&mut V2Store) -> Result<T, V2StoreError> + Send + 'static,
+    ) -> Result<T, V2StoreError>;
+
+    fn get_task(&mut self, id: &str) -> Result<Option<TaskRecord>, V2StoreError> {
+        let id = id.to_owned();
+        self.access(move |store| V2Store::get_task(store, &id))
     }
-    task.status = status.into();
-    task.current_stage = None;
-    task.active_attempt_id = None;
-    let mut saved = row.clone();
-    saved.updated_epoch = now_epoch();
+    fn list_deliveries(
+        &mut self,
+        id: Option<&str>,
+    ) -> Result<Vec<PostMergeDelivery>, V2StoreError> {
+        let id = id.map(str::to_owned);
+        self.access(move |store| V2Store::list_deliveries(store, id.as_deref()))
+    }
+    fn append_event(
+        &mut self,
+        task: &str,
+        group: &str,
+        kind: &str,
+        payload: &Value,
+    ) -> Result<crate::v2::store::TaskEventRecord, V2StoreError> {
+        let (task, group, kind, payload) = (
+            task.to_owned(),
+            group.to_owned(),
+            kind.to_owned(),
+            payload.clone(),
+        );
+        self.access(move |store| store.append_event(&task, &group, &kind, &payload))
+    }
+    fn mark_delivery_board_synced(
+        &mut self,
+        task: &str,
+        version: i64,
+        status: &str,
+    ) -> Result<bool, V2StoreError> {
+        let (task, status) = (task.to_owned(), status.to_owned());
+        self.access(move |store| store.mark_delivery_board_synced(&task, version, &status))
+    }
+}
+
+impl DeliveryStore for V2Store {
+    fn access<T: Send + 'static>(
+        &mut self,
+        operation: impl FnOnce(&mut V2Store) -> Result<T, V2StoreError> + Send + 'static,
+    ) -> Result<T, V2StoreError> {
+        operation(self)
+    }
+}
+
+fn checkpoint(
+    store: &mut impl DeliveryStore,
+    row: &PostMergeDelivery,
+    status: &str,
+) -> Result<(), String> {
+    let row = row.clone();
+    let status = status.to_owned();
     store
-        .save_deliveries_and_task(&task, std::slice::from_ref(&saved))
+        .access(move |store| {
+            (|| -> Result<(), String> {
+                let mut task = store
+                    .get_task(&row.task_id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("delivery task missing")?;
+                if !task.autonomous_consent
+                    || task.memory.halt_requested
+                    || matches!(
+                        task.status.as_str(),
+                        "Done" | "Cancelled" | "Delivery Aborted"
+                    )
+                {
+                    return Err("delivery task is already terminal".into());
+                }
+                task.status = status;
+                task.current_stage = None;
+                task.active_attempt_id = None;
+                let mut saved = row.clone();
+                saved.updated_epoch = now_epoch();
+                store
+                    .save_deliveries_and_task(&task, std::slice::from_ref(&saved))
+                    .map_err(|e| e.to_string())
+            })()
+            .map_err(V2StoreError)
+        })
         .map_err(|e| e.to_string())
 }
 
 fn open_gate(
-    store: &mut V2Store,
+    store: &mut impl DeliveryStore,
     row: &mut PostMergeDelivery,
     kind: &str,
     status: &str,
     options: &[String],
     context: &str,
 ) -> Result<(), String> {
-    let task = store
-        .get_task(&row.task_id)
-        .map_err(|e| e.to_string())?
-        .ok_or("delivery task missing")?;
-    if matches!(
-        task.status.as_str(),
-        "Done" | "Cancelled" | "Delivery Aborted"
-    ) {
-        return Ok(());
-    }
-    if row.state == "waiting"
-        && let Some(id) = &row.decision_id
-        && store.get_decision(id).map_err(|e| e.to_string())?.is_some()
-    {
-        // Resolution already updated the persisted row in its transaction.
-        // A stale tick must not replace that resolved gate with another one.
-        return Ok(());
-    }
-    let id = if row.state == "waiting"
-        && row
-            .decision_id
-            .as_ref()
-            .is_some_and(|id| store.get_decision(id).ok().flatten().is_none())
-    {
-        row.decision_id.clone().ok_or("missing gate ID")?
-    } else {
-        format!(
-            "{}:{}:{}:{}:{}",
-            row.delivery_id,
-            row.attempt,
-            row.run_id.as_deref().unwrap_or("0"),
-            kind,
-            task.version
-        )
-    };
-    row.decision_id = Some(id.clone());
-    row.state = "waiting".into();
-    row.evidence_json["gate_kind"] = json!(kind);
-    row.evidence_json["waiting_status"] = json!(status);
-    row.evidence_json["gate_options"] = json!(options);
-    row.evidence_json["gate_context"] = json!(context);
-    checkpoint(store, row, status)?;
-    if store
-        .get_decision(&id)
-        .map_err(|e| e.to_string())?
-        .is_none()
-    {
-        store
-            .open_decision(
-                &id,
-                &task.task_id,
-                &task.task_group,
-                kind,
-                context,
-                options,
-                Some(0),
-                context,
-                Some(&row.merge_sha),
-            )
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    let mut row = row.clone();
+    let (kind, status, options, context) = (
+        kind.to_owned(),
+        status.to_owned(),
+        options.to_vec(),
+        context.to_owned(),
+    );
+    store
+        .access(move |store| {
+            (|| -> Result<(), String> {
+                let task = store
+                    .get_task(&row.task_id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("delivery task missing")?;
+                if !task.autonomous_consent
+                    || task.memory.halt_requested
+                    || matches!(
+                        task.status.as_str(),
+                        "Done" | "Cancelled" | "Delivery Aborted"
+                    )
+                {
+                    return Ok(());
+                }
+                if row.state == "waiting"
+                    && let Some(id) = &row.decision_id
+                    && store.get_decision(id).map_err(|e| e.to_string())?.is_some()
+                {
+                    // Resolution already updated the persisted row in its transaction.
+                    // A stale tick must not replace that resolved gate with another one.
+                    return Ok(());
+                }
+                let id = if row.state == "waiting"
+                    && row
+                        .decision_id
+                        .as_ref()
+                        .is_some_and(|id| store.get_decision(id).ok().flatten().is_none())
+                {
+                    row.decision_id.clone().ok_or("missing gate ID")?
+                } else {
+                    format!(
+                        "{}:{}:{}:{}:{}",
+                        row.delivery_id,
+                        row.attempt,
+                        row.run_id.as_deref().unwrap_or("0"),
+                        kind,
+                        task.version
+                    )
+                };
+                row.decision_id = Some(id.clone());
+                row.state = "waiting".into();
+                row.evidence_json["gate_kind"] = json!(kind);
+                row.evidence_json["waiting_status"] = json!(status);
+                row.evidence_json["gate_options"] = json!(options);
+                row.evidence_json["gate_context"] = json!(context);
+                checkpoint(store, &row, &status)?;
+                if store
+                    .get_decision(&id)
+                    .map_err(|e| e.to_string())?
+                    .is_none()
+                {
+                    store
+                        .open_decision(
+                            &id,
+                            &task.task_id,
+                            &task.task_group,
+                            &kind,
+                            &context,
+                            &options,
+                            Some(0),
+                            &context,
+                            Some(&row.merge_sha),
+                        )
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            })()
+            .map_err(V2StoreError)
+        })
+        .map_err(|e| e.to_string())
 }
 
-fn error_gate(store: &mut V2Store, row: &mut PostMergeDelivery, error: &str) -> Result<(), String> {
+fn error_gate(
+    store: &mut impl DeliveryStore,
+    row: &mut PostMergeDelivery,
+    error: &str,
+) -> Result<(), String> {
     row.evidence_json["error"] = json!(error);
     let context = format!(
         "Delivery {} at {} requires intervention: {error}",
@@ -2016,7 +2107,7 @@ fn probe(driver: &mut dyn DeliveryDriver, rule: &Promotion) -> Result<String, St
 }
 
 fn workflow_tick(
-    store: &mut V2Store,
+    store: &mut impl DeliveryStore,
     driver: &mut dyn DeliveryDriver,
     row: &mut PostMergeDelivery,
 ) -> Result<(), String> {
@@ -2120,7 +2211,7 @@ fn verify_plan(value: &Value, row: &PostMergeDelivery) -> Result<(), String> {
 }
 
 fn promotion_tick(
-    store: &mut V2Store,
+    store: &mut impl DeliveryStore,
     driver: &mut dyn DeliveryDriver,
     row: &mut PostMergeDelivery,
 ) -> Result<(), String> {
@@ -2275,7 +2366,7 @@ fn promotion_tick(
 }
 
 fn contract_tick(
-    store: &mut V2Store,
+    store: &mut impl DeliveryStore,
     driver: &mut dyn DeliveryDriver,
     row: &mut PostMergeDelivery,
 ) -> Result<(), String> {
@@ -2293,15 +2384,30 @@ fn contract_tick(
     };
     row.state = "verified".into();
     rows.push(row.clone());
+    let task_id = task.task_id;
     store
-        .save_deliveries_and_task(&task, &rows)
+        .access(move |store| {
+            let task = store
+                .get_task(&task_id)?
+                .ok_or_else(|| V2StoreError("delivery task missing".into()))?;
+            if !task.autonomous_consent
+                || task.memory.halt_requested
+                || matches!(
+                    task.status.as_str(),
+                    "Done" | "Cancelled" | "Delivery Aborted"
+                )
+            {
+                return Ok(());
+            }
+            store.save_deliveries_and_task(&task, &rows)
+        })
         .map_err(|e| e.to_string())
 }
 
 /// One bounded observation/transition per row per tick, with no workflow wait or
-/// sleep loop. Safe to call from both `zach run` and the daemon's tick loop.
+/// sleep loop. The daemon runs this on a bounded worker using coordinator store access.
 pub fn poll_post_merge_deliveries(
-    store: &mut V2Store,
+    store: &mut impl DeliveryStore,
     driver: &mut dyn DeliveryDriver,
 ) -> Result<(), String> {
     let rows = store.list_deliveries(None).map_err(|e| e.to_string())?;
@@ -2310,7 +2416,10 @@ pub fn poll_post_merge_deliveries(
         let Some(task) = store.get_task(&row.task_id).map_err(|e| e.to_string())? else {
             continue;
         };
-        if matches!(task.status.as_str(), "Cancelled" | "Delivery Aborted") {
+        if !task.autonomous_consent
+            || task.memory.halt_requested
+            || matches!(task.status.as_str(), "Cancelled" | "Delivery Aborted")
+        {
             continue;
         }
         if task.status == "Done" {
@@ -2353,62 +2462,66 @@ pub fn poll_post_merge_deliveries(
         }
     }
     for id in tasks {
-        let mut task = store
-            .get_task(&id)
+        let Some((task, rows)) = store
+            .access(move |store| {
+                (|| -> Result<Option<(TaskRecord, Vec<PostMergeDelivery>)>, String> {
+                    let mut task = store
+                        .get_task(&id)
+                        .map_err(|e| e.to_string())?
+                        .ok_or("delivery task missing")?;
+                    if !task.autonomous_consent
+                        || task.memory.halt_requested
+                        || matches!(task.status.as_str(), "Cancelled" | "Delivery Aborted")
+                    {
+                        return Ok(None);
+                    }
+                    let rows = store
+                        .list_deliveries(Some(&id))
+                        .map_err(|e| e.to_string())?;
+                    if task.status == "Done" && rows.iter().any(|r| r.state != "verified") {
+                        return Ok(None);
+                    }
+                    let status = if rows.iter().any(|r| r.state == "aborted") {
+                        "Delivery Aborted"
+                    } else if task.status == "Done" {
+                        "Done"
+                    } else if rows.iter().any(|r| {
+                        r.state == "waiting"
+                            && r.evidence_json["waiting_status"] == "Waiting New APK"
+                    }) {
+                        "Waiting New APK"
+                    } else if rows.iter().any(|r| {
+                        r.state == "waiting"
+                            && r.evidence_json["waiting_status"] == "Pending Prod Promotion"
+                    }) {
+                        "Pending Prod Promotion"
+                    } else {
+                        "Delivery Pending"
+                    };
+                    let verified = !rows.is_empty() && rows.iter().all(|r| r.state == "verified");
+                    task.status = status.into();
+                    store
+                        .save_delivery_status(&task, verified.then_some(rows.as_slice()))
+                        .map_err(|e| e.to_string())?;
+                    let task = store
+                        .get_task(&id)
+                        .map_err(|e| e.to_string())?
+                        .ok_or("delivery task missing")?;
+                    Ok(Some((task, rows)))
+                })()
+                .map_err(V2StoreError)
+            })
             .map_err(|e| e.to_string())?
-            .ok_or("delivery task missing")?;
-        if matches!(task.status.as_str(), "Cancelled" | "Delivery Aborted") {
+        else {
             continue;
-        }
-        let rows = store
-            .list_deliveries(Some(&id))
-            .map_err(|e| e.to_string())?;
-        if task.status == "Done" && rows.iter().any(|r| r.state != "verified") {
-            continue;
-        }
-        let status = if rows.iter().any(|r| r.state == "aborted") {
-            "Delivery Aborted"
-        } else if rows.iter().all(|r| r.state == "verified") {
-            "Done"
-        } else if rows
-            .iter()
-            .any(|r| r.state == "waiting" && r.evidence_json["waiting_status"] == "Waiting New APK")
-        {
-            "Waiting New APK"
-        } else if rows.iter().any(|r| {
-            r.state == "waiting" && r.evidence_json["waiting_status"] == "Pending Prod Promotion"
-        }) {
-            "Pending Prod Promotion"
-        } else {
-            "Delivery Pending"
         };
-        let became_done = task.status != "Done" && status == "Done";
-        task.status = status.into();
-        store
-            .save_deliveries_and_task(&task, &[])
-            .map_err(|e| e.to_string())?;
-        if became_done {
-            store
-                .append_event(
-                    &task.task_id,
-                    &task.task_group,
-                    "POST_MERGE_DELIVERY_VERIFIED",
-                    &json!({"deliveries": rows}),
-                )
-                .map_err(|e| e.to_string())?;
-        }
         if rows
             .iter()
             .all(|r| r.evidence_json["board_synced_status"] == task.status)
         {
             continue;
         }
-        // Capture the version after the aggregate status checkpoint. A human
-        // decision during network I/O must not be overwritten by this receipt.
-        task = store
-            .get_task(&id)
-            .map_err(|e| e.to_string())?
-            .ok_or("delivery task missing")?;
+        // A human decision during board I/O invalidates this versioned receipt.
         if let Err(error) = driver.sync_board(&task) {
             store
                 .append_event(
@@ -2428,7 +2541,7 @@ pub fn poll_post_merge_deliveries(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::v2::store::{ContextPackSpec, TaskMemory};
 
@@ -2459,6 +2572,9 @@ mod tests {
             executor: None,
             autonomous_consent: true,
             retry_count: 0,
+            next_retry_epoch: 0,
+            lease_owner: None,
+            lease_expires_epoch: None,
             memory: TaskMemory::default(),
             version: 1,
             updated_epoch: 1,
@@ -2483,7 +2599,7 @@ mod tests {
         }
     }
 
-    fn promotion() -> Promotion {
+    pub(crate) fn promotion() -> Promotion {
         let mut plan_inputs = BTreeMap::from([
             ("build_run_id".into(), "${build_run_id}".into()),
             ("source_sha".into(), "${source_sha}".into()),
@@ -2730,7 +2846,11 @@ promotions:
     }
 
     #[derive(Default)]
-    struct MockDriver {
+    pub(crate) struct MockDriver {
+        pub(crate) probe_barrier:
+            Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+        pub(crate) dispatch_barrier:
+            Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
         runs: BTreeMap<(String, String), Vec<WorkflowRun>>,
         files: BTreeMap<(String, String), Vec<u8>>,
         dispatches: Vec<BTreeMap<String, String>>,
@@ -2819,6 +2939,10 @@ promotions:
             _: &str,
             inputs: &BTreeMap<String, String>,
         ) -> Result<String, String> {
+            if let Some((entered, resume)) = self.dispatch_barrier.take() {
+                entered.send(()).unwrap();
+                resume.recv().unwrap();
+            }
             self.dispatches.push(inputs.clone());
             Ok((200 + self.dispatches.len()).to_string())
         }
@@ -2835,6 +2959,10 @@ promotions:
                 .and_then(|runs| runs.iter().find(|r| r.id == id).cloned()))
         }
         fn get_https(&mut self, url: &str) -> Result<String, String> {
+            if let Some((entered, resume)) = self.probe_barrier.take() {
+                entered.send(()).unwrap();
+                resume.recv().unwrap();
+            }
             if url.ends_with("/current") {
                 return Ok(if self.current.is_empty() {
                     "none".into()
@@ -2910,12 +3038,29 @@ promotions:
         driver.run("publish-sample.yml", "push", "101", 3, true, true);
         driver.files.insert(("101".into(), "delivery.json".into()), serde_json::to_vec(&json!({"source_sha":SHA,"update_id":"sample-update","group_id":"sample-group","previous_group_id":"sample-previous"})).unwrap());
         tick(&mut store, &mut driver);
-        assert_eq!(status(&store), "Done");
+        assert_eq!(status(&store), "Delivery Pending");
+        assert!(store.delivery_verification_recorded("DEMO-1", SHA).unwrap());
         assert_eq!(
             only_row(&store).evidence_json["artifacts"][0]["group_id"],
             "sample-group"
         );
-        assert_eq!(driver.board_calls.last().unwrap(), "Done");
+        assert_eq!(driver.board_calls.last().unwrap(), "Blocked");
+        let polls = driver.polls;
+        tick(&mut store, &mut driver);
+        tick(&mut store, &mut driver);
+        assert_eq!(
+            driver.polls, polls,
+            "verified workflows must not execute again"
+        );
+        assert_eq!(
+            store
+                .list_events_since(None, 0, 100)
+                .unwrap()
+                .iter()
+                .filter(|e| e.event_type == "POST_MERGE_DELIVERY_VERIFIED")
+                .count(),
+            1
+        );
     }
 
     fn promotion_setup() -> (V2Store, MockDriver) {
@@ -2994,7 +3139,7 @@ promotions:
         );
         driver.promotion_result("202", "result.json");
         tick(&mut store, &mut driver);
-        assert_eq!(status(&store), "Done");
+        assert_eq!(status(&store), "Delivery Pending");
         assert_eq!(only_row(&store).state, "verified");
         assert!(
             store
@@ -3087,7 +3232,7 @@ promotions:
     }
 
     #[test]
-    fn all_deliveries_must_verify_and_final_board_sync_is_retried() {
+    fn all_deliveries_must_verify_and_pending_board_sync_is_retried() {
         let mut second = workflow();
         second.workflow = "publish-other.yml".into();
         second.artifacts.clear();
@@ -3098,16 +3243,19 @@ promotions:
             post_merge_workflows: vec![first, second],
             promotions: vec![],
         });
+        driver.board_errors = 2;
         driver.run("publish-sample.yml", "push", "101", 1, true, true);
         tick(&mut store, &mut driver);
         assert_eq!(status(&store), "Delivery Pending");
+        assert!(!store.delivery_verification_recorded("DEMO-1", SHA).unwrap());
         driver.run("publish-other.yml", "push", "102", 1, true, true);
-        driver.board_errors = 1;
         tick(&mut store, &mut driver);
-        assert_eq!(status(&store), "Done");
+        assert_eq!(status(&store), "Delivery Pending");
+        assert!(store.delivery_verification_recorded("DEMO-1", SHA).unwrap());
         let calls = driver.board_calls.len();
         tick(&mut store, &mut driver);
         assert_eq!(driver.board_calls.len(), calls + 1);
+        assert!(!driver.board_calls.iter().any(|status| status == "Done"));
         tick(&mut store, &mut driver);
         assert_eq!(driver.board_calls.len(), calls + 1);
     }
@@ -3131,6 +3279,12 @@ promotions:
         );
         approve(&mut store, "Retry");
         driver.contract = Some(ContractLookup::ContractNotFound);
+        tick(&mut store, &mut driver);
+        assert_eq!(status(&store), "Delivery Pending");
+        assert!(store.delivery_verification_recorded("DEMO-1", SHA).unwrap());
+        let mut terminal = store.get_task("DEMO-1").unwrap().unwrap();
+        terminal.status = "Done".into();
+        store.sync_task(&terminal).unwrap();
         tick(&mut store, &mut driver);
         assert_eq!(status(&store), "Done");
         assert!(checkpoint(&mut store, &row, "Delivery Pending").is_err());
