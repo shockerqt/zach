@@ -49,6 +49,8 @@ pub struct AcceptanceCriterionSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ContextPackSpec {
     #[serde(default)]
+    pub network: Option<String>,
+    #[serde(default)]
     pub weight: String,
     #[serde(default)]
     pub base_sha: Option<String>,

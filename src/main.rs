@@ -40,6 +40,14 @@ fn main() {
             run_ledger_validator(&config)
         }
         "governance.audit-task-integration" => run_audit(&args[2..]),
+        "doctor" => run_doctor(&args[2..]),
+        "__sandbox-bridge" => match zach::v2::isolation::sandbox_bridge(&args[2..]) {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("sandbox bridge: {error}");
+                std::process::exit(1);
+            }
+        },
         "status" => run_v2_status(&args[2..]),
         "queue" => run_v2_queue(&args[2..]),
         "decisions" => run_v2_decisions(&args[2..]),
@@ -56,6 +64,42 @@ fn main() {
             print_usage();
             std::process::exit(2);
         }
+    }
+}
+
+fn isolation_preflight_or_exit(store: &mut V2Store) {
+    if let Err(error) = zach::v2::isolation::verify_host_isolation() {
+        let _ = store.append_event(
+            "",
+            "system",
+            "ISOLATION_PREFLIGHT_FAILED",
+            &serde_json::json!({"message":error}),
+        );
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+}
+
+fn run_doctor(args: &[String]) {
+    let worktree = flag_value(args, "--worktree").map(PathBuf::from);
+    let report = zach::v2::isolation::doctor(worktree.as_deref());
+    if has_flag(args, "--json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_default()
+        );
+    } else {
+        for probe in &report.probes {
+            println!(
+                "{} {}: {}",
+                if probe.ok { "PASS" } else { "FAIL" },
+                probe.name,
+                probe.detail
+            );
+        }
+    }
+    if !report.ok {
+        std::process::exit(1);
     }
 }
 
@@ -286,10 +330,10 @@ fn run_v2_config(args: &[String]) {
 
 fn run_v2_run(args: &[String]) {
     let mut store = open_store(args);
-    let _ = reconcile_orphan_units(&mut store);
-
     let dry_run = has_flag(args, "--dry-run");
     if !dry_run {
+        isolation_preflight_or_exit(&mut store);
+        let _ = reconcile_orphan_units(&mut store);
         let _ = prune_old_attempts(&default_state_dir(), attempt_retention_from_env());
     }
     let once = has_flag(args, "--once");
@@ -434,6 +478,7 @@ fn usage_error(message: &str) -> ! {
 
 fn run_v2_daemon(args: &[String]) {
     let mut store = open_store(args);
+    isolation_preflight_or_exit(&mut store);
     let _ = prune_old_attempts(&default_state_dir(), attempt_retention_from_env());
     let socket_path = flag_value(args, "--socket")
         .map(PathBuf::from)
@@ -584,6 +629,7 @@ fn print_usage() {
     println!(
         "       zach run [--task <TASK_ID>] [--group <GROUP>] [--once] [--dry-run] [--json] [--db <PATH>]"
     );
+    println!("       zach doctor [--json] [--worktree <PATH>]");
     println!("       zach daemon [--socket <PATH>] [--db <PATH>] [--once]");
     println!("       zach attach [--group <GROUP>] [--since-seq <N>] [--once] [--socket <PATH>]");
     println!(
