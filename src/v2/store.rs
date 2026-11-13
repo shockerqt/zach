@@ -212,6 +212,30 @@ pub struct DaemonStatusSummary {
     pub merge_queue_count: usize,
 }
 
+/// Durable post-merge work. `rule_json` is the immutable contract rule captured
+/// at `merge_sha`; evidence and dispatch identifiers survive process restarts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PostMergeDelivery {
+    pub delivery_id: String,
+    pub task_id: String,
+    pub repository: String,
+    pub github_repo: String,
+    pub merge_sha: String,
+    pub kind: String,
+    pub name: String,
+    pub state: String,
+    pub workflow: String,
+    pub run_id: Option<String>,
+    pub build_run_id: Option<String>,
+    pub artifact_digest: Option<String>,
+    pub expected_current: Option<String>,
+    pub evidence_json: serde_json::Value,
+    pub rule_json: serde_json::Value,
+    pub decision_id: Option<String>,
+    pub attempt: i64,
+    pub updated_epoch: i64,
+}
+
 pub struct V2Store {
     conn: Connection,
 }
@@ -243,6 +267,33 @@ impl V2Store {
     }
 
     fn initialize(&mut self) -> Result<(), V2StoreError> {
+        // Never downgrade or rewrite a database created by a newer binary.
+        // This check deliberately precedes even additive schema mutations.
+        let has_meta: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'daemon_meta')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_meta {
+            let version: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT value FROM daemon_meta WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(raw) = version {
+                let version = raw
+                    .parse::<u32>()
+                    .map_err(|_| V2StoreError("invalid SQLite schema_version".into()))?;
+                if version == 0 || version > SCHEMA_VERSION {
+                    return Err(V2StoreError(format!(
+                        "unsupported SQLite schema_version {version} (supported through {SCHEMA_VERSION})"
+                    )));
+                }
+            }
+        }
         self.conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=FULL;
@@ -348,10 +399,50 @@ impl V2Store {
                  enqueued_epoch INTEGER NOT NULL,
                  state TEXT NOT NULL,
                  PRIMARY KEY(repo, task_id)
-             );",
+             );
+
+             CREATE TABLE IF NOT EXISTS post_merge_deliveries (
+                 delivery_id TEXT PRIMARY KEY,
+                 task_id TEXT NOT NULL REFERENCES tasks(task_id),
+                 repository TEXT NOT NULL,
+                 github_repo TEXT NOT NULL,
+                 merge_sha TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 name TEXT NOT NULL,
+                 state TEXT NOT NULL,
+                 workflow TEXT NOT NULL,
+                 run_id TEXT,
+                 build_run_id TEXT,
+                 artifact_digest TEXT,
+                 expected_current TEXT,
+                 evidence_json TEXT NOT NULL DEFAULT '{}',
+                 rule_json TEXT NOT NULL DEFAULT '{}',
+                 decision_id TEXT,
+                 attempt INTEGER NOT NULL DEFAULT 0,
+                 updated_epoch INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_deliveries_task ON post_merge_deliveries(task_id);",
         )?;
 
         self.migrate_stage_attempts_nullable_tokens()?;
+        // These additive fields also tolerate an interrupted pre-release upgrade.
+        let delivery_columns: BTreeSet<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("PRAGMA table_info('post_merge_deliveries')")?;
+            stmt.query_map([], |row| row.get(1))?
+                .collect::<Result<_, _>>()?
+        };
+        for (name, definition) in [
+            ("rule_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("attempt", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            if !delivery_columns.contains(name) {
+                self.conn.execute_batch(&format!(
+                    "ALTER TABLE post_merge_deliveries ADD COLUMN {name} {definition}"
+                ))?;
+            }
+        }
 
         let tx = self
             .conn
@@ -781,6 +872,173 @@ impl V2Store {
         Ok(result)
     }
 
+    fn upsert_delivery_tx(
+        tx: &rusqlite::Transaction<'_>,
+        delivery: &PostMergeDelivery,
+    ) -> Result<(), V2StoreError> {
+        let changed = tx.execute(
+            "INSERT INTO post_merge_deliveries (
+                 delivery_id, task_id, repository, github_repo, merge_sha, kind,
+                 name, state, workflow, run_id, build_run_id, artifact_digest,
+                 expected_current, evidence_json, rule_json, decision_id, attempt, updated_epoch
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+             ON CONFLICT(delivery_id) DO UPDATE SET
+                 state = excluded.state, workflow = excluded.workflow,
+                 run_id = excluded.run_id, build_run_id = excluded.build_run_id,
+                 artifact_digest = excluded.artifact_digest,
+                 expected_current = excluded.expected_current,
+                 evidence_json = excluded.evidence_json, rule_json = excluded.rule_json,
+                 decision_id = excluded.decision_id, attempt = excluded.attempt,
+                 updated_epoch = excluded.updated_epoch
+             WHERE post_merge_deliveries.task_id = excluded.task_id
+               AND post_merge_deliveries.merge_sha = excluded.merge_sha",
+            params![
+                delivery.delivery_id, delivery.task_id, delivery.repository,
+                delivery.github_repo, delivery.merge_sha, delivery.kind,
+                delivery.name, delivery.state, delivery.workflow, delivery.run_id,
+                delivery.build_run_id, delivery.artifact_digest, delivery.expected_current,
+                serde_json::to_string(&delivery.evidence_json)?,
+                serde_json::to_string(&delivery.rule_json)?, delivery.decision_id,
+                delivery.attempt, delivery.updated_epoch,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(V2StoreError(
+                "delivery_id is already bound to another task or merge".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn upsert_delivery(&mut self, delivery: &PostMergeDelivery) -> Result<(), V2StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::upsert_delivery_tx(&tx, delivery)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Checkpoint task and delivery rows together before releasing merge lane/locks.
+    pub fn save_deliveries_and_task(
+        &mut self,
+        task: &TaskRecord,
+        deliveries: &[PostMergeDelivery],
+    ) -> Result<(), V2StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = now_epoch();
+        match Self::get_task_tx(&tx, &task.task_id)? {
+            Some(old) => {
+                if (is_terminal_task_status(&old.status) || old.status == "Delivery Aborted")
+                    && task.status != old.status
+                {
+                    return Err(V2StoreError(
+                        "delivery checkpoint cannot change a terminal task".into(),
+                    ));
+                }
+
+                Self::update_task_tx(&tx, &old, task, now)?;
+            }
+            None => {
+                Self::insert_task_tx(&tx, task, now)?;
+            }
+        }
+        for delivery in deliveries {
+            if delivery.task_id != task.task_id {
+                return Err(V2StoreError("delivery belongs to another task".into()));
+            }
+            Self::upsert_delivery_tx(&tx, delivery)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Record a completed board write without replacing delivery/decision state
+    /// captured before network I/O. A concurrent decision invalidates this receipt.
+    pub fn mark_delivery_board_synced(
+        &mut self,
+        task_id: &str,
+        expected_version: i64,
+        status: &str,
+    ) -> Result<bool, V2StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(task) = Self::get_task_tx(&tx, task_id)? else {
+            return Ok(false);
+        };
+        if task.version != expected_version || task.status != status {
+            return Ok(false);
+        }
+        let rows: Vec<(String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT delivery_id, evidence_json FROM post_merge_deliveries WHERE task_id = ?1",
+            )?;
+            stmt.query_map(params![task_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<_, _>>()?
+        };
+        for (id, raw) in rows {
+            let mut evidence: serde_json::Value = serde_json::from_str(&raw)?;
+            evidence["board_synced_status"] = serde_json::json!(status);
+            tx.execute(
+                "UPDATE post_merge_deliveries SET evidence_json = ?2 WHERE delivery_id = ?1",
+                params![id, serde_json::to_string(&evidence)?],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn list_deliveries(
+        &self,
+        task_id: Option<&str>,
+    ) -> Result<Vec<PostMergeDelivery>, V2StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT delivery_id, task_id, repository, github_repo, merge_sha, kind,
+                    name, state, workflow, run_id, build_run_id, artifact_digest,
+                    expected_current, evidence_json, rule_json, decision_id, attempt, updated_epoch
+             FROM post_merge_deliveries WHERE (?1 IS NULL OR task_id = ?1)
+             ORDER BY delivery_id",
+        )?;
+        let records = stmt.query_map(params![task_id], |row| {
+            let json_at = |index| -> rusqlite::Result<serde_json::Value> {
+                let raw: String = row.get(index)?;
+                serde_json::from_str(&raw).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        index,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+            };
+            Ok(PostMergeDelivery {
+                delivery_id: row.get(0)?,
+                task_id: row.get(1)?,
+                repository: row.get(2)?,
+                github_repo: row.get(3)?,
+                merge_sha: row.get(4)?,
+                kind: row.get(5)?,
+                name: row.get(6)?,
+                state: row.get(7)?,
+                workflow: row.get(8)?,
+                run_id: row.get(9)?,
+                build_run_id: row.get(10)?,
+                artifact_digest: row.get(11)?,
+                expected_current: row.get(12)?,
+                evidence_json: json_at(13)?,
+                rule_json: json_at(14)?,
+                decision_id: row.get(15)?,
+                attempt: row.get(16)?,
+                updated_epoch: row.get(17)?,
+            })
+        })?;
+        records
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(V2StoreError::from)
+    }
+
     pub fn get_task(&self, task_id: &str) -> Result<Option<TaskRecord>, V2StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT task_id, task_group, title, repository, github_repo, issue_number,
@@ -995,8 +1253,12 @@ impl V2Store {
             ],
         )?;
         tx.execute(
-            "UPDATE tasks SET status = 'Blocked', version = version + 1, updated_epoch = ?2 WHERE task_id = ?1",
-            params![task_id, now],
+            "UPDATE tasks SET status = CASE
+                 WHEN status IN ('Delivery Pending', 'Waiting New APK', 'Pending Prod Promotion', 'Delivery Aborted', 'Done', 'Cancelled') THEN status
+                 WHEN ?3 IN ('new_apk_required', 'prod_promotion_approval', 'delivery_contract_error') THEN 'Delivery Pending'
+                 ELSE 'Blocked' END,
+                 version = version + 1, updated_epoch = ?2 WHERE task_id = ?1",
+            params![task_id, now, kind],
         )?;
         tx.commit()?;
         self.get_decision(decision_id)?
@@ -1033,6 +1295,82 @@ impl V2Store {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
 
+        let task_status: String = tx.query_row(
+            "SELECT status FROM tasks WHERE task_id = ?1",
+            params![task_id],
+            |row| row.get(0),
+        )?;
+        let linked: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM post_merge_deliveries WHERE task_id = ?1)",
+            params![task_id],
+            |row| row.get(0),
+        )?;
+        let post_merge =
+            is_post_merge_decision(&kind) || is_post_merge_status(&task_status) || linked;
+        let mut next_status = if task_status == "Blocked" {
+            "Ready"
+        } else {
+            &task_status
+        };
+        if post_merge {
+            let options_raw: String = tx.query_row(
+                "SELECT options_json FROM pending_decisions WHERE decision_id = ?1",
+                params![decision_id],
+                |row| row.get(0),
+            )?;
+            let options: Vec<String> = serde_json::from_str(&options_raw)?;
+            // Accept the displayed option or its one-based CLI index. Persist the
+            // canonical option so approval cannot be inferred from free-form text.
+            let selected = choice
+                .parse::<usize>()
+                .ok()
+                .and_then(|index| index.checked_sub(1))
+                .and_then(|index| options.get(index))
+                .or_else(|| {
+                    options
+                        .iter()
+                        .find(|option| option.eq_ignore_ascii_case(choice))
+                })
+                .ok_or_else(|| V2StoreError("choice is not a post-merge decision option".into()))?;
+            let first_word = selected
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let rejected = matches!(first_word.as_str(), "reject" | "abort" | "cancel");
+            let approved =
+                kind == "prod_promotion_approval" && selected.eq_ignore_ascii_case("Approve");
+            let terminal =
+                is_terminal_task_status(&task_status) || task_status == "Delivery Aborted";
+            next_status = if terminal {
+                &task_status
+            } else if rejected {
+                "Delivery Aborted"
+            } else {
+                "Delivery Pending"
+            };
+            let delivery_state = if rejected || terminal {
+                "aborted"
+            } else if approved {
+                "approved"
+            } else {
+                "pending"
+            };
+            tx.execute(
+                "UPDATE post_merge_deliveries SET state = ?2,
+                     attempt = attempt + 1,
+                     run_id = CASE WHEN ?2 = 'pending' THEN NULL ELSE run_id END,
+                     decision_id = CASE WHEN ?2 = 'pending' THEN NULL ELSE decision_id END,
+                     updated_epoch = ?3
+                 WHERE task_id = ?4 AND decision_id = ?1",
+                params![decision_id, delivery_state, now, task_id],
+            )?;
+            tx.execute(
+                "UPDATE pending_decisions SET choice = ?2 WHERE decision_id = ?1",
+                params![decision_id, selected],
+            )?;
+        }
+
         let memory_str: String = tx
             .query_row(
                 "SELECT memory_json FROM tasks WHERE task_id = ?1",
@@ -1052,12 +1390,12 @@ impl V2Store {
         }
         let updated_memory_json = serde_json::to_string(&memory)?;
         tx.execute(
-            "UPDATE tasks SET status = CASE WHEN status = 'Blocked' THEN 'Ready' ELSE status END,
+            "UPDATE tasks SET status = ?4,
                               memory_json = ?2,
                               version = version + 1,
                               updated_epoch = ?3
              WHERE task_id = ?1",
-            params![task_id, updated_memory_json, now],
+            params![task_id, updated_memory_json, now, next_status],
         )?;
         Self::insert_event_tx(
             &tx,
@@ -1686,9 +2024,24 @@ fn is_zach_executor(executor: Option<&str>) -> bool {
     executor.is_some_and(|e| e.trim().eq_ignore_ascii_case("zach"))
 }
 
+pub fn is_post_merge_status(status: &str) -> bool {
+    matches!(
+        status,
+        "Delivery Pending" | "Waiting New APK" | "Pending Prod Promotion" | "Delivery Aborted"
+    )
+}
+
+fn is_post_merge_decision(kind: &str) -> bool {
+    matches!(
+        kind,
+        "new_apk_required" | "prod_promotion_approval" | "delivery_contract_error"
+    )
+}
+
 fn should_preserve_zach_state(existing: &TaskRecord, incoming: &TaskRecord) -> bool {
-    is_zach_executor(existing.executor.as_deref())
-        && !is_terminal_task_status(&existing.status)
+    (is_post_merge_status(&existing.status)
+        || (is_zach_executor(existing.executor.as_deref())
+            && !is_terminal_task_status(&existing.status)))
         && !is_terminal_task_status(&incoming.status)
 }
 
@@ -2407,5 +2760,446 @@ mod tests {
 
         drop(store);
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    fn delivery_task(status: &str) -> TaskRecord {
+        let mut task = sample_task("TASK-001", status, Vec::new());
+        task.repository = "sample-app".into();
+        task.github_repo = Some("acme/sample-app".into());
+        task.worktree_path = None;
+        task
+    }
+
+    fn sample_delivery(task: &TaskRecord) -> PostMergeDelivery {
+        PostMergeDelivery {
+            delivery_id: format!("{}:promotion:release", task.task_id),
+            task_id: task.task_id.clone(),
+            repository: task.repository.clone(),
+            github_repo: "acme/sample-app".into(),
+            merge_sha: "a".repeat(40),
+            kind: "promotion".into(),
+            name: "release".into(),
+            state: "waiting_decision".into(),
+            workflow: "release.yml".into(),
+            run_id: Some("42".into()),
+            build_run_id: Some("41".into()),
+            artifact_digest: Some("b".repeat(64)),
+            expected_current: Some("none".into()),
+            evidence_json: serde_json::json!({"source_sha": "a".repeat(40)}),
+            rule_json: serde_json::json!({"name": "release"}),
+            decision_id: Some("release:0:42".into()),
+            attempt: 0,
+            updated_epoch: 1,
+        }
+    }
+
+    #[test]
+    fn delivery_schema_upgrade_is_additive_idempotent_and_rejects_future_versions() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE daemon_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO daemon_meta VALUES ('schema_version', '2');",
+        )
+        .unwrap();
+        let mut store = V2Store { conn };
+        store.initialize().unwrap();
+        let task = delivery_task("Delivery Pending");
+        let delivery = sample_delivery(&task);
+        store
+            .save_deliveries_and_task(&task, std::slice::from_ref(&delivery))
+            .unwrap();
+        store.initialize().unwrap();
+        assert_eq!(
+            store.list_deliveries(Some(&task.task_id)).unwrap(),
+            vec![delivery]
+        );
+        let schema: String = store
+            .conn
+            .query_row(
+                "SELECT value FROM daemon_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema, SCHEMA_VERSION.to_string());
+
+        for value in ["999", "invalid", "0"] {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE daemon_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO daemon_meta VALUES ('schema_version', ?1)",
+                params![value],
+            )
+            .unwrap();
+            let mut incompatible = V2Store { conn };
+            assert!(incompatible.initialize().is_err());
+            let tables: i64 = incompatible.conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name != 'daemon_meta'",
+                [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(tables, 0, "must reject before changing schema");
+        }
+    }
+
+    #[test]
+    fn delivery_sync_preserves_waiting_states_without_executor_until_terminal_board_state() {
+        for status in [
+            "Delivery Pending",
+            "Waiting New APK",
+            "Pending Prod Promotion",
+            "Delivery Aborted",
+        ] {
+            let mut store = V2Store::open_in_memory().unwrap();
+            let task = delivery_task(status);
+            store.upsert_task(&task).unwrap();
+            for board_status in ["Blocked", "Ready"] {
+                let mut incoming = task.clone();
+                incoming.status = board_status.into();
+                let synced = store.sync_task(&incoming).unwrap();
+                assert_eq!(synced.status, status);
+                assert_eq!(synced.executor, None);
+                assert!(store.list_ready_queue(None).unwrap().is_empty());
+                assert_eq!(store.status_summary().unwrap().in_progress_count, 0);
+            }
+            for terminal in ["Done", "Cancelled"] {
+                store.upsert_task(&task).unwrap();
+                let mut incoming = task.clone();
+                incoming.status = terminal.into();
+                assert_eq!(store.sync_task(&incoming).unwrap().status, terminal);
+            }
+        }
+    }
+
+    #[test]
+    fn delivery_decision_resolution_is_atomic_and_retries_do_not_reopen_implementation() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        let task = delivery_task("Pending Prod Promotion");
+        let mut delivery = sample_delivery(&task);
+        store
+            .save_deliveries_and_task(&task, std::slice::from_ref(&delivery))
+            .unwrap();
+        let options = vec!["Approve".into(), "Retry".into(), "Reject".into()];
+        let decision_id = delivery.decision_id.clone().unwrap();
+        store
+            .open_decision(
+                &decision_id,
+                &task.task_id,
+                &task.task_group,
+                "prod_promotion_approval",
+                "Approve release?",
+                &options,
+                None,
+                "release evidence",
+                Some(&delivery.merge_sha),
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_task(&task.task_id).unwrap().unwrap().status,
+            "Pending Prod Promotion"
+        );
+        assert!(
+            store
+                .resolve_decision(&decision_id, "Deploy everything", "operator", None)
+                .is_err()
+        );
+        assert_eq!(
+            store.get_decision(&decision_id).unwrap().unwrap().status,
+            "OPEN"
+        );
+        assert_eq!(
+            store.list_deliveries(None).unwrap()[0].state,
+            "waiting_decision"
+        );
+        store
+            .resolve_decision(&decision_id, "1", "operator", None)
+            .unwrap();
+        delivery = store.list_deliveries(None).unwrap().remove(0);
+        assert_eq!(delivery.state, "approved");
+        assert_eq!(delivery.attempt, 1);
+        assert_eq!(
+            store
+                .get_decision(&decision_id)
+                .unwrap()
+                .unwrap()
+                .choice
+                .as_deref(),
+            Some("Approve")
+        );
+        assert_eq!(
+            store.get_task(&task.task_id).unwrap().unwrap().status,
+            "Delivery Pending"
+        );
+        assert!(store.list_ready_queue(None).unwrap().is_empty());
+
+        // A later run gets a different gate and remains resolvable after retry.
+        delivery.state = "waiting_decision".into();
+        delivery.decision_id = Some(format!("{}:{}:43", delivery.delivery_id, delivery.attempt));
+        let next_id = delivery.decision_id.clone().unwrap();
+        store.upsert_delivery(&delivery).unwrap();
+        store
+            .open_decision(
+                &next_id,
+                &task.task_id,
+                &task.task_group,
+                "prod_promotion_approval",
+                "Approve new plan?",
+                &options,
+                None,
+                "new evidence",
+                Some(&delivery.merge_sha),
+            )
+            .unwrap();
+        store
+            .resolve_decision(&next_id, "Retry", "operator", None)
+            .unwrap();
+        delivery = store.list_deliveries(None).unwrap().remove(0);
+        assert_eq!(delivery.state, "pending");
+        assert_eq!(delivery.attempt, 2);
+        assert_eq!(delivery.run_id, None);
+        assert_eq!(delivery.decision_id, None);
+        assert_eq!(store.list_decisions(false, None).unwrap().len(), 2);
+        assert_eq!(
+            store.get_task(&task.task_id).unwrap().unwrap().status,
+            "Delivery Pending"
+        );
+    }
+
+    #[test]
+    fn delivery_reject_aborts_linked_work_and_fallback_gate_never_becomes_ready() {
+        for kind in [
+            "new_apk_required",
+            "prod_promotion_approval",
+            "delivery_contract_error",
+            "custom_gate",
+        ] {
+            let mut store = V2Store::open_in_memory().unwrap();
+            let task = delivery_task("Waiting New APK");
+            let delivery = sample_delivery(&task);
+            store
+                .save_deliveries_and_task(&task, std::slice::from_ref(&delivery))
+                .unwrap();
+            let decision_id = delivery.decision_id.clone().unwrap();
+            let options = vec!["Retry".into(), "Abort delivery".into()];
+            store
+                .open_decision(
+                    &decision_id,
+                    &task.task_id,
+                    &task.task_group,
+                    kind,
+                    "Continue?",
+                    &options,
+                    None,
+                    "",
+                    None,
+                )
+                .unwrap();
+            assert_eq!(
+                store.get_task(&task.task_id).unwrap().unwrap().status,
+                "Waiting New APK"
+            );
+            store
+                .resolve_decision(&decision_id, "Abort delivery", "operator", None)
+                .unwrap();
+            assert_eq!(store.list_deliveries(None).unwrap()[0].state, "aborted");
+            assert_eq!(
+                store.get_task(&task.task_id).unwrap().unwrap().status,
+                "Delivery Aborted"
+            );
+            assert!(store.list_ready_queue(None).unwrap().is_empty());
+            store
+                .open_decision(
+                    "stale-gate",
+                    &task.task_id,
+                    &task.task_group,
+                    kind,
+                    "Retry?",
+                    &["Retry".into()],
+                    None,
+                    "",
+                    None,
+                )
+                .unwrap();
+            store
+                .resolve_decision("stale-gate", "Retry", "operator", None)
+                .unwrap();
+            assert_eq!(
+                store.get_task(&task.task_id).unwrap().unwrap().status,
+                "Delivery Aborted",
+                "an abort is terminal even if another decision remains open"
+            );
+        }
+
+        let mut store = V2Store::open_in_memory().unwrap();
+        let task = delivery_task("Blocked");
+        let delivery = sample_delivery(&task);
+        store
+            .save_deliveries_and_task(&task, std::slice::from_ref(&delivery))
+            .unwrap();
+        store
+            .open_decision(
+                "unlinked-gate",
+                &task.task_id,
+                &task.task_group,
+                "custom_gate",
+                "Retry?",
+                &["Retry".into()],
+                None,
+                "",
+                None,
+            )
+            .unwrap();
+        store
+            .resolve_decision("unlinked-gate", "Retry", "operator", None)
+            .unwrap();
+        assert_eq!(
+            store.get_task(&task.task_id).unwrap().unwrap().status,
+            "Delivery Pending"
+        );
+        assert_eq!(
+            store.list_deliveries(None).unwrap()[0].state,
+            "waiting_decision",
+            "unrelated gate must remain untouched"
+        );
+    }
+
+    #[test]
+    fn delivery_task_checkpoint_rolls_back_if_a_row_belongs_to_another_task() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        let mut task = delivery_task("Delivery Pending");
+        store.upsert_task(&task).unwrap();
+        let mut delivery = sample_delivery(&task);
+        delivery.task_id = "TASK-OTHER".into();
+        task.status = "Done".into();
+        assert!(store.save_deliveries_and_task(&task, &[delivery]).is_err());
+        assert_eq!(
+            store.get_task(&task.task_id).unwrap().unwrap().status,
+            "Delivery Pending"
+        );
+        assert!(store.list_deliveries(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn delivery_board_receipt_preserves_concurrent_approval_and_terminal_task_state() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        let task = delivery_task("Pending Prod Promotion");
+        let delivery = sample_delivery(&task);
+        store
+            .save_deliveries_and_task(&task, std::slice::from_ref(&delivery))
+            .unwrap();
+        let decision_id = delivery.decision_id.as_deref().unwrap();
+        store
+            .open_decision(
+                decision_id,
+                &task.task_id,
+                &task.task_group,
+                "prod_promotion_approval",
+                "Approve release?",
+                &["Approve".into(), "Retry".into(), "Reject".into()],
+                None,
+                "release evidence",
+                Some(&delivery.merge_sha),
+            )
+            .unwrap();
+        let before_network = store.get_task(&task.task_id).unwrap().unwrap();
+        store
+            .resolve_decision(decision_id, "Approve", "operator", None)
+            .unwrap();
+        let approved_task = store.get_task(&task.task_id).unwrap().unwrap();
+        let approved_row = store
+            .list_deliveries(Some(&task.task_id))
+            .unwrap()
+            .remove(0);
+        assert_eq!(approved_task.status, "Delivery Pending");
+        assert_eq!(approved_row.state, "approved");
+        assert_eq!(approved_row.attempt, delivery.attempt + 1);
+        assert!(approved_task.version > before_network.version);
+
+        assert!(
+            !store
+                .mark_delivery_board_synced(
+                    &task.task_id,
+                    before_network.version,
+                    "Pending Prod Promotion",
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store.list_deliveries(Some(&task.task_id)).unwrap(),
+            vec![approved_row.clone()]
+        );
+        assert_eq!(
+            store.get_task(&task.task_id).unwrap().unwrap(),
+            approved_task
+        );
+
+        assert!(
+            store
+                .mark_delivery_board_synced(
+                    &task.task_id,
+                    approved_task.version,
+                    &approved_task.status,
+                )
+                .unwrap()
+        );
+        let mut expected_row = approved_row;
+        expected_row.evidence_json["board_synced_status"] = serde_json::json!("Delivery Pending");
+        assert_eq!(
+            store.list_deliveries(Some(&task.task_id)).unwrap(),
+            vec![expected_row]
+        );
+        assert_eq!(
+            store.get_task(&task.task_id).unwrap().unwrap(),
+            approved_task
+        );
+
+        for terminal in ["Done", "Cancelled"] {
+            let mut terminal_store = V2Store::open_in_memory().unwrap();
+            let stale_task = delivery_task("Delivery Pending");
+            let stale_row = sample_delivery(&stale_task);
+            terminal_store
+                .save_deliveries_and_task(&stale_task, std::slice::from_ref(&stale_row))
+                .unwrap();
+            let mut terminal_task = terminal_store
+                .get_task(&stale_task.task_id)
+                .unwrap()
+                .unwrap();
+            terminal_task.status = terminal.into();
+            terminal_store.upsert_task(&terminal_task).unwrap();
+            assert!(
+                terminal_store
+                    .save_deliveries_and_task(&stale_task, std::slice::from_ref(&stale_row))
+                    .is_err()
+            );
+            terminal_store
+                .open_decision(
+                    "late-delivery-gate",
+                    &stale_task.task_id,
+                    &stale_task.task_group,
+                    "delivery_contract_error",
+                    "Retry delivery?",
+                    &["Retry".into(), "Abort".into()],
+                    None,
+                    "late observation",
+                    Some(&stale_row.merge_sha),
+                )
+                .unwrap();
+            assert_eq!(
+                terminal_store
+                    .get_task(&stale_task.task_id)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                terminal
+            );
+            assert_eq!(
+                terminal_store
+                    .list_deliveries(Some(&stale_task.task_id))
+                    .unwrap(),
+                vec![stale_row]
+            );
+        }
     }
 }
