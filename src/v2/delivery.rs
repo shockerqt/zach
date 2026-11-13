@@ -2483,7 +2483,7 @@ pub fn poll_post_merge_deliveries(
                     }
                     let status = if rows.iter().any(|r| r.state == "aborted") {
                         "Delivery Aborted"
-                    } else if rows.iter().all(|r| r.state == "verified") {
+                    } else if task.status == "Done" {
                         "Done"
                     } else if rows.iter().any(|r| {
                         r.state == "waiting"
@@ -2498,10 +2498,10 @@ pub fn poll_post_merge_deliveries(
                     } else {
                         "Delivery Pending"
                     };
-                    let became_done = task.status != "Done" && status == "Done";
+                    let verified = !rows.is_empty() && rows.iter().all(|r| r.state == "verified");
                     task.status = status.into();
                     store
-                        .save_delivery_status(&task, became_done.then_some(rows.as_slice()))
+                        .save_delivery_status(&task, verified.then_some(rows.as_slice()))
                         .map_err(|e| e.to_string())?;
                     let task = store
                         .get_task(&id)
@@ -3038,12 +3038,29 @@ promotions:
         driver.run("publish-sample.yml", "push", "101", 3, true, true);
         driver.files.insert(("101".into(), "delivery.json".into()), serde_json::to_vec(&json!({"source_sha":SHA,"update_id":"sample-update","group_id":"sample-group","previous_group_id":"sample-previous"})).unwrap());
         tick(&mut store, &mut driver);
-        assert_eq!(status(&store), "Done");
+        assert_eq!(status(&store), "Delivery Pending");
+        assert!(store.delivery_verification_recorded("DEMO-1", SHA).unwrap());
         assert_eq!(
             only_row(&store).evidence_json["artifacts"][0]["group_id"],
             "sample-group"
         );
-        assert_eq!(driver.board_calls.last().unwrap(), "Done");
+        assert_eq!(driver.board_calls.last().unwrap(), "Blocked");
+        let polls = driver.polls;
+        tick(&mut store, &mut driver);
+        tick(&mut store, &mut driver);
+        assert_eq!(
+            driver.polls, polls,
+            "verified workflows must not execute again"
+        );
+        assert_eq!(
+            store
+                .list_events_since(None, 0, 100)
+                .unwrap()
+                .iter()
+                .filter(|e| e.event_type == "POST_MERGE_DELIVERY_VERIFIED")
+                .count(),
+            1
+        );
     }
 
     fn promotion_setup() -> (V2Store, MockDriver) {
@@ -3122,7 +3139,7 @@ promotions:
         );
         driver.promotion_result("202", "result.json");
         tick(&mut store, &mut driver);
-        assert_eq!(status(&store), "Done");
+        assert_eq!(status(&store), "Delivery Pending");
         assert_eq!(only_row(&store).state, "verified");
         assert!(
             store
@@ -3215,7 +3232,7 @@ promotions:
     }
 
     #[test]
-    fn all_deliveries_must_verify_and_final_board_sync_is_retried() {
+    fn all_deliveries_must_verify_and_pending_board_sync_is_retried() {
         let mut second = workflow();
         second.workflow = "publish-other.yml".into();
         second.artifacts.clear();
@@ -3226,16 +3243,19 @@ promotions:
             post_merge_workflows: vec![first, second],
             promotions: vec![],
         });
+        driver.board_errors = 2;
         driver.run("publish-sample.yml", "push", "101", 1, true, true);
         tick(&mut store, &mut driver);
         assert_eq!(status(&store), "Delivery Pending");
+        assert!(!store.delivery_verification_recorded("DEMO-1", SHA).unwrap());
         driver.run("publish-other.yml", "push", "102", 1, true, true);
-        driver.board_errors = 1;
         tick(&mut store, &mut driver);
-        assert_eq!(status(&store), "Done");
+        assert_eq!(status(&store), "Delivery Pending");
+        assert!(store.delivery_verification_recorded("DEMO-1", SHA).unwrap());
         let calls = driver.board_calls.len();
         tick(&mut store, &mut driver);
         assert_eq!(driver.board_calls.len(), calls + 1);
+        assert!(!driver.board_calls.iter().any(|status| status == "Done"));
         tick(&mut store, &mut driver);
         assert_eq!(driver.board_calls.len(), calls + 1);
     }
@@ -3259,6 +3279,12 @@ promotions:
         );
         approve(&mut store, "Retry");
         driver.contract = Some(ContractLookup::ContractNotFound);
+        tick(&mut store, &mut driver);
+        assert_eq!(status(&store), "Delivery Pending");
+        assert!(store.delivery_verification_recorded("DEMO-1", SHA).unwrap());
+        let mut terminal = store.get_task("DEMO-1").unwrap().unwrap();
+        terminal.status = "Done".into();
+        store.sync_task(&terminal).unwrap();
         tick(&mut store, &mut driver);
         assert_eq!(status(&store), "Done");
         assert!(checkpoint(&mut store, &row, "Delivery Pending").is_err());

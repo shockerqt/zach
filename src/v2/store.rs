@@ -72,6 +72,10 @@ pub struct ContextPackSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct TaskMemory {
+    /// An authoritative Governance export observed a terminal task. Local
+    /// delivery recovery must never reinterpret that as premature completion.
+    #[serde(default)]
+    pub governance_terminal_observed: bool,
     #[serde(default)]
     pub halt_requested: bool,
     #[serde(default)]
@@ -1198,9 +1202,16 @@ impl V2Store {
                     coalesce_runtime_fields(&old, &mut next);
                     next.retry_count = old.retry_count.max(next.retry_count);
                 }
+                next.memory.governance_terminal_observed |= old.memory.governance_terminal_observed
+                    || is_terminal_task_status(&incoming.status);
                 Self::update_task_tx(&tx, &old, &next, now)?
             }
-            None => Self::insert_task_tx(&tx, incoming, now)?,
+            None => {
+                let mut next = incoming.clone();
+                next.memory.governance_terminal_observed |=
+                    is_terminal_task_status(&incoming.status);
+                Self::insert_task_tx(&tx, &next, now)?
+            }
         };
         tx.commit()?;
         Ok(result)
@@ -1262,7 +1273,8 @@ impl V2Store {
         self.save_delivery_checkpoint(task, deliveries, None)
     }
 
-    /// Completion and its verified event commit together, before close is eligible.
+    /// Delivery verification and its receipt commit together; task completion
+    /// remains exclusively owned by the close acknowledgment.
     pub fn save_delivery_status(
         &mut self,
         task: &TaskRecord,
@@ -1305,17 +1317,110 @@ impl V2Store {
             Self::upsert_delivery_tx(&tx, delivery)?;
         }
         if let Some(payload) = verified_event {
-            Self::insert_event_tx(
-                &tx,
-                &task.task_id,
-                &task.task_group,
-                now,
-                "POST_MERGE_DELIVERY_VERIFIED",
-                payload,
-            )?;
+            let rows = payload["deliveries"]
+                .as_array()
+                .filter(|rows| !rows.is_empty())
+                .ok_or_else(|| V2StoreError("verification requires delivery evidence".into()))?;
+            let sha = rows[0]["merge_sha"]
+                .as_str()
+                .ok_or_else(|| V2StoreError("verification requires merge SHA".into()))?;
+            if rows.iter().any(|row| {
+                row["task_id"] != task.task_id
+                    || row["merge_sha"] != sha
+                    || row["state"] != "verified"
+            }) {
+                return Err(V2StoreError(
+                    "inconsistent delivery verification evidence".into(),
+                ));
+            }
+            if !Self::delivery_verification_recorded_on(&tx, &task.task_id, sha)? {
+                Self::insert_event_tx(
+                    &tx,
+                    &task.task_id,
+                    &task.task_group,
+                    now,
+                    "POST_MERGE_DELIVERY_VERIFIED",
+                    payload,
+                )?;
+            }
         }
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn delivery_verification_recorded(
+        &self,
+        task_id: &str,
+        sha: &str,
+    ) -> Result<bool, V2StoreError> {
+        Self::delivery_verification_recorded_on(&self.conn, task_id, sha)
+    }
+
+    fn delivery_verification_recorded_on(
+        conn: &Connection,
+        task_id: &str,
+        sha: &str,
+    ) -> Result<bool, V2StoreError> {
+        let mut stmt = conn.prepare("SELECT payload_json FROM task_events WHERE task_id=?1 AND event_type='POST_MERGE_DELIVERY_VERIFIED'")?;
+        for payload in stmt.query_map([task_id], |row| row.get::<_, String>(0))? {
+            let payload: serde_json::Value = serde_json::from_str(&payload?)?;
+            if payload["deliveries"].as_array().is_some_and(|rows| {
+                !rows.is_empty()
+                    && rows
+                        .iter()
+                        .all(|row| row["merge_sha"] == sha && row["state"] == "verified")
+            }) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Repair only a Zach-owned, provably unfinished legacy delivery close.
+    /// An authoritative terminal export or an acknowledged close always wins.
+    pub fn recover_unclosed_delivery(
+        &mut self,
+        id: &str,
+    ) -> Result<Option<TaskRecord>, V2StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(old) = Self::get_task_tx(&tx, id)? else {
+            return Ok(None);
+        };
+        if old.status != "Done"
+            || !is_zach_executor(old.executor.as_deref())
+            || old.memory.governance_terminal_observed
+            || old.memory.halt_requested
+            || !old.autonomous_consent
+        {
+            return Ok(None);
+        }
+        let Some(cp) = old.memory.merge_checkpoint.as_ref().filter(|cp| {
+            cp.post_merge_verified
+                && matches!(cp.phase.as_str(), "DELIVERY_PENDING" | "CLOSE_PENDING")
+                && Some(cp.pr_number) == old.pr_number
+        }) else {
+            return Ok(None);
+        };
+        let Some(sha) = cp.merge_sha.as_deref().filter(|sha| !sha.is_empty()) else {
+            return Ok(None);
+        };
+        let matches_receipt: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM post_merge_deliveries WHERE task_id=?1)
+             AND NOT EXISTS(SELECT 1 FROM post_merge_deliveries WHERE task_id=?1 AND (state!='verified' OR merge_sha!=?2))
+             AND NOT EXISTS(SELECT 1 FROM lifecycle_ops WHERE task_id=?1 AND kind='close' AND state='ACKNOWLEDGED')",
+            params![id, sha], |row| row.get(0),
+        )?;
+        if !matches_receipt {
+            return Ok(None);
+        }
+        let mut next = old.clone();
+        next.status = "Delivery Pending".into();
+        next.memory.merge_lane_released = true;
+        let saved = Self::update_task_tx(&tx, &old, &next, now_epoch())?;
+        tx.commit()?;
+        Ok(Some(saved))
     }
 
     /// Record a completed board write without replacing delivery/decision state
@@ -3822,16 +3927,63 @@ mod tests {
     }
 
     #[test]
-    fn delivery_done_and_verified_event_roll_back_together() {
+    fn delivery_verification_receipt_is_atomic_and_idempotent_without_completing_task() {
         let mut store = V2Store::open_in_memory().unwrap();
         let mut task = delivery_task("Delivery Pending");
         store.upsert_task(&task).unwrap();
-        task.status = "Done".into();
+        let mut row = sample_delivery(&task);
+        row.state = "verified".into();
+        store.upsert_delivery(&row).unwrap();
+        task.memory.merge_lane_released = true;
         store.conn.execute_batch("CREATE TRIGGER reject_verified BEFORE INSERT ON task_events WHEN NEW.event_type='POST_MERGE_DELIVERY_VERIFIED' BEGIN SELECT RAISE(ABORT,'injected event failure'); END;").unwrap();
-        assert!(store.save_delivery_status(&task, Some(&[])).is_err());
+        assert!(
+            store
+                .save_delivery_status(&task, Some(std::slice::from_ref(&row)))
+                .is_err()
+        );
         assert_eq!(
             store.get_task(&task.task_id).unwrap().unwrap().status,
             "Delivery Pending"
+        );
+        assert!(
+            !store
+                .get_task(&task.task_id)
+                .unwrap()
+                .unwrap()
+                .memory
+                .merge_lane_released
+        );
+        assert!(
+            !store
+                .delivery_verification_recorded(&task.task_id, &row.merge_sha)
+                .unwrap()
+        );
+        store
+            .conn
+            .execute_batch("DROP TRIGGER reject_verified")
+            .unwrap();
+        for _ in 0..2 {
+            store
+                .save_delivery_status(&task, Some(std::slice::from_ref(&row)))
+                .unwrap();
+        }
+        assert_eq!(
+            store.get_task(&task.task_id).unwrap().unwrap().status,
+            "Delivery Pending"
+        );
+        assert!(
+            store
+                .delivery_verification_recorded(&task.task_id, &row.merge_sha)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .list_events_since(None, 0, 100)
+                .unwrap()
+                .iter()
+                .filter(|e| e.event_type == "POST_MERGE_DELIVERY_VERIFIED")
+                .count(),
+            1
         );
     }
 }

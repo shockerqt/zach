@@ -714,6 +714,13 @@ impl Coordinator {
 
     fn reconcile_terminal_tasks(&mut self) -> Result<(), String> {
         for mut task in self.store.list_tasks(None).map_err(|e| e.to_string())? {
+            if let Some(recovered) = self
+                .store
+                .recover_unclosed_delivery(&task.task_id)
+                .map_err(|e| e.to_string())?
+            {
+                task = recovered;
+            }
             if !matches!(task.status.as_str(), "Done" | "Cancelled")
                 && task.autonomous_consent
                 && !task.memory.halt_requested
@@ -749,11 +756,13 @@ impl Coordinator {
                 self.save(&task)?;
             }
             if task.status == "Done"
-                && self
+                && (self
                     .store
                     .list_deliveries(Some(&task.task_id))
                     .map_err(|e| e.to_string())?
                     .is_empty()
+                    || (task.memory.governance_terminal_observed
+                        && self.delivery_receipt_verified(&task)?))
                 && task
                     .memory
                     .merge_checkpoint
@@ -2750,8 +2759,13 @@ impl Coordinator {
                         .update_lifecycle(&op.operation_id, "PENDING", None, 0)
                         .map_err(|e| e.to_string())?;
                 }
-                task.status = if choice == "Retry close" && self.delivery_verified(&task)? {
-                    "Done"
+                task.status = if matches!(
+                    task.status.as_str(),
+                    "Done" | "Cancelled" | "Delivery Aborted"
+                ) {
+                    task.status.as_str()
+                } else if choice == "Retry close" && self.delivery_verified(&task)? {
+                    "Delivery Pending"
                 } else if task.memory.merge_checkpoint.is_some() {
                     "Queued for Merge"
                 } else {
@@ -2840,24 +2854,38 @@ impl Coordinator {
     }
 
     fn delivery_verified(&self, task: &TaskRecord) -> Result<bool, String> {
+        Ok(task.status == "Delivery Pending" && self.delivery_receipt_verified(task)?)
+    }
+
+    fn delivery_receipt_verified(&self, task: &TaskRecord) -> Result<bool, String> {
         let rows = self
             .store
             .list_deliveries(Some(&task.task_id))
             .map_err(|e| e.to_string())?;
-        Ok(task.status == "Done"
-            && !rows.is_empty()
+        Ok(!rows.is_empty()
             && rows.iter().all(|r| r.state == "verified")
-            && task.memory.merge_checkpoint.as_ref().is_none_or(|cp| {
+            && task.memory.merge_checkpoint.as_ref().is_some_and(|cp| {
                 cp.post_merge_verified
                     && rows
                         .iter()
                         .all(|row| Some(&row.merge_sha) == cp.merge_sha.as_ref())
-            }))
+            })
+            && self
+                .store
+                .delivery_verification_recorded(&task.task_id, &rows[0].merge_sha)
+                .map_err(|e| e.to_string())?)
     }
 
     fn poll_deliveries(&mut self) -> Result<(), String> {
         // Recover the small gap between the durable handoff and lane release.
         for mut task in self.store.list_tasks(None).map_err(|e| e.to_string())? {
+            if let Some(recovered) = self
+                .store
+                .recover_unclosed_delivery(&task.task_id)
+                .map_err(|e| e.to_string())?
+            {
+                task = recovered;
+            }
             let rows = self
                 .store
                 .list_deliveries(Some(&task.task_id))
@@ -2876,23 +2904,6 @@ impl Coordinator {
                 || task.memory.halt_requested
             {
                 continue;
-            }
-            if task.memory.merge_checkpoint.is_none() {
-                let sha = rows[0].merge_sha.clone();
-                if rows.iter().any(|r| r.merge_sha != sha) {
-                    continue;
-                }
-                let Some(pr_number) = task.pr_number else {
-                    continue;
-                };
-                task.memory.merge_checkpoint = Some(MergeCheckpoint {
-                    phase: "DELIVERY_PENDING".into(),
-                    target_sha: task.reviewed_sha.clone().unwrap_or_default(),
-                    pr_number,
-                    merge_sha: Some(sha),
-                    post_merge_verified: true,
-                    phase_started_epoch: now_epoch(),
-                });
             }
             let Some(cp) = task.memory.merge_checkpoint.as_mut() else {
                 continue;
@@ -4695,6 +4706,8 @@ mod tests {
     fn delivery_handoff_approval_and_verified_close_preserve_both_lifecycles() {
         let dir = TestDirectory::new();
         let mut c = coordinator(&dir.0);
+        let db = dir.0.join("close.sqlite");
+        c.store = V2Store::open(&db).unwrap();
         let ws = Arc::new(RecordingWsTaskClient::default());
         c.ws = ws.clone();
         let mut t = task("delivery-close");
@@ -4761,17 +4774,35 @@ mod tests {
         c.store.enqueue_lifecycle(&close).unwrap();
         c.replay_lifecycle().unwrap();
         assert!(ws.calls.lock().unwrap().is_empty());
-        let mut done = c.task(&t.task_id).unwrap();
-        done.status = "Done".into();
-        done.memory.merge_checkpoint.as_mut().unwrap().phase = "CLOSE_PENDING".into();
+        let mut verified = c.task(&t.task_id).unwrap();
+        verified.memory.merge_checkpoint.as_mut().unwrap().phase = "CLOSE_PENDING".into();
         row.state = "verified".into();
         c.store.upsert_delivery(&row).unwrap();
-        c.store.save_delivery_status(&done, Some(&[row])).unwrap();
+        c.store
+            .save_delivery_status(&verified, Some(std::slice::from_ref(&row)))
+            .unwrap();
+        c.store
+            .save_delivery_status(&verified, Some(&[row]))
+            .unwrap();
         c.reconcile_terminal_tasks().unwrap();
         assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "PENDING");
         c.lifecycle_failed(&close.operation_id, "Governance temporarily unavailable")
             .unwrap();
-        assert_eq!(c.task(&t.task_id).unwrap().status, "Done");
+        assert_eq!(c.task(&t.task_id).unwrap().status, "Delivery Pending");
+        // Reopen the real SQLite file after the failed close, retaining its receipt.
+        drop(c);
+        let (mut c, _) = Coordinator::create(V2Store::open(&db).unwrap(), dir.0.clone());
+        c.ws = ws.clone();
+        c.reconcile_terminal_tasks().unwrap();
+        assert_eq!(c.task(&t.task_id).unwrap().status, "Delivery Pending");
+        let mut successor = task("next-task");
+        successor.repository = t.repository.clone();
+        c.save(&successor).unwrap();
+        assert!(
+            c.store
+                .acquire_path_locks(&t.repository, &["*".into()], &successor.task_id)
+                .unwrap()
+        );
         let decision = c.store.list_decisions(true, None).unwrap().remove(0);
         let DecisionResolution::Resolved(decision) = c
             .store
@@ -4781,16 +4812,36 @@ mod tests {
             panic!()
         };
         c.apply_decision(&decision).unwrap();
-        assert_eq!(c.task(&t.task_id).unwrap().status, "Done");
+        assert_eq!(c.task(&t.task_id).unwrap().status, "Delivery Pending");
         c.replay_lifecycle().unwrap();
         let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
         c.handle_event(event).unwrap();
+        c.lifecycle_ack(&close.operation_id, "").unwrap(); // duplicate receipt
+        assert_eq!(c.task(&t.task_id).unwrap().status, "Done");
+        assert_eq!(
+            c.store.list_path_locks(None).unwrap()[0].task_id,
+            successor.task_id
+        );
         assert_eq!(
             ws.calls.lock().unwrap().as_slice(),
             &[vec!["close", "delivery-close", "--pr", "9"]]
         );
         assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "ACKNOWLEDGED");
         let events = c.store.list_events_since(None, 0, 100).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.event_type == "POST_MERGE_DELIVERY_VERIFIED")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.event_type == "MERGE_COMPLETED")
+                .count(),
+            1
+        );
         assert!(
             events
                 .iter()
@@ -4859,22 +4910,30 @@ mod tests {
     }
 
     #[test]
-    fn upgraded_delivery_receipt_recovers_close_without_reacquiring_lane() {
+    fn legacy_delivery_close_recovers_only_from_matching_receipt_without_reacquiring_lane() {
         let dir = TestDirectory::new();
         let mut c = coordinator(&dir.0);
-        let mut t = task("v3-delivery");
+        let mut t = task("legacy-delivery");
         t.status = "Done".into();
-        t.worktree_path = None;
+        t.memory.merge_checkpoint = Some(MergeCheckpoint {
+            phase: "CLOSE_PENDING".into(),
+            target_sha: "head".into(),
+            pr_number: 9,
+            merge_sha: Some("a".repeat(40)),
+            post_merge_verified: true,
+            ..Default::default()
+        });
         let mut rows = delivery_rows(&t);
         rows[0].state = "verified".into();
         c.store.save_deliveries_and_task(&t, &rows).unwrap();
+        c.store.save_delivery_status(&t, Some(&rows)).unwrap();
+        c.reconcile_terminal_tasks().unwrap();
+        let saved = c.task(&t.task_id).unwrap();
+        assert_eq!(saved.status, "Delivery Pending");
+        assert_eq!(saved.memory.merge_checkpoint, t.memory.merge_checkpoint);
         c.last_delivery_poll = Instant::now();
         c.jobs.insert(format!("delivery-close:{}", t.task_id));
         c.poll_deliveries().unwrap();
-        let saved = c.task(&t.task_id).unwrap();
-        let cp = saved.memory.merge_checkpoint.as_ref().unwrap();
-        assert_eq!(cp.phase, "CLOSE_PENDING");
-        assert_eq!(cp.merge_sha, Some("a".repeat(40)));
         assert!(c.store.list_path_locks(None).unwrap().is_empty());
         c.handle_event(CoordinatorEvent::Completed {
             key: format!("delivery-close:{}", t.task_id),
@@ -4895,7 +4954,7 @@ mod tests {
             panic!()
         };
         c.apply_decision(&decision).unwrap();
-        assert_eq!(c.task(&t.task_id).unwrap().status, "Done");
+        assert_eq!(c.task(&t.task_id).unwrap().status, "Delivery Pending");
         assert_eq!(c.task(&t.task_id).unwrap().memory.merge_retry_generation, 1);
         let mut driver = merge_queue::tests::MockMergeDriver {
             pr_merge_state: Some(merge_queue::PrMergeState::Merged(Some("a".repeat(40)))),
@@ -4908,17 +4967,141 @@ mod tests {
         let mut stale = saved.clone();
         stale.status = "Ready".into();
         stale.memory = TaskMemory::default();
-        assert_eq!(c.store.sync_task(&stale).unwrap().status, "Done");
+        assert_eq!(
+            c.store.sync_task(&stale).unwrap().status,
+            "Delivery Pending"
+        );
         let mut terminal = stale;
         terminal.status = "Done".into();
         terminal.memory.governance_started = true;
+        let terminal = c.store.sync_task(&terminal).unwrap();
         assert_eq!(
-            c.store
-                .sync_task(&terminal)
-                .unwrap()
-                .memory
-                .merge_checkpoint,
+            terminal.memory.merge_checkpoint,
             saved.memory.merge_checkpoint
         );
+        assert!(terminal.memory.governance_terminal_observed);
+        assert!(
+            c.store
+                .recover_unclosed_delivery(&t.task_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn terminal_governance_readback_acknowledges_saved_delivery_close_once() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        let mut t = task("remote-closed-delivery");
+        t.status = "Delivery Pending".into();
+        t.memory.merge_checkpoint = Some(MergeCheckpoint {
+            phase: "CLOSE_PENDING".into(),
+            target_sha: "head".into(),
+            pr_number: 9,
+            merge_sha: Some("a".repeat(40)),
+            post_merge_verified: true,
+            ..Default::default()
+        });
+        let mut rows = delivery_rows(&t);
+        rows[0].state = "verified".into();
+        c.store.save_deliveries_and_task(&t, &rows).unwrap();
+        c.store.save_delivery_status(&t, Some(&rows)).unwrap();
+        let close = merge_queue::close_operation(&t, 9);
+        c.store.enqueue_lifecycle(&close).unwrap();
+        c.store
+            .update_lifecycle(&close.operation_id, "IN_FLIGHT", None, 0)
+            .unwrap();
+        // Remote close succeeded; the daemon lost its ACK before restart/export.
+        t.status = "Done".into();
+        c.worker_result(WorkerResult::Export(vec![t.clone()]))
+            .unwrap();
+        c.reconcile_terminal_tasks().unwrap();
+        c.reconcile_terminal_tasks().unwrap();
+        c.replay_lifecycle().unwrap();
+        assert_eq!(c.task(&t.task_id).unwrap().status, "Done");
+        assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "ACKNOWLEDGED");
+        assert!(
+            !c.jobs
+                .iter()
+                .any(|job| job.starts_with("ws:") || job.starts_with("merge:"))
+        );
+        assert_eq!(
+            c.store
+                .list_events_since(None, 0, 100)
+                .unwrap()
+                .iter()
+                .filter(|e| e.event_type == "MERGE_COMPLETED")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn legacy_delivery_recovery_preserves_external_terminal_and_unproven_records() {
+        for case in [
+            "external-done",
+            "cancelled",
+            "acknowledged",
+            "missing-checkpoint",
+            "wrong-sha",
+            "other-executor",
+            "revoked",
+            "halted",
+        ] {
+            let dir = TestDirectory::new();
+            let mut c = coordinator(&dir.0);
+            let mut t = task(case);
+            t.status = "Done".into();
+            t.memory.merge_checkpoint = Some(MergeCheckpoint {
+                phase: "CLOSE_PENDING".into(),
+                target_sha: "head".into(),
+                pr_number: 9,
+                merge_sha: Some("a".repeat(40)),
+                post_merge_verified: true,
+                ..Default::default()
+            });
+            if case == "missing-checkpoint" {
+                t.memory.merge_checkpoint = None;
+            }
+            if case == "other-executor" {
+                t.executor = Some("session".into());
+            }
+            if case == "revoked" {
+                t.autonomous_consent = false;
+            }
+            if case == "halted" {
+                t.memory.halt_requested = true;
+            }
+            let mut rows = delivery_rows(&t);
+            rows[0].state = "verified".into();
+            if case == "wrong-sha" {
+                rows[0].merge_sha = "b".repeat(40);
+            }
+            c.store.save_deliveries_and_task(&t, &rows).unwrap();
+            c.store.save_delivery_status(&t, Some(&rows)).unwrap();
+            if matches!(case, "external-done" | "cancelled") {
+                if case == "cancelled" {
+                    t.status = "Cancelled".into();
+                }
+                c.store.sync_task(&t).unwrap();
+            }
+            if case == "acknowledged" {
+                let op = merge_queue::close_operation(&t, 9);
+                c.store.enqueue_lifecycle(&op).unwrap();
+                c.lifecycle_ack(&op.operation_id, "").unwrap();
+            }
+            c.reconcile_terminal_tasks().unwrap();
+            c.last_delivery_poll = Instant::now();
+            c.poll_deliveries().unwrap();
+            assert_eq!(c.task(&t.task_id).unwrap().status, t.status, "{case}");
+            assert!(
+                c.store
+                    .lifecycle_ops()
+                    .unwrap()
+                    .iter()
+                    .all(|op| op.state == "ACKNOWLEDGED"),
+                "{case}"
+            );
+        }
     }
 }

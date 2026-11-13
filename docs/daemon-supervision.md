@@ -158,9 +158,20 @@ errors create durable delivery work rather than silently completing the task.
 Delivery polling runs on a bounded general worker. Short store operations return
 through the coordinator channel, so promotion dispatch intent commits on the sole
 SQLite writer before remote I/O. Delivery decisions update their linked rows and
-never restart implementation. Aggregate Done and POST_MERGE_DELIVERY_VERIFIED
-commit together. Only verified delivery can enter the merge-SHA readback and
-Governance close outbox; close failures retain the separate retry-close gate.
+never restart implementation. Verified rows and an idempotent
+POST_MERGE_DELIVERY_VERIFIED receipt leave the task in Delivery Pending while
+Governance close is outstanding. Only verified delivery with a matching saved
+merge checkpoint and durable verification event can enter the merge-SHA readback
+and Governance close outbox. Failed close and Retry close remain nonterminal;
+Done and MERGE_COMPLETED commit only with the close acknowledgment. Polling or
+restarting does not repeat verified delivery work or emit duplicate events.
+
+The delivery handoff releases the repository lane; close retries never acquire a
+successor task's lane. Recovery repairs an old premature Done only for a
+consenting Zach-owned task with verified delivery rows, a matching saved merge/
+close checkpoint, and no acknowledged close or observed terminal Governance
+export. An externally completed/cancelled task, or one without sufficient proof,
+is never reopened based solely on delivery rows or local Done.
 `zach run` wakes this polling through its daemon Run request; dry runs remain
 read-only.
 
