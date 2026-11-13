@@ -81,6 +81,14 @@ pub struct TaskMemory {
     #[serde(default)]
     pub approved_plan: Option<String>,
     #[serde(default)]
+    pub candidate_plan_artifact_path: Option<String>,
+    #[serde(default)]
+    pub approved_plan_artifact_path: Option<String>,
+    #[serde(default)]
+    pub plan_rework_count: u32,
+    #[serde(default)]
+    pub last_plan_review_findings: Option<String>,
+    #[serde(default)]
     pub last_review_findings: Option<String>,
     #[serde(default)]
     pub review_rework_count: u32,
@@ -711,6 +719,56 @@ impl V2Store {
                     next.executor = old.executor.clone();
                     next.retry_count = old.retry_count;
                     next.memory = old.memory.clone();
+                    if crate::v2::pipeline::weight_rank(&old.weight)
+                        > crate::v2::pipeline::weight_rank(&next.weight)
+                    {
+                        next.weight = old.weight.clone();
+                    }
+                    next.context_pack.weight = next.weight.clone();
+                    next.required_stages = crate::v2::intake::default_required_stages(&next.weight);
+                    for path in &old.context_pack.forbidden_paths {
+                        if !next.context_pack.forbidden_paths.contains(path) {
+                            next.context_pack.forbidden_paths.push(path.clone());
+                        }
+                    }
+                    // An exported board snapshot can predate publication of the approved plan.
+                    if old.memory.approved_plan_artifact_path.is_some() {
+                        next.context_pack.target_files = old.context_pack.target_files.clone();
+                        for (required, refreshed) in [
+                            (
+                                &old.context_pack.worker_checks,
+                                &mut next.context_pack.worker_checks,
+                            ),
+                            (
+                                &old.context_pack.gate_checks,
+                                &mut next.context_pack.gate_checks,
+                            ),
+                            (
+                                &old.context_pack.verification_commands,
+                                &mut next.context_pack.verification_commands,
+                            ),
+                            (
+                                &old.context_pack.human_operations,
+                                &mut next.context_pack.human_operations,
+                            ),
+                        ] {
+                            for check in required {
+                                if !refreshed.contains(check) {
+                                    refreshed.push(check.clone());
+                                }
+                            }
+                        }
+                        for ac in &old.context_pack.acceptance_criteria {
+                            if !next
+                                .context_pack
+                                .acceptance_criteria
+                                .iter()
+                                .any(|a| a.id == ac.id)
+                            {
+                                next.context_pack.acceptance_criteria.push(ac.clone());
+                            }
+                        }
+                    }
                 } else {
                     coalesce_runtime_fields(&old, &mut next);
                     next.retry_count = old.retry_count.max(next.retry_count);
@@ -1670,6 +1728,62 @@ mod tests {
             version: 1,
             updated_epoch: 1000,
         }
+    }
+
+    #[test]
+    fn zach027_plan_memory_defaults_and_sync_preserve_approved_scope_weight_and_boundaries() {
+        let legacy: TaskMemory =
+            serde_json::from_str(r#"{"approved_plan":"legacy excerpt"}"#).unwrap();
+        assert_eq!(legacy.plan_rework_count, 0);
+        assert!(legacy.approved_plan_artifact_path.is_none());
+        let mut store = V2Store::open_in_memory().unwrap();
+        let mut old = sample_task("ZACH-027-SYNC", "Blocked", Vec::new());
+        old.executor = Some("zach".to_owned());
+        old.weight = "L".to_owned();
+        old.context_pack.weight = "L".to_owned();
+        old.context_pack.forbidden_paths = vec![
+            "src/ledger/**".to_owned(),
+            ".github/workflows/**".to_owned(),
+            "private/**".to_owned(),
+        ];
+        old.context_pack.target_files = vec![TargetFileSpec {
+            path: "src/v2/pipeline.rs".to_owned(),
+            ..Default::default()
+        }];
+        old.context_pack.worker_checks = vec!["cargo test".to_owned()];
+        old.context_pack.gate_checks = vec!["cargo fmt --check".to_owned()];
+        old.memory.approved_plan = Some("bounded excerpt".to_owned());
+        old.memory.approved_plan_artifact_path = Some("/state/plans/approved.md".to_owned());
+        old.memory.candidate_plan_artifact_path = Some("/state/plans/candidate.md".to_owned());
+        old.memory.plan_rework_count = 1;
+        old.memory.last_plan_review_findings = Some("bounded findings".to_owned());
+        store.upsert_task(&old).unwrap();
+        let mut incoming = sample_task(&old.task_id, "Ready", Vec::new());
+        incoming.weight = "M".to_owned();
+        incoming.context_pack = ContextPackSpec::default();
+        incoming.required_stages = crate::v2::intake::default_required_stages("M");
+        store.sync_task(&incoming).unwrap();
+        let saved = store.get_task(&old.task_id).unwrap().unwrap();
+        assert_eq!(saved.weight, "L");
+        assert_eq!(saved.context_pack.weight, "L");
+        assert_eq!(
+            saved.required_stages,
+            crate::v2::intake::default_required_stages("L")
+        );
+        assert_eq!(saved.memory, old.memory);
+        assert_eq!(
+            saved.context_pack.target_files,
+            old.context_pack.target_files
+        );
+        assert_eq!(
+            saved.context_pack.forbidden_paths,
+            old.context_pack.forbidden_paths
+        );
+        assert_eq!(
+            saved.context_pack.worker_checks,
+            old.context_pack.worker_checks
+        );
+        assert_eq!(saved.context_pack.gate_checks, old.context_pack.gate_checks);
     }
 
     #[test]

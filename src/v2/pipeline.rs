@@ -19,7 +19,8 @@ use std::process::Command;
 
 pub const MAX_APPROVED_PLAN_BYTES: usize = 2048;
 pub const MAX_REVIEW_REWORK_LOOPS: u32 = 2;
-pub const MAX_WORKER_PROMPT_BYTES: usize = 16_000;
+pub const MAX_WORKER_PROMPT_CHARS: usize = 18_000;
+pub const MAX_PLAN_REWORK_CYCLES: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffFileEntry {
@@ -718,54 +719,583 @@ pub fn build_agy_cli_payload(
     })
 }
 
-pub fn build_impl_prompt(task: &TaskRecord, worktree_path: &str) -> String {
-    let mut prompt = format!(
-        "Implement task {} ({}) inside governed worktree {}.\n",
-        task.task_id, task.title, worktree_path
-    );
-    if let Some(ref plan) = task.memory.approved_plan
-        && !plan.trim().is_empty()
-    {
-        prompt.push_str("\n## Approved Plan:\n");
-        prompt.push_str(plan.trim());
-        prompt.push('\n');
-    }
-    if let Some(ref findings) = task.memory.last_review_findings
-        && !findings.trim().is_empty()
-    {
-        prompt.push_str("\n## Prior Review Findings (Address All Blocking Items):\n");
-        prompt.push_str(findings.trim());
-        prompt.push('\n');
-    }
-    if let Some(ref check_err) = task.memory.last_check_failure
-        && !check_err.trim().is_empty()
-    {
-        prompt.push_str("\n## Prior Check Failure:\n");
-        prompt.push_str(check_err.trim());
-        prompt.push('\n');
-    }
-    if !task.context_pack.acceptance_criteria.is_empty() {
-        prompt.push_str("\n## Acceptance Criteria:\n");
-        for ac in &task.context_pack.acceptance_criteria {
-            prompt.push_str(&format!("- {}: {}\n", ac.id, ac.description));
-        }
-    }
-    if !task.context_pack.target_files.is_empty() {
-        prompt.push_str("\n## Target Files:\n");
-        for tf in &task.context_pack.target_files {
-            prompt.push_str(&format!(
-                "- {} (action: {}, summary: {})\n",
-                tf.path, tf.action, tf.summary
+/// Locate the same Context Pack-shaped YAML block Governance consumes, skipping
+/// unrelated fenced examples. Offsets include the fences for canonical publication.
+fn context_pack_block(markdown: &str) -> Result<(&str, std::ops::Range<usize>), String> {
+    let mut offset = 0;
+    let mut fence: Option<(bool, usize, usize)> = None;
+    for line in markdown.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if let Some((yaml, start, body_start)) = fence {
+            if trimmed.starts_with("```") {
+                let body = &markdown[body_start..offset];
+                if yaml
+                    && body.lines().any(|l| {
+                        l.starts_with("target_files:") || l.starts_with("acceptance_criteria:")
+                    })
+                {
+                    return Ok((body, start..offset + line.len()));
+                }
+                fence = None;
+            }
+        } else if trimmed.starts_with("```") {
+            fence = Some((
+                matches!(trimmed, "```yaml" | "```yml"),
+                offset,
+                offset + line.len(),
             ));
         }
+        offset += line.len();
     }
-    if !task.context_pack.verification_commands.is_empty() {
-        prompt.push_str("\n## Verification Commands:\n");
-        for cmd in &task.context_pack.verification_commands {
-            prompt.push_str(&format!("- {}\n", cmd));
+    Err("plan must contain a closed yaml/yml Context Pack block".to_owned())
+}
+
+// This deliberately supports a small, auditable YAML subset, with no dependency
+// or subprocess parser. Unsupported YAML constructs fail closed.
+fn yaml_without_comment(line: &str) -> Result<String, String> {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut out = String::new();
+    let mut prev_space = true;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+            continue;
+        }
+        if quote == Some('"') && ch == '\\' {
+            out.push(ch);
+            escaped = true;
+            continue;
+        }
+        if let Some(q) = quote {
+            if ch == q {
+                if q == '\'' && chars.peek() == Some(&'\'') {
+                    out.push(ch);
+                    out.push(chars.next().unwrap());
+                    continue;
+                }
+                quote = None;
+            }
+        } else if matches!(ch, '\'' | '"') && prev_space {
+            quote = Some(ch);
+        } else if ch == '#' && prev_space {
+            break;
+        }
+        out.push(ch);
+        prev_space = ch.is_whitespace();
+    }
+    if quote.is_some() {
+        return Err("unterminated YAML quote".to_owned());
+    }
+    Ok(out.trim_end().to_owned())
+}
+
+fn yaml_scalar(raw: &str) -> Result<String, String> {
+    let raw = raw.trim();
+    if raw.starts_with('"') {
+        return serde_json::from_str::<String>(raw)
+            .map_err(|e| format!("invalid YAML string: {e}"));
+    }
+    if raw.starts_with('\'') {
+        return raw
+            .strip_prefix('\'')
+            .and_then(|s| s.strip_suffix('\''))
+            .map(|s| s.replace("''", "'"))
+            .ok_or_else(|| "invalid single-quoted YAML string".to_owned());
+    }
+    if raw.is_empty()
+        || raw.starts_with(['[', '{', '&', '*', '!', '|', '>'])
+        || raw.contains(": ")
+        || matches!(raw, "null" | "~")
+    {
+        return Err(format!("unsupported YAML scalar: {raw}"));
+    }
+    Ok(raw.to_owned())
+}
+
+pub fn extract_and_parse_context_pack_yaml(markdown: &str) -> Result<ContextPackSpec, String> {
+    use serde_json::{Map, Value};
+    let (body, _) = context_pack_block(markdown)?;
+    let mut map = Map::new();
+    let mut current = String::new();
+    let mut item_indent = None;
+    for raw in body.lines() {
+        if raw.contains('\t') {
+            return Err("tabs are unsupported in Context Pack YAML".to_owned());
+        }
+        let line = yaml_without_comment(raw)?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        let text = line.trim();
+        if indent == 0 && !text.starts_with("- ") {
+            let (key, value) = text
+                .split_once(':')
+                .ok_or_else(|| "expected YAML key: value".to_owned())?;
+            if map.contains_key(key) {
+                return Err(format!("duplicate Context Pack key: {key}"));
+            }
+            let value = value.trim();
+            let parsed = match key {
+                "weight" | "base_sha" => Value::String(yaml_scalar(value)?),
+                "target_files"
+                | "acceptance_criteria"
+                | "forbidden_paths"
+                | "worker_checks"
+                | "gate_checks"
+                | "human_operations"
+                | "verification_commands" => {
+                    if !value.is_empty() && value != "[]" {
+                        return Err(format!("{key} requires a block list or []"));
+                    }
+                    Value::Array(Vec::new())
+                }
+                _ => return Err(format!("unsupported Context Pack key: {key}")),
+            };
+            current = key.to_owned();
+            item_indent = None;
+            map.insert(current.clone(), parsed);
+            continue;
+        }
+        let list = map
+            .get_mut(&current)
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| "unexpected YAML indentation".to_owned())?;
+        if let Some(value) = text.strip_prefix("- ") {
+            if item_indent.is_some_and(|i| i != indent) {
+                return Err("inconsistent YAML list indentation".to_owned());
+            }
+            item_indent = Some(indent);
+            if matches!(current.as_str(), "target_files" | "acceptance_criteria") {
+                let mapping = if value.starts_with(['\'', '"']) {
+                    None
+                } else {
+                    value
+                        .split_once(": ")
+                        .or_else(|| value.strip_suffix(':').map(|k| (k, "")))
+                };
+                if let Some((key, value)) = mapping {
+                    let mut obj = Map::new();
+                    obj.insert(key.to_owned(), Value::String(yaml_scalar(value)?));
+                    list.push(Value::Object(obj));
+                } else if current == "target_files" {
+                    list.push(serde_json::json!({"path": yaml_scalar(value)?}));
+                } else {
+                    return Err("acceptance_criteria requires id/description entries".to_owned());
+                }
+            } else {
+                list.push(Value::String(yaml_scalar(value)?));
+            }
+        } else {
+            if !matches!(current.as_str(), "target_files" | "acceptance_criteria")
+                || item_indent.is_none_or(|i| indent != i + 2)
+            {
+                return Err("unexpected YAML list continuation".to_owned());
+            }
+            let (key, value) = text
+                .split_once(':')
+                .ok_or_else(|| "expected YAML entry field".to_owned())?;
+            let obj = list
+                .last_mut()
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| "YAML field without list entry".to_owned())?;
+            if obj.contains_key(key) {
+                return Err(format!("duplicate YAML entry field: {key}"));
+            }
+            obj.insert(key.to_owned(), Value::String(yaml_scalar(value)?));
         }
     }
-    truncate_utf8_bytes(&prompt, MAX_WORKER_PROMPT_BYTES)
+    for (key, allowed) in [
+        ("target_files", &["path", "action", "summary"][..]),
+        ("acceptance_criteria", &["id", "description"][..]),
+    ] {
+        if let Some(entries) = map.get(key).and_then(Value::as_array) {
+            for entry in entries {
+                if entry
+                    .as_object()
+                    .is_some_and(|o| o.keys().any(|k| !allowed.contains(&k.as_str())))
+                {
+                    return Err(format!("unknown field in {key}"));
+                }
+            }
+        }
+    }
+    serde_json::from_value(Value::Object(map)).map_err(|e| format!("invalid Context Pack: {e}"))
+}
+
+fn merge_plan_context(
+    task: &TaskRecord,
+    mut proposed: ContextPackSpec,
+) -> Result<ContextPackSpec, String> {
+    if proposed.target_files.is_empty() {
+        return Err("M/L plan requires non-empty target_files".to_owned());
+    }
+    if !proposed.weight.is_empty() && !matches!(proposed.weight.as_str(), "XS" | "S" | "M" | "L") {
+        return Err("invalid plan weight".to_owned());
+    }
+    for path in &task.context_pack.forbidden_paths {
+        if !proposed.forbidden_paths.contains(path) {
+            return Err(format!("plan removes existing forbidden path: {path}"));
+        }
+    }
+    for mandatory in ["src/ledger/**", ".github/workflows/**"] {
+        if !proposed.forbidden_paths.iter().any(|p| p == mandatory) {
+            proposed.forbidden_paths.push(mandatory.to_owned());
+        }
+    }
+    let mut paths = BTreeSet::new();
+    for target in &proposed.target_files {
+        let path = normalize_cited_diff_path(&target.path, "")?;
+        if path != target.path
+            || path.contains(['*', '?', '[', '\\'])
+            || !paths.insert(path.clone())
+        {
+            return Err(format!("invalid or duplicate plan target: {}", target.path));
+        }
+        if proposed
+            .forbidden_paths
+            .iter()
+            .any(|f| matches_path_pattern(&path, f))
+        {
+            return Err(format!("plan target is forbidden: {path}"));
+        }
+    }
+    if weight_rank(&proposed.weight) < weight_rank(&task.weight) {
+        proposed.weight = task.weight.clone();
+    }
+    proposed.base_sha = task.context_pack.base_sha.clone().or(proposed.base_sha);
+    for (old, new) in [
+        (
+            &task.context_pack.worker_checks,
+            &mut proposed.worker_checks,
+        ),
+        (&task.context_pack.gate_checks, &mut proposed.gate_checks),
+        (
+            &task.context_pack.verification_commands,
+            &mut proposed.verification_commands,
+        ),
+        (
+            &task.context_pack.human_operations,
+            &mut proposed.human_operations,
+        ),
+    ] {
+        for entry in old {
+            if !new.contains(entry) {
+                new.push(entry.clone());
+            }
+        }
+    }
+    // A generated plan may add criteria, but cannot remove or weaken Issue criteria.
+    for ac in &task.context_pack.acceptance_criteria {
+        if let Some(found) = proposed
+            .acceptance_criteria
+            .iter_mut()
+            .find(|a| a.id == ac.id)
+        {
+            *found = ac.clone();
+        } else {
+            proposed.acceptance_criteria.push(ac.clone());
+        }
+    }
+    let mut ids = BTreeSet::new();
+    if proposed
+        .acceptance_criteria
+        .iter()
+        .any(|a| a.id.trim().is_empty() || !ids.insert(a.id.clone()))
+    {
+        return Err("invalid or duplicate acceptance criterion id".to_owned());
+    }
+    Ok(proposed)
+}
+
+/// Publish the merged pack, since ws-task replaces the board pack with this block.
+fn plan_with_context(markdown: &str, pack: &ContextPackSpec) -> Result<String, String> {
+    let (_, span) = context_pack_block(markdown)?;
+    let value = serde_json::to_value(pack).map_err(|e| e.to_string())?;
+    let mut yaml = String::from("```yaml\n");
+    for (key, value) in value.as_object().ok_or("invalid Context Pack object")? {
+        if value.is_null() {
+            continue;
+        }
+        match value {
+            serde_json::Value::Array(entries) => {
+                yaml.push_str(&format!(
+                    "{key}:{}\n",
+                    if entries.is_empty() { " []" } else { "" }
+                ));
+                for entry in entries {
+                    if let Some(obj) = entry.as_object() {
+                        for (idx, (k, v)) in obj.iter().enumerate() {
+                            yaml.push_str(&format!(
+                                "  {}{k}: {v}\n",
+                                if idx == 0 { "- " } else { "  " }
+                            ));
+                        }
+                    } else {
+                        yaml.push_str(&format!("  - {entry}\n"));
+                    }
+                }
+            }
+            _ => yaml.push_str(&format!("{key}: {value}\n")),
+        }
+    }
+    yaml.push_str("```\n");
+    Ok(format!(
+        "{}{}{}",
+        &markdown[..span.start],
+        yaml,
+        &markdown[span.end..]
+    ))
+}
+
+pub fn validate_plan_review_verdict(
+    raw: &str,
+    task: &TaskRecord,
+    proposed: &ContextPackSpec,
+    artifact: &str,
+    worktree: &str,
+) -> Result<ReviewVerdict, String> {
+    // Reuse the strict schema/coverage/consistency validator with plan citation
+    // ranges. PR reviews still use only actual changed hunks (ZACH-026).
+    let raw_verdict: ReviewVerdict =
+        serde_json::from_str(raw).map_err(|e| format!("plan-review schema: {e}"))?;
+    let mut context = ReviewedDiffContext::default();
+    for (file, line) in raw_verdict
+        .ac_results
+        .iter()
+        .map(|a| (&a.file, a.line))
+        .chain(raw_verdict.findings.iter().map(|f| (&f.file, f.line)))
+    {
+        let virtual_plan = file == "plan" || file == artifact;
+        let normalized = if virtual_plan {
+            "plan".to_owned()
+        } else {
+            normalize_cited_diff_path(file, worktree)?
+        };
+        if line < 1
+            || (!virtual_plan
+                && !proposed.target_files.iter().any(|t| t.path == normalized)
+                && !task
+                    .context_pack
+                    .target_files
+                    .iter()
+                    .any(|t| t.path == normalized)
+                && !Path::new(worktree).join(&normalized).is_file())
+        {
+            return Err(format!("invalid plan-review citation: {file}:{line}"));
+        }
+        context.files.insert(
+            normalized,
+            vec![crate::v2::runner::LineRange {
+                start: 1,
+                end: usize::MAX,
+            }],
+        );
+    }
+    let mut normalized_verdict = raw_verdict;
+    for file in normalized_verdict
+        .ac_results
+        .iter_mut()
+        .map(|a| &mut a.file)
+        .chain(normalized_verdict.findings.iter_mut().map(|f| &mut f.file))
+    {
+        if file == artifact {
+            *file = "plan".to_owned();
+        }
+    }
+    let expected: Vec<String> = proposed
+        .acceptance_criteria
+        .iter()
+        .map(|a| a.id.clone())
+        .collect();
+    validate_review_verdict(
+        &serde_json::to_string(&normalized_verdict).map_err(|e| e.to_string())?,
+        &expected,
+        &context,
+        worktree,
+    )
+}
+
+/// Character-safe section budgets keep all headings and the output schema present,
+/// even when a skill, plan, context pack, or diagnostic is unexpectedly large.
+/// Count UTF-16 units for worker.mjs; this also bounds Rust scalar characters.
+fn truncate_prompt_section(text: &str, max_chars: usize) -> String {
+    if text.encode_utf16().count() <= max_chars {
+        return text.to_owned();
+    }
+    let mut units = 0;
+    let mut out: String = text
+        .chars()
+        .take_while(|ch| {
+            units += ch.len_utf16();
+            units <= max_chars.saturating_sub(1)
+        })
+        .collect();
+    if max_chars > 0 {
+        out.push('…');
+    }
+    out
+}
+
+fn bounded_prompt(header: String, sections: Vec<(&str, String)>) -> String {
+    let mut out = truncate_prompt_section(&header, 1000);
+    let headings: usize = sections
+        .iter()
+        .map(|(name, _)| name.encode_utf16().count() + 8)
+        .sum();
+    let mut budget = MAX_WORKER_PROMPT_CHARS.saturating_sub(out.encode_utf16().count() + headings);
+    // Share spare capacity among sections; short schemas/findings remain complete.
+    let mut caps = vec![0; sections.len()];
+    for (i, (name, body)) in sections.iter().enumerate() {
+        if *name == "Required Output Format (Strict JSON Only)" {
+            caps[i] = body.encode_utf16().count();
+            budget = budget.saturating_sub(caps[i]);
+        }
+    }
+    loop {
+        let active: Vec<usize> = sections
+            .iter()
+            .enumerate()
+            .filter(|(i, (_, body))| caps[*i] < body.encode_utf16().count())
+            .map(|(i, _)| i)
+            .collect();
+        if active.is_empty() || budget == 0 {
+            break;
+        }
+        let share = (budget / active.len()).max(1);
+        for i in active {
+            let add = share
+                .min(budget)
+                .min(sections[i].1.encode_utf16().count() - caps[i]);
+            caps[i] += add;
+            budget -= add;
+        }
+    }
+    for ((name, body), cap) in sections.into_iter().zip(caps) {
+        out.push_str(&format!("\n## {name}:\n"));
+        out.push_str(&truncate_prompt_section(&body, cap));
+        out.push('\n');
+    }
+    debug_assert!(out.encode_utf16().count() <= MAX_WORKER_PROMPT_CHARS);
+    out
+}
+
+fn governance_skill(name: &str) -> String {
+    let root = std::env::var_os("ZACH_GOVERNANCE_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| "/home/ubuntu/workspace/governance".into());
+    format!(
+        "{}\nDaemon mode: return output to zachd. Do not publish stages or call ws-task/gh; zachd owns publication.",
+        governance_skill_from_root(&root, name)
+    )
+}
+
+fn governance_skill_from_root(root: &Path, name: &str) -> String {
+    std::fs::read_to_string(root.join(".agents/skills").join(name).join("SKILL.md"))
+        .unwrap_or_else(|_| match name {
+            "governance-planner" => "governance-planner: Explore canonical owners read-only; propose architecture, risks, tests and a ## [PLAN] with a fenced yaml Context Pack containing weight, target_files, forbidden_paths, verification_commands and acceptance_criteria. Escalate weight for critical scope; preserve existing boundaries and criteria.".to_owned(),
+            _ => "governance-plan-reviewer: Independently audit ownership and path existence, weight accuracy, testability of every acceptance criterion, safety and forbidden paths. Return APPROVED or CHANGES_REQUESTED using the required ReviewVerdict schema.".to_owned(),
+        })
+}
+
+fn prompt_context(task: &TaskRecord) -> String {
+    serde_json::to_string_pretty(&task.context_pack).unwrap_or_default()
+}
+
+fn prompt_acs(task: &TaskRecord) -> String {
+    task.context_pack
+        .acceptance_criteria
+        .iter()
+        .map(|ac| format!("- {}: {}", ac.id, ac.description))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn prompt_diagnostic(text: &Option<String>) -> String {
+    truncate_utf8_bytes(text.as_deref().unwrap_or_default(), MAX_SUMMARY_BYTES)
+}
+
+pub fn build_plan_prompt(task: &TaskRecord, worktree_path: &str) -> String {
+    bounded_prompt(
+        format!(
+            "Plan task {} ({}) inside governed worktree {}.\nDaemon mode: read-only. Return the full plan; do not publish stages or call ws-task, git, or gh. Use only the supported YAML subset: scalars, block lists/maps, and inline []. Preserve forbidden_paths and acceptance criteria.\n",
+            task.task_id, task.title, worktree_path
+        ),
+        vec![
+            ("governance-planner", governance_skill("governance-planner")),
+            ("Context Pack", prompt_context(task)),
+            ("Acceptance Criteria", prompt_acs(task)),
+            (
+                "Prior Plan Review Findings",
+                prompt_diagnostic(&task.memory.last_plan_review_findings),
+            ),
+        ],
+    )
+}
+
+pub fn build_plan_review_prompt(task: &TaskRecord, worktree_path: &str, plan: &str) -> String {
+    bounded_prompt(
+        format!(
+            "Review architectural plan for {} ({}) inside {}.\nDaemon mode: read-only; return JSON only; do not publish or call ws-task, git, or gh. Citations must use line >= 1 in plan, the candidate artifact, or existing/proposed repository files. APPROVED requires every AC PASS and no blocking findings.\n",
+            task.task_id, task.title, worktree_path
+        ),
+        vec![
+            (
+                "governance-plan-reviewer",
+                governance_skill("governance-plan-reviewer"),
+            ),
+            (
+                "Required Output Format (Strict JSON Only)",
+                review_verdict_json_schema_string(),
+            ),
+            ("Context Pack", prompt_context(task)),
+            ("Acceptance Criteria", prompt_acs(task)),
+            ("Candidate Plan", plan.to_owned()),
+            (
+                "Prior Plan Review Findings",
+                prompt_diagnostic(&task.memory.last_plan_review_findings),
+            ),
+        ],
+    )
+}
+
+fn task_with_full_approved_plan(
+    task: &TaskRecord,
+    executor: &dyn StageExecutor,
+) -> Result<TaskRecord, String> {
+    let mut prompt_task = task.clone();
+    if let Some(path) = &task.memory.approved_plan_artifact_path {
+        prompt_task.memory.approved_plan = Some(executor.read_plan_artifact(Path::new(path))?);
+    }
+    Ok(prompt_task)
+}
+
+pub fn build_impl_prompt(task: &TaskRecord, worktree_path: &str) -> String {
+    bounded_prompt(
+        format!(
+            "Implement task {} ({}) inside governed worktree {}.\n",
+            task.task_id, task.title, worktree_path
+        ),
+        vec![
+            ("Context Pack", prompt_context(task)),
+            ("Acceptance Criteria", prompt_acs(task)),
+            (
+                "Approved Plan",
+                task.memory.approved_plan.clone().unwrap_or_default(),
+            ),
+            (
+                "Prior Review Findings (Address All Blocking Items)",
+                prompt_diagnostic(&task.memory.last_review_findings),
+            ),
+            (
+                "Prior Check Failure",
+                prompt_diagnostic(&task.memory.last_check_failure),
+            ),
+        ],
+    )
 }
 
 pub fn build_pr_review_prompt(
@@ -773,90 +1303,54 @@ pub fn build_pr_review_prompt(
     worktree_path: &str,
     diff_ctx: &ReviewedDiffContext,
 ) -> String {
-    let schema_str = review_verdict_json_schema_string();
-    let mut prompt = format!(
-        "Review implementation of task {} ({}) inside governed worktree {}.\n\
-         You MUST inspect the real git diff over the commit range below and verify every acceptance criterion.\n\n\
-         ## Reviewed Commit Range:\n\
-         - Range: {}\n\
-         - Merge Base SHA: {}\n\
-         - Reviewed SHA: {}\n\
-         - Inspect with: git diff {}\n",
-        task.task_id,
-        task.title,
-        worktree_path,
-        diff_ctx.commit_range,
-        diff_ctx.merge_base_sha,
-        diff_ctx.reviewed_sha,
-        diff_ctx.commit_range
-    );
-
-    prompt.push_str("\n## Changed Files & Valid Line Ranges:\n");
-    if diff_ctx.files.is_empty() {
-        prompt.push_str("- (no changed files detected in commit range)\n");
-    } else {
-        for (path, ranges) in &diff_ctx.files {
-            let range_list: Vec<String> = ranges
-                .iter()
-                .map(|r| format!("{}-{}", r.start, r.end))
-                .collect();
-            prompt.push_str(&format!("- {}: lines [{}]\n", path, range_list.join(", ")));
-        }
-    }
-
-    prompt.push_str("\n## Approved Plan:\n");
-    if let Some(ref plan) = task.memory.approved_plan
-        && !plan.trim().is_empty()
-    {
-        prompt.push_str(&truncate_utf8_bytes(plan.trim(), MAX_APPROVED_PLAN_BYTES));
-        prompt.push('\n');
-    } else {
-        prompt.push_str("No approved plan recorded (XS/S task or pre-plan resume).\n");
-    }
-
-    if let Some(ref prior_findings) = task.memory.last_review_findings
-        && !prior_findings.trim().is_empty()
-    {
-        prompt.push_str("\n## Prior Review Findings:\n");
-        prompt.push_str(&truncate_utf8_bytes(
-            prior_findings.trim(),
-            MAX_SUMMARY_BYTES,
-        ));
-        prompt.push('\n');
-    }
-
-    prompt.push_str("\n## Acceptance Criteria:\n");
-    if task.context_pack.acceptance_criteria.is_empty() {
-        prompt.push_str("- (no acceptance criteria specified)\n");
-    } else {
-        for ac in &task.context_pack.acceptance_criteria {
-            prompt.push_str(&format!("- {}: {}\n", ac.id, ac.description));
-        }
-    }
-
-    let footer = format!(
-        "\n## Required Output Format (Strict JSON Only):\n\
-         Output ONLY a single valid JSON object matching this exact schema (no markdown fences, no prose before or after).\n\
-         Every cited `file` and `line` in `ac_results` and `findings` MUST exist in the reviewed commit range `{}`.\n\
-         {}\n",
-        diff_ctx.commit_range, schema_str
-    );
-
-    let remaining_for_excerpt = MAX_WORKER_PROMPT_BYTES
-        .saturating_sub(prompt.len())
-        .saturating_sub(footer.len())
-        .saturating_sub(64);
-    if !diff_ctx.diff_excerpt.trim().is_empty() && remaining_for_excerpt >= 128 {
-        prompt.push_str("\n## Diff Excerpt (--unified=0):\n");
-        prompt.push_str(&truncate_utf8_bytes(
-            diff_ctx.diff_excerpt.trim(),
-            remaining_for_excerpt,
-        ));
-        prompt.push('\n');
-    }
-
-    prompt.push_str(&footer);
-    truncate_utf8_bytes(&prompt, MAX_WORKER_PROMPT_BYTES)
+    bounded_prompt(
+        format!(
+            "Review implementation of task {} ({}) inside governed worktree {}.\nYou MUST inspect the real git diff and verify every acceptance criterion.\nReviewed Commit Range: {}\nMerge Base SHA: {}\nReviewed SHA: {}\nInspect with: git diff {}\nEvery cited file and line MUST exist in the reviewed commit range.\n",
+            task.task_id,
+            task.title,
+            worktree_path,
+            diff_ctx.commit_range,
+            diff_ctx.merge_base_sha,
+            diff_ctx.reviewed_sha,
+            diff_ctx.commit_range
+        ),
+        vec![
+            (
+                "Required Output Format (Strict JSON Only)",
+                review_verdict_json_schema_string(),
+            ),
+            ("Context Pack", prompt_context(task)),
+            ("Acceptance Criteria", prompt_acs(task)),
+            (
+                "Approved Plan",
+                task.memory.approved_plan.clone().unwrap_or_else(|| {
+                    "No approved plan recorded (XS/S task or pre-plan resume).".to_owned()
+                }),
+            ),
+            (
+                "Prior Review Findings",
+                prompt_diagnostic(&task.memory.last_review_findings),
+            ),
+            (
+                "Changed Files & Valid Line Ranges",
+                diff_ctx
+                    .files
+                    .iter()
+                    .map(|(p, r)| {
+                        format!(
+                            "{p}: lines [{}]",
+                            r.iter()
+                                .map(|r| format!("{}-{}", r.start, r.end))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            ("Diff Excerpt (--unified=0)", diff_ctx.diff_excerpt.clone()),
+        ],
+    )
 }
 
 /// Parses the JSON stdout/stderr produced by `worker.mjs --cli`, mapping infrastructure
@@ -981,6 +1475,7 @@ pub fn parse_agy_cli_response(
         status: "PASSED".to_owned(),
         summary,
         review_markdown,
+        stage_output: review_output.clone(),
         review_output,
         invocation_id,
         input_tokens,
@@ -1263,7 +1758,13 @@ fn resolve_author_family(
     {
         return Ok(infer_model_family(&attempt.model));
     }
-    Ok(ModelFamily::OpenAiSol)
+    let task = store
+        .get_task(task_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("missing task {task_id}"))?;
+    resolve_stage_route(&task.weight, stage, task.retry_count, None)?
+        .map(|route| route.family)
+        .ok_or_else(|| format!("missing {stage} author route"))
 }
 
 fn pause_for_missing_cross_family_reviewer(
@@ -1386,7 +1887,8 @@ fn execute_pr_review_gate(
         task.task_id.to_ascii_lowercase(),
         task.version
     );
-    let rev_prompt = build_pr_review_prompt(&task, worktree_path, &diff_ctx);
+    let prompt_task = task_with_full_approved_plan(&task, executor)?;
+    let rev_prompt = build_pr_review_prompt(&prompt_task, worktree_path, &diff_ctx);
     let rev_spec = build_systemd_stage_command(&task, &rev_attempt_id, &rev_route, &rev_prompt)?;
 
     task.status = "PR Review".to_owned();
@@ -1499,8 +2001,9 @@ fn execute_pr_review_gate(
         .map(|ac| ac.id.clone())
         .collect();
     let raw_verdict = rev_result
-        .review_output
+        .stage_output
         .as_deref()
+        .or(rev_result.review_output.as_deref())
         .unwrap_or(&rev_result.summary);
     let verdict =
         match validate_review_verdict(raw_verdict, &expected_acs, &diff_ctx, worktree_path) {
@@ -1685,7 +2188,8 @@ pub fn execute_xs_s_pipeline_with_executor_and_ws_task(
                 task.task_id.to_ascii_lowercase(),
                 task.version
             );
-            let impl_prompt = build_impl_prompt(&task, &worktree_path);
+            let prompt_task = task_with_full_approved_plan(&task, executor)?;
+            let impl_prompt = build_impl_prompt(&prompt_task, &worktree_path);
             let impl_spec =
                 build_systemd_stage_command(&task, &impl_attempt_id, &impl_route, &impl_prompt)?;
 
@@ -2002,307 +2506,466 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
             .count()
     };
 
-    // Stage 1: plan (read-only, no path locks)
-    let mut plan_author_family: Option<ModelFamily> = None;
-    if !task.stages_completed.iter().any(|s| s == "plan")
-        && (task.required_stages.is_empty() || task.required_stages.iter().any(|s| s == "plan"))
-    {
-        let plan_route_initial = resolve_stage_route(&task.weight, "plan", task.retry_count, None)?
-            .ok_or_else(|| "missing plan route".to_owned())?;
-
-        let mut plan_route = plan_route_initial;
-        if plan_route.family == ModelFamily::GeminiAgy && count_agy_infra_failures(&task) >= 2 {
-            plan_route.family = ModelFamily::OpenAiSol;
-            plan_route.model = plan_route
-                .fallback_model
-                .clone()
-                .unwrap_or_else(|| "gpt-6.1-sol".to_owned());
-            if let Some(effort) = plan_route.fallback_effort {
-                plan_route.effort = effort;
-            }
-        }
-        plan_author_family = Some(plan_route.family);
-
-        check_token_budget(&task, &plan_route)?;
-
-        let plan_attempt_id = format!(
-            "{}-plan-{}",
-            task.task_id.to_ascii_lowercase(),
-            task.version
-        );
-        let plan_prompt = format!(
-            "Formulate plan for task {} ({}) inside worktree {}",
-            task.task_id, task.title, worktree_path
-        );
-        let plan_spec =
-            build_systemd_stage_command(&task, &plan_attempt_id, &plan_route, &plan_prompt)?;
-
-        task.status = "Planning".to_owned();
-        task.current_stage = Some("plan".to_owned());
-        task.active_attempt_id = Some(plan_attempt_id.clone());
-        task.executor = Some("zach".to_owned());
-        task = store.upsert_task(&task).map_err(|e| e.to_string())?;
-
-        let plan_started = now_epoch();
-        let mut plan_rec = StageAttemptRecord {
-            attempt_id: plan_attempt_id.clone(),
-            task_id: task.task_id.clone(),
-            stage: "plan".to_owned(),
-            model: plan_route.model.clone(),
-            effort: plan_route.effort.as_str().to_owned(),
-            systemd_unit: Some(plan_spec.unit_name.clone()),
-            invocation_id: None,
-            started_epoch: plan_started,
-            ended_epoch: None,
-            status: "RUNNING".to_owned(),
-            failure_class: None,
-            summary: None,
-            input_tokens: None,
-            output_tokens: None,
-            total_tokens: None,
-            sha_before: None,
-            sha_after: None,
-        };
-        store
-            .record_stage_attempt(&plan_rec)
-            .map_err(|e| e.to_string())?;
-
-        let mut plan_res = executor.execute_stage(&task, &plan_attempt_id, &plan_route, &plan_spec);
-
-        if plan_route.family == ModelFamily::GeminiAgy
-            && let Some(cls) = classify_agy_infra_failure(&plan_res)
+    loop {
+        // Stage 1: plan (read-only, no path locks)
+        let mut plan_author_family: Option<ModelFamily> = None;
+        if !task.stages_completed.iter().any(|s| s == "plan")
+            && (task.required_stages.is_empty() || task.required_stages.iter().any(|s| s == "plan"))
         {
-            push_bounded_recent_attempt(
-                &mut task,
-                format!(
-                    "[AGY_INFRA:{cls}] stage=plan attempt={plan_attempt_id} log=attempts/{plan_attempt_id}/stderr.log"
-                ),
+            let plan_route_initial =
+                resolve_stage_route(&task.weight, "plan", task.retry_count, None)?
+                    .ok_or_else(|| "missing plan route".to_owned())?;
+
+            let mut plan_route = plan_route_initial;
+            if plan_route.family == ModelFamily::GeminiAgy && count_agy_infra_failures(&task) >= 2 {
+                plan_route.family = ModelFamily::OpenAiSol;
+                plan_route.model = plan_route
+                    .fallback_model
+                    .clone()
+                    .unwrap_or_else(|| "gpt-6.1-sol".to_owned());
+                if let Some(effort) = plan_route.fallback_effort {
+                    plan_route.effort = effort;
+                }
+            }
+            plan_author_family = Some(plan_route.family);
+
+            check_token_budget(&task, &plan_route)?;
+
+            let plan_attempt_id = format!(
+                "{}-plan-{}",
+                task.task_id.to_ascii_lowercase(),
+                task.version
             );
-            if count_agy_infra_failures(&task) >= 2 {
-                let fb_route = StageRoute {
-                    family: ModelFamily::OpenAiSol,
-                    model: "gpt-6.1-sol".to_owned(),
-                    effort: ReasoningEffort::High,
-                    fallback_family: None,
-                    fallback_model: None,
-                    fallback_effort: None,
-                    ..plan_route.clone()
-                };
-                let fb_attempt_id = format!(
-                    "{}-plan-fb-{}",
-                    task.task_id.to_ascii_lowercase(),
-                    task.version
-                );
-                let fb_spec =
-                    build_systemd_stage_command(&task, &fb_attempt_id, &fb_route, &plan_prompt)?;
-                plan_author_family = Some(fb_route.family);
-                plan_res = executor.execute_stage(&task, &fb_attempt_id, &fb_route, &fb_spec);
-            }
-        }
+            let plan_prompt = build_plan_prompt(&task, &worktree_path);
+            let plan_spec =
+                build_systemd_stage_command(&task, &plan_attempt_id, &plan_route, &plan_prompt)?;
 
-        let plan_result = match plan_res {
-            Ok(res) => res,
-            Err(err) => {
-                let class = classify_failure_class("plan", "FAILED", &err);
-                fail_stage_attempt(store, &mut task, &mut plan_rec, class, err.clone(), false)?;
-                return Err(format!("plan stage failed for {}: {}", task.task_id, err));
-            }
-        };
-        apply_stage_result_usage(&mut task, &mut plan_rec, "plan", &plan_result);
+            task.status = "Planning".to_owned();
+            task.current_stage = Some("plan".to_owned());
+            task.active_attempt_id = Some(plan_attempt_id.clone());
+            task.executor = Some("zach".to_owned());
+            task = store.upsert_task(&task).map_err(|e| e.to_string())?;
 
-        if plan_result.status != "PASSED" {
-            let class = classify_failure_class("plan", &plan_result.status, &plan_result.summary);
-            fail_stage_attempt(
-                store,
-                &mut task,
-                &mut plan_rec,
-                class,
-                plan_result.summary.clone(),
-                false,
-            )?;
-            return Err(format!(
-                "plan stage failed for {}: {}",
-                task.task_id, plan_result.summary
-            ));
-        }
+            let plan_started = now_epoch();
+            let mut plan_rec = StageAttemptRecord {
+                attempt_id: plan_attempt_id.clone(),
+                task_id: task.task_id.clone(),
+                stage: "plan".to_owned(),
+                model: plan_route.model.clone(),
+                effort: plan_route.effort.as_str().to_owned(),
+                systemd_unit: Some(plan_spec.unit_name.clone()),
+                invocation_id: None,
+                started_epoch: plan_started,
+                ended_epoch: None,
+                status: "RUNNING".to_owned(),
+                failure_class: None,
+                summary: None,
+                input_tokens: None,
+                output_tokens: None,
+                total_tokens: None,
+                sha_before: None,
+                sha_after: None,
+            };
+            store
+                .record_stage_attempt(&plan_rec)
+                .map_err(|e| e.to_string())?;
 
-        plan_rec.failure_class = None;
-        store
-            .record_stage_attempt(&plan_rec)
-            .map_err(|e| e.to_string())?;
+            let mut plan_res =
+                executor.execute_stage(&task, &plan_attempt_id, &plan_route, &plan_spec);
 
-        let plan_text = plan_result
-            .review_output
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or(&plan_result.summary);
-        if !plan_text.trim().is_empty() {
-            task.memory.approved_plan =
-                Some(truncate_utf8_bytes(plan_text, MAX_APPROVED_PLAN_BYTES));
-        }
-        task.stages_completed.push("plan".to_owned());
-        task = store.upsert_task(&task).map_err(|e| e.to_string())?;
-    }
-
-    // Stage 2: plan-review (read-only, cross-model review of plan)
-    if !task.stages_completed.iter().any(|s| s == "plan-review")
-        && (task.required_stages.is_empty()
-            || task.required_stages.iter().any(|s| s == "plan-review"))
-    {
-        let plan_author = resolve_author_family(store, &task.task_id, "plan", plan_author_family)?;
-        let rev_route = match resolve_stage_route(
-            &task.weight,
-            "plan-review",
-            task.retry_count,
-            Some(plan_author),
-        ) {
-            Ok(Some(route)) => route,
-            Ok(None) => return Err("missing plan-review route".to_owned()),
-            Err(err) if is_no_cross_family_reviewer_error(&err) => {
-                return pause_for_missing_cross_family_reviewer(
-                    store,
+            if plan_route.family == ModelFamily::GeminiAgy
+                && let Some(cls) = classify_agy_infra_failure(&plan_res)
+            {
+                push_bounded_recent_attempt(
                     &mut task,
-                    "plan-review",
-                    plan_author,
-                    &err,
-                );
-            }
-            Err(err) => return Err(err),
-        };
-
-        if rev_route.family == ModelFamily::GeminiAgy
-            && count_agy_infra_for_stage(&task, "plan-review") >= 2
-        {
-            return pause_for_missing_cross_family_reviewer(
-                store,
-                &mut task,
-                "plan-review",
-                plan_author,
-                "Gemini AGY plan reviewer unavailable after >= 2 AGY infra failures; refusing same-family fallback",
-            );
-        }
-
-        check_token_budget(&task, &rev_route)?;
-
-        let rev_attempt_id = format!(
-            "{}-plan-review-{}",
-            task.task_id.to_ascii_lowercase(),
-            task.version
-        );
-        let rev_prompt = format!(
-            "Review architectural plan for {} ({})",
-            task.task_id, task.title
-        );
-        let rev_spec =
-            build_systemd_stage_command(&task, &rev_attempt_id, &rev_route, &rev_prompt)?;
-
-        task.status = "Plan Review".to_owned();
-        task.current_stage = Some("plan-review".to_owned());
-        task.active_attempt_id = Some(rev_attempt_id.clone());
-        task.executor = Some("zach".to_owned());
-        task = store.upsert_task(&task).map_err(|e| e.to_string())?;
-
-        let rev_started = now_epoch();
-        let mut rev_rec = StageAttemptRecord {
-            attempt_id: rev_attempt_id.clone(),
-            task_id: task.task_id.clone(),
-            stage: "plan-review".to_owned(),
-            model: rev_route.model.clone(),
-            effort: rev_route.effort.as_str().to_owned(),
-            systemd_unit: Some(rev_spec.unit_name.clone()),
-            invocation_id: None,
-            started_epoch: rev_started,
-            ended_epoch: None,
-            status: "RUNNING".to_owned(),
-            failure_class: None,
-            summary: None,
-            input_tokens: None,
-            output_tokens: None,
-            total_tokens: None,
-            sha_before: None,
-            sha_after: None,
-        };
-        store
-            .record_stage_attempt(&rev_rec)
-            .map_err(|e| e.to_string())?;
-
-        let rev_res = executor.execute_stage(&task, &rev_attempt_id, &rev_route, &rev_spec);
-
-        if rev_route.family == ModelFamily::GeminiAgy
-            && let Some(cls) = classify_agy_infra_failure(&rev_res)
-        {
-            push_bounded_recent_attempt(
-                &mut task,
-                format!(
-                    "[AGY_INFRA:{cls}] stage=plan-review attempt={rev_attempt_id} log=attempts/{rev_attempt_id}/stderr.log"
-                ),
-            );
-            if count_agy_infra_for_stage(&task, "plan-review") >= 2 {
-                let reason = match &rev_res {
-                    Err(e) => format!("cross-family AGY plan reviewer unavailable ({cls}): {e}"),
-                    Ok(res) => format!(
-                        "cross-family AGY plan reviewer unavailable ({cls}): {}",
-                        res.summary
+                    format!(
+                        "[AGY_INFRA:{cls}] stage=plan attempt={plan_attempt_id} log=attempts/{plan_attempt_id}/stderr.log"
                     ),
-                };
-                rev_rec.ended_epoch = Some(now_epoch());
-                rev_rec.status = "FAILED".to_owned();
-                rev_rec.failure_class = Some(FAILURE_CLASS_INFRA.to_owned());
-                rev_rec.summary = Some(truncate_utf8_bytes(&reason, MAX_SUMMARY_BYTES));
-                store
-                    .record_stage_attempt(&rev_rec)
-                    .map_err(|e| e.to_string())?;
-                return pause_for_missing_cross_family_reviewer(
+                );
+                if count_agy_infra_failures(&task) >= 2 {
+                    let fb_route = StageRoute {
+                        family: ModelFamily::OpenAiSol,
+                        model: "gpt-6.1-sol".to_owned(),
+                        effort: ReasoningEffort::High,
+                        fallback_family: None,
+                        fallback_model: None,
+                        fallback_effort: None,
+                        ..plan_route.clone()
+                    };
+                    let fb_attempt_id = format!(
+                        "{}-plan-fb-{}",
+                        task.task_id.to_ascii_lowercase(),
+                        task.version
+                    );
+                    let fb_spec = build_systemd_stage_command(
+                        &task,
+                        &fb_attempt_id,
+                        &fb_route,
+                        &plan_prompt,
+                    )?;
+                    plan_rec.status = "FAILED".to_owned();
+                    plan_rec.ended_epoch = Some(now_epoch());
+                    plan_rec.failure_class = Some(FAILURE_CLASS_INFRA.to_owned());
+                    store
+                        .record_stage_attempt(&plan_rec)
+                        .map_err(|e| e.to_string())?;
+                    plan_rec.attempt_id = fb_attempt_id.clone();
+                    plan_rec.model = fb_route.model.clone();
+                    plan_rec.effort = fb_route.effort.as_str().to_owned();
+                    plan_rec.systemd_unit = Some(fb_spec.unit_name.clone());
+                    plan_rec.status = "RUNNING".to_owned();
+                    plan_rec.ended_epoch = None;
+                    plan_rec.failure_class = None;
+                    store
+                        .record_stage_attempt(&plan_rec)
+                        .map_err(|e| e.to_string())?;
+                    task.active_attempt_id = Some(fb_attempt_id.clone());
+                    task = store.upsert_task(&task).map_err(|e| e.to_string())?;
+                    plan_author_family = Some(fb_route.family);
+                    plan_res = executor.execute_stage(&task, &fb_attempt_id, &fb_route, &fb_spec);
+                }
+            }
+
+            let plan_result = match plan_res {
+                Ok(res) => res,
+                Err(err) => {
+                    let class = classify_failure_class("plan", "FAILED", &err);
+                    fail_stage_attempt(store, &mut task, &mut plan_rec, class, err.clone(), false)?;
+                    return Err(format!("plan stage failed for {}: {}", task.task_id, err));
+                }
+            };
+            apply_stage_result_usage(&mut task, &mut plan_rec, "plan", &plan_result);
+
+            if plan_result.status != "PASSED" {
+                let class =
+                    classify_failure_class("plan", &plan_result.status, &plan_result.summary);
+                fail_stage_attempt(
                     store,
                     &mut task,
-                    "plan-review",
-                    plan_author,
-                    &reason,
-                );
-            }
-        }
-
-        let rev_result = match rev_res {
-            Ok(res) => res,
-            Err(err) => {
-                let class = classify_failure_class("plan-review", "FAILED", &err);
-                fail_stage_attempt(store, &mut task, &mut rev_rec, class, err.clone(), false)?;
+                    &mut plan_rec,
+                    class,
+                    plan_result.summary.clone(),
+                    false,
+                )?;
                 return Err(format!(
-                    "plan-review stage failed for {}: {}",
-                    task.task_id, err
+                    "plan stage failed for {}: {}",
+                    task.task_id, plan_result.summary
                 ));
             }
-        };
-        apply_stage_result_usage(&mut task, &mut rev_rec, "plan-review", &rev_result);
 
-        if rev_result.status != "PASSED" {
-            let class =
-                classify_failure_class("plan-review", &rev_result.status, &rev_result.summary);
-            fail_stage_attempt(
-                store,
-                &mut task,
-                &mut rev_rec,
-                class,
-                rev_result.summary.clone(),
-                false,
-            )?;
-            return Err(format!(
-                "plan-review stage failed for {}: {}",
-                task.task_id, rev_result.summary
-            ));
+            plan_rec.failure_class = None;
+            store
+                .record_stage_attempt(&plan_rec)
+                .map_err(|e| e.to_string())?;
+
+            let prepared = (|| {
+                let plan_text = plan_result
+                    .stage_output
+                    .as_deref()
+                    .or(plan_result.review_output.as_deref())
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| "plan stage returned no full stage_output".to_owned())?;
+                let artifact =
+                    executor.persist_plan_artifact(&task, &plan_rec.attempt_id, plan_text)?;
+                task.memory.candidate_plan_artifact_path =
+                    Some(artifact.to_string_lossy().into_owned());
+                extract_and_parse_context_pack_yaml(plan_text)
+                    .and_then(|p| merge_plan_context(&task, p))?;
+                Ok::<(), String>(())
+            })();
+            if let Err(err) = prepared {
+                fail_stage_attempt(
+                    store,
+                    &mut task,
+                    &mut plan_rec,
+                    FAILURE_CLASS_SEMANTIC,
+                    err.clone(),
+                    false,
+                )?;
+                return Err(err);
+            }
+            // Never label a candidate as approved, including after rework/resume.
+            task.memory.approved_plan = None;
+            task.memory.approved_plan_artifact_path = None;
+            task.stages_completed.push("plan".to_owned());
+            task = store.upsert_task(&task).map_err(|e| e.to_string())?;
         }
 
-        rev_rec.failure_class = None;
-        store
-            .record_stage_attempt(&rev_rec)
-            .map_err(|e| e.to_string())?;
+        // Stage 2: plan-review (read-only, cross-model review of plan)
+        if !task.stages_completed.iter().any(|s| s == "plan-review")
+            && (task.required_stages.is_empty()
+                || task.required_stages.iter().any(|s| s == "plan-review"))
+        {
+            let plan_author =
+                resolve_author_family(store, &task.task_id, "plan", plan_author_family)?;
+            let rev_route = match resolve_stage_route(
+                &task.weight,
+                "plan-review",
+                task.retry_count,
+                Some(plan_author),
+            ) {
+                Ok(Some(route)) => route,
+                Ok(None) => return Err("missing plan-review route".to_owned()),
+                Err(err) if is_no_cross_family_reviewer_error(&err) => {
+                    return pause_for_missing_cross_family_reviewer(
+                        store,
+                        &mut task,
+                        "plan-review",
+                        plan_author,
+                        &err,
+                    );
+                }
+                Err(err) => return Err(err),
+            };
 
-        task.stages_completed.push("plan-review".to_owned());
-        task = store.upsert_task(&task).map_err(|e| e.to_string())?;
+            if rev_route.family == ModelFamily::GeminiAgy
+                && count_agy_infra_for_stage(&task, "plan-review") >= 2
+            {
+                return pause_for_missing_cross_family_reviewer(
+                    store,
+                    &mut task,
+                    "plan-review",
+                    plan_author,
+                    "Gemini AGY plan reviewer unavailable after >= 2 AGY infra failures; refusing same-family fallback",
+                );
+            }
+
+            check_token_budget(&task, &rev_route)?;
+
+            let rev_attempt_id = format!(
+                "{}-plan-review-{}",
+                task.task_id.to_ascii_lowercase(),
+                task.version
+            );
+            let candidate_path = task
+                .memory
+                .candidate_plan_artifact_path
+                .clone()
+                .ok_or_else(|| "plan-review requires a candidate plan artifact".to_owned())?;
+            let candidate = executor.read_plan_artifact(Path::new(&candidate_path))?;
+            let proposed = extract_and_parse_context_pack_yaml(&candidate)
+                .and_then(|pack| merge_plan_context(&task, pack))?;
+            let canonical_plan = plan_with_context(&candidate, &proposed)?;
+            let mut review_task = task.clone();
+            review_task.context_pack = proposed.clone();
+            let rev_prompt =
+                build_plan_review_prompt(&review_task, &worktree_path, &canonical_plan);
+            let mut rev_spec =
+                build_systemd_stage_command(&task, &rev_attempt_id, &rev_route, &rev_prompt)?;
+            rev_spec.output_schema_json = Some(review_verdict_json_schema_string());
+
+            task.status = "Plan Review".to_owned();
+            task.current_stage = Some("plan-review".to_owned());
+            task.active_attempt_id = Some(rev_attempt_id.clone());
+            task.executor = Some("zach".to_owned());
+            task = store.upsert_task(&task).map_err(|e| e.to_string())?;
+
+            let rev_started = now_epoch();
+            let mut rev_rec = StageAttemptRecord {
+                attempt_id: rev_attempt_id.clone(),
+                task_id: task.task_id.clone(),
+                stage: "plan-review".to_owned(),
+                model: rev_route.model.clone(),
+                effort: rev_route.effort.as_str().to_owned(),
+                systemd_unit: Some(rev_spec.unit_name.clone()),
+                invocation_id: None,
+                started_epoch: rev_started,
+                ended_epoch: None,
+                status: "RUNNING".to_owned(),
+                failure_class: None,
+                summary: None,
+                input_tokens: None,
+                output_tokens: None,
+                total_tokens: None,
+                sha_before: None,
+                sha_after: None,
+            };
+            store
+                .record_stage_attempt(&rev_rec)
+                .map_err(|e| e.to_string())?;
+
+            let rev_res = executor.execute_stage(&task, &rev_attempt_id, &rev_route, &rev_spec);
+
+            if rev_route.family == ModelFamily::GeminiAgy
+                && let Some(cls) = classify_agy_infra_failure(&rev_res)
+            {
+                push_bounded_recent_attempt(
+                    &mut task,
+                    format!(
+                        "[AGY_INFRA:{cls}] stage=plan-review attempt={rev_attempt_id} log=attempts/{rev_attempt_id}/stderr.log"
+                    ),
+                );
+                if count_agy_infra_for_stage(&task, "plan-review") >= 2 {
+                    let reason = match &rev_res {
+                        Err(e) => {
+                            format!("cross-family AGY plan reviewer unavailable ({cls}): {e}")
+                        }
+                        Ok(res) => format!(
+                            "cross-family AGY plan reviewer unavailable ({cls}): {}",
+                            res.summary
+                        ),
+                    };
+                    rev_rec.ended_epoch = Some(now_epoch());
+                    rev_rec.status = "FAILED".to_owned();
+                    rev_rec.failure_class = Some(FAILURE_CLASS_INFRA.to_owned());
+                    rev_rec.summary = Some(truncate_utf8_bytes(&reason, MAX_SUMMARY_BYTES));
+                    store
+                        .record_stage_attempt(&rev_rec)
+                        .map_err(|e| e.to_string())?;
+                    return pause_for_missing_cross_family_reviewer(
+                        store,
+                        &mut task,
+                        "plan-review",
+                        plan_author,
+                        &reason,
+                    );
+                }
+            }
+
+            let rev_result = match rev_res {
+                Ok(res) => res,
+                Err(err) => {
+                    let class = classify_failure_class("plan-review", "FAILED", &err);
+                    fail_stage_attempt(store, &mut task, &mut rev_rec, class, err.clone(), false)?;
+                    return Err(format!(
+                        "plan-review stage failed for {}: {}",
+                        task.task_id, err
+                    ));
+                }
+            };
+            apply_stage_result_usage(&mut task, &mut rev_rec, "plan-review", &rev_result);
+
+            if rev_result.status != "PASSED" {
+                let class =
+                    classify_failure_class("plan-review", &rev_result.status, &rev_result.summary);
+                fail_stage_attempt(
+                    store,
+                    &mut task,
+                    &mut rev_rec,
+                    class,
+                    rev_result.summary.clone(),
+                    false,
+                )?;
+                return Err(format!(
+                    "plan-review stage failed for {}: {}",
+                    task.task_id, rev_result.summary
+                ));
+            }
+
+            let raw_verdict = rev_result
+                .stage_output
+                .as_deref()
+                .or(rev_result.review_output.as_deref())
+                .unwrap_or(&rev_result.summary);
+            let verdict = match validate_plan_review_verdict(
+                raw_verdict,
+                &task,
+                &proposed,
+                &candidate_path,
+                &worktree_path,
+            ) {
+                Ok(verdict) => verdict,
+                Err(err) => {
+                    fail_stage_attempt(
+                        store,
+                        &mut task,
+                        &mut rev_rec,
+                        FAILURE_CLASS_SEMANTIC,
+                        err.clone(),
+                        false,
+                    )?;
+                    return Err(err);
+                }
+            };
+            rev_rec.failure_class = None;
+            rev_rec.summary = Some(truncate_utf8_bytes(
+                &format!("{}: {}", verdict.verdict, verdict.summary),
+                MAX_SUMMARY_BYTES,
+            ));
+            store
+                .record_stage_attempt(&rev_rec)
+                .map_err(|e| e.to_string())?;
+            if verdict.verdict == "CHANGES_REQUESTED" {
+                let findings = format_review_findings(&verdict);
+                task.memory.last_plan_review_findings = Some(findings.clone());
+                task.memory.approved_plan = None;
+                task.memory.approved_plan_artifact_path = None;
+                task.active_attempt_id = None;
+                if task.memory.plan_rework_count >= MAX_PLAN_REWORK_CYCLES {
+                    let decision_id = format!(
+                        "dec-{}-plan-rework-{}",
+                        task.task_id.to_ascii_lowercase(),
+                        task.memory.plan_rework_count
+                    );
+                    store
+                        .open_decision(
+                            &decision_id,
+                            &task.task_id,
+                            &task.task_group,
+                            "plan_rework_limit",
+                            "Plan rework limit reached. How should we proceed?",
+                            &[
+                                "Authorize additional plan rework".to_owned(),
+                                "Abort task".to_owned(),
+                            ],
+                            Some(0),
+                            &findings,
+                            task.plan_base_sha.as_deref(),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    task.status = "Blocked".to_owned();
+                    return store.upsert_task(&task).map_err(|e| e.to_string());
+                }
+                task.memory.plan_rework_count += 1;
+                task.stages_completed.retain(|s| {
+                    !matches!(s.as_str(), "plan" | "plan-review" | "human-plan-approval")
+                });
+                task.memory.candidate_plan_artifact_path = None;
+                task.current_stage = Some("plan".to_owned());
+                task = store.upsert_task(&task).map_err(|e| e.to_string())?;
+                continue;
+            }
+            let artifact = executor.persist_plan_artifact(
+                &task,
+                &format!("approved-plan-{rev_attempt_id}"),
+                &canonical_plan,
+            )?;
+            if let Err(err) = executor.publish_plan_stage(&task, &artifact, &canonical_plan) {
+                fail_stage_attempt(
+                    store,
+                    &mut task,
+                    &mut rev_rec,
+                    FAILURE_CLASS_INFRA,
+                    err.clone(),
+                    false,
+                )?;
+                return Err(err);
+            }
+            if weight_rank(&proposed.weight) > weight_rank(&task.weight) {
+                apply_weight_escalation(
+                    &mut task,
+                    proposed.weight.clone(),
+                    Vec::new(),
+                    "approved plan",
+                );
+            }
+            task.context_pack = proposed;
+            task.required_stages = default_required_stages(&task.weight);
+            task.memory.approved_plan = Some(truncate_utf8_bytes(
+                &canonical_plan,
+                MAX_APPROVED_PLAN_BYTES,
+            ));
+            task.memory.approved_plan_artifact_path = Some(artifact.to_string_lossy().into_owned());
+            task.memory.last_plan_review_findings = None;
+            task.stages_completed.push("plan-review".to_owned());
+            task.active_attempt_id = None;
+            task = store.upsert_task(&task).map_err(|e| e.to_string())?;
+        }
+        break;
     }
 
     // Human Gate 1: human-plan-approval for L tasks
-    if norm_weight == "L"
+    if task.weight.trim().eq_ignore_ascii_case("L")
         && !task
             .stages_completed
             .iter()
@@ -2408,7 +3071,8 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                 task.task_id.to_ascii_lowercase(),
                 task.version
             );
-            let impl_prompt = build_impl_prompt(&task, &worktree_path);
+            let prompt_task = task_with_full_approved_plan(&task, executor)?;
+            let impl_prompt = build_impl_prompt(&prompt_task, &worktree_path);
             let impl_spec =
                 build_systemd_stage_command(&task, &impl_attempt_id, &impl_route, &impl_prompt)?;
 
@@ -2745,6 +3409,559 @@ mod tests {
     use crate::v2::runner::{MockStageExecutor, StageExecutionResult};
     use crate::v2::store::{AcceptanceCriterionSpec, TargetFileSpec, TaskMemory};
 
+    fn plan_result(text: String) -> StageExecutionResult {
+        StageExecutionResult {
+            status: "PASSED".to_owned(),
+            summary: "bounded summary".to_owned(),
+            stage_output: Some(text),
+            review_output: None,
+            review_markdown: None,
+            invocation_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            sha_before: None,
+            sha_after: None,
+            diff_files: Vec::new(),
+        }
+    }
+
+    fn sample_plan_task(id: &str) -> TaskRecord {
+        let mut task = sample_s_task(id);
+        task.weight = "M".to_owned();
+        task.context_pack = sample_context_pack("M");
+        task.required_stages = default_required_stages("M");
+        task
+    }
+
+    #[test]
+    fn zach027_ac1_all_four_prompts_budget_unicode_and_retain_schema_and_sections() {
+        let mut task = sample_plan_task("ZACH-027-PROMPTS");
+        let huge = "🦀é".repeat(30_000);
+        task.memory.approved_plan = Some(format!("approved marker {huge}"));
+        task.memory.last_plan_review_findings = Some(format!("plan finding marker {huge}"));
+        task.memory.last_review_findings = Some(format!("review finding marker {huge}"));
+        task.memory.last_check_failure = Some(huge.clone());
+        task.context_pack.acceptance_criteria[0].description = format!("AC marker {huge}");
+        task.context_pack.target_files[0].summary = huge.clone();
+        let diff = ReviewedDiffContext {
+            diff_excerpt: huge.clone(),
+            ..Default::default()
+        };
+        let prompts = [
+            build_plan_prompt(&task, "/wt"),
+            build_plan_review_prompt(&task, "/wt", &format!("candidate marker {huge}")),
+            build_impl_prompt(&task, "/wt"),
+            build_pr_review_prompt(&task, "/wt", &diff),
+        ];
+        for prompt in &prompts {
+            assert!(prompt.chars().count() <= MAX_WORKER_PROMPT_CHARS);
+            assert!(prompt.encode_utf16().count() <= MAX_WORKER_PROMPT_CHARS);
+            assert!(prompt.contains("## Context Pack:"));
+            assert!(prompt.contains("## Acceptance Criteria:\n- AC-1: AC marker"));
+        }
+        assert!(prompts[0].contains("governance-planner"));
+        assert!(prompts[0].contains("plan finding marker"));
+        assert!(prompts[1].contains("governance-plan-reviewer"));
+        assert!(prompts[1].contains("candidate marker"));
+        assert!(prompts[2].contains("approved marker"));
+        assert!(prompts[3].contains("approved marker"));
+        for index in [1, 3] {
+            assert!(prompts[index].contains(&review_verdict_json_schema_string()));
+        }
+        assert!(
+            governance_skill_from_root(Path::new("/nonexistent-governance"), "governance-planner")
+                .contains("read-only")
+        );
+        assert!(
+            governance_skill_from_root(
+                Path::new("/nonexistent-governance"),
+                "governance-plan-reviewer"
+            )
+            .contains("ReviewVerdict")
+        );
+    }
+
+    #[test]
+    fn zach027_ac3_yaml_subset_multiblock_quotes_comments_and_invariants() {
+        let text = "```yaml\nunrelated: true\n```\n```text\ntarget_files: []\n```\n## [PLAN]\n```yml\nweight: 'L' # escalate\ntarget_files:\n  - path: \"src/v2/pipeline.rs\" # owner\n    action: modify\n    summary: 'it''s # quoted: text'\n  - src/v2/runner.rs\nforbidden_paths:\n  - '.github/workflows/**' # preserve\nworker_checks:\n  - 'cargo test'\ngate_checks: []\nhuman_operations: []\nverification_commands:\n  - \"cargo fmt --check\"\nacceptance_criteria:\n  - id: AC-2\n    description: \"extra: criterion # preserved\"\n```\n";
+        let task = sample_plan_task("ZACH-027-YAML");
+        let parsed = extract_and_parse_context_pack_yaml(text).unwrap();
+        assert_eq!(parsed.target_files[0].summary, "it's # quoted: text");
+        assert_eq!(parsed.target_files[1].path, "src/v2/runner.rs");
+        let merged = merge_plan_context(&task, parsed).unwrap();
+        assert_eq!(merged.weight, "L");
+        assert!(merged.forbidden_paths.contains(&"src/ledger/**".to_owned()));
+        assert_eq!(merged.worker_checks, task.context_pack.worker_checks);
+        assert_eq!(merged.gate_checks, task.context_pack.gate_checks);
+        assert_eq!(merged.acceptance_criteria.len(), 2);
+        assert_eq!(
+            extract_and_parse_context_pack_yaml(&plan_with_context(text, &merged).unwrap())
+                .unwrap(),
+            merged
+        );
+        for bad in [
+            "```yaml\ntarget_files: []\n",
+            "```yaml\ntarget_files: [foo]\n```",
+            "```yaml\ntarget_files: []\nweight: M\nweight: L\n```",
+            "```yaml\ntarget_files:\n  - path: foo\n    unknown: field\n```",
+            "```yaml\ntarget_files:\n  - path: 'unterminated\n```",
+        ] {
+            assert!(
+                extract_and_parse_context_pack_yaml(bad).is_err(),
+                "accepted {bad}"
+            );
+        }
+        for path in [
+            "src/ledger/store.rs",
+            ".github/workflows/test.yml",
+            "../escape",
+            "/absolute",
+            "src/*",
+        ] {
+            let mut pack = task.context_pack.clone();
+            pack.target_files[0].path = path.to_owned();
+            assert!(merge_plan_context(&task, pack).is_err(), "accepted {path}");
+        }
+        let mut pack = task.context_pack.clone();
+        pack.forbidden_paths.clear();
+        assert!(merge_plan_context(&task, pack).is_err());
+        let mut pack = task.context_pack.clone();
+        pack.target_files.clear();
+        assert!(merge_plan_context(&task, pack).is_err());
+        let mut pack = task.context_pack.clone();
+        pack.weight = "S".to_owned();
+        assert_eq!(merge_plan_context(&task, pack).unwrap().weight, "M");
+    }
+
+    #[test]
+    fn zach027_plan_review_schema_coverage_consistency_and_plan_citations() {
+        let task = sample_plan_task("ZACH-027-SCHEMA");
+        let pack = task.context_pack.clone();
+        for file in ["plan:1", "/virtual/candidate.md:5", "src/v2/router.rs:500"] {
+            let verdict = approved_verdict_json("AC-1", file);
+            validate_plan_review_verdict(&verdict, &task, &pack, "/virtual/candidate.md", "/wt")
+                .unwrap();
+        }
+        let original: serde_json::Value =
+            serde_json::from_str(&approved_verdict_json("AC-1", "plan:1")).unwrap();
+        for variant in 0..7 {
+            let mut bad = original.clone();
+            match variant {
+                0 => bad["extra"] = true.into(),
+                1 => bad["ac_results"] = serde_json::json!([]),
+                2 => bad["ac_results"][0]["status"] = "FAIL".into(),
+                3 => bad["ac_results"][0]["line"] = 0.into(),
+                4 => bad["ac_results"][0]["file"] = "../escape".into(),
+                5 => {
+                    bad["findings"] = serde_json::json!([{"severity":"blocking","file":"plan","line":1,"summary":"unsafe"}])
+                }
+                _ => bad["ac_results"][0]["file"] = "missing.rs".into(),
+            }
+            assert!(
+                validate_plan_review_verdict(
+                    &bad.to_string(),
+                    &task,
+                    &pack,
+                    "/virtual/candidate.md",
+                    "/wt"
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            validate_plan_review_verdict("APPROVED", &task, &pack, "candidate", "/wt").is_err()
+        );
+    }
+
+    #[test]
+    fn zach027_ac2_ac3_plan_scope_publication_and_live_l_gates() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        let task = sample_plan_task("ZACH-027-SCOPE");
+        store.upsert_task(&task).unwrap();
+        let mut pack = task.context_pack.clone();
+        pack.weight = "L".to_owned();
+        pack.target_files = vec![TargetFileSpec {
+            path: "src/v2/pipeline.rs".to_owned(),
+            ..Default::default()
+        }];
+        let candidate = plan_with_context(
+            "## [PLAN]\nThread all stages.\n```yaml\ntarget_files: []\n```\n",
+            &pack,
+        )
+        .unwrap();
+        let mut mock = MockStageExecutor {
+            staged_results: vec![
+                plan_result(candidate.clone()),
+                plan_result(approved_verdict_json("AC-1", "plan:1")),
+            ],
+            ..Default::default()
+        };
+        let stub = StubWsTask::passthrough_clean("zach027-plan-scope");
+        let paused = execute_m_l_pipeline_with_executor_and_ws_task(
+            &mut store,
+            &task.task_id,
+            &mut mock,
+            stub.path(),
+        )
+        .unwrap();
+        assert_eq!(paused.current_stage.as_deref(), Some("human-plan-approval"));
+        assert_eq!(paused.weight, "L");
+        assert_eq!(paused.required_stages, default_required_stages("L"));
+        assert_eq!(paused.context_pack.target_files, pack.target_files);
+        assert_eq!(mock.executed_specs.len(), 2);
+        assert!(mock.executed_specs[1].output_schema_json.is_some());
+        assert_ne!(
+            mock.executed_routes[0].family,
+            mock.executed_routes[1].family
+        );
+        assert_eq!(mock.published_plans.len(), 1);
+        assert!(mock.plan_artifacts.values().any(|p| p == &candidate));
+        let (path, published) = &mock.published_plans[0];
+        assert_eq!(
+            paused.memory.approved_plan_artifact_path.as_deref(),
+            path.to_str()
+        );
+        assert_eq!(
+            extract_and_parse_context_pack_yaml(published).unwrap(),
+            paused.context_pack
+        );
+        for prompt in [
+            build_impl_prompt(&paused, "/wt"),
+            build_pr_review_prompt(&paused, "/wt", &ReviewedDiffContext::default()),
+        ] {
+            assert!(prompt.contains("Thread all stages."));
+        }
+        let diff = vec![DiffFileEntry {
+            path: "src/v2/pipeline.rs".to_owned(),
+            status: "M".to_owned(),
+            added_lines: 1,
+            deleted_lines: 0,
+        }];
+        assert!(!matches!(
+            verify_worktree_diff_with("zach", "L", &paused.context_pack, &diff, stub.path())
+                .unwrap(),
+            DiffCheckOutcome::OutOfScopeFiles { .. }
+        ));
+        let old_diff = vec![DiffFileEntry {
+            path: "src/v2/router.rs".to_owned(),
+            ..diff[0].clone()
+        }];
+        assert!(matches!(
+            verify_worktree_diff_with("zach", "L", &paused.context_pack, &old_diff, stub.path())
+                .unwrap(),
+            DiffCheckOutcome::OutOfScopeFiles { .. }
+        ));
+
+        store
+            .resolve_decision("dec-zach-027-scope-plan-approval", "Approve", "test", None)
+            .unwrap();
+        let mut implementation = plan_result("implementation".to_owned());
+        implementation.diff_files = diff;
+        mock.staged_results = vec![
+            implementation,
+            plan_result(approved_verdict_json("AC-1", "src/v2/pipeline.rs:1")),
+        ];
+        let paused = execute_m_l_pipeline_with_executor_and_ws_task(
+            &mut store,
+            &task.task_id,
+            &mut mock,
+            stub.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            paused.current_stage.as_deref(),
+            Some("human-merge-approval")
+        );
+        assert_eq!(mock.published_plans.len(), 1);
+        assert!(mock.executed_specs[2].prompt.contains("Thread all stages."));
+        assert!(mock.executed_specs[3].prompt.contains("Thread all stages."));
+    }
+
+    #[test]
+    fn zach027_changes_requested_replans_without_process_retry_and_blocks_at_limit() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        let task = sample_plan_task("ZACH-027-REWORK");
+        store.upsert_task(&task).unwrap();
+        let mut changes: serde_json::Value =
+            serde_json::from_str(&approved_verdict_json("AC-1", "plan:1")).unwrap();
+        changes["verdict"] = "CHANGES_REQUESTED".into();
+        changes["ac_results"][0]["status"] = "FAIL".into();
+        changes["summary"] = format!("clarify scope {}", "é".repeat(2000)).into();
+        let mut mock = MockStageExecutor::default();
+        for _ in 0..=MAX_PLAN_REWORK_CYCLES {
+            mock.staged_results.push(plan_result(plan_fixture("M")));
+            mock.staged_results.push(plan_result(changes.to_string()));
+        }
+        let stub = StubWsTask::passthrough_clean("zach027-rework");
+        let paused = execute_m_l_pipeline_with_executor_and_ws_task(
+            &mut store,
+            &task.task_id,
+            &mut mock,
+            stub.path(),
+        )
+        .unwrap();
+        assert_eq!(paused.status, "Blocked");
+        assert_eq!(paused.retry_count, 0);
+        assert_eq!(paused.memory.plan_rework_count, MAX_PLAN_REWORK_CYCLES);
+        assert!(
+            paused
+                .memory
+                .last_plan_review_findings
+                .as_ref()
+                .unwrap()
+                .len()
+                <= MAX_SUMMARY_BYTES
+        );
+        assert!(paused.memory.approved_plan.is_none());
+        assert!(mock.published_plans.is_empty());
+        assert!(mock.executed_specs[2].prompt.contains("clarify scope"));
+        assert!(
+            store
+                .list_decisions(true, None)
+                .unwrap()
+                .iter()
+                .any(|d| d.kind == "plan_rework_limit")
+        );
+        assert!(
+            store
+                .list_stage_attempts(&task.task_id)
+                .unwrap()
+                .iter()
+                .all(|a| a.status == "PASSED" && a.failure_class.is_none())
+        );
+    }
+
+    #[test]
+    fn zach027_rework_can_approve_and_full_artifact_reaches_downstream_prompts() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        let task = sample_plan_task("ZACH-027-REWORK-APPROVE");
+        store.upsert_task(&task).unwrap();
+        let mut changes: serde_json::Value =
+            serde_json::from_str(&approved_verdict_json("AC-1", "plan:1")).unwrap();
+        changes["verdict"] = "CHANGES_REQUESTED".into();
+        changes["summary"] = "Add the missing late step".into();
+        let approved_plan = format!(
+            "{}\n{}\nlate step: test the full artifact",
+            plan_fixture("M"),
+            "padding ".repeat(400)
+        );
+        let mut implementation = plan_result("implementation".to_owned());
+        implementation.diff_files = vec![DiffFileEntry {
+            path: "src/v2/router.rs".to_owned(),
+            status: "M".to_owned(),
+            added_lines: 1,
+            deleted_lines: 0,
+        }];
+        let mut mock = MockStageExecutor {
+            staged_results: vec![
+                plan_result(plan_fixture("M")),
+                plan_result(changes.to_string()),
+                plan_result(approved_plan),
+                plan_result(approved_verdict_json("AC-1", "plan:1")),
+                implementation,
+                plan_result(approved_verdict_json("AC-1", "src/v2/router.rs:1")),
+            ],
+            ..Default::default()
+        };
+        let stub = StubWsTask::passthrough_clean("zach027-rework-approve");
+        let done = execute_m_l_pipeline_with_executor_and_ws_task(
+            &mut store,
+            &task.task_id,
+            &mut mock,
+            stub.path(),
+        )
+        .unwrap();
+        assert_eq!(done.status, "Queued for Merge");
+        assert_eq!(done.retry_count, 0);
+        assert_eq!(done.memory.plan_rework_count, 1);
+        assert!(done.memory.last_plan_review_findings.is_none());
+        assert_eq!(mock.published_plans.len(), 1);
+        let excerpt = done.memory.approved_plan.as_ref().unwrap();
+        assert!(excerpt.len() <= MAX_APPROVED_PLAN_BYTES);
+        assert!(!excerpt.contains("late step: test the full artifact"));
+        for index in [4, 5] {
+            assert!(
+                mock.executed_specs[index]
+                    .prompt
+                    .contains("late step: test the full artifact")
+            );
+        }
+    }
+
+    #[test]
+    fn zach027_invalid_or_missing_full_plan_never_reaches_review_or_publication() {
+        for text in [
+            None,
+            Some("summary-only plan".to_owned()),
+            Some("```yaml\nweight: M\ntarget_files: []\n```".to_owned()),
+        ] {
+            let mut store = V2Store::open_in_memory().unwrap();
+            let task = sample_plan_task("ZACH-027-BAD-CANDIDATE");
+            store.upsert_task(&task).unwrap();
+            let mut result = plan_result(String::new());
+            result.stage_output = text;
+            let mut mock = MockStageExecutor {
+                staged_results: vec![result],
+                ..Default::default()
+            };
+            let stub = StubWsTask::passthrough_clean("zach027-bad-candidate");
+            assert!(
+                execute_m_l_pipeline_with_executor_and_ws_task(
+                    &mut store,
+                    &task.task_id,
+                    &mut mock,
+                    stub.path()
+                )
+                .is_err()
+            );
+            assert_eq!(mock.executed_specs.len(), 1);
+            assert!(mock.published_plans.is_empty());
+            let saved = store.get_task(&task.task_id).unwrap().unwrap();
+            assert!(saved.memory.approved_plan.is_none());
+            assert!(!saved.stages_completed.contains(&"plan".to_owned()));
+            assert_eq!(
+                store.list_stage_attempts(&task.task_id).unwrap()[0].status,
+                "FAILED"
+            );
+        }
+    }
+
+    #[test]
+    fn zach027_plan_fallback_records_actual_author_for_cross_family_review_on_resume() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        let mut task = sample_plan_task("ZACH-027-FALLBACK");
+        task.retry_count = 1; // M plan retries route to Gemini.
+        task.memory
+            .recent_attempts
+            .push("[AGY_INFRA:AGY_TIMEOUT] stage=plan".to_owned());
+        store.upsert_task(&task).unwrap();
+        let mut failed = plan_result("provider failure".to_owned());
+        failed.status = "FAILED".to_owned();
+        failed.summary = "AGY_STATUS provider unavailable".to_owned();
+        let mut mock = MockStageExecutor {
+            staged_results: vec![
+                failed,
+                plan_result(plan_fixture("L")),
+                plan_result(approved_verdict_json("AC-1", "plan:1")),
+            ],
+            ..Default::default()
+        };
+        let stub = StubWsTask::passthrough_clean("zach027-plan-fallback");
+        let paused = execute_m_l_pipeline_with_executor_and_ws_task(
+            &mut store,
+            &task.task_id,
+            &mut mock,
+            stub.path(),
+        )
+        .unwrap();
+        assert_eq!(paused.current_stage.as_deref(), Some("human-plan-approval"));
+        assert_eq!(mock.executed_routes[0].family, ModelFamily::GeminiAgy);
+        assert_eq!(mock.executed_routes[1].family, ModelFamily::OpenAiSol);
+        assert_eq!(mock.executed_routes[2].family, ModelFamily::GeminiAgy);
+        assert_eq!(
+            resolve_author_family(&store, &task.task_id, "plan", None).unwrap(),
+            ModelFamily::OpenAiSol
+        );
+        let attempts = store.list_stage_attempts(&task.task_id).unwrap();
+        assert_eq!(attempts.iter().filter(|a| a.stage == "plan").count(), 2);
+        let actual = attempts
+            .iter()
+            .find(|a| a.stage == "plan" && a.status == "PASSED")
+            .unwrap();
+        assert_eq!(infer_model_family(&actual.model), ModelFamily::OpenAiSol);
+        assert!(actual.attempt_id.contains("plan-fb"));
+        assert!(
+            paused
+                .memory
+                .candidate_plan_artifact_path
+                .as_ref()
+                .unwrap()
+                .contains(&actual.attempt_id)
+        );
+    }
+
+    #[test]
+    fn zach027_resume_uses_persisted_author_and_publication_fails_closed() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        let mut task = sample_plan_task("ZACH-027-RESUME");
+        task.stages_completed.push("plan".to_owned());
+        let mut mock = MockStageExecutor::default();
+        let candidate = mock
+            .persist_plan_artifact(&task, "old-attempt", &plan_fixture("M"))
+            .unwrap();
+        task.memory.candidate_plan_artifact_path = Some(candidate.to_string_lossy().into_owned());
+        store.upsert_task(&task).unwrap();
+        store
+            .record_stage_attempt(&StageAttemptRecord {
+                attempt_id: "old-attempt".to_owned(),
+                task_id: task.task_id.clone(),
+                stage: "plan".to_owned(),
+                model: "gemini-4-argon-high".to_owned(),
+                effort: "high".to_owned(),
+                systemd_unit: None,
+                invocation_id: None,
+                started_epoch: 1,
+                ended_epoch: Some(2),
+                status: "PASSED".to_owned(),
+                failure_class: None,
+                summary: Some("truncated".to_owned()),
+                input_tokens: None,
+                output_tokens: None,
+                total_tokens: None,
+                sha_before: None,
+                sha_after: None,
+            })
+            .unwrap();
+        mock.staged_results
+            .push(plan_result(approved_verdict_json("AC-1", "plan:1")));
+        mock.publish_plan_error = Some("publication unavailable".to_owned());
+        let stub = StubWsTask::passthrough_clean("zach027-resume");
+        let error = execute_m_l_pipeline_with_executor_and_ws_task(
+            &mut store,
+            &task.task_id,
+            &mut mock,
+            stub.path(),
+        )
+        .unwrap_err();
+        assert!(error.contains("publication unavailable"));
+        assert_eq!(mock.executed_routes[0].family, ModelFamily::OpenAiSol);
+        assert_eq!(mock.executed_specs.len(), 1);
+        assert!(
+            mock.executed_specs[0]
+                .prompt
+                .contains("Step 1: update router")
+        );
+        let saved = store.get_task(&task.task_id).unwrap().unwrap();
+        assert!(!saved.stages_completed.contains(&"plan-review".to_owned()));
+        assert!(saved.memory.approved_plan.is_none());
+        // Without an opposite-family AGY reviewer, a resumed OpenAI-authored plan pauses.
+        let mut task = saved;
+        task.task_id = "ZACH-027-NO-REVIEWER".to_owned();
+        task.retry_count = 0;
+        task.memory.recent_attempts =
+            vec!["[AGY_INFRA:AGY_STATUS] stage=plan-review".to_owned(); 2];
+        task.version = 1;
+        store.upsert_task(&task).unwrap();
+        let paused = execute_m_l_pipeline_with_executor_and_ws_task(
+            &mut store,
+            &task.task_id,
+            &mut mock,
+            stub.path(),
+        )
+        .unwrap();
+        assert_eq!(paused.status, "Blocked");
+        assert_eq!(mock.executed_specs.len(), 1);
+    }
+
+    fn plan_fixture(weight: &str) -> String {
+        plan_with_context(
+            "## [PLAN]\nStep 1: update router\n```yaml\ntarget_files: []\n```\n",
+            &sample_context_pack(weight),
+        )
+        .unwrap()
+    }
+
     fn sample_context_pack(weight: &str) -> ContextPackSpec {
         ContextPackSpec {
             weight: weight.to_owned(),
@@ -3056,6 +4273,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "Implemented router and runner".to_owned(),
                     review_markdown: None,
+                    stage_output: None,
                     review_output: None,
                     invocation_id: Some("inv-1".to_owned()),
                     input_tokens: Some(12_000),
@@ -3074,6 +4292,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "PR Review LGTM".to_owned(),
                     review_markdown: None,
+                    stage_output: None,
                     review_output: Some(approved_verdict_json("AC-1", "src/v2/router.rs:10")),
                     invocation_id: Some("inv-2".to_owned()),
                     input_tokens: Some(8_000),
@@ -3165,6 +4384,7 @@ print(json.dumps({
                 status: "PASSED".to_owned(),
                 summary: "Implemented XS change".to_owned(),
                 review_markdown: None,
+                stage_output: None,
                 review_output: None,
                 invocation_id: Some("inv-xs-1".to_owned()),
                 input_tokens: Some(4_000),
@@ -3254,6 +4474,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "Architectural plan generated".to_owned(),
                     review_markdown: None,
+                    stage_output: Some(plan_fixture("M")),
                     review_output: None,
                     invocation_id: Some("inv-plan".to_owned()),
                     input_tokens: Some(10_000),
@@ -3268,6 +4489,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "Plan review approved".to_owned(),
                     review_markdown: None,
+                    stage_output: Some(approved_verdict_json("AC-1", "plan:1")),
                     review_output: None,
                     invocation_id: Some("inv-plan-review".to_owned()),
                     input_tokens: Some(8_000),
@@ -3282,6 +4504,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "Implementation complete".to_owned(),
                     review_markdown: None,
+                    stage_output: None,
                     review_output: None,
                     invocation_id: Some("inv-impl".to_owned()),
                     input_tokens: Some(15_000),
@@ -3301,6 +4524,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "PR review verified".to_owned(),
                     review_markdown: None,
+                    stage_output: None,
                     review_output: Some(approved_verdict_json("AC-1", "src/v2/router.rs:10")),
                     invocation_id: Some("inv-pr-rev".to_owned()),
                     input_tokens: Some(12_000),
@@ -3394,6 +4618,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "L Plan".to_owned(),
                     review_markdown: None,
+                    stage_output: Some(plan_fixture("L")),
                     review_output: None,
                     invocation_id: None,
                     input_tokens: Some(1_000),
@@ -3408,6 +4633,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "L Plan Review".to_owned(),
                     review_markdown: None,
+                    stage_output: Some(approved_verdict_json("AC-1", "plan:1")),
                     review_output: None,
                     invocation_id: None,
                     input_tokens: Some(1_000),
@@ -3454,6 +4680,7 @@ print(json.dumps({
             status: "PASSED".to_owned(),
             summary: "L Impl".to_owned(),
             review_markdown: None,
+            stage_output: None,
             review_output: None,
             invocation_id: None,
             input_tokens: Some(5_000),
@@ -3472,6 +4699,7 @@ print(json.dumps({
             status: "PASSED".to_owned(),
             summary: "L PR Review".to_owned(),
             review_markdown: None,
+            stage_output: None,
             review_output: Some(approved_verdict_json("AC-1", "src/v2/router.rs:10")),
             invocation_id: None,
             input_tokens: Some(5_000),
@@ -3635,6 +4863,7 @@ print(json.dumps({
                 status: "PASSED".to_owned(),
                 summary: "Fallback succeeded".to_owned(),
                 review_markdown: None,
+                stage_output: Some(plan_fixture("M")),
                 review_output: None,
                 invocation_id: None,
                 input_tokens: Some(1_000),
@@ -3819,7 +5048,7 @@ print(json.dumps({
         assert!(impl_prompt.contains("## Approved Plan:"));
         assert!(impl_prompt.contains("## Prior Review Findings"));
         assert!(impl_prompt.contains("## Prior Check Failure:"));
-        assert!(impl_prompt.len() <= MAX_WORKER_PROMPT_BYTES);
+        assert!(impl_prompt.len() <= MAX_WORKER_PROMPT_CHARS);
 
         let rev_prompt = build_pr_review_prompt(&task, "/tmp/wt", &diff_ctx);
         assert!(rev_prompt.contains("abc1234..def5678"));
@@ -3828,7 +5057,7 @@ print(json.dumps({
         assert!(rev_prompt.contains("## Approved Plan:"));
         assert!(rev_prompt.contains("\"ac_results\""));
         assert!(rev_prompt.contains("\"findings\""));
-        assert!(rev_prompt.len() <= MAX_WORKER_PROMPT_BYTES);
+        assert!(rev_prompt.len() <= MAX_WORKER_PROMPT_CHARS);
     }
 
     #[test]
@@ -3925,6 +5154,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "Initial impl".to_owned(),
                     review_markdown: None,
+                    stage_output: None,
                     review_output: None,
                     invocation_id: Some("impl-1".to_owned()),
                     input_tokens: Some(1_000),
@@ -3943,6 +5173,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "Requested changes".to_owned(),
                     review_markdown: None,
+                    stage_output: None,
                     review_output: Some(changes_requested_json.clone()),
                     invocation_id: Some("rev-1".to_owned()),
                     input_tokens: Some(500),
@@ -3956,6 +5187,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "Rework impl".to_owned(),
                     review_markdown: None,
+                    stage_output: None,
                     review_output: None,
                     invocation_id: Some("impl-2".to_owned()),
                     input_tokens: Some(1_000),
@@ -3974,6 +5206,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "Approved rework".to_owned(),
                     review_markdown: None,
+                    stage_output: None,
                     review_output: Some(approved_verdict_json("AC-1", "src/v2/router.rs:10")),
                     invocation_id: Some("rev-2".to_owned()),
                     input_tokens: Some(500),
@@ -4020,13 +5253,14 @@ print(json.dumps({
             "pr-review".to_owned(),
         ];
         m_store.upsert_task(&m_task).unwrap();
-        let long_plan = format!("Step 1: update router {}", "x".repeat(3000));
+        let long_plan = format!("{}\n{}", plan_fixture("M"), "x".repeat(3000));
         let mut m_mock = MockStageExecutor {
             staged_results: vec![
                 StageExecutionResult {
                     status: "PASSED".to_owned(),
                     summary: "Plan done".to_owned(),
                     review_markdown: None,
+                    stage_output: None,
                     review_output: Some(long_plan),
                     invocation_id: None,
                     input_tokens: Some(500),
@@ -4040,6 +5274,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "Plan approved".to_owned(),
                     review_markdown: None,
+                    stage_output: Some(approved_verdict_json("AC-1", "plan:1")),
                     review_output: None,
                     invocation_id: None,
                     input_tokens: Some(500),
@@ -4053,6 +5288,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "Impl 1".to_owned(),
                     review_markdown: None,
+                    stage_output: None,
                     review_output: None,
                     invocation_id: None,
                     input_tokens: Some(500),
@@ -4071,6 +5307,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "Changes requested".to_owned(),
                     review_markdown: None,
+                    stage_output: None,
                     review_output: Some(changes_requested_json.clone()),
                     invocation_id: None,
                     input_tokens: Some(500),
@@ -4084,6 +5321,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "Impl 2".to_owned(),
                     review_markdown: None,
+                    stage_output: None,
                     review_output: None,
                     invocation_id: None,
                     input_tokens: Some(500),
@@ -4102,6 +5340,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "Approved".to_owned(),
                     review_markdown: None,
+                    stage_output: None,
                     review_output: Some(approved_verdict_json("AC-1", "src/v2/router.rs:10")),
                     invocation_id: None,
                     input_tokens: Some(500),
@@ -4150,6 +5389,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "Impl".to_owned(),
                     review_markdown: None,
+                    stage_output: None,
                     review_output: None,
                     invocation_id: None,
                     input_tokens: Some(500),
@@ -4168,6 +5408,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "Still needs changes".to_owned(),
                     review_markdown: None,
+                    stage_output: None,
                     review_output: Some(changes_requested_json),
                     invocation_id: None,
                     input_tokens: Some(500),
@@ -4231,6 +5472,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "impl ok".to_owned(),
                     review_markdown: None,
+                    stage_output: None,
                     review_output: None,
                     invocation_id: None,
                     input_tokens: Some(1_000),
@@ -4249,6 +5491,7 @@ print(json.dumps({
                     status: "FAILED".to_owned(),
                     summary: "AGY_TIMEOUT: gemini worker timed out".to_owned(),
                     review_markdown: None,
+                    stage_output: None,
                     review_output: None,
                     invocation_id: None,
                     input_tokens: None,
@@ -4348,6 +5591,7 @@ print(json.dumps({
                 status: "FAILED".to_owned(),
                 summary: "transient failure".to_owned(),
                 review_markdown: None,
+                stage_output: None,
                 review_output: None,
                 invocation_id: Some("inv-fail".to_owned()),
                 input_tokens: Some(100),
@@ -4427,6 +5671,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "Plan ok".to_owned(),
                     review_markdown: None,
+                    stage_output: Some(plan_fixture("M")),
                     review_output: None,
                     invocation_id: Some("inv-plan".to_owned()),
                     input_tokens: Some(1_000),
@@ -4440,6 +5685,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "Plan review ok".to_owned(),
                     review_markdown: None,
+                    stage_output: Some(approved_verdict_json("AC-1", "plan:1")),
                     review_output: None,
                     invocation_id: Some("inv-plan-rev".to_owned()),
                     input_tokens: Some(800),
@@ -4453,6 +5699,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "Impl ok".to_owned(),
                     review_markdown: None,
+                    stage_output: None,
                     review_output: None,
                     invocation_id: Some("inv-impl".to_owned()),
                     input_tokens: Some(1_500),
@@ -4471,6 +5718,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "PR review ok".to_owned(),
                     review_markdown: None,
+                    stage_output: None,
                     review_output: Some(approved_verdict_json("AC-1", "src/v2/router.rs:10")),
                     invocation_id: Some("inv-pr-rev".to_owned()),
                     input_tokens: Some(900),
@@ -4557,6 +5805,7 @@ print(json.dumps({
                 status: "PASSED".to_owned(),
                 summary: "Re-review ok".to_owned(),
                 review_markdown: None,
+                stage_output: None,
                 review_output: Some(approved_verdict_json("AC-1", "src/v2/router.rs:10")),
                 invocation_id: Some("inv-pr-rerev".to_owned()),
                 input_tokens: Some(500),
@@ -4762,6 +6011,7 @@ print(json.dumps({
                         status: "PASSED".to_owned(),
                         summary: "impl ok".to_owned(),
                         review_markdown: None,
+                        stage_output: None,
                         review_output: None,
                         invocation_id: Some("inv-impl".to_owned()),
                         input_tokens: Some(1_000),
@@ -4780,6 +6030,7 @@ print(json.dumps({
                         status: "PASSED".to_owned(),
                         summary: "missing table".to_owned(),
                         review_markdown: Some("No AC table here".to_owned()),
+                        stage_output: None,
                         review_output: None,
                         invocation_id: Some("inv-rev".to_owned()),
                         input_tokens: Some(500),
@@ -4830,6 +6081,7 @@ print(json.dumps({
                         status: "PASSED".to_owned(),
                         summary: "impl ok".to_owned(),
                         review_markdown: None,
+                        stage_output: None,
                         review_output: None,
                         invocation_id: None,
                         input_tokens: Some(100),
@@ -4881,6 +6133,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "edited workflow".to_owned(),
                     review_markdown: None,
+                    stage_output: None,
                     review_output: None,
                     invocation_id: None,
                     input_tokens: Some(100),
@@ -4941,6 +6194,7 @@ print(json.dumps({
                         status: "PASSED".to_owned(),
                         summary: "plan ok".to_owned(),
                         review_markdown: None,
+                        stage_output: Some(plan_fixture("M")),
                         review_output: None,
                         invocation_id: None,
                         input_tokens: Some(100),
@@ -4954,6 +6208,7 @@ print(json.dumps({
                         status: "FAILED".to_owned(),
                         summary: "changes_requested: clarify migration steps".to_owned(),
                         review_markdown: None,
+                        stage_output: None,
                         review_output: None,
                         invocation_id: None,
                         input_tokens: Some(100),
@@ -5002,6 +6257,7 @@ print(json.dumps({
             status: "PASSED".to_owned(),
             summary: "impl ok".to_owned(),
             review_markdown: None,
+            stage_output: None,
             review_output: None,
             invocation_id: Some("inv-impl".to_owned()),
             input_tokens: Some(1_000),
@@ -5020,6 +6276,7 @@ print(json.dumps({
             status: "PASSED".to_owned(),
             summary: "review ok".to_owned(),
             review_markdown: None,
+            stage_output: None,
             review_output: Some(approved_verdict_json("AC-1", "src/v2/router.rs:10")),
             invocation_id: Some("inv-rev".to_owned()),
             input_tokens: Some(500),
@@ -5166,6 +6423,7 @@ print(json.dumps({
                         status: "PASSED".to_owned(),
                         summary: "Modified router without committing".to_owned(),
                         review_markdown: None,
+                        stage_output: None,
                         review_output: None,
                         invocation_id: Some("inv-real-impl".to_owned()),
                         input_tokens: Some(1_000),
@@ -5188,6 +6446,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "Reviewed committed head".to_owned(),
                     review_markdown: None,
+                    stage_output: None,
                     review_output: Some(approved_verdict_json("AC-1", "src/v2/router.rs:1")),
                     invocation_id: Some("inv-real-rev".to_owned()),
                     input_tokens: Some(600),
@@ -5438,6 +6697,7 @@ print(json.dumps({
                 status: "FAILED".to_owned(),
                 summary: format!("AGY_TIMEOUT: {giant_raw}"),
                 review_markdown: None,
+                stage_output: None,
                 review_output: None,
                 invocation_id: None,
                 input_tokens: Some(100),
@@ -5482,6 +6742,7 @@ print(json.dumps({
                 status: "PASSED".to_owned(),
                 summary: giant_raw.clone(),
                 review_markdown: None,
+                stage_output: None,
                 review_output: None,
                 invocation_id: None,
                 input_tokens: Some(10),
@@ -5522,6 +6783,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "impl ok".to_owned(),
                     review_markdown: None,
+                    stage_output: None,
                     review_output: None,
                     invocation_id: None,
                     input_tokens: Some(10),
@@ -5665,6 +6927,7 @@ print(json.dumps({
                 status: "FAILED".to_owned(),
                 summary: "first impl failed".to_owned(),
                 review_markdown: None,
+                stage_output: None,
                 review_output: None,
                 invocation_id: None,
                 input_tokens: Some(200_000),
@@ -5699,6 +6962,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "impl ok".to_owned(),
                     review_markdown: None,
+                    stage_output: None,
                     review_output: None,
                     invocation_id: None,
                     input_tokens: Some(80_000),
@@ -5717,6 +6981,7 @@ print(json.dumps({
                     status: "PASSED".to_owned(),
                     summary: "review ok".to_owned(),
                     review_markdown: None,
+                    stage_output: None,
                     review_output: Some(approved_verdict_json("AC-1", "src/v2/runner.rs:10")),
                     invocation_id: None,
                     input_tokens: Some(50_000),
@@ -5768,6 +7033,7 @@ print(json.dumps({
                 status: failed_codex.status,
                 summary: failed_codex.summary,
                 review_markdown: failed_codex.review_markdown,
+                stage_output: None,
                 review_output: failed_codex.review_output,
                 invocation_id: None,
                 input_tokens: failed_codex.input_tokens,
@@ -6014,6 +7280,7 @@ raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={
                 status: "PASSED".to_owned(),
                 summary: "impl ok".to_owned(),
                 review_markdown: None,
+                stage_output: None,
                 review_output: None,
                 invocation_id: None,
                 input_tokens: Some(100),
@@ -6051,6 +7318,7 @@ raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={
                 status: "PASSED".to_owned(),
                 summary: "impl ok".to_owned(),
                 review_markdown: None,
+                stage_output: None,
                 review_output: None,
                 invocation_id: None,
                 input_tokens: Some(100),
@@ -6103,6 +7371,7 @@ raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={
                     status: "PASSED".to_owned(),
                     summary: "impl touched critical path".to_owned(),
                     review_markdown: None,
+                    stage_output: None,
                     review_output: None,
                     invocation_id: Some("inv-impl".to_owned()),
                     input_tokens: Some(1_000),
@@ -6121,6 +7390,7 @@ raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={
                     status: "PASSED".to_owned(),
                     summary: "pr-review ok".to_owned(),
                     review_markdown: None,
+                    stage_output: None,
                     review_output: Some(approved_verdict_json("AC-1", "src/v2/router.rs:1")),
                     invocation_id: Some("inv-rev".to_owned()),
                     input_tokens: Some(500),
