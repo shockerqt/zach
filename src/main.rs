@@ -3,6 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use zach::ledger;
+use zach::v2::delivery::{SystemDeliveryDriver, poll_post_merge_deliveries};
 use zach::v2::intake::{ingest_export_json, sync_from_ws_task};
 use zach::v2::merge_queue::{SystemMergeDriver, process_repo_merge_queue};
 use zach::v2::pipeline::{execute_m_l_pipeline, execute_xs_s_pipeline, plan_task_execution};
@@ -422,6 +423,10 @@ fn run_v2_run(args: &[String]) {
     unique_repos.dedup();
     for repo in unique_repos {
         let _ = process_repo_merge_queue(&mut store, &repo, &mut driver, &semaphore);
+    }
+
+    if let Err(error) = poll_post_merge_deliveries(&mut store, &mut SystemDeliveryDriver) {
+        eprintln!("post-merge delivery polling failed: {error}");
     }
 
     println!(
