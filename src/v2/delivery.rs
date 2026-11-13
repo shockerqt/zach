@@ -89,8 +89,24 @@ pub struct Promotion {
     pub delivery_file: Option<String>,
     #[serde(default)]
     pub current_source_probe: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "plan_authority"
+    )]
+    pub current_source_authority: Option<String>,
     #[serde(default)]
     pub health_checks: Vec<HealthCheck>,
+}
+
+fn plan_authority<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let value = String::deserialize(d)?;
+    if value != "plan" {
+        return Err(serde::de::Error::custom(
+            "unsupported current_source_authority",
+        ));
+    }
+    Ok(Some(value))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -579,6 +595,17 @@ impl DeliveryContract {
         for rule in &self.promotions {
             if !safe_token(&rule.name) || !names.insert(format!("promotion:{}", rule.name)) {
                 return Err("invalid/duplicate promotion name".into());
+            }
+            if let Some(authority) = &rule.current_source_authority
+                && (authority != "plan"
+                    || rule.current_source_probe.is_some()
+                    || rule.delivery_file.is_none()
+                    || rule
+                        .plan_inputs
+                        .values()
+                        .any(|v| v.contains("${expected_current}")))
+            {
+                return Err("plan authority requires exclusive selector, delivery_file and current-independent plan inputs".into());
             }
             validate_workflow(&rule.build_workflow)?;
             validate_workflow(&rule.promote_workflow)?;
@@ -2178,7 +2205,7 @@ fn workflow_tick(
     checkpoint(store, row, "Delivery Pending")
 }
 
-fn verify_plan(value: &Value, row: &PostMergeDelivery) -> Result<(), String> {
+fn verify_immutable_plan(value: &Value, row: &PostMergeDelivery) -> Result<(), String> {
     if value
         .get("status")
         .and_then(Value::as_str)
@@ -2201,13 +2228,52 @@ fn verify_plan(value: &Value, row: &PostMergeDelivery) -> Result<(), String> {
     if value["source_sha"].as_str() != Some(&row.merge_sha)
         || build.as_deref() != row.build_run_id.as_deref()
         || digest != row.artifact_digest.as_deref()
-        || value["expected_current"].as_str() != row.expected_current.as_deref()
     {
         return Err(
             "promotion artifact does not match the approved build/source/digest/current".into(),
         );
     }
     Ok(())
+}
+
+fn verify_plan(value: &Value, row: &PostMergeDelivery) -> Result<(), String> {
+    verify_immutable_plan(value, row)?;
+    if value["expected_current"].as_str() != row.expected_current.as_deref() {
+        return Err("promotion artifact current mismatch".into());
+    }
+    Ok(())
+}
+
+fn observed_current(value: &Value) -> Result<String, String> {
+    let current = value["expected_current"]
+        .as_str()
+        .ok_or("plan missing string expected_current")?;
+    if !safe_token(current) {
+        return Err("unsafe plan expected_current".into());
+    }
+    Ok(current.to_owned())
+}
+
+fn promotion_approval(
+    store: &mut impl DeliveryStore,
+    row: &mut PostMergeDelivery,
+) -> Result<(), String> {
+    let context = format!(
+        "Approve production promotion {}? build_run_id={}, source_sha={}, artifact_digest={}, expected_current={}",
+        row.name,
+        row.build_run_id.as_deref().unwrap_or(""),
+        row.merge_sha,
+        row.artifact_digest.as_deref().unwrap_or(""),
+        row.expected_current.as_deref().unwrap_or("")
+    );
+    open_gate(
+        store,
+        row,
+        "prod_promotion_approval",
+        "Pending Prod Promotion",
+        &["Approve".into(), "Retry".into(), "Reject".into()],
+        &context,
+    )
 }
 
 fn promotion_tick(
@@ -2217,6 +2283,7 @@ fn promotion_tick(
 ) -> Result<(), String> {
     let rule: Promotion =
         serde_json::from_value(row.rule_json.clone()).map_err(|e| e.to_string())?;
+    let plan_authority = rule.current_source_authority.as_deref() == Some("plan");
     match row.state.as_str() {
         "pending" => {
             let Some(run) = driver.find_run(
@@ -2248,13 +2315,49 @@ fn promotion_tick(
             }
             row.build_run_id = Some(run.id);
             row.artifact_digest = Some(digest.to_owned());
-            row.expected_current = Some(probe(driver, &rule)?);
+            row.expected_current = if plan_authority {
+                row.evidence_json = json!({});
+                None
+            } else {
+                Some(probe(driver, &rule)?)
+            };
             row.state = "plan_dispatch".into();
             checkpoint(store, row, "Delivery Pending")
         }
-        "plan_dispatch" | "approved" => {
-            let approved = row.state == "approved";
-            if approved && probe(driver, &rule)? != row.expected_current.clone().unwrap_or_default()
+        "plan_validated" if plan_authority => {
+            verify_plan(&row.evidence_json["plan"], row)?;
+            observed_current(&row.evidence_json["plan"])?;
+            let id = row.evidence_json["validated_plan_run_id"]
+                .as_str()
+                .ok_or("missing validated plan run")?;
+            validate_run(id)?;
+            promotion_approval(store, row)
+        }
+        "approved" if plan_authority => {
+            row.state = "revalidate_dispatch".into();
+            checkpoint(store, row, "Delivery Pending")
+        }
+        "plan_dispatch" | "approved" | "revalidate_dispatch" | "apply_ready" => {
+            let revalidate = row.state == "revalidate_dispatch";
+            let approved = row.state == "approved" || row.state == "apply_ready";
+            if row.state == "apply_ready" {
+                verify_plan(&row.evidence_json["revalidation"], row)?;
+                observed_current(&row.evidence_json["revalidation"])?;
+                let id = row.evidence_json["revalidation_dispatch_run_id"]
+                    .as_str()
+                    .ok_or("missing durable revalidation run")?;
+                validate_run(id)?;
+                if row.run_id.as_deref() != Some(id)
+                    || row.decision_id.is_none()
+                    || row.evidence_json["revalidation_decision_id"].as_str()
+                        != row.decision_id.as_deref()
+                {
+                    return Err("revalidation binding mismatch".into());
+                }
+            }
+            if approved
+                && !plan_authority
+                && probe(driver, &rule)? != row.expected_current.clone().unwrap_or_default()
             {
                 // The approval was for a different production base. Re-plan and
                 // require a fresh gate; never silently deploy across this race.
@@ -2277,6 +2380,8 @@ fn promotion_tick(
             row.run_id = None;
             row.state = if approved {
                 "approve_dispatching"
+            } else if revalidate {
+                "revalidate_dispatching"
             } else {
                 "plan_dispatching"
             }
@@ -2291,28 +2396,46 @@ fn promotion_tick(
             validate_run(&run_id)?;
             row.evidence_json[if approved {
                 "approve_dispatch_run_id"
+            } else if revalidate {
+                "revalidation_dispatch_run_id"
             } else {
                 "plan_dispatch_run_id"
             }] = json!(run_id);
             row.run_id = Some(run_id);
             row.state = if approved {
                 "approve_waiting"
+            } else if revalidate {
+                "revalidate_waiting"
             } else {
                 "plan_waiting"
             }
             .into();
             checkpoint(store, row, "Delivery Pending")
         }
-        "plan_dispatching" | "approve_dispatching" => Err(
+        "plan_dispatching" | "approve_dispatching" | "revalidate_dispatching" => Err(
             "dispatch outcome unknown after interruption; inspect workflow runs before retry"
                 .into(),
         ),
-        "plan_waiting" | "approve_waiting" => {
+        "plan_waiting" | "approve_waiting" | "revalidate_waiting" => {
+            let revalidate = row.state == "revalidate_waiting";
             let approved = row.state == "approve_waiting";
             let id = row.run_id.as_deref().ok_or("dispatched run ID missing")?;
             let Some(run) = driver.query_run(&row.github_repo, &rule.promote_workflow, id)? else {
                 return Ok(());
             };
+            let dispatch_key = if approved {
+                "approve_dispatch_run_id"
+            } else if revalidate {
+                "revalidation_dispatch_run_id"
+            } else {
+                "plan_dispatch_run_id"
+            };
+            if plan_authority && row.evidence_json[dispatch_key].as_str() != Some(id) {
+                return Err("stored dispatch binding mismatch".into());
+            }
+            if run.id != id {
+                return Err("dispatched run ID mismatch".into());
+            }
             if !run.completed {
                 return checkpoint(store, row, "Delivery Pending");
             }
@@ -2332,6 +2455,25 @@ fn promotion_tick(
                     &rule.plan_file
                 };
                 let value = artifact_json(driver, row, &run, &name, file, true)?;
+                if plan_authority && !approved {
+                    verify_immutable_plan(&value, row)?;
+                    let current = observed_current(&value)?;
+                    if revalidate {
+                        row.evidence_json["revalidation"] = value.clone();
+                        if row.expected_current.as_deref() == Some(&current) {
+                            row.evidence_json["revalidation_decision_id"] = json!(row.decision_id);
+                            row.state = "apply_ready".into();
+                            return checkpoint(store, row, "Delivery Pending");
+                        }
+                        row.attempt += 1;
+                        row.decision_id = None;
+                    }
+                    row.evidence_json["validated_plan_run_id"] = json!(run.id);
+                    row.expected_current = Some(current);
+                    row.evidence_json["plan"] = value;
+                    row.state = "plan_validated".into();
+                    return checkpoint(store, row, "Delivery Pending");
+                }
                 verify_plan(&value, row)?;
                 value
             } else {
@@ -2343,22 +2485,7 @@ fn promotion_tick(
                 row.state = "verified".into();
                 checkpoint(store, row, "Delivery Pending")
             } else {
-                let context = format!(
-                    "Approve production promotion {}? build_run_id={}, source_sha={}, artifact_digest={}, expected_current={}",
-                    row.name,
-                    row.build_run_id.as_deref().unwrap_or(""),
-                    row.merge_sha,
-                    row.artifact_digest.as_deref().unwrap_or(""),
-                    row.expected_current.as_deref().unwrap_or("")
-                );
-                open_gate(
-                    store,
-                    row,
-                    "prod_promotion_approval",
-                    "Pending Prod Promotion",
-                    &["Approve".into(), "Retry".into(), "Reject".into()],
-                    &context,
-                )
+                promotion_approval(store, row)
             }
         }
         other => Err(format!("unknown promotion state {other}")),
@@ -2622,6 +2749,7 @@ pub(crate) mod tests {
             plan_file: "plan.json".into(),
             delivery_file: Some("result.json".into()),
             current_source_probe: None,
+            current_source_authority: None,
             health_checks: vec![HealthCheck::Detailed(HealthCheckSpec {
                 url: "https://example.invalid/release".into(),
                 contains: None,
@@ -3094,6 +3222,366 @@ promotions:
         driver.promotion_result("201", "plan.json");
         tick(store, driver);
         assert_eq!(status(store), "Pending Prod Promotion");
+    }
+
+    fn plan_setup() -> (V2Store, MockDriver) {
+        let (mut store, driver) = promotion_setup();
+        let mut row = only_row(&store);
+        row.rule_json["current_source_authority"] = json!("plan");
+        row.rule_json["plan_inputs"]
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_current");
+        store.upsert_delivery(&row).unwrap();
+        (store, driver)
+    }
+
+    fn plan_result(driver: &mut MockDriver, id: &str, current: Value) {
+        driver.run("promote-sample.yml", "workflow_dispatch", id, 1, true, true);
+        driver.promotion_result(id, "plan.json");
+        let key = (id.into(), "plan.json".into());
+        let mut value: Value = serde_json::from_slice(&driver.files[&key]).unwrap();
+        value["expected_current"] = current;
+        driver
+            .files
+            .insert(key, serde_json::to_vec(&value).unwrap());
+    }
+
+    fn plan_gate(store: &mut V2Store, driver: &mut MockDriver, current: &str) {
+        tick(store, driver);
+        assert_eq!(only_row(store).expected_current, None);
+        tick(store, driver);
+        assert!(!driver.dispatches[0].contains_key("expected_current"));
+        plan_result(driver, "201", json!(current));
+        tick(store, driver);
+        assert_eq!(only_row(store).state, "plan_validated");
+        assert!(store.list_decisions(true, None).unwrap().is_empty());
+        tick(store, driver);
+        assert_eq!(only_row(store).state, "waiting");
+    }
+
+    #[test]
+    fn explicit_plan_selector_is_strict_and_legacy_remains_absent() {
+        let mut value = serde_json::to_value(promotion()).unwrap();
+        assert!(value.get("current_source_authority").is_none());
+        for invalid in [Value::Null, json!(""), json!("probe"), json!(1)] {
+            value["current_source_authority"] = invalid;
+            assert!(serde_json::from_value::<Promotion>(value.clone()).is_err());
+        }
+        value["current_source_authority"] = json!("plan");
+        let mut rule: Promotion = serde_json::from_value(value).unwrap();
+        let validate = |r| {
+            DeliveryContract {
+                schema_version: 1,
+                promotions: vec![r],
+                post_merge_workflows: vec![],
+            }
+            .validate()
+        };
+        assert!(validate(rule.clone()).is_err()); // current-dependent plan
+        rule.plan_inputs.remove("expected_current");
+        assert!(validate(rule.clone()).is_ok());
+        rule.current_source_probe = Some("https://example.invalid/current".into());
+        assert!(validate(rule.clone()).is_err());
+        rule.current_source_probe = None;
+        rule.delivery_file = None;
+        assert!(validate(rule).is_err());
+    }
+
+    #[test]
+    fn plan_adoption_rejects_invalid_current_and_immutable_tuple_before_gating() {
+        let mut bad = vec![
+            json!({}),
+            json!({"expected_current":null}),
+            json!({"expected_current":""}),
+            json!({"expected_current":" unsafe"}),
+            json!({"expected_current":42}),
+        ];
+        for (key, value) in [
+            ("source_sha", json!("wrong")),
+            ("build_run_id", json!("101")),
+            ("artifact_digest", json!("wrong")),
+            ("status", json!("blocked")),
+        ] {
+            let mut patch = json!({"expected_current":"otherwise-valid"});
+            patch[key] = value;
+            bad.push(patch);
+        }
+        for patch in bad {
+            let (mut store, mut driver) = plan_setup();
+            tick(&mut store, &mut driver);
+            tick(&mut store, &mut driver);
+            plan_result(&mut driver, "201", json!("none"));
+            let key = ("201".into(), "plan.json".into());
+            let mut value: Value = serde_json::from_slice(&driver.files[&key]).unwrap();
+            value.as_object_mut().unwrap().remove("expected_current");
+            for (k, v) in patch.as_object().unwrap() {
+                value[k] = v.clone();
+            }
+            driver
+                .files
+                .insert(key, serde_json::to_vec(&value).unwrap());
+            tick(&mut store, &mut driver);
+            assert_eq!(only_row(&store).expected_current, None);
+            assert_eq!(
+                store.list_decisions(true, None).unwrap()[0].kind,
+                "delivery_contract_error"
+            );
+            assert_eq!(driver.dispatches.len(), 1);
+        }
+    }
+
+    #[test]
+    fn plan_mode_revalidates_fresh_exact_run_and_dispatches_apply_once() {
+        for current in ["none", "release.opaque-v2"] {
+            let (mut store, mut driver) = plan_setup();
+            plan_gate(&mut store, &mut driver, current);
+            tick(&mut store, &mut driver);
+            assert_eq!(driver.dispatches.len(), 1);
+            approve(&mut store, "Approve");
+            tick(&mut store, &mut driver);
+            assert_eq!(only_row(&store).state, "revalidate_dispatch");
+            tick(&mut store, &mut driver);
+            assert_eq!(only_row(&store).state, "revalidate_waiting");
+            assert_eq!(driver.dispatches[1]["approve_production"], "false");
+            plan_result(&mut driver, "999", json!(current));
+            tick(&mut store, &mut driver);
+            assert_eq!(only_row(&store).state, "revalidate_waiting");
+            plan_result(&mut driver, "202", json!(current));
+            tick(&mut store, &mut driver);
+            assert_eq!(only_row(&store).state, "apply_ready");
+            tick(&mut store, &mut driver);
+            assert_eq!(only_row(&store).state, "approve_waiting");
+            assert_eq!(driver.dispatches[2]["approve_production"], "true");
+            assert_eq!(driver.dispatches[2]["expected_current"], current);
+            tick(&mut store, &mut driver);
+            assert_eq!(driver.dispatches.len(), 3);
+            driver.run(
+                "promote-sample.yml",
+                "workflow_dispatch",
+                "203",
+                1,
+                true,
+                true,
+            );
+            driver.promotion_result("203", "result.json");
+            let key = ("203".into(), "result.json".into());
+            let mut receipt: Value = serde_json::from_slice(&driver.files[&key]).unwrap();
+            receipt["expected_current"] = json!(current);
+            driver
+                .files
+                .insert(key, serde_json::to_vec(&receipt).unwrap());
+            tick(&mut store, &mut driver);
+            assert_eq!(only_row(&store).state, "verified");
+        }
+    }
+
+    #[test]
+    fn plan_drift_requires_new_gate_and_invalid_revalidation_is_error() {
+        for invalid in [false, true] {
+            let (mut store, mut driver) = plan_setup();
+            plan_gate(&mut store, &mut driver, "old");
+            let old_gate = only_row(&store).decision_id;
+            approve(&mut store, "Approve");
+            tick(&mut store, &mut driver);
+            tick(&mut store, &mut driver);
+            plan_result(&mut driver, "202", json!("new"));
+            if invalid {
+                let key = ("202".into(), "plan.json".into());
+                let mut value: Value = serde_json::from_slice(&driver.files[&key]).unwrap();
+                value["build_run_id"] = json!("wrong");
+                driver
+                    .files
+                    .insert(key, serde_json::to_vec(&value).unwrap());
+            }
+            tick(&mut store, &mut driver);
+            assert_eq!(driver.dispatches.len(), 2);
+            if invalid {
+                assert_eq!(only_row(&store).expected_current.as_deref(), Some("old"));
+                assert_eq!(
+                    store.list_decisions(true, None).unwrap()[0].kind,
+                    "delivery_contract_error"
+                );
+                approve(&mut store, "Retry");
+                tick(&mut store, &mut driver);
+                assert_eq!(only_row(&store).expected_current, None);
+                tick(&mut store, &mut driver);
+                assert_eq!(driver.dispatches[2]["approve_production"], "false");
+            } else {
+                assert_eq!(only_row(&store).state, "plan_validated");
+                assert_eq!(only_row(&store).expected_current.as_deref(), Some("new"));
+                assert_eq!(only_row(&store).decision_id, None);
+                tick(&mut store, &mut driver);
+                assert_ne!(only_row(&store).decision_id, old_gate);
+                approve(&mut store, "Reject");
+                tick(&mut store, &mut driver);
+                assert_eq!(driver.dispatches.len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn plan_missing_artifact_or_dispatch_binding_never_adopts_current() {
+        for wrong_binding in [false, true] {
+            let (mut store, mut driver) = plan_setup();
+            tick(&mut store, &mut driver);
+            tick(&mut store, &mut driver);
+            driver.run(
+                "promote-sample.yml",
+                "workflow_dispatch",
+                "201",
+                1,
+                true,
+                true,
+            );
+            if wrong_binding {
+                plan_result(&mut driver, "201", json!("none"));
+                let mut row = only_row(&store);
+                row.evidence_json["plan_dispatch_run_id"] = json!("999");
+                store.upsert_delivery(&row).unwrap();
+            }
+            tick(&mut store, &mut driver);
+            assert_eq!(only_row(&store).expected_current, None);
+            assert_eq!(
+                store.list_decisions(true, None).unwrap()[0].kind,
+                "delivery_contract_error"
+            );
+            assert_eq!(driver.dispatches.len(), 1);
+        }
+    }
+
+    #[test]
+    fn plan_apply_receipt_and_host_failure_remain_fail_closed() {
+        for field in [
+            "source_sha",
+            "build_run_id",
+            "artifact_digest",
+            "expected_current",
+            "host_cas",
+        ] {
+            let (mut store, mut driver) = plan_setup();
+            plan_gate(&mut store, &mut driver, "none");
+            approve(&mut store, "Approve");
+            tick(&mut store, &mut driver);
+            tick(&mut store, &mut driver);
+            plan_result(&mut driver, "202", json!("none"));
+            // Numeric IDs retain the existing artifact envelope semantics.
+            let key = ("202".into(), "plan.json".into());
+            let mut value: Value = serde_json::from_slice(&driver.files[&key]).unwrap();
+            value["build_run_id"] = json!(100);
+            driver
+                .files
+                .insert(key, serde_json::to_vec(&value).unwrap());
+            tick(&mut store, &mut driver);
+            tick(&mut store, &mut driver);
+            driver.run(
+                "promote-sample.yml",
+                "workflow_dispatch",
+                "203",
+                1,
+                true,
+                field != "host_cas",
+            );
+            driver.promotion_result("203", "result.json");
+            if field != "host_cas" {
+                let key = ("203".into(), "result.json".into());
+                let mut value: Value = serde_json::from_slice(&driver.files[&key]).unwrap();
+                value[field] = json!("wrong");
+                driver
+                    .files
+                    .insert(key, serde_json::to_vec(&value).unwrap());
+            }
+            tick(&mut store, &mut driver);
+            assert_eq!(only_row(&store).state, "waiting");
+            assert_eq!(
+                store.list_decisions(true, None).unwrap()[0].kind,
+                "delivery_contract_error"
+            );
+            assert!(!store.delivery_verification_recorded("DEMO-1", SHA).unwrap());
+            approve(&mut store, "Retry");
+            tick(&mut store, &mut driver);
+            assert_eq!(only_row(&store).expected_current, None);
+            tick(&mut store, &mut driver);
+            assert_eq!(driver.dispatches[3]["approve_production"], "false");
+        }
+    }
+
+    #[test]
+    fn plan_checkpoints_survive_real_sqlite_reopen_and_unknown_dispatch_fails_closed() {
+        let temp = IsolatedDir::new().unwrap();
+        let path = temp.0.join("delivery.sqlite");
+        let (initial, mut driver) = plan_setup();
+        let mut store = V2Store::open(&path).unwrap();
+        store
+            .upsert_task(&initial.get_task("DEMO-1").unwrap().unwrap())
+            .unwrap();
+        store.upsert_delivery(&only_row(&initial)).unwrap();
+        let reopen = |store: &mut V2Store| {
+            let replacement = V2Store::open(&path).unwrap();
+            *store = replacement;
+        };
+        for expected in ["plan_dispatch", "plan_waiting"] {
+            tick(&mut store, &mut driver);
+            reopen(&mut store);
+            assert_eq!(only_row(&store).state, expected);
+        }
+        plan_result(&mut driver, "201", json!("none"));
+        for expected in ["plan_validated", "waiting"] {
+            tick(&mut store, &mut driver);
+            reopen(&mut store);
+            assert_eq!(only_row(&store).state, expected);
+        }
+        approve(&mut store, "Approve");
+        reopen(&mut store);
+        assert_eq!(only_row(&store).state, "approved");
+        for expected in ["revalidate_dispatch", "revalidate_waiting"] {
+            tick(&mut store, &mut driver);
+            reopen(&mut store);
+            assert_eq!(only_row(&store).state, expected);
+        }
+        plan_result(&mut driver, "202", json!("new"));
+        tick(&mut store, &mut driver);
+        reopen(&mut store);
+        assert_eq!(only_row(&store).state, "plan_validated");
+        assert_eq!(only_row(&store).expected_current.as_deref(), Some("new"));
+        tick(&mut store, &mut driver);
+        reopen(&mut store);
+        approve(&mut store, "Approve");
+        reopen(&mut store);
+        tick(&mut store, &mut driver);
+        reopen(&mut store);
+        tick(&mut store, &mut driver);
+        reopen(&mut store);
+        plan_result(&mut driver, "203", json!("new"));
+        tick(&mut store, &mut driver);
+        reopen(&mut store);
+        assert_eq!(only_row(&store).state, "apply_ready");
+        tick(&mut store, &mut driver);
+        reopen(&mut store);
+        assert_eq!(
+            driver
+                .dispatches
+                .iter()
+                .filter(|d| d["approve_production"] == "true")
+                .count(),
+            1
+        );
+        for state in [
+            "plan_dispatching",
+            "revalidate_dispatching",
+            "approve_dispatching",
+        ] {
+            let mut row = only_row(&store);
+            row.state = state.into();
+            row.decision_id = None;
+            store.upsert_delivery(&row).unwrap();
+            reopen(&mut store);
+            let count = driver.dispatches.len();
+            tick(&mut store, &mut driver);
+            reopen(&mut store);
+            assert_eq!(only_row(&store).state, "waiting");
+            assert_eq!(driver.dispatches.len(), count);
+        }
     }
 
     #[test]

@@ -255,3 +255,44 @@ from a regular non-symlink file. The output uses exclusive creation with mode
 `.github/workflows/ci.yml` policy. It emits static failure codes and no success
 metadata on stdout. This executable is trusted tooling for the existing Actions
 owner, not a service, candidate-code runner, authenticator or publisher.
+
+Repository-owned promotion contracts may opt in to `current_source_authority: plan`
+under a promotion in schema version 1. The selector is exclusive with
+`current_source_probe`; omitted selectors preserve the existing probe behavior
+(and `none` when no probe is configured). Unknown, empty and null selectors fail
+closed. A generic promotion fragment is:
+
+```yaml
+current_source_authority: plan
+plan_inputs:
+  build_run_id: '${build_run_id}'
+  source_sha: '${source_sha}'
+  artifact_digest: '${artifact_digest}'
+  approve_production: 'false'
+approve_inputs:
+  build_run_id: '${build_run_id}'
+  source_sha: '${source_sha}'
+  artifact_digest: '${artifact_digest}'
+  expected_current: '${expected_current}'
+  approve_production: 'true'
+plan_file: plan.json
+delivery_file: result.json
+```
+
+The read-only producer must observe the actual deployment host and return a
+normalized top-level `expected_current` string, explicitly `none` for an empty
+host, alongside `source_sha`, `build_run_id` and `artifact_digest` (or
+`artifact_sha256`). Current identities may be safe opaque tokens; missing, null,
+empty, nonstring and unsafe values are errors. Plan inputs cannot reference
+`${expected_current}`. This mode requires a complete delivery receipt through
+`delivery_file`.
+
+Zach verifies the exact dispatched plan run and its immutable tuple before
+saving the observed current at `plan_validated` and opening human production
+approval. Approval triggers a new read-only run. Equal current is durably saved
+at `apply_ready` before one apply dispatch; drift adopts the newly verified
+current and requires a fresh approval. The host must still enforce
+expected-current CAS during apply, and the final receipt must match the entire
+approved tuple. A failed apply requires a fresh plan and approval through Retry.
+Restarting an unknown dispatch outcome requires intervention and never replays
+that dispatch automatically.
