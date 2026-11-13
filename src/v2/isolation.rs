@@ -525,13 +525,16 @@ pub fn validate_addresses(addresses: Vec<SocketAddr>) -> Result<Vec<SocketAddr>,
 // globally and bound each caller's wait; a stuck resolver retains its slot.
 fn resolve_public_host(host: &str) -> Result<Vec<SocketAddr>, String> {
     static RESOLVERS: AtomicUsize = AtomicUsize::new(0);
-    if RESOLVERS
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-            (n < MAX_TUNNELS).then_some(n + 1)
-        })
-        .is_err()
-    {
-        return Err("resolver capacity reached".into());
+    let mut count = RESOLVERS.load(Ordering::Acquire);
+    loop {
+        if count >= MAX_TUNNELS {
+            return Err("resolver capacity reached".into());
+        }
+        match RESOLVERS.compare_exchange_weak(count, count + 1, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => break,
+            Err(current) => count = current,
+        }
     }
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     let host = host.to_owned();
