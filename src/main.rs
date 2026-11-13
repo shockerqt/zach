@@ -549,6 +549,8 @@ fn parse_gateway_options(
     let mut port = None;
     let mut bind = None;
     let mut socket = None;
+    let mut allowed_origins = Vec::new();
+    let mut allowed_decision_kinds = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     let mut i = 0;
     while i < args.len() {
@@ -556,6 +558,8 @@ fn parse_gateway_options(
             "--web" if daemon => "web",
             "--once" if daemon => "once",
             "--db" if daemon => "db",
+            "--web-allow-origin" => "origin",
+            "--web-allow-decision-kind" => "kind",
             "--socket" => "socket",
             "--web-port" => "port",
             "--port" if !daemon => "port",
@@ -563,7 +567,7 @@ fn parse_gateway_options(
             "--web-bind" if daemon => "bind",
             _ => return Err("unsupported web/daemon option; see --help".into()),
         };
-        if !seen.insert(key) {
+        if !matches!(key, "origin" | "kind") && !seen.insert(key) {
             return Err("duplicate web/daemon option".into());
         }
         if key == "web" {
@@ -586,13 +590,31 @@ fn parse_gateway_options(
                 }
                 "bind" => bind = Some(value.as_str()),
                 "socket" => socket = Some(PathBuf::from(value)),
+                "origin" => {
+                    if allowed_origins.len() >= 16 {
+                        return Err("too many allowed origins".into());
+                    }
+                    allowed_origins.push(value.clone());
+                }
+                "kind" => {
+                    if allowed_decision_kinds.len() >= 32 {
+                        return Err("too many allowed decision kinds".into());
+                    }
+                    allowed_decision_kinds.push(value.clone());
+                }
                 _ => {}
             }
         }
         i += 1;
     }
+    zach::v2::web_gateway::validate_web_policy(&allowed_origins, &allowed_decision_kinds)
+        .map_err(|_| "invalid web policy configuration")?;
     if !enabled {
-        if port.is_some() || bind.is_some() {
+        if port.is_some()
+            || bind.is_some()
+            || !allowed_origins.is_empty()
+            || !allowed_decision_kinds.is_empty()
+        {
             return Err("web binding options require --web".into());
         }
         return Ok(None);
@@ -616,6 +638,8 @@ fn parse_gateway_options(
         bind_addr: addr,
         socket_path: socket.unwrap_or_else(default_socket_path),
         state_dir: default_state_dir(),
+        allowed_origins,
+        allowed_decision_kinds,
     }))
 }
 
@@ -793,6 +817,9 @@ fn print_usage() {
         "       zach daemon [--socket <PATH>] [--db <PATH>] [--once] [--web] [--web-port <PORT>] [--web-bind <IP:PORT>]"
     );
     println!("       zach web [--socket <PATH>] [--web-port <PORT>] [--bind <IP:PORT>]");
+    println!(
+        "       Web policy (both forms): [--web-allow-origin <ORIGIN>] [--web-allow-decision-kind <KIND>] (repeatable)"
+    );
     println!("       zach attach [--group <GROUP>] [--since-seq <N>] [--once] [--socket <PATH>]");
     println!(
         "       zach events [--group <GROUP>] [--since-seq <N>] [--wait] [--socket <PATH>] [--db <PATH>]"
@@ -916,5 +943,68 @@ mod tests {
         }
         assert!(web_options(&[], false, Some("0.0.0.0:8096")).is_err());
         assert!(web_options(&[], false, Some("invalid")).is_err());
+    }
+    #[test]
+    fn web_options_policy_validation_and_daemon_requires_web() {
+        for daemon in [false, true] {
+            let mut args = vec![
+                "--web-allow-origin",
+                "https://zach.shocker.cl",
+                "--web-allow-origin",
+                "http://[::1]:8096",
+                "--web-allow-decision-kind",
+                "merge_approval",
+            ];
+            if daemon {
+                args.push("--web");
+            }
+            let config = web_options(&args, daemon, None).unwrap().unwrap();
+            assert_eq!(config.allowed_origins.len(), 2);
+            assert_eq!(config.allowed_decision_kinds, ["merge_approval"]);
+            for bad in [
+                vec!["--web-allow-origin", "*"],
+                vec!["--web-allow-origin", "null"],
+                vec!["--web-allow-origin", "https://a/"],
+                vec![
+                    "--web-allow-origin",
+                    "https://a",
+                    "--web-allow-origin",
+                    "https://a",
+                ],
+                vec!["--web-allow-decision-kind", "UPPER"],
+                vec![
+                    "--web-allow-decision-kind",
+                    "a",
+                    "--web-allow-decision-kind",
+                    "a",
+                ],
+            ] {
+                let mut bad = bad;
+                if daemon {
+                    bad.push("--web");
+                }
+                assert!(web_options(&bad, daemon, None).is_err());
+            }
+            for (flag, count) in [
+                ("--web-allow-origin", 17),
+                ("--web-allow-decision-kind", 33),
+            ] {
+                let mut args = Vec::new();
+                for i in 0..count {
+                    args.push(flag.to_string());
+                    args.push(if flag.ends_with("origin") {
+                        format!("https://a{i}")
+                    } else {
+                        format!("kind{i}")
+                    });
+                }
+                if daemon {
+                    args.push("--web".into());
+                }
+                assert!(parse_gateway_options(&args, daemon, None).is_err());
+            }
+        }
+        assert!(web_options(&["--web-allow-origin", "https://a"], true, None).is_err());
+        assert!(web_options(&["--web-allow-decision-kind", "merge_approval"], true, None).is_err());
     }
 }

@@ -573,6 +573,12 @@ impl Coordinator {
                     as_of_seq,
                 }]
             }
+            ClientCommand::GetDecision { decision_id } => vec![ServerMessage::Decision {
+                decision: self
+                    .store
+                    .get_decision(&decision_id)
+                    .map_err(|e| e.to_string())?,
+            }],
             ClientCommand::Decide {
                 decision_id,
                 choice,
@@ -5102,6 +5108,82 @@ mod tests {
                     .all(|op| op.state == "ACKNOWLEDGED"),
                 "{case}"
             );
+        }
+    }
+    #[test]
+    fn coordinator_get_decision_is_read_only_including_resolved_and_kind_invariant() {
+        let dir = TestDirectory::new();
+        let (mut c, _) = Coordinator::create(V2Store::open_in_memory().unwrap(), dir.0.clone());
+        let t = task("lookup");
+        c.save(&t).unwrap();
+        let initial = c
+            .store
+            .open_decision(
+                "arbitrary-id",
+                &t.task_id,
+                &t.task_group,
+                "human-merge-approval",
+                "choose",
+                &["approve".into(), "reject".into()],
+                Some(0),
+                "synthetic",
+                None,
+            )
+            .unwrap();
+        // Reopening an existing ID cannot replace the authoritative kind.
+        let reopened = c
+            .store
+            .open_decision(
+                "arbitrary-id",
+                &t.task_id,
+                &t.task_group,
+                "plan_approval",
+                "different",
+                &["other".into()],
+                None,
+                "different",
+                None,
+            )
+            .unwrap();
+        assert_eq!(initial, reopened);
+        for resolved in [false, true] {
+            if resolved {
+                c.store
+                    .resolve_decision("arbitrary-id", "reject", "tester", None)
+                    .unwrap();
+            }
+            let before = c.store.status_summary().unwrap();
+            for id in ["arbitrary-id", "missing"] {
+                let expected = c.store.get_decision(id).unwrap();
+                assert_eq!(
+                    c.socket_command(ClientCommand::GetDecision {
+                        decision_id: id.into()
+                    })
+                    .unwrap(),
+                    vec![ServerMessage::Decision { decision: expected }]
+                );
+            }
+            assert_eq!(before, c.store.status_summary().unwrap());
+            if !resolved {
+                // Another owner resolves after lookup, before the eventual Decide.
+                c.store
+                    .resolve_decision("arbitrary-id", "reject", "other-owner", None)
+                    .unwrap();
+                let winner = c.store.get_decision("arbitrary-id").unwrap();
+                assert_eq!(
+                    c.socket_command(ClientCommand::Decide {
+                        decision_id: "arbitrary-id".into(),
+                        choice: "approve".into(),
+                        by: Some("web-client".into()),
+                        note: None
+                    })
+                    .unwrap(),
+                    vec![ServerMessage::DecisionResult {
+                        outcome: "ALREADY_RESOLVED".into(),
+                        decision: winner
+                    }]
+                );
+            }
         }
     }
 }

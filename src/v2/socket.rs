@@ -40,6 +40,9 @@ pub enum ClientCommand {
         #[serde(default)]
         once: bool,
     },
+    GetDecision {
+        decision_id: String,
+    },
     #[serde(alias = "DECIDE", alias = "Decide")]
     Decide {
         decision_id: String,
@@ -67,6 +70,10 @@ pub enum ServerMessage {
     Status {
         ok: bool,
         status: DaemonStatusSummary,
+    },
+    #[serde(rename = "DECISION")]
+    Decision {
+        decision: Option<PendingDecisionRecord>,
     },
     #[serde(rename = "DECISION_RESULT")]
     DecisionResult {
@@ -414,6 +421,10 @@ impl DaemonServer {
                         status: summary,
                     };
                     let _ = write_ndjson(&mut sub.stream, &msg);
+                }
+                Ok(ClientCommand::GetDecision { decision_id }) => {
+                    let decision = store.get_decision(&decision_id)?;
+                    let _ = write_ndjson(&mut sub.stream, &ServerMessage::Decision { decision });
                 }
                 Ok(ClientCommand::Decide {
                     decision_id,
@@ -1160,6 +1171,26 @@ mod tests {
         assert_eq!(status_resp["ok"], true);
         assert_eq!(status_resp["status"]["open_decisions_count"], 1);
 
+        let before_lookup = store.status_summary().unwrap();
+        write_ndjson(
+            &mut write_client1,
+            &ClientCommand::GetDecision {
+                decision_id: "DEC-001".into(),
+            },
+        )
+        .unwrap();
+        server.tick(&mut store).unwrap();
+        line.clear();
+        reader1.read_line(&mut line).unwrap();
+        let lookup: ServerMessage = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            lookup,
+            ServerMessage::Decision {
+                decision: store.get_decision("DEC-001").unwrap()
+            }
+        );
+        assert_eq!(store.status_summary().unwrap(), before_lookup);
+
         // Client 1: resolve decision
         write_ndjson(
             &mut write_client1,
@@ -1180,6 +1211,27 @@ mod tests {
         assert_eq!(dec_resp["type"], "DECISION_RESULT");
         assert_eq!(dec_resp["outcome"], "RESOLVED");
         assert_eq!(dec_resp["decision"]["choice"].as_str(), Some("approve"));
+
+        let before_lookup = store.status_summary().unwrap();
+        for id in ["DEC-001", "missing"] {
+            write_ndjson(
+                &mut write_client1,
+                &ClientCommand::GetDecision {
+                    decision_id: id.into(),
+                },
+            )
+            .unwrap();
+            server.tick(&mut store).unwrap();
+            line.clear();
+            reader1.read_line(&mut line).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ServerMessage>(&line).unwrap(),
+                ServerMessage::Decision {
+                    decision: store.get_decision(id).unwrap()
+                }
+            );
+        }
+        assert_eq!(store.status_summary().unwrap(), before_lookup);
 
         // Client 1: decide again -> ALREADY_RESOLVED
         write_ndjson(

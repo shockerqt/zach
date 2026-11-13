@@ -14,7 +14,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use subtle::ConstantTimeEq;
 
+const REQUEST_LINE_LIMIT: usize = 4096;
+const QUERY_LIMIT: usize = 32;
 const HEADER_LIMIT: usize = 16 * 1024;
 const BODY_LIMIT: usize = 16 * 1024;
 const BACKEND_LIMIT: usize = 4 * 1024 * 1024;
@@ -23,15 +26,185 @@ const MAX_SSE: usize = 8;
 const WAIT: Duration = Duration::from_secs(5);
 const TICK: Duration = Duration::from_millis(50);
 
+const DEFAULT_DECISION_KINDS: &[&str] = &[
+    "plan_approval",
+    "human-plan-approval",
+    "retries_exhausted",
+    "scope_violation",
+    "plan_rework_limit",
+    "review_rework_limit",
+    "governance_close_failed",
+    "governance_publication_failed",
+    "checkpoint_unverifiable",
+    "repository_ownership_conflict",
+    "cross_family_reviewer_unavailable",
+    "merge_failed",
+    "post_merge_failure",
+    "new_apk_required",
+    "prod_promotion_approval",
+    "delivery_contract_error",
+];
+struct Policy {
+    bind_origin: String,
+    allowed_origins: Vec<String>,
+    allowed_decision_kinds: Vec<String>,
+}
+impl Policy {
+    fn origin_allowed(&self, origin: &str) -> bool {
+        valid_origin(origin)
+            && (origin == self.bind_origin || self.allowed_origins.iter().any(|o| o == origin))
+    }
+    fn kind_allowed(&self, kind: &str) -> bool {
+        DEFAULT_DECISION_KINDS.contains(&kind)
+            || self.allowed_decision_kinds.iter().any(|k| k == kind)
+    }
+}
+// Deliberately accepts only serialized origins, never URLs or proxy-derived authorities.
+fn valid_origin(origin: &str) -> bool {
+    if origin.len() > 512
+        || !origin.is_ascii()
+        || origin
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return false;
+    }
+    let Some(authority) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    if authority.is_empty() || authority.contains(['/', '?', '#', '@', '\\', '*']) {
+        return false;
+    }
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let Some((host, tail)) = rest.split_once(']') else {
+            return false;
+        };
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        let port = if tail.is_empty() {
+            None
+        } else if let Some(port) = tail.strip_prefix(':') {
+            Some(port)
+        } else {
+            return false;
+        };
+        (host, port)
+    } else {
+        let (host, port) = authority
+            .split_once(':')
+            .map_or((authority, None), |(h, p)| (h, Some(p)));
+        if host.len() > 253
+            || host.split('.').any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || label.starts_with('-')
+                    || label.ends_with('-')
+                    || !label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
+        {
+            return false;
+        }
+        (host, port)
+    };
+    if host.is_empty() {
+        return false;
+    }
+    port.is_none_or(|p| {
+        !p.is_empty()
+            && p.bytes().all(|b| b.is_ascii_digit())
+            && p.parse::<u16>().is_ok_and(|p| p > 0)
+    })
+}
+pub fn validate_web_policy(origins: &[String], kinds: &[String]) -> io::Result<()> {
+    if origins.len() > 16 || kinds.len() > 32 {
+        return Err(invalid("too many web policy entries"));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for origin in origins {
+        if !valid_origin(origin) || !seen.insert(origin) {
+            return Err(invalid("invalid or duplicate allowed origin"));
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    for kind in kinds {
+        if kind.is_empty()
+            || kind.len() > 64
+            || !kind
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+            || !seen.insert(kind)
+        {
+            return Err(invalid("invalid or duplicate decision kind"));
+        }
+    }
+    Ok(())
+}
+fn cors_headers(origin: Option<&str>) -> String {
+    match origin {
+        Some(origin) => format!("Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n"),
+        None => "Vary: Origin\r\n".into(),
+    }
+}
+fn preflight(
+    stream: &mut TcpStream,
+    req: &Request,
+    origin: Option<&str>,
+    stop: &AtomicBool,
+) -> io::Result<()> {
+    let method = match req.route.as_str() {
+        "/api/snapshot" | "/api/events" => "GET",
+        "/api/decide" => "POST",
+        _ => return error(stream, 403, "preflight forbidden", stop, origin),
+    };
+    if origin.is_none()
+        || !req.body.is_empty()
+        || req
+            .headers
+            .get("access-control-request-method")
+            .map(String::as_str)
+            != Some(method)
+    {
+        return error(stream, 403, "preflight forbidden", stop, origin);
+    }
+    let mut headers = Vec::new();
+    if let Some(requested) = req.headers.get("access-control-request-headers") {
+        for name in requested.split(',') {
+            let name = name.trim_matches([' ', '\t']).to_ascii_lowercase();
+            if headers.len() >= 3
+                || !["authorization", "content-type", "last-event-id"].contains(&name.as_str())
+                || headers.contains(&name)
+            {
+                return error(stream, 403, "preflight forbidden", stop, origin);
+            }
+            headers.push(name);
+        }
+    }
+    let head = format!(
+        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\nAccess-Control-Allow-Origin: {}\r\nAccess-Control-Allow-Methods: {method}\r\nAccess-Control-Allow-Headers: {}\r\nVary: Origin, Access-Control-Request-Method, Access-Control-Request-Headers\r\n\r\n",
+        origin.unwrap(),
+        headers.join(", ")
+    );
+    write_bounded(stream, head.as_bytes(), stop, Instant::now() + WAIT)
+}
+
 pub struct GatewayConfig {
     pub bind_addr: SocketAddr,
     pub socket_path: PathBuf,
     pub state_dir: PathBuf,
+    pub allowed_origins: Vec<String>,
+    pub allowed_decision_kinds: Vec<String>,
 }
 pub struct WebGateway {
     listener: TcpListener,
     socket_path: PathBuf,
     token: String,
+    policy: Arc<Policy>,
 }
 pub struct GatewayHandle {
     stop: Arc<AtomicBool>,
@@ -66,13 +239,20 @@ impl WebGateway {
         if !config.bind_addr.ip().is_loopback() {
             return Err(invalid("loopback address required"));
         }
+        validate_web_policy(&config.allowed_origins, &config.allowed_decision_kinds)?;
         let listener = TcpListener::bind(config.bind_addr)?;
+        let policy = Arc::new(Policy {
+            bind_origin: format!("http://{}", listener.local_addr()?),
+            allowed_origins: config.allowed_origins,
+            allowed_decision_kinds: config.allowed_decision_kinds,
+        });
         listener.set_nonblocking(true)?;
         let token = session_token(&config.state_dir)?;
         Ok(Self {
             listener,
             socket_path: config.socket_path,
             token,
+            policy,
         })
     }
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -110,6 +290,7 @@ impl WebGateway {
                     }
                     let path = self.socket_path.clone();
                     let token = self.token.clone();
+                    let policy = self.policy.clone();
                     let stop = stop.clone();
                     let sse = sse.clone();
                     match thread::Builder::new()
@@ -117,7 +298,7 @@ impl WebGateway {
                         .spawn(move || {
                             let _ = stream.set_read_timeout(Some(TICK));
                             let _ = stream.set_write_timeout(Some(TICK));
-                            let _ = serve(&mut stream, &path, &token, &stop, &sse);
+                            let _ = serve(&mut stream, &path, &token, &stop, &sse, &policy);
                         }) {
                         Ok(t) => workers.push(t),
                         Err(e) => {
@@ -335,6 +516,14 @@ fn read_request(stream: &mut TcpStream, stop: &AtomicBool) -> io::Result<Request
     let mut chunk = [0u8; 2048];
     let end = loop {
         check(stop, deadline)?;
+        if bytes
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .unwrap_or(bytes.len())
+            > REQUEST_LINE_LIMIT
+        {
+            return Err(invalid("request line too large"));
+        }
         if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
             if pos + 4 > HEADER_LIMIT {
                 return Err(invalid("headers too large"));
@@ -369,7 +558,15 @@ fn read_request(stream: &mut TcpStream, stop: &AtomicBool) -> io::Result<Request
         .to_owned();
     let path = parsed.path.ok_or_else(|| invalid("missing path"))?;
     let (route, query_text) = path.split_once('?').unwrap_or((path, ""));
-    if !route.starts_with('/') {
+    if !route.starts_with('/')
+        || route.starts_with("//")
+        || path.contains('#')
+        || path.contains('\\')
+    {
+        return Err(invalid("invalid target"));
+    }
+    let decoded_route = decode(route)?;
+    if decoded_route.chars().any(char::is_control) {
         return Err(invalid("invalid target"));
     }
     let route = route.to_owned();
@@ -378,7 +575,7 @@ fn read_request(stream: &mut TcpStream, stop: &AtomicBool) -> io::Result<Request
         let key = h.name.to_ascii_lowercase();
         let value = std::str::from_utf8(h.value)
             .map_err(|_| invalid("invalid header"))?
-            .trim()
+            .trim_matches([' ', '\t'])
             .to_owned();
         if headers.insert(key, value).is_some() {
             return Err(invalid("duplicate header"));
@@ -398,9 +595,30 @@ fn read_request(stream: &mut TcpStream, stop: &AtomicBool) -> io::Result<Request
         return Err(invalid("invalid body length"));
     }
     let mut query = HashMap::new();
-    for pair in query_text.split('&').filter(|s| !s.is_empty()) {
+    for (index, pair) in query_text.split('&').filter(|s| !s.is_empty()).enumerate() {
+        if index >= QUERY_LIMIT {
+            return Err(invalid("too many query fields"));
+        }
         let (key, val) = pair.split_once('=').unwrap_or((pair, ""));
-        if query.insert(decode(key)?, decode(val)?).is_some() {
+        let key = decode(key)?;
+        let val = decode(val)?;
+        if [
+            "token",
+            "access_token",
+            "session_token",
+            "web_session_token",
+            "authorization",
+            "bearer",
+        ]
+        .iter()
+        .any(|name| key.eq_ignore_ascii_case(name))
+        {
+            return Err(invalid("URL credentials forbidden"));
+        }
+        if key.chars().chain(val.chars()).any(char::is_control) {
+            return Err(invalid("invalid query"));
+        }
+        if query.insert(key, val).is_some() {
             return Err(invalid("duplicate query"));
         }
     }
@@ -427,11 +645,13 @@ fn response(
     code: u16,
     data: &impl Serialize,
     stop: &AtomicBool,
+    origin: Option<&str>,
 ) -> io::Result<()> {
     let body = serde_json::to_vec(data).map_err(io::Error::other)?;
     let reason = match code {
         200 => "OK",
         400 => "Bad Request",
+        403 => "Forbidden",
         401 => "Unauthorized",
         404 => "Not Found",
         503 => "Service Unavailable",
@@ -439,15 +659,28 @@ fn response(
         _ => "Error",
     };
     let head = format!(
-        "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-        body.len()
+        "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n{}\r\n",
+        body.len(),
+        cors_headers(origin)
     );
     let deadline = Instant::now() + WAIT;
     write_bounded(stream, head.as_bytes(), stop, deadline)?;
     write_bounded(stream, &body, stop, deadline)
 }
-fn error(stream: &mut TcpStream, code: u16, message: &str, stop: &AtomicBool) -> io::Result<()> {
-    response(stream, code, &serde_json::json!({"error": message}), stop)
+fn error(
+    stream: &mut TcpStream,
+    code: u16,
+    message: &str,
+    stop: &AtomicBool,
+    origin: Option<&str>,
+) -> io::Result<()> {
+    response(
+        stream,
+        code,
+        &serde_json::json!({"error": message}),
+        stop,
+        origin,
+    )
 }
 fn cursor(req: &Request) -> io::Result<i64> {
     // Validate both supplied values even when the header takes precedence.
@@ -473,14 +706,10 @@ fn authorized(value: Option<&String>, token: &str) -> bool {
     let Some((scheme, supplied)) = value.split_once(' ') else {
         return false;
     };
-    if !scheme.eq_ignore_ascii_case("Bearer") || supplied.len() != token.len() {
+    if !scheme.eq_ignore_ascii_case("Bearer") || supplied.len() != 64 || token.len() != 64 {
         return false;
     }
-    supplied
-        .bytes()
-        .zip(token.bytes())
-        .fold(0u8, |diff, (a, b)| diff | (a ^ b))
-        == 0
+    bool::from(supplied.as_bytes().ct_eq(token.as_bytes()))
 }
 
 struct Backend {
@@ -608,6 +837,7 @@ fn backend_error(
     e: io::Error,
     dispatched: bool,
     stop: &AtomicBool,
+    origin: Option<&str>,
 ) -> io::Result<()> {
     let timeout = e.kind() == io::ErrorKind::TimedOut;
     error(
@@ -621,6 +851,7 @@ fn backend_error(
             "backend unavailable"
         },
         stop,
+        origin,
     )
 }
 fn serve(
@@ -629,13 +860,23 @@ fn serve(
     token: &str,
     stop: &AtomicBool,
     sse: &std::sync::atomic::AtomicUsize,
+    policy: &Policy,
 ) -> io::Result<()> {
     let req = match read_request(stream, stop) {
         Ok(r) => r,
-        Err(_) => return error(stream, 400, "invalid request", stop),
+        Err(_) => return error(stream, 400, "invalid request", stop, None),
     };
+    let origin = req.headers.get("origin").map(String::as_str);
+    if origin.is_some_and(|o| !policy.origin_allowed(o))
+        || (req.method == "POST" && origin.is_none())
+    {
+        return error(stream, 403, "origin forbidden", stop, None);
+    }
+    if req.method == "OPTIONS" {
+        return preflight(stream, &req, origin, stop);
+    }
     if !authorized(req.headers.get("authorization"), token) {
-        return error(stream, 401, "unauthorized", stop);
+        return error(stream, 401, "unauthorized", stop, origin);
     }
     let group = req.query.get("group").cloned();
     match (req.method.as_str(), req.route.as_str()) {
@@ -679,8 +920,8 @@ fn serve(
                 })
             })();
             match result {
-                Ok(data) => response(stream, 200, &data, stop),
-                Err(e) => backend_error(stream, e, false, stop),
+                Ok(data) => response(stream, 200, &data, stop, origin),
+                Err(e) => backend_error(stream, e, false, stop, origin),
             }
         }
         ("POST", "/api/decide") => {
@@ -693,12 +934,36 @@ fn serve(
                 {
                     b
                 }
-                _ => return error(stream, 400, "invalid decision request", stop),
+                _ => return error(stream, 400, "invalid decision request", stop, origin),
             };
             let deadline = Instant::now() + WAIT;
             let mut dispatched = false;
             let result = (|| {
                 let mut backend = Backend::connect(path, stop, deadline)?;
+                backend.send(
+                    &ClientCommand::GetDecision {
+                        decision_id: body.decision_id.clone(),
+                    },
+                    stop,
+                    deadline,
+                )?;
+                let record = match backend.receive(stop, deadline)? {
+                    Some(ServerMessage::Decision { decision: None }) => {
+                        return Ok(("NOT_FOUND".into(), None));
+                    }
+                    Some(ServerMessage::Decision {
+                        decision: Some(record),
+                    }) if record.decision_id == body.decision_id
+                        && matches!(record.status.as_str(), "OPEN" | "RESOLVED")
+                        && !record.kind.is_empty() =>
+                    {
+                        record
+                    }
+                    _ => return Err(invalid("backend decision unavailable")),
+                };
+                if !policy.kind_allowed(&record.kind) {
+                    return Ok(("FORBIDDEN".into(), None));
+                }
                 // Once sending starts, any failure may leave an unknown outcome.
                 dispatched = true;
                 backend.send(
@@ -735,24 +1000,28 @@ fn serve(
                         if outcome == "NOT_FOUND" { 404 } else { 200 },
                         &serde_json::json!({"outcome":outcome,"decision":decision}),
                         stop,
+                        origin,
                     )
                 }
-                Ok((outcome, _)) if outcome == "INVALID_REQUEST" => {
-                    error(stream, 400, "invalid decision request", stop)
+                Ok((outcome, _)) if outcome == "FORBIDDEN" => {
+                    error(stream, 403, "decision kind forbidden", stop, origin)
                 }
-                Ok(_) => error(stream, 503, "backend decision unavailable", stop),
-                Err(e) => backend_error(stream, e, dispatched, stop),
+                Ok((outcome, _)) if outcome == "INVALID_REQUEST" => {
+                    error(stream, 400, "invalid decision request", stop, origin)
+                }
+                Ok(_) => error(stream, 503, "backend decision unavailable", stop, origin),
+                Err(e) => backend_error(stream, e, dispatched, stop, origin),
             }
         }
         ("GET", "/api/events") => {
             let since = match cursor(&req) {
                 Ok(n) => n,
-                Err(_) => return error(stream, 400, "invalid cursor", stop),
+                Err(_) => return error(stream, 400, "invalid cursor", stop, origin),
             };
             let mut active = sse.load(Ordering::Acquire);
             loop {
                 if active >= MAX_SSE {
-                    return error(stream, 503, "event capacity reached", stop);
+                    return error(stream, 503, "event capacity reached", stop, origin);
                 }
                 match sse.compare_exchange_weak(
                     active,
@@ -785,15 +1054,19 @@ fn serve(
                 Ok(b)
             }) {
                 Ok(b) => b,
-                Err(e) => return backend_error(stream, e, false, stop),
+                Err(e) => return backend_error(stream, e, false, stop, origin),
             };
             // Wait for the first backend response before committing HTTP success.
             let mut next = match backend.receive(stop, deadline) {
                 Ok(Some(m)) if !matches!(m, ServerMessage::Error { .. }) => Some(m),
-                Ok(_) => return error(stream, 503, "backend unavailable", stop),
-                Err(e) => return backend_error(stream, e, false, stop),
+                Ok(_) => return error(stream, 503, "backend unavailable", stop, origin),
+                Err(e) => return backend_error(stream, e, false, stop, origin),
             };
-            write_bounded(stream, b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache, no-transform\r\nConnection: close\r\n\r\n", stop, Instant::now() + WAIT)?;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache, no-transform\r\nConnection: close\r\n{}\r\n",
+                cors_headers(origin)
+            );
+            write_bounded(stream, head.as_bytes(), stop, Instant::now() + WAIT)?;
             loop {
                 if let Some(message) = next.take() {
                     let (kind, id, close) = match &message {
@@ -827,7 +1100,7 @@ fn serve(
             }
             Ok(())
         }
-        _ => error(stream, 404, "not found", stop),
+        _ => error(stream, 404, "not found", stop, origin),
     }
 }
 
@@ -850,6 +1123,9 @@ mod tests {
     }
     impl Fixture {
         fn new() -> Self {
+            Self::with_policy(vec![], vec![])
+        }
+        fn with_policy(allowed_origins: Vec<String>, allowed_decision_kinds: Vec<String>) -> Self {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
             let dir = std::env::temp_dir().join(format!(
                 "zach-web-test-{}-{}",
@@ -860,6 +1136,8 @@ mod tests {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
                 socket_path: dir.join("backend.sock"),
                 state_dir: dir.clone(),
+                allowed_origins,
+                allowed_decision_kinds,
             })
             .unwrap();
             let addr = gateway.local_addr().unwrap();
@@ -883,8 +1161,20 @@ mod tests {
         fn request(&self, method: &str, target: &str, headers: &str, body: &str) -> TcpStream {
             let mut stream = TcpStream::connect(self.addr).unwrap();
             stream.set_read_timeout(Some(WAIT + WAIT)).unwrap();
-            write!(stream, "{method} {target} HTTP/1.1\r\nHost: localhost\r\n{headers}Content-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+            let origin = if method == "POST" {
+                format!("Origin: http://{}\r\n", self.addr)
+            } else {
+                String::new()
+            };
+            write!(stream, "{method} {target} HTTP/1.1\r\nHost: localhost\r\n{origin}{headers}Content-Length: {}\r\n\r\n{body}", body.len()).unwrap();
             stream
+        }
+        fn raw(&self, request: &[u8]) -> String {
+            let mut stream = TcpStream::connect(self.addr).unwrap();
+            stream.set_read_timeout(Some(WAIT + WAIT)).unwrap();
+            let _ = stream.write_all(request);
+            stream.shutdown(Shutdown::Write).unwrap();
+            read_all(stream)
         }
         fn auth(&self) -> String {
             format!("Authorization: Bearer {}\r\n", self.token)
@@ -908,10 +1198,35 @@ mod tests {
         }
         out
     }
-    fn command(reader: &mut BufReader<UnixStream>) -> ClientCommand {
+    fn raw_command(reader: &mut BufReader<UnixStream>) -> ClientCommand {
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
         serde_json::from_str(&line).unwrap()
+    }
+    fn decision(id: &str, kind: &str, status: &str) -> PendingDecisionRecord {
+        serde_json::from_value(serde_json::json!({
+            "decision_id": id, "task_id":"SYNTHETIC", "task_group":"test", "kind":kind,
+            "question":"choose", "options":["APPROVE","REJECT"], "recommended_option":0,
+            "context_summary":"synthetic", "sha":null, "status":status, "created_seq":1,
+            "resolved_by":null, "resolved_epoch":null, "choice":null, "note":null
+        }))
+        .unwrap()
+    }
+    // Existing ACK regression fixtures now answer the prerequisite authoritative lookup.
+    fn command(reader: &mut BufReader<UnixStream>) -> ClientCommand {
+        let command = raw_command(reader);
+        if let ClientCommand::GetDecision { decision_id } = command {
+            write_ndjson(
+                reader.get_mut(),
+                &ServerMessage::Decision {
+                    decision: Some(decision(&decision_id, "plan_approval", "OPEN")),
+                },
+            )
+            .unwrap();
+            raw_command(reader)
+        } else {
+            command
+        }
     }
     fn snapshot() -> ServerMessage {
         ServerMessage::Snapshot {
@@ -950,7 +1265,7 @@ mod tests {
             ] {
                 let reply =
                     read_all(f.request("GET", &format!("{route}?token={}", f.token), &alias, ""));
-                assert!(reply.starts_with("HTTP/1.1 401"));
+                assert!(reply.starts_with("HTTP/1.1 400"));
                 assert!(!reply.contains(&f.token));
                 assert!(!reply.contains("Access-Control"));
             }
@@ -989,6 +1304,8 @@ mod tests {
             WebGateway::bind(GatewayConfig {
                 bind_addr: "0.0.0.0:0".parse().unwrap(),
                 socket_path: bad,
+                allowed_origins: vec![],
+                allowed_decision_kinds: vec![],
                 state_dir: f.dir.clone()
             })
             .is_err()
@@ -1326,6 +1643,417 @@ mod tests {
         let start = Instant::now();
         f.handle.take().unwrap().shutdown_and_join().unwrap();
         assert!(start.elapsed() < Duration::from_secs(2));
+        backend.join().unwrap();
+    }
+    #[test]
+    fn web_gateway_constant_time_auth_behavior_and_empty_file() {
+        let token = "a".repeat(64);
+        assert!(authorized(Some(&format!("Bearer {token}")), &token));
+        for i in 0..64 {
+            let mut wrong = token.as_bytes().to_vec();
+            wrong[i] = b'b';
+            assert!(!authorized(
+                Some(&format!("Bearer {}", String::from_utf8(wrong).unwrap())),
+                &token
+            ));
+        }
+        for value in [
+            "Bearer ".to_string(),
+            format!("Basic {token}"),
+            format!("Bearer  {token}"),
+            format!("Bearer {}", "a".repeat(63)),
+            format!("Bearer {}", "a".repeat(65)),
+        ] {
+            assert!(!authorized(Some(&value), &token));
+        }
+        assert!(!authorized(Some(&"Bearer ".into()), ""));
+        assert!(!authorized(None, &token));
+        let f = Fixture::new();
+        fs::write(f.dir.join("web_session_token"), "").unwrap();
+        assert!(
+            WebGateway::bind(GatewayConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                socket_path: f.dir.join("absent"),
+                state_dir: f.dir.clone(),
+                allowed_origins: vec![],
+                allowed_decision_kinds: vec![]
+            })
+            .is_err()
+        );
+        assert_eq!(
+            fs::metadata(f.dir.join("web_session_token")).unwrap().len(),
+            0
+        );
+    }
+    #[test]
+    fn web_gateway_url_credentials_and_parser_rejections_never_contact_backend() {
+        let f = Fixture::new();
+        let listener = UnixListener::bind(f.dir.join("backend.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        for route in ["/api/snapshot", "/api/events", "/api/decide"] {
+            for name in [
+                "token",
+                "ACCESS_TOKEN",
+                "%73ession_token",
+                "web_session_token",
+                "Authorization",
+                "bEaReR",
+            ] {
+                for auth in [String::new(), f.auth()] {
+                    let reply =
+                        read_all(f.request("GET", &format!("{route}?{name}=synthetic"), &auth, ""));
+                    assert!(reply.starts_with("HTTP/1.1 400"), "{reply}");
+                    assert!(!reply.contains(&f.token));
+                }
+            }
+            for headers in [
+                format!("Cookie: token={}\r\n", f.token),
+                format!("X-Auth-Token: {}\r\n", f.token),
+            ] {
+                assert!(
+                    read_all(f.request("GET", route, &headers, "")).starts_with("HTTP/1.1 401")
+                );
+            }
+        }
+        for target in [
+            "http://user:secret@localhost/api/events".into(),
+            "//localhost/api/events".into(),
+            "/api/events?x=%ff".into(),
+            "/api/events?x=%0a".into(),
+            "/api/%zz".into(),
+            format!(
+                "/api/events?{}",
+                (0..33)
+                    .map(|i| format!("q{i}=1"))
+                    .collect::<Vec<_>>()
+                    .join("&")
+            ),
+        ] {
+            assert!(read_all(f.request("GET", &target, &f.auth(), "")).starts_with("HTTP/1.1 400"));
+        }
+        let origin = format!("http://{}", f.addr);
+        let cases = [
+            format!(
+                "GET /api/events HTTP/1.1\r\n{}Authorization: Bearer synthetic\r\n\r\n",
+                f.auth()
+            ),
+            format!("POST /api/decide HTTP/1.1\r\nOrigin: {origin}\r\nOrigin: {origin}\r\n\r\n"),
+            format!("GET /{}", "x".repeat(REQUEST_LINE_LIMIT)),
+            format!(
+                "GET /api/events HTTP/1.1\r\n{}\r\n",
+                (0..65).map(|i| format!("X-{i}: x\r\n")).collect::<String>()
+            ),
+            "POST /api/decide HTTP/1.1\r\nContent-Length: 16385\r\n\r\n".into(),
+            "POST /api/decide HTTP/1.1\r\nContent-Length: 5\r\n\r\nx".into(),
+            "GET /api/events HTTP/1.0\r\n\r\n".into(),
+        ];
+        for request in cases {
+            assert!(f.raw(request.as_bytes()).starts_with("HTTP/1.1 400"));
+        }
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+    #[test]
+    fn web_gateway_exact_origin_and_preflight() {
+        let f = Fixture::with_policy(
+            vec!["https://zach.shocker.cl".into(), "http://[::1]:8080".into()],
+            vec![],
+        );
+        let listener = UnixListener::bind(f.dir.join("backend.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        for origin in [
+            "null",
+            "*",
+            "https://zach.shocker.cl.evil",
+            "http://zach.shocker.cl",
+            "https://zach.shocker.cl:444",
+            "https://zach.shocker.cl/",
+            "https://user@zach.shocker.cl",
+            "https://zach.shocker.cl?x=1",
+            "http://localhost:1234",
+            "\u{a0}https://zach.shocker.cl",
+            "https://zach.shocker.cl\u{a0}",
+        ] {
+            for method in ["GET", "POST", "OPTIONS"] {
+                let reply = f.raw(
+                    format!(
+                        "{method} /api/decide HTTP/1.1\r\nOrigin: {origin}\r\n{}\r\n",
+                        f.auth()
+                    )
+                    .as_bytes(),
+                );
+                assert!(reply.starts_with("HTTP/1.1 403"), "{reply}");
+                assert!(!reply.contains("Access-Control-Allow-Origin"));
+            }
+        }
+        assert!(
+            f.raw(format!("POST /api/decide HTTP/1.1\r\n{}\r\n", f.auth()).as_bytes())
+                .starts_with("HTTP/1.1 403")
+        );
+        for origin in [
+            format!("http://{}", f.addr),
+            "https://zach.shocker.cl".into(),
+            "http://[::1]:8080".into(),
+        ] {
+            let reply = read_all(f.request("GET", "/api/session", &format!("Origin: {origin}\r\n{}Host-Other: evil\r\nForwarded: host=evil\r\nX-Forwarded-Host: evil\r\n", f.auth()), ""));
+            assert!(reply.starts_with("HTTP/1.1 404"));
+            assert!(reply.contains(&format!("Access-Control-Allow-Origin: {origin}\r\n")));
+            assert!(reply.contains("Vary: Origin"));
+            assert!(
+                read_all(f.request("GET", "/api/session", &format!("Origin: {origin}\r\n"), ""))
+                    .starts_with("HTTP/1.1 401")
+            );
+            for (route, method) in [
+                ("/api/snapshot", "GET"),
+                ("/api/events", "GET"),
+                ("/api/decide", "POST"),
+            ] {
+                let reply = read_all(f.request("OPTIONS", route, &format!("Origin: {origin}\r\nAccess-Control-Request-Method: {method}\r\nAccess-Control-Request-Headers: AUTHORIZATION, Content-Type, Last-Event-ID\r\n"), ""));
+                assert!(reply.starts_with("HTTP/1.1 204"), "{reply}");
+                assert!(reply.contains(&format!("Access-Control-Allow-Origin: {origin}\r\n")));
+                assert!(!reply.contains("Allow-Credentials"));
+                assert!(!reply.contains('*'));
+            }
+        }
+        for (route, method, headers, body) in [
+            ("/api/decide", "GET", "authorization", ""),
+            ("/api/session", "GET", "authorization", ""),
+            ("/api/events", "GET", "cookie", ""),
+            ("/api/events", "GET", "authorization, Authorization", ""),
+            ("/api/events", "GET", "", "body"),
+        ] {
+            assert!(read_all(f.request("OPTIONS", route, &format!("Origin: https://zach.shocker.cl\r\nAccess-Control-Request-Method: {method}\r\nAccess-Control-Request-Headers: {headers}\r\n"), body)).starts_with("HTTP/1.1 403"));
+        }
+        assert!(
+            read_all(f.request(
+                "OPTIONS",
+                "/api/events",
+                "Access-Control-Request-Method: GET\r\n",
+                ""
+            ))
+            .starts_with("HTTP/1.1 403")
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+    #[test]
+    fn web_gateway_policy_configuration_is_bounded() {
+        for origin in [
+            "",
+            "null",
+            "*",
+            "ftp://a",
+            "https://a/",
+            "https://a?b",
+            "https://a#b",
+            "https://a@b",
+            "https://a:0",
+            "https://a:65536",
+            "https://a:",
+            "https://a:1:2",
+            "http://[::1",
+            "http://[invalid]",
+            "https://-bad",
+            "https://a..b",
+            "https://a b",
+            "https://a\r\nx:y",
+            "https://a\\b",
+        ] {
+            assert!(
+                validate_web_policy(&[origin.into()], &[]).is_err(),
+                "{origin}"
+            );
+        }
+        for origins in [
+            vec!["https://a".into(); 2],
+            (0..17).map(|i| format!("https://a{i}")).collect(),
+            vec![format!("https://{}", "a".repeat(513))],
+        ] {
+            assert!(validate_web_policy(&origins, &[]).is_err());
+        }
+        for kinds in [
+            vec!["".into()],
+            vec!["UPPER".into()],
+            vec!["bad kind".into()],
+            vec!["a".repeat(65)],
+            vec!["a".into(); 2],
+            (0..33).map(|i| format!("kind{i}")).collect(),
+        ] {
+            assert!(validate_web_policy(&[], &kinds).is_err());
+        }
+        let f = Fixture::new();
+        assert!(
+            WebGateway::bind(GatewayConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                socket_path: f.dir.join("absent"),
+                state_dir: f.dir.clone(),
+                allowed_origins: vec!["*".into()],
+                allowed_decision_kinds: vec![]
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn web_gateway_authoritative_kind_policy_and_exact_opt_in() {
+        let mut cases: Vec<(&str, Vec<String>, &str, &str, u16)> = Vec::new();
+        for status in ["OPEN", "RESOLVED"] {
+            for kind in ["merge_approval", "human-merge-approval"] {
+                cases.push((kind, vec![], "innocent", status, 403));
+                cases.push((kind, vec![kind.into()], "innocent", status, 200));
+                let other = if kind == "merge_approval" {
+                    "human-merge-approval"
+                } else {
+                    "merge_approval"
+                };
+                cases.push((kind, vec![other.into()], "innocent", status, 403));
+            }
+        }
+        for kind in DEFAULT_DECISION_KINDS {
+            cases.push((
+                kind,
+                vec![],
+                "human-merge-approval:looks-like-merge",
+                "OPEN",
+                200,
+            ));
+        }
+        cases.extend([
+            ("future_kind", vec![], "innocent", "OPEN", 403),
+            (
+                "future_kind",
+                vec!["future_kind".into()],
+                "innocent",
+                "OPEN",
+                200,
+            ),
+            ("", vec![], "innocent", "OPEN", 503),
+            ("plan_approval", vec![], "innocent", "UNKNOWN", 503),
+        ]);
+        for (kind, kinds, id, status, code) in cases {
+            let f = Fixture::with_policy(vec![], kinds);
+            let record = decision(id, kind, status);
+            let resolved = status == "RESOLVED";
+            let id = id.to_string();
+            let expected_id = id.clone();
+            let backend = f.backend(move |stream| {
+                let mut reader = BufReader::new(stream);
+                assert_eq!(raw_command(&mut reader), ClientCommand::GetDecision { decision_id: expected_id.clone() });
+                write_ndjson(reader.get_mut(), &ServerMessage::Decision { decision: Some(record.clone()) }).unwrap();
+                if code == 200 {
+                    assert!(matches!(raw_command(&mut reader), ClientCommand::Decide { decision_id, .. } if decision_id == expected_id));
+                    // A concurrent resolver's winning choice must survive unchanged.
+                    let mut winner = record; winner.status = "RESOLVED".into(); winner.choice = Some("REJECT".into());
+                    write_ndjson(reader.get_mut(), &ServerMessage::DecisionResult { outcome: if resolved { "ALREADY_RESOLVED" } else { "RESOLVED" }.into(), decision: Some(winner) }).unwrap();
+                }
+                let mut rest = String::new(); reader.read_to_string(&mut rest).unwrap(); assert!(rest.is_empty(), "no mutation after denial or retry after ACK");
+            });
+            let reply = read_all(f.request(
+                "POST",
+                "/api/decide",
+                &f.auth(),
+                &serde_json::json!({"decision_id":id,"choice":"APPROVE"}).to_string(),
+            ));
+            assert!(
+                reply.starts_with(&format!("HTTP/1.1 {code}")),
+                "kind={kind}: {reply}"
+            );
+            if code == 200 {
+                assert!(reply.contains("REJECT"));
+                assert!(reply.contains(if resolved {
+                    "ALREADY_RESOLVED"
+                } else {
+                    "RESOLVED"
+                }));
+            }
+            backend.join().unwrap();
+        }
+    }
+    #[test]
+    fn web_gateway_lookup_missing_mismatched_malformed_and_timeout_are_not_dispatched() {
+        for case in [
+            "missing",
+            "mismatched",
+            "wrong_type",
+            "malformed",
+            "timeout",
+        ] {
+            let f = Fixture::new();
+            let backend = f.backend(move |stream| {
+                let mut reader = BufReader::new(stream);
+                assert_eq!(
+                    raw_command(&mut reader),
+                    ClientCommand::GetDecision {
+                        decision_id: "synthetic".into()
+                    }
+                );
+                match case {
+                    "missing" => write_ndjson(
+                        reader.get_mut(),
+                        &ServerMessage::Decision { decision: None },
+                    )
+                    .unwrap(),
+                    "mismatched" => write_ndjson(
+                        reader.get_mut(),
+                        &ServerMessage::Decision {
+                            decision: Some(decision("other", "plan_approval", "OPEN")),
+                        },
+                    )
+                    .unwrap(),
+                    "wrong_type" => write_ndjson(reader.get_mut(), &snapshot()).unwrap(),
+                    "malformed" => reader.get_mut().write_all(b"{bad}\n").unwrap(),
+                    _ => (),
+                }
+                let mut rest = String::new();
+                let _ = reader.read_to_string(&mut rest);
+                assert!(rest.is_empty());
+            });
+            let reply = read_all(f.request(
+                "POST",
+                "/api/decide",
+                &f.auth(),
+                r#"{"decision_id":"synthetic","choice":"APPROVE"}"#,
+            ));
+            let code = match case {
+                "missing" => 404,
+                "timeout" => 504,
+                _ => 503,
+            };
+            assert!(
+                reply.starts_with(&format!("HTTP/1.1 {code}")),
+                "{case}: {reply}"
+            );
+            assert!(!reply.contains("outcome unknown"));
+            backend.join().unwrap();
+        }
+    }
+    #[test]
+    fn web_gateway_sse_uses_validated_cors() {
+        let f = Fixture::new();
+        let backend = f.backend(|stream| {
+            let mut reader = BufReader::new(stream);
+            assert!(matches!(
+                raw_command(&mut reader),
+                ClientCommand::Subscribe { .. }
+            ));
+            write_ndjson(reader.get_mut(), &snapshot()).unwrap();
+        });
+        let reply = read_all(f.request(
+            "GET",
+            "/api/events",
+            &format!("{}Origin: http://{}\r\n", f.auth(), f.addr),
+            "",
+        ));
+        assert!(reply.starts_with("HTTP/1.1 200"));
+        assert!(reply.contains(&format!(
+            "Access-Control-Allow-Origin: http://{}\r\n",
+            f.addr
+        )));
+        assert!(reply.contains("event: snapshot"));
         backend.join().unwrap();
     }
 }
