@@ -172,6 +172,12 @@ pub fn parse_context_pack(raw: Option<&Value>, fallback_weight: &str) -> Context
         .unwrap_or_default();
 
     ContextPackSpec {
+        // Preserve invalid values for per-task rejection; never poison the export.
+        network: map.get("network").filter(|v| !v.is_null()).map(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| v.to_string())
+        }),
         weight,
         base_sha,
         target_files,
@@ -330,6 +336,66 @@ pub fn sync_from_ws_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_intake_preserves_invalid_values_for_per_task_rejection() {
+        use crate::v2::isolation::NetworkPolicy;
+        use crate::v2::router::ModelFamily;
+        for value in [
+            serde_json::json!("all"),
+            serde_json::json!(true),
+            serde_json::json!(["none"]),
+        ] {
+            let raw = serde_json::json!({"network":value});
+            let pack = parse_context_pack(Some(&raw), "S");
+            assert!(pack.network.is_some());
+            assert!(
+                NetworkPolicy::resolve(pack.network.as_deref(), ModelFamily::OpenAiSol).is_err()
+            );
+        }
+        for network in ["none", "provider-api"] {
+            let raw = serde_json::json!({"network":network});
+            assert_eq!(
+                parse_context_pack(Some(&raw), "S").network.as_deref(),
+                Some(network)
+            );
+        }
+        assert_eq!(
+            parse_context_pack(Some(&serde_json::json!({})), "S").network,
+            None
+        );
+        let mut store = V2Store::open_in_memory().unwrap();
+        let export = serde_json::json!({"schema_version":2,"tasks":[
+            {"id":"BAD","weight":"S","repository":"zach","status":"Ready","context_pack":{"network":true}},
+            {"id":"GOOD","weight":"S","repository":"zach","status":"Ready","context_pack":{"network":"none"}}
+        ]});
+        assert_eq!(
+            ingest_export_json(&mut store, &export.to_string())
+                .unwrap()
+                .ingested_count,
+            2
+        );
+        assert_eq!(
+            store
+                .get_task("GOOD")
+                .unwrap()
+                .unwrap()
+                .context_pack
+                .network
+                .as_deref(),
+            Some("none")
+        );
+        assert_eq!(
+            store
+                .get_task("BAD")
+                .unwrap()
+                .unwrap()
+                .context_pack
+                .network
+                .as_deref(),
+            Some("true")
+        );
+    }
 
     #[test]
     fn ingest_export_json_populates_store_and_filters_ready_queue_by_dependencies() {

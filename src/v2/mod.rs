@@ -1,5 +1,6 @@
 pub mod delivery;
 pub mod intake;
+pub mod isolation;
 pub mod merge_queue;
 pub mod pipeline;
 pub mod router;

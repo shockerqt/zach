@@ -840,7 +840,7 @@ pub fn extract_and_parse_context_pack_yaml(markdown: &str) -> Result<ContextPack
             }
             let value = value.trim();
             let parsed = match key {
-                "weight" | "base_sha" => Value::String(yaml_scalar(value)?),
+                "weight" | "base_sha" | "network" => Value::String(yaml_scalar(value)?),
                 "target_files"
                 | "acceptance_criteria"
                 | "forbidden_paths"
@@ -967,6 +967,14 @@ fn merge_plan_context(
         proposed.weight = task.weight.clone();
     }
     proposed.base_sha = task.context_pack.base_sha.clone().or(proposed.base_sha);
+    // A plan may narrow network access, but cannot widen an offline contract.
+    crate::v2::isolation::NetworkPolicy::resolve(
+        proposed.network.as_deref(),
+        ModelFamily::OpenAiSol,
+    )?;
+    if task.context_pack.network.as_deref() == Some("none") || proposed.network.is_none() {
+        proposed.network = task.context_pack.network.clone();
+    }
     for (old, new) in [
         (
             &task.context_pack.worker_checks,
@@ -1529,6 +1537,9 @@ pub const FAILURE_CLASS_POLICY: &str = "policy";
 
 /// Maps a failed stage, execution error, or gate violation to `"infra"`, `"semantic"`, or `"policy"`.
 pub fn classify_failure_class(stage: &str, status: &str, message: &str) -> &'static str {
+    if message.starts_with("ISOLATION_PREFLIGHT_FAILED") {
+        return FAILURE_CLASS_INFRA;
+    }
     let lower_msg = message.to_ascii_lowercase();
     let lower_status = status.trim().to_ascii_lowercase();
     let lower_stage = stage.trim().to_ascii_lowercase();
@@ -1660,6 +1671,27 @@ fn run_stage_checks(
         return Ok(());
     }
     if let Err(err) = executor.run_checks(worktree_path, commands) {
+        let bounded_err = truncate_utf8_bytes(&err, MAX_SUMMARY_BYTES);
+        task.memory.last_check_failure = Some(bounded_err.clone());
+        let class = classify_failure_class(&attempt.stage, "FAILED", &err);
+        fail_stage_attempt(store, task, attempt, class, bounded_err, true)?;
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn run_host_gate_checks(
+    store: &mut V2Store,
+    task: &mut TaskRecord,
+    attempt: &mut StageAttemptRecord,
+    executor: &mut dyn StageExecutor,
+    worktree_path: &str,
+    commands: &[String],
+) -> Result<(), String> {
+    if commands.is_empty() {
+        return Ok(());
+    }
+    if let Err(err) = executor.run_gate_checks(worktree_path, commands) {
         let bounded_err = truncate_utf8_bytes(&err, MAX_SUMMARY_BYTES);
         task.memory.last_check_failure = Some(bounded_err.clone());
         let class = classify_failure_class(&attempt.stage, "FAILED", &err);
@@ -2130,6 +2162,10 @@ pub fn execute_xs_s_pipeline_with_executor_and_ws_task(
         .get_task(task_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("task '{task_id}' not found in store"))?;
+    crate::v2::isolation::NetworkPolicy::resolve(
+        task.context_pack.network.as_deref(),
+        ModelFamily::OpenAiSol,
+    )?;
 
     let initial_weight = task.weight.trim().to_ascii_uppercase();
     if !matches!(initial_weight.as_str(), "XS" | "S") {
@@ -2386,7 +2422,7 @@ pub fn execute_xs_s_pipeline_with_executor_and_ws_task(
                 &worker_checks,
             )?;
             let gate_checks = task.context_pack.gate_checks.clone();
-            run_stage_checks(
+            run_host_gate_checks(
                 store,
                 &mut task,
                 &mut attempt_rec,
@@ -2470,6 +2506,10 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
         .get_task(task_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("task '{task_id}' not found in store"))?;
+    crate::v2::isolation::NetworkPolicy::resolve(
+        task.context_pack.network.as_deref(),
+        ModelFamily::OpenAiSol,
+    )?;
 
     let norm_weight = task.weight.trim().to_ascii_uppercase();
     if !matches!(norm_weight.as_str(), "M" | "L") {
@@ -3257,7 +3297,7 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                 &worker_checks,
             )?;
             let gate_checks = task.context_pack.gate_checks.clone();
-            run_stage_checks(
+            run_host_gate_checks(
                 store,
                 &mut task,
                 &mut attempt_rec,
@@ -3432,6 +3472,68 @@ mod tests {
         task.context_pack = sample_context_pack("M");
         task.required_stages = default_required_stages("M");
         task
+    }
+
+    #[test]
+    fn invalid_network_is_rejected_before_pipeline_dispatch_or_path_locks() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        for weight in ["S", "M"] {
+            let mut task = sample_plan_task(&format!("INVALID-{weight}"));
+            task.weight = weight.into();
+            task.context_pack.network = Some("all".into());
+            let task = store.upsert_task(&task).unwrap();
+            let mut mock = MockStageExecutor::default();
+            let result = if weight == "S" {
+                execute_xs_s_pipeline_with_executor_and_ws_task(
+                    &mut store,
+                    &task.task_id,
+                    &mut mock,
+                    Path::new("/missing/ws-task"),
+                )
+            } else {
+                execute_m_l_pipeline_with_executor_and_ws_task(
+                    &mut store,
+                    &task.task_id,
+                    &mut mock,
+                    Path::new("/missing/ws-task"),
+                )
+            };
+            assert!(result.unwrap_err().contains("context_pack.network"));
+            assert!(mock.executed_specs.is_empty());
+            assert_eq!(store.get_task(&task.task_id).unwrap().unwrap(), task);
+        }
+    }
+
+    #[test]
+    fn network_yaml_roundtrip_preserves_offline_boundary_and_invalid_values_fail_resolution() {
+        let mut task = sample_plan_task("NETWORK");
+        let mut pack = sample_context_pack("M");
+        pack.network = Some("provider-api".into());
+        task.context_pack.network = Some("none".into());
+        let merged = merge_plan_context(&task, pack.clone()).unwrap();
+        assert_eq!(merged.network.as_deref(), Some("none"));
+        pack.network = Some("bogus".into());
+        assert!(merge_plan_context(&task, pack).is_err());
+        let markdown = plan_with_context(
+            "## [PLAN]\n```yaml\nweight: M\ntarget_files: []\n```\n",
+            &merged,
+        )
+        .unwrap();
+        assert_eq!(
+            extract_and_parse_context_pack_yaml(&markdown)
+                .unwrap()
+                .network
+                .as_deref(),
+            Some("none")
+        );
+        assert_eq!(
+            classify_failure_class(
+                "impl",
+                "FAILED",
+                "ISOLATION_PREFLIGHT_FAILED: forbidden policy"
+            ),
+            FAILURE_CLASS_INFRA
+        );
     }
 
     #[test]
@@ -3964,6 +4066,7 @@ mod tests {
 
     fn sample_context_pack(weight: &str) -> ContextPackSpec {
         ContextPackSpec {
+            network: None,
             weight: weight.to_owned(),
             base_sha: Some("abc1234".to_owned()),
             target_files: vec![
@@ -4323,6 +4426,12 @@ print(json.dumps({
         assert_eq!(
             queued.stages_completed,
             vec!["impl".to_owned(), "pr-review".to_owned()]
+        );
+        assert_eq!(mock.executed_gate_checks, task.context_pack.gate_checks);
+        assert!(
+            mock.executed_checks
+                .iter()
+                .any(|check| task.context_pack.worker_checks.contains(check))
         );
         assert_eq!(mock.executed_routes.len(), 2);
         // Verify cross-model family separation between impl and pr-review
