@@ -48,6 +48,8 @@ pub struct StageExecutionResult {
     pub review_markdown: Option<String>,
     #[serde(default)]
     pub review_output: Option<String>,
+    #[serde(default)]
+    pub stage_output: Option<String>,
     pub invocation_id: Option<String>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
@@ -80,6 +82,28 @@ pub struct ReviewedDiffContext {
 }
 
 pub trait StageExecutor {
+    fn persist_plan_artifact(
+        &mut self,
+        _task: &TaskRecord,
+        _artifact_id: &str,
+        _markdown: &str,
+    ) -> Result<PathBuf, String> {
+        Err("plan artifact persistence is unsupported by this executor".to_owned())
+    }
+
+    fn read_plan_artifact(&self, _path: &std::path::Path) -> Result<String, String> {
+        Err("plan artifact reading is unsupported by this executor".to_owned())
+    }
+
+    fn publish_plan_stage(
+        &mut self,
+        _task: &TaskRecord,
+        _plan_artifact_path: &std::path::Path,
+        _plan_markdown: &str,
+    ) -> Result<(), String> {
+        Err("plan publication is unsupported by this executor".to_owned())
+    }
+
     fn execute_stage(
         &mut self,
         task: &TaskRecord,
@@ -298,8 +322,8 @@ pub fn build_systemd_stage_command_with_env(
         }
     };
 
-    let output_schema_json =
-        (route.stage == "pr-review").then(crate::v2::pipeline::review_verdict_json_schema_string);
+    let output_schema_json = (matches!(route.stage.as_str(), "plan-review" | "pr-review"))
+        .then(crate::v2::pipeline::review_verdict_json_schema_string);
 
     Ok(StageCommandSpec {
         unit_name,
@@ -588,12 +612,14 @@ fn write_secure_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), String>
 #[derive(Debug, Clone)]
 pub struct SystemdStageExecutor {
     pub state_dir: PathBuf,
+    pub ws_task_bin: PathBuf,
 }
 
 impl Default for SystemdStageExecutor {
     fn default() -> Self {
         Self {
             state_dir: crate::v2::default_state_dir(),
+            ws_task_bin: crate::v2::default_ws_task_bin(),
         }
     }
 }
@@ -602,6 +628,7 @@ impl SystemdStageExecutor {
     pub fn with_state_dir(state_dir: impl Into<PathBuf>) -> Self {
         Self {
             state_dir: state_dir.into(),
+            ws_task_bin: crate::v2::default_ws_task_bin(),
         }
     }
 }
@@ -769,6 +796,81 @@ fn write_stage_result_json(
 }
 
 impl StageExecutor for SystemdStageExecutor {
+    fn persist_plan_artifact(
+        &mut self,
+        task: &TaskRecord,
+        artifact_id: &str,
+        markdown: &str,
+    ) -> Result<PathBuf, String> {
+        validate_attempt_id(&task.task_id)?;
+        validate_attempt_id(artifact_id)?;
+        ensure_secure_dir(&self.state_dir)?;
+        let dir = ensure_secure_dir(&self.state_dir.join("plans"))?;
+        let path = dir.join(format!("{}-{}.md", task.task_id, artifact_id));
+        write_secure_file(&path, markdown.as_bytes())?;
+        Ok(path)
+    }
+
+    fn read_plan_artifact(&self, path: &std::path::Path) -> Result<String, String> {
+        let dir = self.state_dir.join("plans");
+        if path.parent() != Some(dir.as_path()) {
+            return Err("plan artifact is outside plans directory".to_owned());
+        }
+        ensure_secure_dir(&self.state_dir)?;
+        ensure_secure_dir(&dir)?;
+        let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        if !meta.is_file() || meta.file_type().is_symlink() {
+            return Err("refusing non-file or symlink plan artifact".to_owned());
+        }
+        std::fs::read_to_string(path).map_err(|e| e.to_string())
+    }
+
+    fn publish_plan_stage(
+        &mut self,
+        task: &TaskRecord,
+        path: &std::path::Path,
+        markdown: &str,
+    ) -> Result<(), String> {
+        if self.read_plan_artifact(path)? != markdown {
+            return Err("plan publication body differs from artifact".to_owned());
+        }
+        let mut cmd = Command::new(&self.ws_task_bin);
+        cmd.args([
+            "stage",
+            &task.task_id,
+            "plan",
+            "--actor",
+            "zach",
+            "--body-file",
+        ])
+        .arg(path);
+        // Never forward the historical placeholder SHA; let ws-task resolve HEAD.
+        if let Some(sha) = task
+            .plan_base_sha
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "head-sha")
+        {
+            cmd.args(["--sha", sha]);
+        }
+        let artifact_id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| "invalid plan artifact name".to_owned())?;
+        cmd.args(["--idempotency-key", &format!("zach-plan-{artifact_id}")]);
+        let output = cmd
+            .output()
+            .map_err(|e| format!("failed to publish plan: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "ws-task stage plan failed ({}): {}",
+                output.status,
+                truncate_utf8_bytes(&String::from_utf8_lossy(&output.stderr), MAX_SUMMARY_BYTES)
+            ));
+        }
+        Ok(())
+    }
+
     fn execute_stage(
         &mut self,
         task: &TaskRecord,
@@ -960,6 +1062,7 @@ impl StageExecutor for SystemdStageExecutor {
                     status: parsed.status,
                     summary: parsed.summary,
                     review_markdown: parsed.review_markdown,
+                    stage_output: parsed.review_output.clone(),
                     review_output: parsed.review_output,
                     invocation_id: None,
                     input_tokens: parsed.input_tokens,
@@ -1765,6 +1868,9 @@ pub fn collect_worktree_diff_entries(worktree_path: &str) -> Vec<DiffFileEntry> 
 }
 
 pub struct MockStageExecutor {
+    pub plan_artifacts: BTreeMap<PathBuf, String>,
+    pub published_plans: Vec<(PathBuf, String)>,
+    pub publish_plan_error: Option<String>,
     pub staged_results: Vec<StageExecutionResult>,
     pub executed_specs: Vec<StageCommandSpec>,
     pub executed_routes: Vec<StageRoute>,
@@ -1781,6 +1887,9 @@ pub struct MockStageExecutor {
 impl Default for MockStageExecutor {
     fn default() -> Self {
         Self {
+            plan_artifacts: BTreeMap::new(),
+            published_plans: Vec::new(),
+            publish_plan_error: None,
             staged_results: Vec::new(),
             executed_specs: Vec::new(),
             executed_routes: Vec::new(),
@@ -1797,6 +1906,39 @@ impl Default for MockStageExecutor {
 }
 
 impl StageExecutor for MockStageExecutor {
+    fn persist_plan_artifact(
+        &mut self,
+        task: &TaskRecord,
+        artifact_id: &str,
+        markdown: &str,
+    ) -> Result<PathBuf, String> {
+        let path = PathBuf::from(format!("/virtual/plans/{}-{artifact_id}.md", task.task_id));
+        self.plan_artifacts
+            .insert(path.clone(), markdown.to_owned());
+        Ok(path)
+    }
+
+    fn read_plan_artifact(&self, path: &std::path::Path) -> Result<String, String> {
+        self.plan_artifacts
+            .get(path)
+            .cloned()
+            .ok_or_else(|| "missing mock plan artifact".to_owned())
+    }
+
+    fn publish_plan_stage(
+        &mut self,
+        _task: &TaskRecord,
+        path: &std::path::Path,
+        markdown: &str,
+    ) -> Result<(), String> {
+        if let Some(err) = &self.publish_plan_error {
+            return Err(err.clone());
+        }
+        self.published_plans
+            .push((path.to_path_buf(), markdown.to_owned()));
+        Ok(())
+    }
+
     fn execute_stage(
         &mut self,
         task: &TaskRecord,
@@ -2063,6 +2205,149 @@ other-user-unit.service loaded active running
         let low_payload: serde_json::Value =
             serde_json::from_str(&low_spec.stdin_payload).expect("valid JSON");
         assert_eq!(low_payload["timeout_seconds"], 30);
+    }
+
+    #[test]
+    fn zach027_plan_artifacts_are_private_symlink_safe_and_publication_fails_closed() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let temp = TempTestDir::new("zach027-plan-publish");
+        let script = temp.path().join("ws-task");
+        std::fs::write(&script, "#!/usr/bin/env python3\nimport sys,json,pathlib\np=pathlib.Path(__file__)\np.with_suffix('.args').write_text(json.dumps(sys.argv[1:]))\nif p.with_suffix('.fail').exists():\n print('publication rejected',file=sys.stderr)\n sys.exit(37)\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut exec = SystemdStageExecutor::with_state_dir(temp.path().join("state"));
+        exec.ws_task_bin = script.clone();
+        let mut task = sample_task();
+        let markdown = format!("## [PLAN]\n{}", "full plan é".repeat(500));
+        let path = exec
+            .persist_plan_artifact(&task, "plan-attempt-123", &markdown)
+            .unwrap();
+        assert_eq!(exec.read_plan_artifact(&path).unwrap(), markdown);
+        for (file, mode) in [
+            (&exec.state_dir, 0o700),
+            (&exec.state_dir.join("plans"), 0o700),
+            (&path, 0o600),
+        ] {
+            assert_eq!(
+                std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+        }
+        for sha in [
+            Some("base123"),
+            None,
+            Some(""),
+            Some("  "),
+            Some("head-sha"),
+        ] {
+            task.plan_base_sha = sha.map(str::to_owned);
+            exec.publish_plan_stage(&task, &path, &markdown).unwrap();
+            let args: Vec<String> = serde_json::from_str(
+                &std::fs::read_to_string(script.with_extension("args")).unwrap(),
+            )
+            .unwrap();
+            let mut expected = vec![
+                "stage".to_owned(),
+                task.task_id.clone(),
+                "plan".to_owned(),
+                "--actor".to_owned(),
+                "zach".to_owned(),
+                "--body-file".to_owned(),
+                path.to_string_lossy().into_owned(),
+            ];
+            if sha == Some("base123") {
+                expected.extend(["--sha".to_owned(), "base123".to_owned()]);
+            }
+            expected.extend([
+                "--idempotency-key".to_owned(),
+                format!("zach-plan-{}-plan-attempt-123", task.task_id),
+            ]);
+            assert_eq!(args, expected);
+        }
+        std::fs::write(script.with_extension("fail"), "fail").unwrap();
+        assert!(
+            exec.publish_plan_stage(&task, &path, &markdown)
+                .unwrap_err()
+                .contains("publication rejected")
+        );
+        exec.ws_task_bin = temp.path().join("missing-command");
+        assert!(
+            exec.publish_plan_stage(&task, &path, &markdown)
+                .unwrap_err()
+                .contains("failed to publish plan")
+        );
+        assert!(
+            exec.publish_plan_stage(&task, &path, "different body")
+                .is_err()
+        );
+        assert!(
+            exec.persist_plan_artifact(&task, "../escape", "bad")
+                .is_err()
+        );
+        let outside = temp.path().join("outside.md");
+        std::fs::write(&outside, "original").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        symlink(&outside, &path).unwrap();
+        assert!(exec.read_plan_artifact(&path).is_err());
+        assert!(
+            exec.persist_plan_artifact(&task, "plan-attempt-123", "overwrite")
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "original");
+        let other = TempTestDir::new("zach027-plan-symlink-dir");
+        symlink(temp.path().join("state/plans"), other.path().join("plans")).unwrap();
+        let mut exec = SystemdStageExecutor::with_state_dir(other.path());
+        assert!(exec.persist_plan_artifact(&task, "other", "bad").is_err());
+    }
+
+    #[test]
+    fn zach027_systemd_preserves_full_stage_output_for_both_families_and_plan_stages() {
+        let temp = TempTestDir::new("zach027-stage-output");
+        let task = sample_task();
+        let mut exec = SystemdStageExecutor::with_state_dir(temp.path());
+        for family in [ModelFamily::OpenAiSol, ModelFamily::GeminiAgy] {
+            for stage in ["plan", "plan-review"] {
+                let text = if stage == "plan" {
+                    format!("## [PLAN]\n{}", "🦀 useful plan\n".repeat(600))
+                } else {
+                    serde_json::json!({"verdict":"APPROVED","ac_results":[],"findings":[],"summary":"review é".repeat(600)}).to_string()
+                };
+                let stdout = match family {
+                    ModelFamily::OpenAiSol => format!("{}\n{}\n", serde_json::json!({"type":"item.completed","item":{"type":"agent_message","text":"earlier commentary"}}), serde_json::json!({"type":"item.completed","item":{"type":"agent_message","text":text}})),
+                    ModelFamily::GeminiAgy => serde_json::json!({"execution_succeeded":true,"summary":"short worker summary","response":text}).to_string(),
+                };
+                let mut route =
+                    crate::v2::router::resolve_stage_route("M", stage, 0, Some(family.opposite()))
+                        .unwrap()
+                        .unwrap();
+                route.family = family;
+                let attempt = format!("{}-{stage}", family.as_str());
+                let mut spec =
+                    build_systemd_stage_command(&task, &attempt, &route, "read only").unwrap();
+                spec.program = "python3".to_owned();
+                spec.args = vec![
+                    "-c".to_owned(),
+                    "import sys; sys.stdout.write(sys.argv[1])".to_owned(),
+                    stdout,
+                ];
+                spec.worktree_path = temp.path_str().to_owned();
+                let result = exec.execute_stage(&task, &attempt, &route, &spec).unwrap();
+                assert_eq!(result.stage_output.as_deref(), Some(text.as_str()));
+                assert_eq!(result.review_output.as_deref(), Some(text.as_str()));
+                assert!(result.summary.len() <= MAX_SUMMARY_BYTES);
+                let saved: serde_json::Value = serde_json::from_str(
+                    &std::fs::read_to_string(
+                        temp.path()
+                            .join("attempts")
+                            .join(&attempt)
+                            .join("result.json"),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(saved["result"]["stage_output"], text);
+                assert_eq!(spec.output_schema_json.is_some(), stage == "plan-review");
+            }
+        }
     }
 
     struct TempTestDir(std::path::PathBuf);
