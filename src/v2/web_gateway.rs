@@ -749,13 +749,20 @@ fn serve(
                 Ok(n) => n,
                 Err(_) => return error(stream, 400, "invalid cursor", stop),
             };
-            if sse
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                    (n < MAX_SSE).then_some(n + 1)
-                })
-                .is_err()
-            {
-                return error(stream, 503, "event capacity reached", stop);
+            let mut active = sse.load(Ordering::Acquire);
+            loop {
+                if active >= MAX_SSE {
+                    return error(stream, 503, "event capacity reached", stop);
+                }
+                match sse.compare_exchange_weak(
+                    active,
+                    active + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(current) => active = current,
+                }
             }
             struct Permit<'a>(&'a std::sync::atomic::AtomicUsize);
             impl Drop for Permit<'_> {
