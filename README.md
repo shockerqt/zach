@@ -285,7 +285,10 @@ watermarks, deduplication and stream-only reconnection. Heartbeat/slot counts
 remain dated observations; keepalives do not prove daemon activity. Provider
 quotas, historical stage model/duration, complete FIFO merge lanes and pause are
 not exposed by the API. Missing data is labelled unavailable. New tasks and
-silent transitions can require a later streamed snapshot. Merge decisions are
+silent transitions can require a later streamed snapshot.
+Stage observations are invalidated on every authoritative snapshot so a stage
+completed during disconnection cannot remain running or failed in the panel;
+model/duration are unavailable until observed again. Merge decisions are
 denied by server policy by default. Decision POSTs never retry automatically;
 unknown outcomes wait for authoritative reconciliation before another explicit
 operator action. Sound defaults off and requires a gesture. Snapshots and replay at or below each

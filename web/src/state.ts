@@ -48,7 +48,11 @@ export function acceptSnapshot(s: State, v: Snapshot): State {
     cursor: v.as_of_seq,
     watermark: v.as_of_seq,
     status: v.status ?? s.status,
-    ...(reset ? { feed: [], stages: {}, mergedUntil: 0 } : {}),
+    // A stage may finish or recover while disconnected. Its replay is below
+    // this snapshot's watermark, so old observations cannot override the new
+    // authoritative tasks. Model/duration become unavailable until observed again.
+    stages: {},
+    ...(reset ? { feed: [], mergedUntil: 0 } : {}),
     reset,
   };
 }

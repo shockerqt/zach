@@ -70,6 +70,36 @@ describe("wire and stream", () => {
   });
 });
 describe("authoritative replay projection", () => {
+  it.each(["RUNNING", "FAILED"])(
+    "reconciles an observed %s stage completed during disconnection before ignoring replay",
+    (previousStatus) => {
+      for (const status of ["Ready", "Done"]) {
+        let s = acceptSnapshot(initial, snapshot(snap));
+        s = applyEvent(
+          s,
+          ev(11, previousStatus === "RUNNING" ? "STAGE_STARTED" : "STAGE_COMPLETED", {
+            attempt_id: "before-disconnect",
+            stage: "impl",
+            status: previousStatus,
+          }),
+        );
+        expect(mood(s)).toBe(previousStatus === "RUNNING" ? "hunting" : "error");
+        s = acceptSnapshot(s, snapshot({
+          ...snap,
+          tasks: [{ ...sampleTask, status, stages_completed: ["plan", "impl"] }],
+          as_of_seq: 12,
+        }));
+        const reconciled = s;
+        s = applyEvent(s, ev(12, "STAGE_COMPLETED", {
+          attempt_id: "before-disconnect", stage: "impl", status: "PASSED",
+        }));
+        expect(s).toBe(reconciled);
+        expect(observedStage(s, s.tasks[0])).toBeUndefined();
+        expect(taskLane(s, s.tasks[0])).toBe(status === "Done" ? "terminal" : "queued");
+        expect(mood(s)).toBe("idle");
+      }
+    },
+  );
   it("ignores overlapping decision replay and accepts lower watermark reset", () => {
     let s = acceptSnapshot(initial, snapshot(snap));
     const d = {
