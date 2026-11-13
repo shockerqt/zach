@@ -255,3 +255,46 @@ from a regular non-symlink file. The output uses exclusive creation with mode
 `.github/workflows/ci.yml` policy. It emits static failure codes and no success
 metadata on stdout. This executable is trusted tooling for the existing Actions
 owner, not a service, candidate-code runner, authenticator or publisher.
+
+## Web panel (ZACH-030)
+
+Use Node 24 LTS. The frontend is independent of the Rust build:
+
+```sh
+npm ci --prefix web
+npm --prefix web run dev
+npm --prefix web run check
+npm --prefix web run test
+npm --prefix web run build
+npm --prefix web exec -- playwright install chromium
+npm --prefix web run test:e2e
+```
+
+The development server binds only to `127.0.0.1:5173`; its fixed `/api` proxy
+forwards to the local gateway at `127.0.0.1:8080`, preserves Origin and strips
+browser cookies. Configure the existing gateway's allowed origins to include
+exactly `http://127.0.0.1:5173` for local development. Enter the existing gateway
+session bearer in the password field and connect. It is held only in memory,
+cleared from the field immediately, and discarded on disconnect/auth failure.
+Never put it in environment variables, URLs or browser storage. Production
+same-origin requests permit the browser-managed Access cookie for the outer
+identity gate; gateway authentication still uses the bearer header exclusively.
+
+The panel loads one initial snapshot and then uses authenticated Fetch SSE with
+watermarks, deduplication and stream-only reconnection. Heartbeat/slot counts
+remain dated observations; keepalives do not prove daemon activity. Provider
+quotas, historical stage model/duration, complete FIFO merge lanes and pause are
+not exposed by the API. Missing data is labelled unavailable. New tasks and
+silent transitions can require a later streamed snapshot.
+Stage observations are invalidated on every authoritative snapshot so a stage
+completed during disconnection cannot remain running or failed in the panel;
+model/duration are unavailable until observed again. Merge decisions are
+denied by server policy by default. Decision POSTs never retry automatically;
+unknown outcomes wait for authoritative reconciliation before another explicit
+operator action. Sound defaults off and requires a gesture. Snapshots and replay at or below each
+accepted snapshot watermark stay silent; newly applied events above that
+watermark may sound, including after reconnect.
+
+`web/dist` is a static build artifact. Production hosting, gateway origin policy,
+Cloudflare Access and reverse proxy activation belong to INF-020 and its approved
+operational delivery workflow; this task does not deploy the panel.

@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="es">
+&lt;head&gt;
+<meta charset="utf-8">
+&lt;title&gt;Zach — panel de control</title>
+<script src="./support.js"></script>
+</head>
+&lt;body&gt;
+&lt;x-dc&gt;
+&lt;helmet&gt;
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+&lt;style&gt;
+body{margin:0;background:#121316}
+a{color:#F0C94A}a:hover{color:#FFE08A}
+button{font-family:inherit;cursor:pointer}
+button:focus-visible,a:focus-visible,input:focus-visible{outline:2px solid #7FB2FF;outline-offset:2px}
+</style>
+</helmet>
+<div style="min-height: 100vh; box-sizing: border-box; background: #121316; color: #ECEAE4; font-family: Inter, system-ui, sans-serif; font-size: 14px; line-height: 1.45">
+
+<header style="display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; padding: 14px 28px; border-bottom: 1px solid #2A2D33">
+<div style="display: flex; align-items: center; gap: 10px; margin-right: auto">
+<div style="width: 36px; height: 36px"><dc-import name="Cat" mood="{{mood}}" hint-size="36px,36px"></dc-import></div>
+<span style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 22px; letter-spacing: -0.01em">Zach</span>
+</div>
+<div style="display: flex; flex-wrap: wrap; gap: 8px">
+<span style="display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border: 1px solid #2A2D33; border-radius: 999px; color: #C9CCD3"><span style="width: 8px; height: 8px; border-radius: 50%; background: #7FB2FF"></span>Daemon activo · latido hace 4 s</span>
+<span style="display: inline-flex; align-items: center; padding: 6px 12px; border: 1px solid #2A2D33; border-radius: 999px; color: #C9CCD3">Slots 1 de 2</span>
+<span style="display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border: 1px solid #6B3A2A; border-radius: 999px; color: #FFA98C"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 8v5M12 17h.01M3 20h18L12 4 3 20z"></path></svg>Codex sin cuota</span>
+<span style="display: inline-flex; align-items: center; padding: 6px 12px; border: 1px solid #2A2D33; border-radius: 999px; color: #C9CCD3">Gemini disponible</span>
+</div>
+<div style="display: flex; gap: 8px">
+<button type="button" style="min-height: 44px; padding: 0 16px; background: transparent; color: #ECEAE4; border: 1px solid #3A3E46; border-radius: 10px; font-size: 14px; font-weight: 500">Pausar cola</button>
+<button type="button" aria-label="Silenciar sonidos" style="width: 44px; height: 44px; display: inline-flex; align-items: center; justify-content: center; background: transparent; color: #ECEAE4; border: 1px solid #3A3E46; border-radius: 10px"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 10v4h4l5 4V6L8 10H4zM17 9a4 4 0 0 1 0 6M19.5 6.5a8 8 0 0 1 0 11"></path></svg></button>
+</div>
+</header>
+
+<main style="display: flex; flex-wrap: wrap; align-items: flex-start; gap: 24px; padding: 24px 28px 40px; max-width: 1480px; margin: 0 auto; box-sizing: border-box">
+
+<section aria-label="Decisión pendiente" style="flex: 1 1 320px; max-width: 380px; display: flex; flex-direction: column; gap: 16px">
+<div style="background: #1A1C20; border: 1px solid #2A2D33; border-radius: 16px; padding: 24px; display: flex; flex-direction: column; align-items: center; gap: 14px">
+<div style="width: 200px; height: 200px"><dc-import name="Cat" mood="{{mood}}" hint-size="200px,200px"></dc-import></div>
+<div style="text-align: center">
+<div style="font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 20px">Zach espera tu decisión</div>
+<div style="color: #A3A6AD; margin-top: 4px">1 decisión abierta · 1 tarea bloqueada en merge</div>
+</div>
+</div>
+
+<div style="background: #1A1C20; border: 1px solid #F0C94A; border-radius: 16px; padding: 20px; display: flex; flex-direction: column; gap: 14px">
+<div style="display: flex; align-items: center; justify-content: space-between; gap: 8px">
+<span style="font-size: 12px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: #F0C94A">Aprobación de plan</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #C9CCD3; border: 1px solid #3A3E46; border-radius: 6px; padding: 2px 8px">INF-020 · L</span>
+</div>
+<div style="font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 18px; line-height: 1.3">¿Aprobar el plan de INF-020?</div>
+<div style="color: #C9CCD3">Expose zach.shocker.cl with Cloudflare Access and Nginx reverse proxy. El plan pasó plan-review; hace falta tu aprobación antes de implementar.</div>
+<a href="#plan" style="font-weight: 500; text-decoration: none">Leer el plan y la revisión</a>
+<div style="display: flex; flex-direction: column; gap: 6px">
+<label for="nota" style="font-size: 12px; color: #A3A6AD">Nota (opcional)</label>
+<input id="nota" type="text" style="min-height: 44px; box-sizing: border-box; padding: 0 12px; background: #121316; color: #ECEAE4; border: 1px solid #3A3E46; border-radius: 10px; font: inherit">
+</div>
+<div style="display: flex; gap: 10px">
+<button type="button" onClick="{{approve}}" style="flex: 1 1 0; min-height: 48px; background: #F0C94A; color: #17150C; border: 0; border-radius: 10px; font-size: 15px; font-weight: 600">Aprobar</button>
+<button type="button" onClick="{{reject}}" style="flex: 1 1 0; min-height: 48px; background: transparent; color: #ECEAE4; border: 1px solid #3A3E46; border-radius: 10px; font-size: 15px; font-weight: 600">Rechazar</button>
+</div>
+<div style="font-size: 12px; color: #A3A6AD">Las decisiones no se aprueban solas por tiempo.</div>
+</div>
+</section>
+
+<section aria-label="Tareas" style="flex: 999 1 520px; min-width: 0; display: flex; flex-direction: column; gap: 16px">
+<h2 style="margin: 0; font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 16px; color: #C9CCD3">En curso</h2>
+<sc-for list="{{tasks}}" as="t" hint-placeholder-count="2">
+<article style="background: #1A1C20; border: 1px solid #2A2D33; border-radius: 16px; padding: 20px; display: flex; flex-direction: column; gap: 16px">
+<div style="display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px">
+<span style="font-family: 'JetBrains Mono', monospace; font-weight: 500; color: #F0C94A">{{t.id}}</span>
+<span style="font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 17px; flex: 1 1 240px; min-width: 0">{{t.title}}</span>
+<span style="font-size: 12px; color: #A3A6AD">{{t.repo}} · peso {{t.weight}}</span>
+</div>
+<ol style="list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px">
+<sc-for list="{{t.stages}}" as="s" hint-placeholder-count="5">
+<li style="flex: 1 1 120px; min-width: 0; border-radius: 10px; padding: 10px 12px; border: 1px solid {{s.border}}; background: {{s.bg}}">
+<div style="display: flex; align-items: center; gap: 6px; font-weight: 600; font-size: 13px; color: {{s.fg}}">
+<sc-if value="{{s.isDone}}" hint-placeholder-val="{{true}}"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"></path></svg></sc-if>
+<sc-if value="{{s.isFail}}" hint-placeholder-val="{{false}}"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"></path></svg></sc-if>
+<sc-if value="{{s.isNow}}" hint-placeholder-val="{{false}}"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24"><circle cx="12" cy="12" r="6" fill="currentColor"></circle></svg></sc-if>
+<sc-if value="{{s.isTodo}}" hint-placeholder-val="{{false}}"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="6"></circle></svg></sc-if>
+&lt;span&gt;{{s.name}}</span>
+</div>
+<div style="font-size: 12px; color: #A3A6AD; margin-top: 4px; overflow-wrap: anywhere">{{s.meta}}</div>
+</li>
+</sc-for>
+</ol>
+<div style="display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px">
+<span style="flex: 1 1 260px; min-width: 0; color: {{t.noteColor}}">{{t.note}}</span>
+<sc-if value="{{t.canRetry}}" hint-placeholder-val="{{false}}">
+<div style="display: flex; gap: 8px">
+<button type="button" style="min-height: 44px; padding: 0 16px; background: transparent; color: #ECEAE4; border: 1px solid #3A3E46; border-radius: 10px; font-weight: 500">Reintentar merge</button>
+<a href="https://github.com/shockerqt/zach/pull/47" style="min-height: 44px; display: inline-flex; align-items: center; padding: 0 16px; border: 1px solid #3A3E46; border-radius: 10px; font-weight: 500; text-decoration: none">Ver PR #47</a>
+</div>
+</sc-if>
+</div>
+</article>
+</sc-for>
+
+<h2 style="margin: 8px 0 0; font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 16px; color: #C9CCD3">En cola</h2>
+<div style="background: #1A1C20; border: 1px solid #2A2D33; border-radius: 16px; padding: 4px 20px">
+<sc-for list="{{queue}}" as="q" hint-placeholder-count="1">
+<div style="display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; padding: 14px 0">
+<span style="font-family: 'JetBrains Mono', monospace; font-weight: 500; color: #C9CCD3">{{q.id}}</span>
+<span style="flex: 1 1 240px; min-width: 0">{{q.title}}</span>
+<span style="font-size: 12px; color: #A3A6AD">{{q.why}}</span>
+</div>
+</sc-for>
+</div>
+</section>
+
+<aside style="flex: 1 1 300px; max-width: 380px; min-width: 0; display: flex; flex-direction: column; gap: 16px">
+<h2 style="margin: 0; font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 16px; color: #C9CCD3">Cola de merge</h2>
+<div style="background: #1A1C20; border: 1px solid #2A2D33; border-radius: 16px; padding: 16px 20px; display: flex; flex-direction: column; gap: 12px">
+<div style="display: flex; align-items: baseline; justify-content: space-between; gap: 8px">
+<span style="font-weight: 600">zach</span>
+<span style="font-size: 12px; color: #FFA98C">carril detenido</span>
+</div>
+<div style="display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 13px">
+<span style="font-family: 'JetBrains Mono', monospace; color: #F0C94A">ZACH-009</span>
+&lt;span&gt;PR #47</span>
+<span style="font-family: 'JetBrains Mono', monospace; color: #A3A6AD">7089a6d</span>
+<span style="color: #FFA98C">CI fallida</span>
+</div>
+<div style="border-top: 1px solid #2A2D33; padding-top: 12px; display: flex; align-items: baseline; justify-content: space-between; gap: 8px">
+<span style="font-weight: 600">discord-ai-bot</span>
+<span style="font-size: 12px; color: #A3A6AD">vacía</span>
+</div>
+</div>
+
+<h2 style="margin: 8px 0 0; font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 16px; color: #C9CCD3">Eventos</h2>
+<div style="background: #1A1C20; border: 1px solid #2A2D33; border-radius: 16px; padding: 6px 20px">
+<sc-for list="{{events}}" as="e" hint-placeholder-count="5">
+<div style="display: flex; gap: 12px; padding: 10px 0; font-size: 13px">
+<span style="font-family: 'JetBrains Mono', monospace; color: #A3A6AD; flex: 0 0 auto">{{e.at}}</span>
+<div style="min-width: 0">
+<div style="font-weight: 500; color: {{e.color}}">{{e.what}}</div>
+<div style="color: #A3A6AD; overflow-wrap: anywhere">{{e.detail}}</div>
+</div>
+</div>
+</sc-for>
+</div>
+</aside>
+
+</main>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"mood":{"editor":"enum","options":["idle","hunting","review","decision","merged","error","paused"],"default":"decision"},"$preview":{"width":1440,"height":1000}}'>
+class Component extends DCLogic {
+renderVals() {
+const S = {
+done: { bg: '#1A1C20', border: '#2A2D33', fg: '#C9CCD3', isDone: true },
+fail: { bg: '#2A1A15', border: '#8A4630', fg: '#FFA98C', isFail: true },
+now: { bg: '#2A2510', border: '#F0C94A', fg: '#F0C94A', isNow: true },
+todo: { bg: '#16181B', border: '#24272C', fg: '#A3A6AD', isTodo: true }
+};
+const st = (name, kind, meta) => Object.assign({ name, meta, isDone: false, isFail: false, isNow: false, isTodo: false }, S[kind]);
+const mood = this.state?.mood ?? this.props.mood ?? 'decision';
+return {
+mood,
+approve: () => this.setState({ mood: 'hunting' }),
+reject: () => this.setState({ mood: 'idle' }),
+tasks: [
+{ id: 'ZACH-009', title: 'Implement local HTTP web gateway and SSE event stream', repo: 'zach', weight: 'M',
+note: 'Merge detenido: la CI falló en 7089a6d.', noteColor: '#FFA98C', canRetry: true,
+stages: [
+st('plan', 'done', 'gemini-3.8-flash · 6 min'),
+st('plan-review', 'done', 'gemini-3.8-flash · 9 min'),
+st('impl', 'done', '3 intentos · 20 min'),
+st('pr-review', 'done', '4 intentos · 20 min'),
+st('merge', 'fail', 'CI en rojo')
+] },
+{ id: 'INF-020', title: 'Expose zach.shocker.cl with Cloudflare Access and Nginx reverse proxy', repo: 'infrastructure', weight: 'L',
+note: 'Esperando tu aprobación del plan.', noteColor: '#F0C94A', canRetry: false,
+stages: [
+st('plan', 'done', 'listo'),
+st('plan-review', 'done', 'aprobado'),
+st('tu aprobación', 'now', 'pendiente'),
+st('impl', 'todo', ''),
+st('pr-review', 'todo', ''),
+st('aprobar merge', 'todo', '')
+] }
+],
+queue: [
+{ id: 'ZACH-010', title: 'Build live visualizer frontend SPA with animated Zach black cat mascot', why: 'espera a ZACH-009' }
+],
+events: [
+{ at: '22:07:06', what: 'Merge fallido', detail: 'ZACH-009 · CI del SHA 7089a6d', color: '#FFA98C' },
+{ at: '22:07:04', what: 'En cola de merge', detail: 'ZACH-009 · PR #47', color: '#ECEAE4' },
+{ at: '22:06:58', what: 'Etapa terminada', detail: 'ZACH-009 · pr-review', color: '#ECEAE4' },
+{ at: '22:02:34', what: 'Etapa iniciada', detail: 'ZACH-009 · pr-review · gemini-3.8-flash-high', color: '#ECEAE4' },
+{ at: '21:24:41', what: 'Etapa terminada', detail: 'ZACH-009 · impl', color: '#ECEAE4' }
+]
+};
+}
+}
+</script>
+</body>
+</html>

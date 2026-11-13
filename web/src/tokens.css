@@ -1,0 +1,40 @@
+:root {
+  --ground: #121316;
+  --panel: #1a1c20;
+  --line: #2a2d33;
+  --line-strong: #3a3e46;
+  --text: #eceae4;
+  --text-2: #c9ccd3;
+  --text-3: #a3a6ad;
+  --amber: #f0c94a;
+  --blue: #7fb2ff;
+  --fail: #ffa98c;
+  --fail-bg: #2a1a15;
+  --fail-border: #8a4630;
+  --now-bg: #2a2510;
+  --moon: #f3e4a4;
+  --crater: #e6d48c;
+  --cat: #0e0e10;
+  --button-text: #17150c;
+  --heading: "Space Grotesk", sans-serif;
+  --body: Inter, sans-serif;
+  --mono: "JetBrains Mono", monospace;
+  --card-radius: 16px;
+  --control-radius: 10px;
+  --chip-radius: 999px;
+  --space: 8px;
+  --body-size: 14px;
+  --wordmark-size: 22px;
+  --section-size: 16px;
+  --card-heading-size: 18px;
+  --task-heading-size: 17px;
+  --mascot-heading-size: 20px;
+  --metadata-size: 12px;
+  --strong-weight: 600;
+}
+
+@media (max-width: 700px) {
+  :root {
+    --body-size: 15px;
+  }
+}
