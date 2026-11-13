@@ -312,6 +312,7 @@ pub struct PreparedResources {
     pub layout: SandboxLayout,
     proxy: Option<ProxyHandle>,
     cleanup_dirs: Vec<PathBuf>,
+    retained: bool,
 }
 
 impl PreparedResources {
@@ -327,6 +328,7 @@ impl PreparedResources {
             layout: SandboxLayout::inspect(home, worktree, writable)?,
             proxy: None,
             cleanup_dirs: vec![],
+            retained: false,
         };
         if let Some(family) = family {
             let (name, destination, files): (&str, &str, &[&str]) = match family {
@@ -393,12 +395,79 @@ impl PreparedResources {
         }
         Ok(prepared)
     }
+    /// After durable launch handoff only confirmed-stop cleanup may remove auth or net/.
+    pub fn retain(&mut self) {
+        self.retained = true;
+    }
+
+    pub fn recover(
+        attempt: &Path,
+        family: ModelFamily,
+        network: NetworkPolicy,
+    ) -> Result<Self, String> {
+        use std::os::unix::fs::MetadataExt;
+        let auth = attempt.join(match family {
+            ModelFamily::OpenAiSol => "codex-home",
+            ModelFamily::GeminiAgy => "gemini-home",
+        });
+        let required_auth = match family {
+            ModelFamily::OpenAiSol => vec![auth.join("auth.json")],
+            ModelFamily::GeminiAgy => vec![
+                auth.join("antigravity-cli/antigravity-oauth-token"),
+                auth.join("jetski-standalone-oauth-token"),
+            ],
+        };
+        if !required_auth.iter().any(|path| path.is_file()) {
+            return Err("missing staged auth on reattachment".into());
+        }
+        for file in &required_auth {
+            reject_symlink_components(file)?;
+        }
+        let mut dirs = vec![auth];
+        if matches!(network, NetworkPolicy::ProviderApi(_)) {
+            dirs.push(attempt.join("net"));
+        }
+        for dir in &dirs {
+            reject_symlink_components(dir)?;
+            let meta = fs::symlink_metadata(dir).map_err(|e| e.to_string())?;
+            if !meta.is_dir()
+                || meta.uid() != unsafe { libc::geteuid() }
+                || meta.mode() & 0o077 != 0
+            {
+                return Err("unsafe or missing recovery resources".into());
+            }
+        }
+        let proxy = match network {
+            NetworkPolicy::ProviderApi(f) => Some(ProxyHandle::rebind(&attempt.join("net"), f)?),
+            NetworkPolicy::None => None,
+        };
+        Ok(Self {
+            layout: SandboxLayout::declared(Path::new("/"), Path::new("/"), false),
+            proxy,
+            cleanup_dirs: dirs,
+            retained: true,
+        })
+    }
+
+    pub fn cleanup_after_stop(mut self) -> Result<(), String> {
+        self.proxy.take();
+        for path in &self.cleanup_dirs {
+            reject_symlink_components(path)?;
+            match fs::remove_dir_all(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        self.cleanup_dirs.clear();
+        Ok(())
+    }
 }
 
 impl Drop for PreparedResources {
     fn drop(&mut self) {
         self.proxy.take();
-        for path in &self.cleanup_dirs {
+        for path in self.cleanup_dirs.iter().filter(|_| !self.retained) {
             let _ = fs::remove_dir_all(path);
         }
     }
@@ -411,12 +480,13 @@ pub fn reject_symlink_components(path: &Path) -> Result<(), String> {
             return Err("parent traversal rejected".into());
         }
         prefix.push(part);
-        if fs::symlink_metadata(&prefix)
-            .map_err(|e| e.to_string())?
-            .file_type()
-            .is_symlink()
-        {
-            return Err(format!("symlink rejected: {}", prefix.display()));
+        match fs::symlink_metadata(&prefix) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(format!("symlink rejected: {}", prefix.display()));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
         }
     }
     Ok(())
@@ -576,6 +646,22 @@ pub struct ProxyHandle {
 }
 
 impl ProxyHandle {
+    pub fn rebind(net: &Path, family: ModelFamily) -> Result<Self, String> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        reject_symlink_components(net)?;
+        let path = net.join("proxy.sock");
+        match fs::symlink_metadata(&path) {
+            Ok(meta)
+                if meta.file_type().is_socket() && meta.uid() == unsafe { libc::geteuid() } =>
+            {
+                fs::remove_file(&path).map_err(|e| e.to_string())?
+            }
+            Ok(_) => return Err("unsafe stale proxy socket".into()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        Self::start(net, family)
+    }
     pub fn start(net: &Path, family: ModelFamily) -> Result<Self, String> {
         reject_symlink_components(net)?;
         let path = net.join("proxy.sock");
@@ -666,7 +752,6 @@ impl Drop for ProxyHandle {
             let _ = join.join();
         }
         let _ = fs::remove_file(self.net.join("proxy.sock"));
-        let _ = fs::remove_dir(&self.net);
     }
 }
 
@@ -1284,7 +1369,8 @@ mod tests {
         let start = std::time::Instant::now();
         drop(proxy);
         assert!(start.elapsed() < Duration::from_secs(2));
-        assert!(!net.exists());
+        assert!(net.is_dir());
+        assert!(!net.join("proxy.sock").exists());
     }
 
     #[test]
@@ -1687,7 +1773,7 @@ mod tests {
     }
 
     #[test]
-    fn proxy_rejects_disallowed_connects_empirically_and_cleans_up_its_directory() {
+    fn proxy_rejects_disallowed_connects_and_preserves_mounted_directory() {
         let temp = Temp::new();
         let net = temp.0.join("net");
         ensure_secure_dir(&net).unwrap();
@@ -1714,7 +1800,8 @@ mod tests {
             assert!(out.starts_with("HTTP/1.1 403"));
         }
         drop(proxy);
-        assert!(!net.exists());
+        assert!(net.is_dir());
+        assert!(!net.join("proxy.sock").exists());
     }
 
     #[test]

@@ -153,6 +153,14 @@ pub trait MergeDriver {
         head_sha: &str,
     ) -> Result<String, MergePrError>;
 
+    fn query_pr_merge_state(
+        &mut self,
+        _gh_repo: &str,
+        _pr_number: i64,
+    ) -> Result<PrMergeState, String> {
+        Err("merge driver does not support PR state recovery".into())
+    }
+
     fn query_post_merge_ci(
         &mut self,
         gh_repo: &str,
@@ -461,6 +469,41 @@ where
 pub struct SystemMergeDriver;
 
 impl MergeDriver for SystemMergeDriver {
+    fn query_pr_merge_state(
+        &mut self,
+        gh_repo: &str,
+        pr_number: i64,
+    ) -> Result<PrMergeState, String> {
+        let output = Command::new("gh")
+            .args([
+                "pr",
+                "view",
+                &pr_number.to_string(),
+                "--repo",
+                gh_repo,
+                "--json",
+                "state,mergeCommit",
+            ])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err("cannot inspect PR state".into());
+        }
+        let value: serde_json::Value =
+            serde_json::from_slice(&output.stdout).map_err(|e| e.to_string())?;
+        match value["state"].as_str() {
+            Some("MERGED") => Ok(PrMergeState::Merged(
+                value["mergeCommit"]["oid"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned),
+            )),
+            Some("OPEN") => Ok(PrMergeState::Open),
+            Some("CLOSED") => Ok(PrMergeState::Closed),
+            _ => Err("unknown PR state".into()),
+        }
+    }
+
     fn default_branch(&mut self, repo: &str, worktree_path: &str) -> Result<String, String> {
         let sym_output = Command::new("git")
             .args([
@@ -1122,6 +1165,9 @@ pub fn process_repo_merge_queue_with_config<S>(
 where
     S: FnMut(Duration),
 {
+    if !cfg!(test) {
+        return Err("merge execution is owned by zachd's resumable phase driver".into());
+    }
     let entries = store
         .list_merge_queue(Some(repo))
         .map_err(|e| e.to_string())?;
@@ -1544,6 +1590,279 @@ where
     })
 }
 
+/// Durable merge phases. A coordinator persists each returned checkpoint before
+/// submitting the next side effect; no SQLite handle enters a merge worker.
+pub enum MergePhaseResult {
+    Advanced(crate::v2::store::MergeCheckpoint),
+    Waiting(crate::v2::store::MergeCheckpoint),
+    Publication(crate::v2::store::LifecycleOperation),
+    Rereview(String),
+    LaneBlocked(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrMergeState {
+    Open,
+    Merged(Option<String>),
+    Closed,
+}
+
+pub fn run_merge_phase(
+    state_dir: &std::path::Path,
+    task: &TaskRecord,
+    driver: &mut dyn MergeDriver,
+    semaphore: &HeavyCheckSemaphore,
+) -> Result<MergePhaseResult, String> {
+    use crate::v2::store::{LifecycleOperation, MergeCheckpoint};
+    let mut checkpoint = task
+        .memory
+        .merge_checkpoint
+        .clone()
+        .unwrap_or(MergeCheckpoint {
+            phase: "MERGE_DEFAULT".into(),
+            target_sha: task.reviewed_sha.clone().ok_or("missing reviewed SHA")?,
+            pr_number: task.pr_number.ok_or("missing PR")?,
+            ..MergeCheckpoint::default()
+        });
+    let repo = &task.repository;
+    let gh = task.github_repo.as_deref().unwrap_or(repo);
+    let wt = task
+        .worktree_path
+        .as_deref()
+        .ok_or("missing merge worktree")?;
+    match checkpoint.phase.as_str() {
+        "MERGE_DEFAULT" => {
+            let branch = driver.default_branch(repo, wt)?;
+            match driver.merge_origin_default(repo, wt, &branch)? {
+                MergeOriginOutcome::Merged(sha) => {
+                    if sha.is_empty() {
+                        return Err("missing merge target SHA".into());
+                    }
+                    checkpoint.target_sha = sha;
+                    checkpoint.phase = "GATE_CHECKS".into();
+                }
+                MergeOriginOutcome::Conflict { conflicted_files } => {
+                    return Err(format!("merge conflict: {}", conflicted_files.join(", ")));
+                }
+            }
+        }
+        "GATE_CHECKS" => {
+            driver.run_gate_checks(repo, wt, &task.context_pack.gate_checks, semaphore)?;
+            checkpoint.phase = "DIFF".into();
+        }
+        "DIFF" => {
+            let reviewed = task.reviewed_sha.as_deref().ok_or("missing reviewed sha")?;
+            match driver.diff_touched_task_files(
+                wt,
+                reviewed,
+                &checkpoint.target_sha,
+                &task.context_pack.target_files,
+            )? {
+                ReviewedDiffOutcome::Clean => {}
+                ReviewedDiffOutcome::Touched(files) => {
+                    return Ok(MergePhaseResult::Rereview(format!(
+                        "merge changed task files: {}",
+                        files.join(", ")
+                    )));
+                }
+                ReviewedDiffOutcome::DiffUnavailable(reason) => {
+                    return Ok(MergePhaseResult::Rereview(reason));
+                }
+            }
+            if reviewed != checkpoint.target_sha {
+                if !task.required_stages.iter().any(|s| s == "pr-review") {
+                    let root = crate::v2::runner::ensure_secure_dir(&state_dir.join("merges"))?;
+                    crate::v2::runner::validate_attempt_id(&task.task_id)?;
+                    let dir = crate::v2::runner::ensure_secure_dir(&root.join(&task.task_id))?;
+                    let path = dir.join(format!("mechanical-{}.md", checkpoint.target_sha));
+                    let body = format!(
+                        "XS mechanical SHA parity: {reviewed} -> {}. No required PR-review stage. The reviewed-diff check found no task file changes. Current Step 2 checks passed:\n{}",
+                        checkpoint.target_sha,
+                        task.context_pack.gate_checks.join("\n")
+                    );
+                    crate::v2::runner::write_secure_file(&path, body.as_bytes())?;
+                    let mut op = crate::v2::intake::stage_operation(
+                        task,
+                        &format!("parity-{}-{}", task.task_id, checkpoint.target_sha),
+                        "impl",
+                        &path,
+                        None,
+                        Some(&checkpoint.target_sha),
+                        "zach",
+                    );
+                    op.kind = "merge-parity".into();
+                    return Ok(MergePhaseResult::Publication(op));
+                }
+                let body = if let Some(body) = &task.memory.last_pr_review_evidence {
+                    body.clone()
+                } else if let Some(path) = &task.memory.last_pr_review_evidence_path {
+                    let path = std::path::Path::new(path);
+                    if !path.starts_with(state_dir) {
+                        return Err("review artifact outside state directory".into());
+                    }
+                    crate::v2::isolation::reject_symlink_components(path)?;
+                    std::fs::read_to_string(path).map_err(|e| e.to_string())?
+                } else {
+                    return Ok(MergePhaseResult::Rereview(
+                        "review evidence unavailable".into(),
+                    ));
+                };
+                crate::v2::pipeline::validate_ac_evidence(task, &body)?;
+                let context = crate::v2::runner::collect_reviewed_diff_ranges(
+                    wt,
+                    task.plan_base_sha.as_deref(),
+                    &checkpoint.target_sha,
+                )?;
+                for line in body.lines() {
+                    let cells: Vec<_> = line
+                        .trim()
+                        .trim_matches('|')
+                        .split('|')
+                        .map(str::trim)
+                        .collect();
+                    if cells.first().is_some_and(|c| c.starts_with("AC-")) {
+                        let (file, line) =
+                            cells[2].rsplit_once(':').ok_or("invalid parity citation")?;
+                        let file = crate::v2::runner::normalize_cited_diff_path(file, wt)?;
+                        let line = line.parse::<usize>().map_err(|e| e.to_string())?;
+                        if !context
+                            .files
+                            .get(&file)
+                            .is_some_and(|ranges| ranges.iter().any(|r| r.contains(line)))
+                        {
+                            return Ok(MergePhaseResult::Rereview(
+                                "review citations invalid at merge target".into(),
+                            ));
+                        }
+                    }
+                }
+                let root = crate::v2::runner::ensure_secure_dir(&state_dir.join("merges"))?;
+                if task.task_id.contains('/') || task.task_id.contains("..") {
+                    return Err("invalid task id".into());
+                }
+                let dir = crate::v2::runner::ensure_secure_dir(&root.join(&task.task_id))?;
+                let path = dir.join(format!("parity-{}.md", checkpoint.target_sha));
+                let body = format!(
+                    "{body}\n\nReview-SHA parity: {reviewed} -> {}. The reviewed-diff check found no task file changes. This carries forward the existing review; no reviewer ran again. Step 2 gate checks passed:\n{}\n",
+                    checkpoint.target_sha,
+                    task.context_pack.gate_checks.join("\n")
+                );
+                crate::v2::runner::write_secure_file(&path, body.as_bytes())?;
+                let mut op = crate::v2::intake::stage_operation(
+                    task,
+                    &format!("parity-{}-{}", task.task_id, checkpoint.target_sha),
+                    "pr-review",
+                    &path,
+                    Some("APPROVED"),
+                    Some(&checkpoint.target_sha),
+                    "zach",
+                );
+                op.kind = "merge-parity".into();
+                return Ok(MergePhaseResult::Publication(op));
+            }
+            checkpoint.phase = "PUSH".into();
+        }
+        "PUSH" => {
+            match driver.push_head(
+                repo,
+                wt,
+                task.branch.as_deref().ok_or("missing merge branch")?,
+            )? {
+                PushOutcome::Pushed => {}
+                PushOutcome::NonFastForward(reason) => {
+                    return Err(format!("non-fast-forward push: {reason}"));
+                }
+            }
+            checkpoint.phase = "CI".into();
+        }
+        "CI" => match driver.query_exact_sha_ci(gh, &checkpoint.target_sha)? {
+            CiCheckState::Success { .. } => checkpoint.phase = "MERGE_PENDING".into(),
+            CiCheckState::Pending { .. } => return Ok(MergePhaseResult::Waiting(checkpoint)),
+            CiCheckState::Failed { failed_checks } => {
+                return Err(format!("exact-SHA CI failed: {}", failed_checks.join(", ")));
+            }
+        },
+        "MERGE_PENDING" => {
+            // Always query first, including after a crash with an uncertain merge result.
+            match driver.query_pr_merge_state(gh, checkpoint.pr_number)? {
+                PrMergeState::Merged(Some(sha)) => checkpoint.merge_sha = Some(sha),
+                PrMergeState::Merged(None) => {
+                    return Ok(MergePhaseResult::LaneBlocked(
+                        "merged PR has no recoverable merge SHA".into(),
+                    ));
+                }
+                PrMergeState::Closed => return Err("PR closed without merge".into()),
+                PrMergeState::Open => match driver.merge_pr_match_head(
+                    gh,
+                    checkpoint.pr_number,
+                    &checkpoint.target_sha,
+                ) {
+                    Ok(sha) => checkpoint.merge_sha = Some(sha),
+                    Err(MergePrError::PostMergeShaUnavailable(reason)) => {
+                        return Ok(MergePhaseResult::LaneBlocked(reason));
+                    }
+                    Err(MergePrError::PreMerge(reason)) => return Err(reason),
+                },
+            }
+            checkpoint.phase = "POST_MERGE_CI".into();
+        }
+        "POST_MERGE_CI" => {
+            let sha = checkpoint
+                .merge_sha
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .ok_or("missing merge receipt SHA")?;
+            match driver.query_post_merge_ci(gh, sha)? {
+                CiCheckState::Success { .. } => {
+                    checkpoint.post_merge_verified = true;
+                    checkpoint.phase = "CLOSE_PENDING".into();
+                }
+                CiCheckState::Pending { .. } => return Ok(MergePhaseResult::Waiting(checkpoint)),
+                CiCheckState::Failed { failed_checks } => {
+                    return Ok(MergePhaseResult::LaneBlocked(format!(
+                        "post-merge CI failed: {}",
+                        failed_checks.join(", ")
+                    )));
+                }
+            }
+        }
+        "CLOSE_PENDING" => {
+            if !checkpoint.post_merge_verified {
+                return Err("close requires verified merge receipt".into());
+            }
+            match driver.query_pr_merge_state(gh, checkpoint.pr_number)? {
+                PrMergeState::Merged(Some(sha)) if Some(&sha) == checkpoint.merge_sha.as_ref() => {}
+                _ => {
+                    return Ok(MergePhaseResult::LaneBlocked(
+                        "close readback does not match saved merge receipt".into(),
+                    ));
+                }
+            }
+            return Ok(MergePhaseResult::Publication(LifecycleOperation {
+                attempt_id: None,
+                decision_id: None,
+                operation_id: format!("close-{}-{}", task.task_id, checkpoint.pr_number),
+                task_id: task.task_id.clone(),
+                kind: "close".into(),
+                args: vec![
+                    "close".into(),
+                    task.task_id.clone(),
+                    "--pr".into(),
+                    checkpoint.pr_number.to_string(),
+                ],
+                body_path: None,
+                depends_on: None,
+                state: "PENDING".into(),
+                retry_epoch: 0,
+                attempts: 0,
+                last_error: None,
+            }));
+        }
+        _ => return Err(format!("unknown merge phase {}", checkpoint.phase)),
+    }
+    Ok(MergePhaseResult::Advanced(checkpoint))
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -1552,6 +1871,7 @@ pub mod tests {
 
     #[derive(Default)]
     pub struct MockMergeDriver {
+        pub pr_merge_state: Option<PrMergeState>,
         pub default_branch: Option<String>,
         pub default_branch_error: Option<String>,
         pub merged_against: Option<String>,
@@ -1574,6 +1894,10 @@ pub mod tests {
     }
 
     impl MergeDriver for MockMergeDriver {
+        fn query_pr_merge_state(&mut self, _repo: &str, _pr: i64) -> Result<PrMergeState, String> {
+            self.steps.push("query_pr_merge_state".into());
+            Ok(self.pr_merge_state.clone().unwrap_or(PrMergeState::Open))
+        }
         fn default_branch(&mut self, _repo: &str, _worktree_path: &str) -> Result<String, String> {
             if let Some(ref err) = self.default_branch_error {
                 return Err(err.clone());
@@ -1736,6 +2060,9 @@ pub mod tests {
             executor: None,
             autonomous_consent: true,
             retry_count: 0,
+            next_retry_epoch: 0,
+            lease_owner: None,
+            lease_expires_epoch: None,
             memory: TaskMemory::default(),
             version: 1,
             updated_epoch: 1000,
@@ -2577,5 +2904,127 @@ pub mod tests {
         assert_eq!(decs.len(), 1);
         assert_eq!(decs[0].task_id, "TASK-1");
         assert_eq!(decs[0].kind, "merge_default_branch_failed");
+    }
+    #[test]
+    fn resumable_merge_phases_keep_receipts_and_query_before_uncertain_merge() {
+        let mut task = sample_task("ZACH-025-MERGE", "zach", vec!["src/example.rs"]);
+        task.reviewed_sha = Some("head".into());
+        task.pr_number = Some(9);
+        task.status = "Queued for Merge".into();
+        let mut driver = MockMergeDriver {
+            origin_default_sha: Some("head".into()),
+            merge_pr_result: Some("receipt".into()),
+            ..MockMergeDriver::default()
+        };
+        let sem = HeavyCheckSemaphore::new();
+        for expected in [
+            "GATE_CHECKS",
+            "DIFF",
+            "PUSH",
+            "CI",
+            "MERGE_PENDING",
+            "POST_MERGE_CI",
+        ] {
+            let MergePhaseResult::Advanced(cp) =
+                run_merge_phase(std::path::Path::new("unused"), &task, &mut driver, &sem).unwrap()
+            else {
+                panic!("phase did not advance")
+            };
+            assert_eq!(cp.phase, expected);
+            // Serialize/reload the exact checkpoint between every side effect.
+            task.memory.merge_checkpoint =
+                Some(serde_json::from_str(&serde_json::to_string(&cp).unwrap()).unwrap());
+        }
+        assert_eq!(
+            driver
+                .steps
+                .iter()
+                .filter(|s| *s == "merge_pr_match_head")
+                .count(),
+            1
+        );
+        assert!(
+            driver
+                .steps
+                .iter()
+                .position(|s| s == "query_pr_merge_state")
+                .unwrap()
+                < driver
+                    .steps
+                    .iter()
+                    .position(|s| s == "merge_pr_match_head")
+                    .unwrap()
+        );
+        assert_eq!(
+            task.memory
+                .merge_checkpoint
+                .as_ref()
+                .unwrap()
+                .merge_sha
+                .as_deref(),
+            Some("receipt")
+        );
+        // The remote merge succeeded, but the daemon lost its completion event.
+        task.memory.merge_checkpoint.as_mut().unwrap().phase = "MERGE_PENDING".into();
+        task.memory.merge_checkpoint.as_mut().unwrap().merge_sha = None;
+        driver.pr_merge_state = Some(PrMergeState::Merged(Some("receipt".into())));
+        let MergePhaseResult::Advanced(cp) =
+            run_merge_phase(std::path::Path::new("unused"), &task, &mut driver, &sem).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(cp.phase, "POST_MERGE_CI");
+        assert_eq!(
+            driver
+                .steps
+                .iter()
+                .filter(|s| *s == "merge_pr_match_head")
+                .count(),
+            1
+        );
+        task.memory.merge_checkpoint = Some(cp);
+        let MergePhaseResult::Advanced(cp) =
+            run_merge_phase(std::path::Path::new("unused"), &task, &mut driver, &sem).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(cp.phase, "CLOSE_PENDING");
+        assert!(cp.post_merge_verified);
+        task.memory.merge_checkpoint = Some(cp);
+        let MergePhaseResult::Publication(op) =
+            run_merge_phase(std::path::Path::new("unused"), &task, &mut driver, &sem).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(op.kind, "close");
+        assert_eq!(op.args, vec!["close", "ZACH-025-MERGE", "--pr", "9"]);
+        assert_ne!(task.status, "Done");
+    }
+
+    #[test]
+    fn resumable_merge_refuses_unrecoverable_evidence_and_missing_merge_sha() {
+        let mut task = sample_task("ZACH-025-SAFE", "zach", vec!["src/example.rs"]);
+        task.reviewed_sha = Some("reviewed".into());
+        task.pr_number = Some(9);
+        task.memory.merge_checkpoint = Some(crate::v2::store::MergeCheckpoint {
+            phase: "DIFF".into(),
+            target_sha: "target".into(),
+            pr_number: 9,
+            ..Default::default()
+        });
+        let sem = HeavyCheckSemaphore::new();
+        let mut driver = MockMergeDriver::default();
+        assert!(matches!(
+            run_merge_phase(std::path::Path::new("unused"), &task, &mut driver, &sem).unwrap(),
+            MergePhaseResult::Rereview(_)
+        ));
+        assert!(!driver.steps.iter().any(|s| s == "push_head"));
+        task.memory.merge_checkpoint.as_mut().unwrap().phase = "MERGE_PENDING".into();
+        driver.pr_merge_state = Some(PrMergeState::Merged(None));
+        assert!(matches!(
+            run_merge_phase(std::path::Path::new("unused"), &task, &mut driver, &sem).unwrap(),
+            MergePhaseResult::LaneBlocked(_)
+        ));
+        assert!(!driver.steps.iter().any(|s| s == "merge_pr_match_head"));
     }
 }

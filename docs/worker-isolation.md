@@ -44,14 +44,19 @@ use O_NOFOLLOW. Token refresh changes the staged copies, not operator files.
 Host sessions, history, conversations, gh, SSH, gcloud, workspace-actions and
 Zach's database/socket remain hidden. Worker checks receive no provider auth.
 
-`PreparedResources` owns the staged directories and `ProxyHandle` owns the
-listener, active clients and listener/tunnel threads. Dropping these handles
-closes connections and removes auth and network state, including on error.
-Ordinary prompt/output/schema artifacts remain subject to attempt retention.
+`PreparedResources` owns staged directories and `ProxyHandle` owns the listener,
+active clients and listener/tunnel threads. Preparation failures clean up their
+resources. Once launch intent is durable, the daemon supervisor retains ownership
+through harvest and confirmed stop; dropping the registry preserves staged auth
+and the mounted network directory for restart recovery. Proxy listeners can be
+rebound at the same socket pathname without replacing that directory. Protected
+detached artifacts remain until their publication/merge receipts permit cleanup.
 Resource discovery/preparation is separate from the pure argv builder; dry-run
 planning performs no staging, filesystem inspection or listener creation.
 Its declarative argv is completed with discovered mounts during execution.
-This ownership boundary permits a future supervisor to retain the handles.
+See [daemon supervision](daemon-supervision.md) for the retained-unit lifecycle.
+The configured daemon state directory must be outside the worker worktree so the
+worktree bind cannot expose daemon state or other attempts' staged credentials.
 
 ## Network boundary
 
