@@ -1,0 +1,65 @@
+<svg viewBox="0 0 200 200" role="img" aria-label="Zach" xmlns="http://www.w3.org/2000/svg">
+<circle cx="100" cy="100" r="94" fill="#F3E4A4"></circle>
+<circle cx="62" cy="58" r="9" fill="#E6D48C"></circle>
+<circle cx="146" cy="128" r="6" fill="#E6D48C"></circle>
+<circle cx="52" cy="124" r="4" fill="#E6D48C"></circle>
+<path d="M144 172 C174 170 180 138 164 124" fill="none" stroke="#0E0E10" stroke-width="11" stroke-linecap="round"></path>
+<path d="M56 186 C46 142 60 108 100 104 C140 108 154 142 144 186 Z" fill="#0E0E10"></path>
+<path d="M66 68 L60 28 L92 54 Z" fill="#0E0E10"></path>
+<path d="M134 68 L140 28 L108 54 Z" fill="#0E0E10"></path>
+<ellipse cx="100" cy="84" rx="42" ry="35" fill="#0E0E10"></ellipse>
+<path d="M96 96 L104 96 L100 101 Z" fill="#D9A08F"></path>
+<path d="M58 92 L32 86 M58 98 L32 102 M142 92 L168 86 M142 98 L168 102" stroke="#0E0E10" stroke-width="1.6" stroke-linecap="round" fill="none"></path>
+<g id="eyes-open" data-state-layer>
+<g>
+<ellipse cx="83" cy="82" rx="9" ry="10" fill="#F0C94A"></ellipse>
+<ellipse cx="117" cy="82" rx="9" ry="10" fill="#F0C94A"></ellipse>
+<ellipse cx="83" cy="82" rx="2.6" ry="8.5" fill="#0E0E10"></ellipse>
+<ellipse cx="117" cy="82" rx="2.6" ry="8.5" fill="#0E0E10"></ellipse>
+</g>
+</g>
+<g id="eyes-wide" data-state-layer>
+<g>
+<ellipse cx="83" cy="82" rx="10" ry="11" fill="#F0C94A"></ellipse>
+<ellipse cx="117" cy="82" rx="10" ry="11" fill="#F0C94A"></ellipse>
+<ellipse cx="83" cy="82" rx="7" ry="8.5" fill="#0E0E10"></ellipse>
+<ellipse cx="117" cy="82" rx="7" ry="8.5" fill="#0E0E10"></ellipse>
+<circle cx="80" cy="78" r="2" fill="#FFF6D6"></circle>
+<circle cx="114" cy="78" r="2" fill="#FFF6D6"></circle>
+</g>
+</g>
+<g id="eyes-nap" data-state-layer>
+<path d="M74 82 Q83 90 92 82 M108 82 Q117 90 126 82" stroke="#F0C94A" stroke-width="3" stroke-linecap="round" fill="none"></path>
+</g>
+<g id="eyes-happy" data-state-layer>
+<path d="M74 86 Q83 76 92 86 M108 86 Q117 76 126 86" stroke="#F0C94A" stroke-width="3" stroke-linecap="round" fill="none"></path>
+</g>
+<g id="eyes-narrow" data-state-layer>
+<g>
+<path d="M73 76 L93 82 L93 86 L73 86 Z" fill="#F0C94A"></path>
+<path d="M127 76 L107 82 L107 86 L127 86 Z" fill="#F0C94A"></path>
+<path d="M60 40 L52 34 M64 36 L58 28 M140 40 L148 34 M136 36 L142 28" stroke="#0E0E10" stroke-width="3" stroke-linecap="round" fill="none"></path>
+</g>
+</g>
+<g id="monocle" data-state-layer>
+<g fill="none" stroke="#F0C94A" stroke-width="2.4" stroke-linecap="round">
+<circle cx="117" cy="82" r="15"></circle>
+<path d="M128 93 C136 108 134 124 126 136"></path>
+</g>
+</g>
+<g id="badge-decision" data-state-layer>
+<g>
+<circle cx="160" cy="40" r="20" fill="#0E0E10"></circle>
+<circle cx="160" cy="40" r="16" fill="#F0C94A"></circle>
+<path d="M160 30 L160 43" stroke="#0E0E10" stroke-width="4.5" stroke-linecap="round"></path>
+<circle cx="160" cy="50" r="2.6" fill="#0E0E10"></circle>
+</g>
+</g>
+<g id="badge-paused" data-state-layer>
+<g>
+<circle cx="160" cy="40" r="20" fill="#0E0E10"></circle>
+<circle cx="160" cy="40" r="16" fill="#C9CCD3"></circle>
+<path d="M155 32 L155 48 M165 32 L165 48" stroke="#0E0E10" stroke-width="4.5" stroke-linecap="round"></path>
+</g>
+</g>
+</svg>

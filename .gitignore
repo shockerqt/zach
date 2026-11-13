@@ -1,1 +1,7 @@
 /target/
+
+# Zach panel local dependencies and generated browser artifacts
+web/node_modules/
+web/dist/
+web/test-results/
+web/playwright-report/

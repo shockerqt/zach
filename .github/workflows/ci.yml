@@ -19,3 +19,42 @@ jobs:
       - run: cargo clippy -- -D warnings
       - run: make test
       - run: cargo build --locked
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci --prefix web
+      - run: npm --prefix web run check
+      - run: npm --prefix web run test
+      - run: npm --prefix web run build
+      - run: npm --prefix web exec -- playwright install --with-deps chromium
+      - run: npm --prefix web run test:e2e
+      - name: Stamp frontend artifact provenance
+        env:
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { execFileSync } from 'node:child_process';
+          import { writeFileSync } from 'node:fs';
+          const sourceSha = process.env.SOURCE_SHA;
+          const head = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+          if (!sourceSha || !/^[0-9a-f]{40}$/.test(sourceSha) || sourceSha !== head) {
+            throw new Error('Frontend artifact source SHA must match the checked-out HEAD');
+          }
+          writeFileSync('web/dist/release.json', JSON.stringify({ schema_version: 1, source_sha: sourceSha }) + '\n');
+          NODE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zach-web-${{ github.event.pull_request.head.sha || github.sha }}
+          path: web/dist
+          if-no-files-found: error
+          retention-days: 30
