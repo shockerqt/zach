@@ -9,12 +9,14 @@ pub mod runner;
 pub mod scheduler;
 pub mod socket;
 pub mod store;
+pub mod web_gateway;
 
 use std::env;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const SCHEMA_VERSION: u32 = 4;
+pub const DEFAULT_WEB_PORT: u16 = 8096;
 
 pub fn now_epoch() -> i64 {
     SystemTime::now()

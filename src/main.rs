@@ -1,13 +1,17 @@
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use zach::ledger;
 use zach::v2::intake::{ingest_export_json, sync_from_ws_task};
 use zach::v2::pipeline::plan_task_execution;
 use zach::v2::socket::{ClientCommand, DaemonServer, write_ndjson};
 use zach::v2::store::{DecisionResolution, V2Store};
-use zach::v2::{default_db_path, default_socket_path, default_state_dir, default_ws_task_bin};
+use zach::v2::web_gateway::{GatewayConfig, GatewayHandle, WebGateway};
+use zach::v2::{
+    DEFAULT_WEB_PORT, default_db_path, default_socket_path, default_state_dir, default_ws_task_bin,
+};
 use zach::{AuditRequest, GithubConfig, audit_task_integration};
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8090";
@@ -55,6 +59,7 @@ fn main() {
         "daemon" | "zachd" => run_v2_daemon(&args[2..]),
         "attach" => run_v2_attach(&args[2..]),
         "events" => run_v2_events(&args[2..]),
+        "web" => run_v2_web(&args[2..]),
         "--help" | "-h" => print_usage(),
         unknown => {
             eprintln!("unknown option: {unknown}");
@@ -468,6 +473,11 @@ fn usage_error(message: &str) -> ! {
 }
 
 fn run_v2_daemon(args: &[String]) {
+    if has_flag(args, "--help") || has_flag(args, "-h") {
+        print_usage();
+        return;
+    }
+    let gateway_config = gateway_options(args, true);
     let state_dir = default_state_dir();
     let _lock = zach::v2::coordinator::DaemonLock::acquire(&state_dir).unwrap_or_else(|error| {
         eprintln!("daemon lock: {error}");
@@ -492,24 +502,170 @@ fn run_v2_daemon(args: &[String]) {
         std::process::exit(1);
     });
 
+    zach::v2::socket::install_shutdown_signals().unwrap_or_else(|error| {
+        eprintln!("install shutdown signals: {error}");
+        std::process::exit(1)
+    });
+    let gateway = gateway_config.map(start_web_gateway);
     println!(
         "zachd started · socket={} · initial_seq={} · once={}",
         socket_path.display(),
         initial_seq,
         once
     );
-
-    zach::v2::socket::install_shutdown_signals().unwrap_or_else(|error| {
-        eprintln!("install shutdown signals: {error}");
-        std::process::exit(1)
-    });
     let coordinator = zach::v2::coordinator::Coordinator::spawn(store, state_dir);
-    if let Err(error) = server.run_coordinated(coordinator, once) {
+    let result = server.run_coordinated(coordinator, once);
+    // Always stop and join the optional listener before any process::exit.
+    let web_result = gateway.map(GatewayHandle::shutdown_and_join).transpose();
+    if let Err(error) = result {
         eprintln!("daemon error: {error}");
+        std::process::exit(1);
+    }
+    if let Err(error) = web_result {
+        eprintln!("web gateway shutdown failed: {error}");
         std::process::exit(1);
     }
     if once {
         println!("zachd: completed single loop execution");
+    }
+}
+
+fn gateway_options(args: &[String], daemon: bool) -> Option<GatewayConfig> {
+    let env_bind = match env::var("ZACH_WEB_ADDR") {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(_) => usage_error("ZACH_WEB_ADDR must be valid UTF-8"),
+    };
+    parse_gateway_options(args, daemon, env_bind.as_deref())
+        .unwrap_or_else(|error| usage_error(&error))
+}
+
+fn parse_gateway_options(
+    args: &[String],
+    daemon: bool,
+    env_bind: Option<&str>,
+) -> Result<Option<GatewayConfig>, String> {
+    let mut enabled = !daemon;
+    let mut port = None;
+    let mut bind = None;
+    let mut socket = None;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut i = 0;
+    while i < args.len() {
+        let key = match args[i].as_str() {
+            "--web" if daemon => "web",
+            "--once" if daemon => "once",
+            "--db" if daemon => "db",
+            "--socket" => "socket",
+            "--web-port" => "port",
+            "--port" if !daemon => "port",
+            "--bind" => "bind",
+            "--web-bind" if daemon => "bind",
+            _ => return Err("unsupported web/daemon option; see --help".into()),
+        };
+        if !seen.insert(key) {
+            return Err("duplicate web/daemon option".into());
+        }
+        if key == "web" {
+            enabled = true;
+        } else if key != "once" {
+            i += 1;
+            let value = args
+                .get(i)
+                .filter(|value| !value.is_empty() && !value.starts_with('-'))
+                .ok_or("web/daemon option requires a value")?;
+            match key {
+                "port" => {
+                    port = Some(
+                        value
+                            .parse::<u16>()
+                            .ok()
+                            .filter(|p| *p > 0)
+                            .ok_or("web port must be an integer from 1 to 65535")?,
+                    )
+                }
+                "bind" => bind = Some(value.as_str()),
+                "socket" => socket = Some(PathBuf::from(value)),
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    if !enabled {
+        if port.is_some() || bind.is_some() {
+            return Err("web binding options require --web".into());
+        }
+        return Ok(None);
+    }
+    if port.is_some() && bind.is_some() {
+        return Err("use a bind address with port, or --web-port; do not combine them".into());
+    }
+    let default = format!("127.0.0.1:{DEFAULT_WEB_PORT}");
+    let mut addr: std::net::SocketAddr = bind
+        .or(env_bind)
+        .unwrap_or(&default)
+        .parse()
+        .map_err(|_| "web bind must be a numeric loopback address and port")?;
+    if let Some(port) = port {
+        addr.set_port(port);
+    }
+    if !addr.ip().is_loopback() || addr.port() == 0 {
+        return Err("web gateway must bind to loopback with a nonzero port".into());
+    }
+    Ok(Some(GatewayConfig {
+        bind_addr: addr,
+        socket_path: socket.unwrap_or_else(default_socket_path),
+        state_dir: default_state_dir(),
+    }))
+}
+
+fn start_web_gateway(config: GatewayConfig) -> GatewayHandle {
+    let gateway = WebGateway::bind(config).unwrap_or_else(|_| {
+        eprintln!("web gateway setup failed (check bind address and private state directory)");
+        std::process::exit(1)
+    });
+    let addr = gateway.local_addr().unwrap_or_else(|_| {
+        eprintln!("cannot inspect bound web listener");
+        std::process::exit(1)
+    });
+    let handle = gateway.spawn().unwrap_or_else(|_| {
+        eprintln!("cannot start web gateway worker");
+        std::process::exit(1)
+    });
+    println!("zach web listening on http://{addr}");
+    handle
+}
+
+static WEB_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+extern "C" fn web_shutdown_signal(_: libc::c_int) {
+    WEB_SHUTDOWN.store(true, Ordering::Relaxed);
+}
+
+fn run_v2_web(args: &[String]) {
+    if has_flag(args, "--help") || has_flag(args, "-h") {
+        print_usage();
+        return;
+    }
+    let config = gateway_options(args, false).expect("standalone web is enabled");
+    WEB_SHUTDOWN.store(false, Ordering::Relaxed);
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = web_shutdown_signal as *const () as usize;
+        libc::sigemptyset(&mut action.sa_mask);
+        if libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut()) != 0
+            || libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) != 0
+        {
+            eprintln!("cannot install web shutdown signals");
+            std::process::exit(1)
+        }
+    }
+    let handle = start_web_gateway(config);
+    while !WEB_SHUTDOWN.load(Ordering::Relaxed) && !handle.is_finished() {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    if handle.shutdown_and_join().is_err() {
+        eprintln!("web gateway stopped with an error");
+        std::process::exit(1)
     }
 }
 
@@ -633,7 +789,10 @@ fn print_usage() {
         "       zach run [--task <TASK_ID>] [--group <GROUP>] [--once] [--dry-run] [--json] [--db <PATH>]"
     );
     println!("       zach doctor [--json] [--worktree <PATH>]");
-    println!("       zach daemon [--socket <PATH>] [--db <PATH>] [--once]");
+    println!(
+        "       zach daemon [--socket <PATH>] [--db <PATH>] [--once] [--web] [--web-port <PORT>] [--web-bind <IP:PORT>]"
+    );
+    println!("       zach web [--socket <PATH>] [--web-port <PORT>] [--bind <IP:PORT>]");
     println!("       zach attach [--group <GROUP>] [--since-seq <N>] [--once] [--socket <PATH>]");
     println!(
         "       zach events [--group <GROUP>] [--since-seq <N>] [--wait] [--socket <PATH>] [--db <PATH>]"
@@ -655,5 +814,107 @@ mod tests {
             ledger::PUBLIC_WEBHOOK_OPERATIONS,
             &["governance.validate-ledger"]
         );
+    }
+
+    fn web_options(
+        args: &[&str],
+        daemon: bool,
+        env: Option<&str>,
+    ) -> Result<Option<GatewayConfig>, String> {
+        let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        parse_gateway_options(&args, daemon, env)
+    }
+
+    #[test]
+    fn gateway_cli_is_explicit_and_keeps_socket_and_bind_configuration() {
+        let config = web_options(&[], false, None).unwrap().unwrap();
+        assert_eq!(config.bind_addr.to_string(), "127.0.0.1:8096");
+        assert!(
+            web_options(&[], true, Some("0.0.0.0:9000"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            web_options(
+                &[
+                    "--db",
+                    "/tmp/example.sqlite",
+                    "--socket",
+                    "/tmp/control.sock",
+                    "--once"
+                ],
+                true,
+                None
+            )
+            .unwrap()
+            .is_none()
+        );
+        let config = web_options(
+            &[
+                "--web",
+                "--web-port",
+                "8097",
+                "--socket",
+                "/tmp/control.sock",
+            ],
+            true,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(config.bind_addr.to_string(), "127.0.0.1:8097");
+        assert_eq!(config.socket_path, PathBuf::from("/tmp/control.sock"));
+        let config = web_options(&["--bind", "127.0.0.1:8098"], false, Some("0.0.0.0:9000"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            config.bind_addr.port(),
+            8098,
+            "explicit address overrides environment default"
+        );
+        let config = web_options(&["--web", "--web-bind", "[::1]:8099"], true, None)
+            .unwrap()
+            .unwrap();
+        assert!(config.bind_addr.ip().is_loopback());
+    }
+
+    #[test]
+    fn gateway_cli_rejects_invalid_exposure_and_ambiguous_options_before_startup() {
+        for args in [
+            vec!["--bind", "0.0.0.0:8096"],
+            vec!["--bind", "[::]:8096"],
+            vec!["--bind", "192.0.2.1:8096"],
+            vec!["--bind", "127.0.0.1:0"],
+            vec!["--bind", "localhost:8096"],
+            vec!["--web-port", "0"],
+            vec!["--web-port", "65536"],
+            vec!["--web-port", "bad"],
+            vec!["--web-port"],
+            vec!["--socket"],
+            vec!["--port", "8096", "--web-port", "8097"],
+            vec!["--bind", "127.0.0.1:8096", "--web-port", "8097"],
+            vec!["--socket", "/tmp/a", "--socket", "/tmp/b"],
+            vec!["--db", "/tmp/no-gateway-database"],
+            vec!["--unknown"],
+        ] {
+            assert!(
+                web_options(&args, false, None).is_err(),
+                "accepted {args:?}"
+            );
+        }
+        for args in [
+            vec!["--web-port", "8097"],
+            vec!["--web-bind", "127.0.0.1:8097"],
+            vec!["--web", "--web"],
+            vec!["--once", "--once"],
+            vec!["--db"],
+            vec!["--socket", "--once"],
+            vec!["--web", "--bind", "0.0.0.0:8096"],
+            vec!["--unknown"],
+        ] {
+            assert!(web_options(&args, true, None).is_err(), "accepted {args:?}");
+        }
+        assert!(web_options(&[], false, Some("0.0.0.0:8096")).is_err());
+        assert!(web_options(&[], false, Some("invalid")).is_err());
     }
 }
