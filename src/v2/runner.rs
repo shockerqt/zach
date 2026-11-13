@@ -1,3 +1,6 @@
+use crate::v2::isolation::{
+    self, IsolationChecker, NetworkPolicy, PreparedResources, SandboxLayout,
+};
 use crate::v2::pipeline::DiffFileEntry;
 use crate::v2::router::{ModelFamily, StageRoute, is_forbidden_daemon_model};
 use crate::v2::store::{TaskRecord, V2Store};
@@ -26,6 +29,10 @@ pub const GEMINI_WORKER_CLI_SCRIPT: &str =
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageCommandSpec {
+    #[serde(default)]
+    pub network: NetworkPolicy,
+    #[serde(default)]
+    pub writable: bool,
     pub unit_name: String,
     pub program: String,
     pub args: Vec<String>,
@@ -113,6 +120,10 @@ pub trait StageExecutor {
     ) -> Result<StageExecutionResult, String>;
 
     fn run_checks(&mut self, worktree_path: &str, commands: &[String]) -> Result<(), String>;
+
+    fn run_gate_checks(&mut self, worktree_path: &str, commands: &[String]) -> Result<(), String> {
+        self.run_checks(worktree_path, commands)
+    }
 
     fn commit_worktree(&mut self, task: &TaskRecord, worktree_path: &str)
     -> Result<String, String>;
@@ -202,7 +213,8 @@ pub fn check_token_budget(task: &TaskRecord, route: &StageRoute) -> Result<u64, 
 }
 
 /// Builds a transient `systemd-run --user` command specification with cgroup resource
-/// limits, credential path isolation (`InaccessiblePaths`), and clean environment.
+/// limits and a declarative bubblewrap namespace wrapper. Runtime filesystem
+/// discovery and resource staging happen only in execute_stage.
 pub fn build_systemd_stage_command(
     task: &TaskRecord,
     attempt_id: &str,
@@ -252,6 +264,8 @@ pub fn build_systemd_stage_command_with_env(
         sanitize_unit_component(attempt_id)
     );
 
+    let network = NetworkPolicy::resolve(task.context_pack.network.as_deref(), route.family)?;
+    let writable = route.stage == "impl";
     let home = clean_env
         .get("HOME")
         .cloned()
@@ -276,12 +290,6 @@ pub fn build_systemd_stage_command_with_env(
         "KillMode=control-group".to_owned(),
         "-p".to_owned(),
         "TimeoutStopSec=20".to_owned(),
-        "-p".to_owned(),
-        format!("InaccessiblePaths=-{home}/.config/gh"),
-        "-p".to_owned(),
-        format!("InaccessiblePaths=-{worktree_path}/.env"),
-        "-p".to_owned(),
-        format!("InaccessiblePaths=-{worktree_path}/.env.local"),
         format!("--working-directory={worktree_path}"),
     ];
 
@@ -325,7 +333,22 @@ pub fn build_systemd_stage_command_with_env(
     let output_schema_json = (matches!(route.stage.as_str(), "plan-review" | "pr-review"))
         .then(crate::v2::pipeline::review_verdict_json_schema_string);
 
+    let worker_start = args
+        .iter()
+        .position(|a| a == "--")
+        .ok_or("missing worker separator")?
+        + 1;
+    let worker = args.split_off(worker_start);
+    let declared = SandboxLayout::declared(
+        std::path::Path::new(&home),
+        std::path::Path::new(&worktree_path),
+        writable,
+    );
+    args.extend(isolation::bwrap_args(&declared, &worker));
+
     Ok(StageCommandSpec {
+        network,
+        writable,
         unit_name,
         program: "systemd-run".to_owned(),
         args,
@@ -337,6 +360,26 @@ pub fn build_systemd_stage_command_with_env(
         stdin_payload,
         output_schema_json,
     })
+}
+
+fn replace_sandbox_args(args: &[String], layout: &SandboxLayout) -> Result<Vec<String>, String> {
+    let outer = args
+        .iter()
+        .position(|a| a == "--")
+        .ok_or("missing supervisor separator")?;
+    let bwrap = outer + 1;
+    if args.get(bwrap).map(String::as_str) != Some("/usr/bin/bwrap") {
+        return Err("missing bubblewrap wrapper".into());
+    }
+    let worker_start = args[bwrap..]
+        .iter()
+        .position(|a| a == "--")
+        .ok_or("missing sandbox separator")?
+        + bwrap
+        + 1;
+    let mut out = args[..=outer].to_vec();
+    out.extend(isolation::bwrap_args(layout, &args[worker_start..]));
+    Ok(out)
 }
 
 /// Inserts `--output-schema <schema_path>` before the trailing positional prompt/`"-"`
@@ -558,8 +601,11 @@ fn validate_attempt_id(attempt_id: &str) -> Result<&str, String> {
     Ok(attempt_id)
 }
 
-fn ensure_secure_dir(dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+pub(crate) fn ensure_secure_dir(dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    if let Some(parent) = dir.parent() {
+        isolation::reject_symlink_components(parent)?;
+    }
     match std::fs::symlink_metadata(dir) {
         Ok(meta) => {
             if meta.file_type().is_symlink() {
@@ -580,14 +626,21 @@ fn ensure_secure_dir(dir: &std::path::Path) -> Result<std::path::PathBuf, String
             return Err(format!("failed to stat directory {}: {e}", dir.display()));
         }
     }
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| format!("failed to chmod 0700 {}: {e}", dir.display()))?;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)
+        .and_then(|file| file.set_permissions(std::fs::Permissions::from_mode(0o700)))
+        .map_err(|e| format!("failed to secure directory {}: {e}", dir.display()))?;
     Ok(dir.to_path_buf())
 }
 
-fn write_secure_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write_secure_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if let Some(parent) = path.parent() {
+        isolation::reject_symlink_components(parent)?;
+    }
     if let Ok(meta) = std::fs::symlink_metadata(path)
         && meta.file_type().is_symlink()
     {
@@ -598,14 +651,18 @@ fn write_secure_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), String>
         .write(true)
         .truncate(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("artifact is not a regular file".to_owned());
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("failed to chmod 0600 {}: {e}", path.display()))?;
     file.write_all(bytes)
         .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
     file.flush()
         .map_err(|e| format!("failed to flush {}: {e}", path.display()))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("failed to chmod 0600 {}: {e}", path.display()))?;
     Ok(())
 }
 
@@ -613,6 +670,9 @@ fn write_secure_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), String>
 pub struct SystemdStageExecutor {
     pub state_dir: PathBuf,
     pub ws_task_bin: PathBuf,
+    pub isolation_checker: IsolationChecker,
+    #[cfg(test)]
+    fixture_transport: bool,
 }
 
 impl Default for SystemdStageExecutor {
@@ -620,15 +680,31 @@ impl Default for SystemdStageExecutor {
         Self {
             state_dir: crate::v2::default_state_dir(),
             ws_task_bin: crate::v2::default_ws_task_bin(),
+            isolation_checker: isolation::verify_host_isolation,
+            #[cfg(test)]
+            fixture_transport: false,
         }
     }
 }
 
 impl SystemdStageExecutor {
+    pub fn with_isolation_checker(mut self, checker: IsolationChecker) -> Self {
+        self.isolation_checker = checker;
+        self
+    }
+
+    fn check_isolation(&self) -> Result<(), String> {
+        (self.isolation_checker)()
+            .map_err(|_| "ISOLATION_PREFLIGHT_FAILED: worker dispatch stopped".to_owned())
+    }
+
     pub fn with_state_dir(state_dir: impl Into<PathBuf>) -> Self {
         Self {
             state_dir: state_dir.into(),
             ws_task_bin: crate::v2::default_ws_task_bin(),
+            isolation_checker: isolation::verify_host_isolation,
+            #[cfg(test)]
+            fixture_transport: false,
         }
     }
 }
@@ -878,26 +954,54 @@ impl StageExecutor for SystemdStageExecutor {
         route: &StageRoute,
         spec: &StageCommandSpec,
     ) -> Result<StageExecutionResult, String> {
+        self.check_isolation()?;
         let valid_attempt_id = validate_attempt_id(attempt_id)?;
-        std::fs::create_dir_all(&self.state_dir).map_err(|e| {
-            format!(
-                "failed to create state_dir {}: {e}",
-                self.state_dir.display()
-            )
-        })?;
+        isolation::secure_parents(&self.state_dir)?;
         let attempts_root = ensure_secure_dir(&self.state_dir.join("attempts"))?;
         let attempt_dir = ensure_secure_dir(&attempts_root.join(valid_attempt_id))?;
 
         write_secure_file(&attempt_dir.join("prompt.md"), spec.prompt.as_bytes())?;
 
         let mut effective_args = spec.args.clone();
+        let mut readonly_files = Vec::new();
         if let Some(ref schema_json) = spec.output_schema_json {
             let schema_path = attempt_dir.join("review-schema.json");
             write_secure_file(&schema_path, schema_json.as_bytes())?;
             if route.family == ModelFamily::OpenAiSol {
                 effective_args = inject_codex_output_schema_args(&effective_args, &schema_path);
+                readonly_files.push(schema_path);
             }
         }
+
+        // The checker is injectable, but production can never switch to a host transport.
+        #[cfg(test)]
+        let fixture_transport = self.fixture_transport;
+        #[cfg(not(test))]
+        let fixture_transport = false;
+        let _resources = if fixture_transport {
+            None
+        } else {
+            if spec.program != "systemd-run" {
+                return Err("invalid worker supervisor".into());
+            }
+            let network =
+                NetworkPolicy::resolve(task.context_pack.network.as_deref(), route.family)?;
+            if network != spec.network || spec.writable != (route.stage == "impl") {
+                return Err("stage isolation declaration mismatch".into());
+            }
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".into());
+            let mut resources = PreparedResources::prepare(
+                &attempt_dir,
+                std::path::Path::new(&home),
+                std::path::Path::new(&spec.worktree_path),
+                spec.writable,
+                Some(route.family),
+                network,
+            )?;
+            resources.layout.readonly_files = readonly_files;
+            effective_args = replace_sandbox_args(&effective_args, &resources.layout)?;
+            Some(resources)
+        };
 
         let sha_before = git_head_sha(&spec.worktree_path);
         let mut child = match Command::new(&spec.program)
@@ -1086,6 +1190,53 @@ impl StageExecutor for SystemdStageExecutor {
     }
 
     fn run_checks(&mut self, worktree_path: &str, commands: &[String]) -> Result<(), String> {
+        self.check_isolation()?;
+        let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".into()));
+        let layout = SandboxLayout::inspect(&home, std::path::Path::new(worktree_path), true)?;
+        for cmd in commands {
+            let worker = vec!["bash".into(), "-c".into(), cmd.clone()];
+            static CHECK_SEQ: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let unit = format!(
+                "--unit=zach-stage-worker-checks-{}-{}",
+                std::process::id(),
+                CHECK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            );
+            let out = Command::new("systemd-run")
+                .arg(unit)
+                .args([
+                    "--user",
+                    "--collect",
+                    "--wait",
+                    "--pipe",
+                    "--slice=zach-workers.slice",
+                    "-p",
+                    "RuntimeMaxSec=1800",
+                    "-p",
+                    "MemoryMax=4G",
+                    "-p",
+                    "CPUWeight=20",
+                    "-p",
+                    "TasksMax=512",
+                    "-p",
+                    "KillMode=control-group",
+                    "--",
+                ])
+                .args(isolation::bwrap_args(&layout, &worker))
+                .stdin(Stdio::null())
+                .output()
+                .map_err(|e| format!("failed to run check '{cmd}': {e}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "check '{cmd}' failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn run_gate_checks(&mut self, worktree_path: &str, commands: &[String]) -> Result<(), String> {
         let clean_env = build_clean_env_from_process();
         for cmd in commands {
             let out = Command::new("bash")
@@ -1096,8 +1247,10 @@ impl StageExecutor for SystemdStageExecutor {
                 .output()
                 .map_err(|e| format!("failed to run check '{cmd}': {e}"))?;
             if !out.status.success() {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                return Err(format!("check '{cmd}' failed: {}", stderr.trim()));
+                return Err(format!(
+                    "check '{cmd}' failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
             }
         }
         Ok(())
@@ -1875,6 +2028,7 @@ pub struct MockStageExecutor {
     pub executed_specs: Vec<StageCommandSpec>,
     pub executed_routes: Vec<StageRoute>,
     pub executed_checks: Vec<String>,
+    pub executed_gate_checks: Vec<String>,
     pub executed_stage_reviewed_shas: Vec<Option<String>>,
     pub committed_worktrees: Vec<String>,
     pub committed_sha_to_return: Option<String>,
@@ -1894,6 +2048,7 @@ impl Default for MockStageExecutor {
             executed_specs: Vec::new(),
             executed_routes: Vec::new(),
             executed_checks: Vec::new(),
+            executed_gate_checks: Vec::new(),
             executed_stage_reviewed_shas: Vec::new(),
             committed_worktrees: Vec::new(),
             committed_sha_to_return: Some("mock-committed-sha".to_owned()),
@@ -1963,6 +2118,10 @@ impl StageExecutor for MockStageExecutor {
     fn run_checks(&mut self, _worktree_path: &str, commands: &[String]) -> Result<(), String> {
         self.executed_checks.extend(commands.iter().cloned());
         Ok(())
+    }
+    fn run_gate_checks(&mut self, worktree_path: &str, commands: &[String]) -> Result<(), String> {
+        self.executed_gate_checks.extend(commands.iter().cloned());
+        self.run_checks(worktree_path, commands)
     }
 
     fn commit_worktree(
@@ -2046,6 +2205,14 @@ impl StageExecutor for MockStageExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_executor(state: impl Into<PathBuf>) -> SystemdStageExecutor {
+        let mut executor =
+            SystemdStageExecutor::with_state_dir(state).with_isolation_checker(|| Ok(()));
+        executor.fixture_transport = true;
+        executor
+    }
+
     use crate::v2::router::resolve_stage_route;
     use crate::v2::store::{ContextPackSpec, TaskMemory};
 
@@ -2080,6 +2247,130 @@ mod tests {
     }
 
     #[test]
+    fn isolation_preflight_rejects_stages_and_checks_before_any_side_effects() {
+        let root = TempTestDir::new("isolation-rejected");
+        let state = root.path().join("uncreated");
+        let task = sample_task();
+        let route = resolve_stage_route("S", "impl", 0, None).unwrap().unwrap();
+        let spec =
+            build_systemd_stage_command_with_env(&task, "rejected", &route, "p", &BTreeMap::new())
+                .unwrap();
+        let mut executor = SystemdStageExecutor::with_state_dir(&state)
+            .with_isolation_checker(|| Err("forbidden policy diagnostic".into()));
+        let error = executor
+            .execute_stage(&task, "rejected", &route, &spec)
+            .unwrap_err();
+        assert!(error.starts_with("ISOLATION_PREFLIGHT_FAILED"));
+        assert_eq!(
+            crate::v2::pipeline::classify_failure_class("impl", "FAILED", &error),
+            "infra"
+        );
+        assert_eq!(
+            executor
+                .run_checks("/missing", &["touch marker".into()])
+                .unwrap_err(),
+            error
+        );
+        assert_eq!(executor.run_checks("/missing", &[]).unwrap_err(), error);
+        assert!(!state.exists());
+    }
+
+    #[test]
+    fn production_transport_cannot_be_replaced_with_a_host_subprocess() {
+        let root = TempTestDir::new("isolation-transport");
+        let mut executor =
+            SystemdStageExecutor::with_state_dir(root.path()).with_isolation_checker(|| Ok(()));
+        let task = sample_task();
+        let route = resolve_stage_route("S", "impl", 0, None).unwrap().unwrap();
+        let mut spec =
+            build_systemd_stage_command_with_env(&task, "transport", &route, "p", &BTreeMap::new())
+                .unwrap();
+        spec.program = "/usr/bin/touch".into();
+        let marker = root.path().join("escaped");
+        spec.args = vec![marker.display().to_string()];
+        assert_eq!(
+            executor
+                .execute_stage(&task, "transport", &route, &spec)
+                .unwrap_err(),
+            "invalid worker supervisor"
+        );
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn stage_declarations_are_pure_network_validated_and_readonly_except_impl() {
+        let mut task = sample_task();
+        // This deliberately nonexistent path must never be inspected by planning.
+        task.worktree_path = Some("/does-not-exist/zach-task".into());
+        for stage in ["plan", "plan-review", "impl", "pr-review"] {
+            let route = resolve_stage_route("M", stage, 0, Some(ModelFamily::OpenAiSol))
+                .unwrap()
+                .unwrap();
+            let spec = build_systemd_stage_command_with_env(
+                &task,
+                "pure",
+                &route,
+                "prompt",
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            assert_eq!(spec.writable, stage == "impl");
+            assert_eq!(spec.network, NetworkPolicy::ProviderApi(route.family));
+            task.context_pack.network = Some("none".into());
+            let offline = build_systemd_stage_command_with_env(
+                &task,
+                "offline",
+                &route,
+                "p",
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            assert_eq!(offline.network, NetworkPolicy::None);
+            task.context_pack.network = None;
+        }
+        task.context_pack.network = Some("all".into());
+        let route = resolve_stage_route("S", "impl", 0, None).unwrap().unwrap();
+        assert!(
+            build_systemd_stage_command_with_env(&task, "bad", &route, "p", &BTreeMap::new())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn runtime_schema_injection_keeps_cli_path_and_exact_readonly_mount() {
+        let task = sample_task();
+        let route = resolve_stage_route("S", "impl", 0, None).unwrap().unwrap();
+        let spec =
+            build_systemd_stage_command_with_env(&task, "schema", &route, "p", &BTreeMap::new())
+                .unwrap();
+        let schema = std::path::Path::new("/tmp/state/attempts/schema/review-schema.json");
+        let args = inject_codex_output_schema_args(&spec.args, schema);
+        let mut layout = SandboxLayout::declared(
+            std::path::Path::new("/home/ubuntu"),
+            std::path::Path::new(&spec.worktree_path),
+            false,
+        );
+        layout.readonly_files.push(schema.into());
+        let args = replace_sandbox_args(&args, &layout).unwrap();
+        assert!(
+            args.windows(3).any(|a| a[0] == "--ro-bind"
+                && a[1] == schema.display().to_string()
+                && a[2] == a[1])
+        );
+        assert!(
+            args.windows(2)
+                .any(|a| a[0] == "--output-schema" && a[1] == schema.display().to_string())
+        );
+        assert_eq!(args.last().unwrap(), "-");
+        assert_eq!(
+            args.iter()
+                .filter(|a| a.as_str() == "/usr/bin/bwrap")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn clean_env_strips_tokens_and_secrets_and_systemd_command_isolates_credentials() {
         let dirty_env = vec![
             ("HOME".to_owned(), "/home/ubuntu".to_owned()),
@@ -2111,15 +2402,9 @@ mod tests {
         assert_eq!(spec.unit_name, "zach-stage-zach-005-impl-att-1");
         assert!(spec.args.contains(&"--slice=zach-workers.slice".to_owned()));
         assert!(spec.args.contains(&"KillMode=control-group".to_owned()));
-        assert!(
-            spec.args
-                .contains(&"InaccessiblePaths=-/home/ubuntu/.config/gh".to_owned())
-        );
-        assert!(
-            spec.args.contains(
-                &"InaccessiblePaths=-/home/ubuntu/workspace/zach--ZACH-005/.env".to_owned()
-            )
-        );
+        assert!(spec.args.contains(&"/usr/bin/bwrap".to_owned()));
+        assert!(spec.args.contains(&"--unshare-all".to_owned()));
+        assert!(spec.args.windows(2).any(|a| a == ["--tmpfs", "/home"]));
         assert!(spec.args.contains(&"codex".to_owned()));
         assert!(spec.args.contains(&"--ignore-user-config".to_owned()));
         assert_eq!(spec.args.last().map(String::as_str), Some("-"));
@@ -2214,7 +2499,7 @@ other-user-unit.service loaded active running
         let script = temp.path().join("ws-task");
         std::fs::write(&script, "#!/usr/bin/env python3\nimport sys,json,pathlib\np=pathlib.Path(__file__)\np.with_suffix('.args').write_text(json.dumps(sys.argv[1:]))\nif p.with_suffix('.fail').exists():\n print('publication rejected',file=sys.stderr)\n sys.exit(37)\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let mut exec = SystemdStageExecutor::with_state_dir(temp.path().join("state"));
+        let mut exec = fixture_executor(temp.path().join("state"));
         exec.ws_task_bin = script.clone();
         let mut task = sample_task();
         let markdown = format!("## [PLAN]\n{}", "full plan é".repeat(500));
@@ -2295,7 +2580,7 @@ other-user-unit.service loaded active running
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "original");
         let other = TempTestDir::new("zach027-plan-symlink-dir");
         symlink(temp.path().join("state/plans"), other.path().join("plans")).unwrap();
-        let mut exec = SystemdStageExecutor::with_state_dir(other.path());
+        let mut exec = fixture_executor(other.path());
         assert!(exec.persist_plan_artifact(&task, "other", "bad").is_err());
     }
 
@@ -2303,7 +2588,7 @@ other-user-unit.service loaded active running
     fn zach027_systemd_preserves_full_stage_output_for_both_families_and_plan_stages() {
         let temp = TempTestDir::new("zach027-stage-output");
         let task = sample_task();
-        let mut exec = SystemdStageExecutor::with_state_dir(temp.path());
+        let mut exec = fixture_executor(temp.path());
         for family in [ModelFamily::OpenAiSol, ModelFamily::GeminiAgy] {
             for stage in ["plan", "plan-review"] {
                 let text = if stage == "plan" {
@@ -2798,7 +3083,7 @@ print(json.dumps({
 
         let state_dir = TempTestDir::new("zach-019-exec-state");
         let work_dir = TempTestDir::new("zach-019-exec-work");
-        let mut exec = SystemdStageExecutor::with_state_dir(state_dir.path());
+        let mut exec = fixture_executor(state_dir.path());
 
         let mut task = sample_task();
         task.worktree_path = Some(work_dir.path_str().to_owned());
@@ -2883,7 +3168,7 @@ print(json.dumps({
     #[test]
     fn systemd_executor_rejects_invalid_attempt_ids_and_symlinks() {
         let state_dir = TempTestDir::new("zach-019-sec");
-        let mut exec = SystemdStageExecutor::with_state_dir(state_dir.path());
+        let mut exec = fixture_executor(state_dir.path());
         let task = sample_task();
         let route = resolve_stage_route("S", "impl", 0, None).unwrap().unwrap();
         let mut spec = build_systemd_stage_command_with_env(
@@ -2979,7 +3264,7 @@ print(json.dumps({
     fn systemd_executor_branches_on_model_family_for_codex_and_gemini() {
         let state_dir = TempTestDir::new("zach-020-exec-state");
         let work_dir = TempTestDir::new("zach-020-exec-work");
-        let mut exec = SystemdStageExecutor::with_state_dir(state_dir.path());
+        let mut exec = fixture_executor(state_dir.path());
         let mut task = sample_task();
         task.worktree_path = Some(work_dir.path_str().to_owned());
 
@@ -3079,7 +3364,7 @@ print(json.dumps({
         // Execute with SystemdStageExecutor using a fake wrapper script that captures argv
         let state_dir = TempTestDir::new("zach-026-schema-state");
         let work_dir = TempTestDir::new("zach-026-schema-work");
-        let mut exec = SystemdStageExecutor::with_state_dir(state_dir.path());
+        let mut exec = fixture_executor(state_dir.path());
         let mut run_spec = spec.clone();
         run_spec.worktree_path = work_dir.path_str().to_owned();
         // Keep "codex exec ... -" after "--" in args so inject_codex_output_schema_args triggers,
