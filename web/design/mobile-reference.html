@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="es">
+&lt;head&gt;
+<meta charset="utf-8">
+&lt;title&gt;Zach — decisión en el teléfono</title>
+<script src="./support.js"></script>
+</head>
+&lt;body&gt;
+&lt;x-dc&gt;
+&lt;helmet&gt;
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+&lt;style&gt;
+body{margin:0;background:#121316}
+a{color:#F0C94A}a:hover{color:#FFE08A}
+button{font-family:inherit;cursor:pointer}
+</style>
+</helmet>
+<div style="width: 390px; height: 844px; box-sizing: border-box; background: #121316; color: #ECEAE4; font-family: Inter, system-ui, sans-serif; font-size: 15px; line-height: 1.45; display: flex; flex-direction: column; overflow: hidden">
+
+<header style="display: flex; align-items: center; gap: 10px; padding: 14px 20px; border-bottom: 1px solid #2A2D33">
+<span style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 20px; margin-right: auto">Zach</span>
+<span style="display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: #C9CCD3"><span style="width: 8px; height: 8px; border-radius: 50%; background: #7FB2FF"></span>Activo</span>
+<button type="button" aria-label="Pausar cola" style="width: 44px; height: 44px; display: inline-flex; align-items: center; justify-content: center; background: transparent; color: #ECEAE4; border: 1px solid #3A3E46; border-radius: 10px"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M9 6v12M15 6v12"></path></svg></button>
+</header>
+
+<div style="flex: 1 1 auto; min-height: 0; padding: 20px; display: flex; flex-direction: column; gap: 16px">
+
+<div style="display: flex; align-items: center; gap: 16px">
+<div style="width: 112px; height: 112px; flex: 0 0 auto"><dc-import name="Cat" mood="decision" hint-size="112px,112px"></dc-import></div>
+&lt;div&gt;
+<div style="font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 20px; line-height: 1.25">Zach espera tu decisión</div>
+<div style="color: #A3A6AD; font-size: 13px; margin-top: 4px">1 abierta</div>
+</div>
+</div>
+
+<div style="background: #1A1C20; border: 1px solid #F0C94A; border-radius: 16px; padding: 18px; display: flex; flex-direction: column; gap: 12px">
+<div style="display: flex; align-items: center; justify-content: space-between; gap: 8px">
+<span style="font-size: 12px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: #F0C94A">Aprobación de plan</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #C9CCD3; border: 1px solid #3A3E46; border-radius: 6px; padding: 2px 8px">INF-020 · L</span>
+</div>
+<div style="font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 19px; line-height: 1.3">¿Aprobar el plan de INF-020?</div>
+<div style="color: #C9CCD3">Expose zach.shocker.cl with Cloudflare Access and Nginx reverse proxy. El plan pasó plan-review.</div>
+<a href="#plan" style="min-height: 44px; display: inline-flex; align-items: center; font-weight: 500; text-decoration: none">Leer el plan y la revisión</a>
+<button type="button" style="min-height: 52px; background: #F0C94A; color: #17150C; border: 0; border-radius: 12px; font-size: 16px; font-weight: 600">Aprobar</button>
+<button type="button" style="min-height: 52px; background: transparent; color: #ECEAE4; border: 1px solid #3A3E46; border-radius: 12px; font-size: 16px; font-weight: 600">Rechazar</button>
+</div>
+
+<h2 style="margin: 4px 0 0; font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 15px; color: #C9CCD3">En curso</h2>
+<div style="background: #1A1C20; border: 1px solid #2A2D33; border-radius: 16px; padding: 4px 18px">
+<div style="padding: 12px 0; border-bottom: 1px solid #2A2D33">
+<div style="display: flex; align-items: baseline; justify-content: space-between; gap: 8px">
+<span style="font-family: 'JetBrains Mono', monospace; font-weight: 500; color: #F0C94A">ZACH-009</span>
+<span style="font-size: 13px; color: #FFA98C">Merge detenido</span>
+</div>
+<div style="font-size: 13px; color: #A3A6AD; margin-top: 2px">La CI falló en 7089a6d · PR #47</div>
+</div>
+<div style="padding: 12px 0">
+<div style="display: flex; align-items: baseline; justify-content: space-between; gap: 8px">
+<span style="font-family: 'JetBrains Mono', monospace; font-weight: 500; color: #F0C94A">INF-020</span>
+<span style="font-size: 13px; color: #F0C94A">Tu aprobación</span>
+</div>
+<div style="font-size: 13px; color: #A3A6AD; margin-top: 2px">Etapa 3 de 6</div>
+</div>
+</div>
+
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":390,"height":844}}'>
+class Component extends DCLogic {
+renderVals() {
+return {};
+}
+}
+</script>
+</body>
+</html>
