@@ -444,7 +444,30 @@ unchanged.
 
 This preservation contract applies to the explicit offline operation. The first
 ordinary **Standard** intake after startup can adopt current Governance consent,
-status and completed-label metadata under its existing rules. Cleared references
+status, weight and completed-label metadata under its existing rules. Standard
+already emits `WEIGHT_ESCALATED` for any accepted weight difference (the event's
+historical name does not itself prove an increase). The activation verifier admits
+only an unchanged Done/Cancelled task with exact known `XS`/`S`/`M`/`L` labels and
+an actual ascending accepted weight matching the decoded canonical task weight.
+It proves the unique ordered owner call, exact task/group/time and native compact
+two-key payload, preserves every prior raw event, and permits only the exact new
+sequence suffix and corresponding `sqlite_sequence` row identity/high-water
+advance. No other event or allocator change is exempted. Unknown, decreasing,
+nonterminal or unattributed changes remain refused by this bounded verifier;
+normal Standard behavior is unchanged. Offline reconciliation still emits no event.
+
+The test-only decode witness binds exact export bytes to the real in-process
+native decoder's ordered records and before/after clock bounds. The Store normally
+selects their positive supplied decode timestamp; accepted task and event times
+must equal that value. A batch executed seconds later is valid. Direct owner APIs
+use their own current time only for nonpositive input, a separate tested contract.
+The root companion bounds the actual harness process and relies on the reviewed
+internal decoder witness; another fixture's decode or the later batch window is
+not timestamp provenance. No timestamp field is added to marker/result schema1.
+Root reports validated metadata-event/allocator counts separately from unexpected
+execution effects. Before/after all other phases, histories remain byte strict.
+
+Cleared references
 and COMPLETE attempt phases remain essential to preventing historical execution
 replay. Offline consent preservation is not a promise that Standard will preserve
 that consent forever.

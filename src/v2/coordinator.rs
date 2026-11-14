@@ -4256,11 +4256,12 @@ mod tests {
                 if let Some(labels) = labels {
                     export["tasks"][0]["stages_completed"] = serde_json::json!(labels);
                 }
-                let input = intake::decode_export_records(&export.to_string()).unwrap();
-                assert_eq!(input[0].memory, TaskMemory::default());
+                let raw_export = export.to_string();
+                let input = actual_decode(&raw_export).unwrap();
+                assert_eq!(input.records[0].memory, TaskMemory::default());
                 c.store
                     .sync_task_with_mode(
-                        &input[0],
+                        &input.records[0],
                         crate::v2::store::SyncMode::ReconcileFinishedLegacy,
                     )
                     .unwrap();
@@ -4274,7 +4275,7 @@ mod tests {
                     progress[0].load(Ordering::Relaxed),
                     progress[1].load(Ordering::Relaxed)
                 );
-                rehearsal_standard(&mut c, input).unwrap();
+                rehearsal_standard(&mut c, &input, &raw_export).unwrap();
                 let standard = database_image(&mut c.store).unwrap();
                 for (table, rows) in &before {
                     if table == "daemon_meta" {
@@ -4669,13 +4670,140 @@ mod tests {
         Ok(())
     }
 
-    // Standard's one named metadata allowance is checked by key, never a blanket
-    // exclusion of daemon_meta or task history. Every task column is inspected.
-    fn rehearsal_standard(c: &mut Coordinator, export: Vec<TaskRecord>) -> Result<(), String> {
+    // Only this constructor observes a real decoder invocation. No fixture or
+    // external timestamp is a substitute for these exact bytes/ordered records.
+    #[derive(Clone)]
+    struct ActualDecodeTimeWitness {
+        records: Vec<TaskRecord>,
+        export_hash: String,
+        records_hash: String,
+        provenance_hash: String,
+        start: i64,
+        end: i64,
+    }
+    fn actual_decode(export: &str) -> Result<ActualDecodeTimeWitness, String> {
+        let start = now_epoch();
+        let records = intake::decode_export_records(export).map_err(|_| "EXPORT_SCHEMA")?;
+        let end = now_epoch();
+        let records_hash =
+            rehearsal_sha256(&serde_json::to_vec(&records).map_err(|_| "DECODE_BINDING")?);
+        let export_hash = rehearsal_sha256(export.as_bytes());
+        let provenance_hash = rehearsal_sha256(
+            &serde_json::to_vec(&(&export_hash, &records_hash, start, end))
+                .map_err(|_| "DECODE_BINDING")?,
+        );
+        let w = ActualDecodeTimeWitness {
+            records,
+            export_hash,
+            records_hash,
+            provenance_hash,
+            start,
+            end,
+        };
+        w.verify(export, now_epoch())?;
+        Ok(w)
+    }
+    impl ActualDecodeTimeWitness {
+        fn verify(&self, export: &str, observation: i64) -> Result<(), String> {
+            if self.start <= 0
+                || self.end < self.start
+                || observation < self.end
+                || rehearsal_sha256(
+                    &serde_json::to_vec(&(
+                        &self.export_hash,
+                        &self.records_hash,
+                        self.start,
+                        self.end,
+                    ))
+                    .map_err(|_| "DECODE_BINDING")?,
+                ) != self.provenance_hash
+                || rehearsal_sha256(export.as_bytes()) != self.export_hash
+                || rehearsal_sha256(
+                    &serde_json::to_vec(&self.records).map_err(|_| "DECODE_BINDING")?,
+                ) != self.records_hash
+                || self
+                    .records
+                    .iter()
+                    .map(|t| &t.task_id)
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    != self.records.len()
+            {
+                return Err("DECODE_BINDING".into());
+            }
+            if let Some(first) = self.records.first()
+                && (first.updated_epoch < self.start
+                    || first.updated_epoch > self.end
+                    || self
+                        .records
+                        .iter()
+                        .any(|t| t.updated_epoch != first.updated_epoch))
+            {
+                return Err("DECODE_TIME".into());
+            }
+            Ok(())
+        }
+    }
+    type SqlRow = Vec<rusqlite::types::Value>;
+    #[derive(Clone)]
+    struct StandardObservation {
+        before: DatabaseImage,
+        after: DatabaseImage,
+        old: Vec<TaskRecord>,
+        accepted: Vec<TaskRecord>,
+        columns: Vec<String>,
+        allocator_before: Vec<SqlRow>,
+        allocator_after: Vec<SqlRow>,
+        schema_before: Vec<String>,
+        schema_after: Vec<String>,
+        epoch: i64,
+    }
+    fn standard_allocator(store: &mut V2Store) -> Result<Vec<SqlRow>, String> {
+        store
+            .connection_mut()
+            .prepare("SELECT rowid,name,seq FROM sqlite_sequence ORDER BY rowid")
+            .and_then(|mut s| {
+                s.query_map([], |r| Ok(vec![r.get(0)?, r.get(1)?, r.get(2)?]))?
+                    .collect()
+            })
+            .map_err(|_| "STANDARD_ALLOCATOR".into())
+    }
+    fn standard_schema(store: &mut V2Store) -> Result<Vec<String>, String> {
+        store.connection_mut().prepare("SELECT type,name,sql FROM sqlite_master WHERE type='trigger' OR name IN ('task_events','sqlite_sequence') ORDER BY type,name")
+            .and_then(|mut s| s.query_map([], |r| Ok(format!("{}:{}:{}",r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?.collect())
+            .map_err(|_| "STANDARD_SCHEMA".into())
+    }
+    fn native_event_schema(schema: &[String]) -> bool {
+        let compact = |s: &str| {
+            s.chars()
+                .filter(|c| !c.is_ascii_whitespace())
+                .collect::<String>()
+                .to_ascii_lowercase()
+        };
+        schema.iter().map(|s| compact(s)).collect::<Vec<_>>()
+            == [
+                "table:sqlite_sequence:createtablesqlite_sequence(name,seq)",
+                "table:task_events:createtabletask_events(seq_idintegerprimarykeyautoincrement,task_idtextnotnull,task_grouptextnotnull,ts_epochintegernotnull,event_typetextnotnull,payload_jsontextnotnull)",
+            ]
+    }
+    fn observe_standard(
+        c: &mut Coordinator,
+        w: &ActualDecodeTimeWitness,
+        export: &str,
+    ) -> Result<StandardObservation, String> {
+        w.verify(export, now_epoch())?;
+        if !c.jobs.is_empty()
+            || c.submission_probe.is_none()
+            || !matches!(c.rx.try_recv(), Err(mpsc::TryRecvError::Empty))
+        {
+            return Err("STANDARD_WRITER_SCOPE".into());
+        }
+        // Reuse the owner's strict original-JSON proof before Standard's decoder.
+        c.startup_ownership().map_err(|_| "STANDARD_RAW_PROOF")?;
         let before = database_image(&mut c.store)?;
         let old = c.store.list_tasks(None).map_err(|_| "STANDARD_READ")?;
-        if old.len() != export.len()
-            || export.iter().any(|t| {
+        if old.len() != w.records.len()
+            || w.records.iter().any(|t| {
                 !old.iter().any(|o| {
                     o.task_id == t.task_id && o.repository == t.repository && o.status == t.status
                 })
@@ -4683,23 +4811,324 @@ mod tests {
         {
             return Err("STANDARD_INVENTORY".into());
         }
-        c.worker_result(WorkerResult::Export(export.clone()))
+        let columns = c
+            .store
+            .connection_mut()
+            .prepare("SELECT * FROM tasks LIMIT 0")
+            .map_err(|_| "STANDARD_READ")?
+            .column_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let allocator_before = standard_allocator(&mut c.store)?;
+        let schema_before = standard_schema(&mut c.store)?;
+        if !native_event_schema(&schema_before) {
+            return Err("STANDARD_SCHEMA".into());
+        }
+        // This is the real unit-returning coordinator intake, not a manufactured
+        // per-task callback or another invocation's predicted result.
+        c.worker_result(WorkerResult::Export(w.records.clone()))
             .map_err(|_| "STANDARD_INTAKE")?;
         let after = database_image(&mut c.store)?;
-        for (table, rows) in &before {
-            let Some(actual) = after.get(table) else {
-                return Err("STANDARD_HISTORY".into());
+        let accepted = c.store.list_tasks(None).map_err(|_| "STANDARD_READ")?;
+        let allocator_after = standard_allocator(&mut c.store)?;
+        let schema_after = standard_schema(&mut c.store)?;
+        Ok(StandardObservation {
+            before,
+            after,
+            old,
+            accepted,
+            columns,
+            allocator_before,
+            allocator_after,
+            schema_before,
+            schema_after,
+            epoch: now_epoch(),
+        })
+    }
+    fn event_rows(rows: &[SqlRow]) -> Result<Vec<SqlRow>, String> {
+        use rusqlite::types::Value as V;
+        let mut result = rows.to_vec();
+        for row in &result {
+            if !matches!(row.as_slice(),[V::Integer(n),V::Text(_),V::Text(_),V::Integer(_),V::Text(_),V::Text(_)] if *n>0)
+            {
+                return Err("STANDARD_EVENT_SHAPE".into());
+            }
+        }
+        // Canonical JSON transport order is not numerical SQLite sequence order.
+        result.sort_by_key(|r| match r[0] {
+            V::Integer(n) => n,
+            _ => 0,
+        });
+        if result.windows(2).any(|r| r[0][0] == r[1][0]) {
+            return Err("STANDARD_EVENT_SEQUENCE".into());
+        }
+        Ok(result)
+    }
+    fn allocator_rows(rows: &[SqlRow]) -> Result<Vec<SqlRow>, String> {
+        use rusqlite::types::Value as V;
+        let mut result = rows.to_vec();
+        let mut names = BTreeSet::new();
+        let mut ids = BTreeSet::new();
+        for r in &result {
+            match r.as_slice() {
+                [V::Integer(id), V::Text(name), V::Integer(seq)]
+                    if *id > 0
+                        && *seq >= 0
+                        && !name.is_empty()
+                        && ids.insert(*id)
+                        && names.insert(name.clone()) => {}
+                _ => return Err("STANDARD_ALLOCATOR".into()),
+            }
+        }
+        result.sort_by_key(|r| match r[0] {
+            V::Integer(n) => n,
+            _ => 0,
+        });
+        Ok(result)
+    }
+    fn known_weight(s: &str) -> Option<u8> {
+        match s {
+            "XS" => Some(1),
+            "S" => Some(2),
+            "M" => Some(3),
+            "L" => Some(4),
+            _ => None,
+        }
+    }
+    fn same_json_fields(raw: &serde_json::Value, expected: &serde_json::Value) -> bool {
+        match (raw, expected) {
+            (serde_json::Value::Object(a), serde_json::Value::Object(b)) => a
+                .iter()
+                .all(|(k, v)| b.get(k).is_some_and(|e| same_json_fields(v, e))),
+            (serde_json::Value::Array(a), serde_json::Value::Array(b)) => {
+                a.len() == b.len() && a.iter().zip(b).all(|(v, e)| same_json_fields(v, e))
+            }
+            _ => raw == expected,
+        }
+    }
+    fn bind_task_rows(
+        image: &DatabaseImage,
+        columns: &[String],
+        records: &[TaskRecord],
+        canonical: bool,
+    ) -> Result<(), String> {
+        use rusqlite::types::Value as V;
+        let rows = image.get("tasks").ok_or("STANDARD_READ")?;
+        if rows.len() != records.len()
+            || columns.iter().collect::<BTreeSet<_>>().len() != columns.len()
+        {
+            return Err("STANDARD_INVENTORY".into());
+        }
+        let id_index = columns
+            .iter()
+            .position(|c| c == "task_id")
+            .ok_or("STANDARD_READ")?;
+        let mut ids = BTreeSet::new();
+        for row in rows {
+            if row.len() != columns.len() {
+                return Err("STANDARD_TASK_SHAPE".into());
+            }
+            let V::Text(id) = &row[id_index] else {
+                return Err("STANDARD_TASK_SHAPE".into());
             };
-            if table == "tasks" {
+            if !ids.insert(id) {
+                return Err("STANDARD_INVENTORY".into());
+            }
+            let t = records
+                .iter()
+                .find(|t| &t.task_id == id)
+                .ok_or("STANDARD_INVENTORY")?;
+            let value = serde_json::to_value(t).map_err(|_| "STANDARD_TASK_SHAPE")?;
+            for (col, raw) in columns.iter().zip(row) {
+                let json = match col.as_str() {
+                    "context_pack_json" => Some(serde_json::to_string(&t.context_pack)),
+                    "depends_on_json" => Some(serde_json::to_string(&t.depends_on)),
+                    "required_stages_json" => Some(serde_json::to_string(&t.required_stages)),
+                    "stages_completed_json" => Some(serde_json::to_string(&t.stages_completed)),
+                    "memory_json" => Some(serde_json::to_string(&t.memory)),
+                    _ => None,
+                };
+                if let Some(expected) = json {
+                    let expected = expected.map_err(|_| "STANDARD_TASK_SHAPE")?;
+                    let V::Text(raw) = raw else {
+                        return Err("STANDARD_TASK_SHAPE".into());
+                    };
+                    if canonical {
+                        if raw != &expected {
+                            return Err("STANDARD_TASK_BINDING".into());
+                        }
+                    } else {
+                        let raw: serde_json::Value =
+                            serde_json::from_str(raw).map_err(|_| "STANDARD_TASK_SHAPE")?;
+                        let expected: serde_json::Value =
+                            serde_json::from_str(&expected).map_err(|_| "STANDARD_TASK_SHAPE")?;
+                        if !same_json_fields(&raw, &expected) {
+                            return Err("STANDARD_TASK_BINDING".into());
+                        }
+                    }
+                } else {
+                    let v = value.get(col).ok_or("STANDARD_TASK_SHAPE")?;
+                    let expected = match v {
+                        serde_json::Value::Null => V::Null,
+                        serde_json::Value::String(s) => V::Text(s.clone()),
+                        serde_json::Value::Bool(b) => V::Integer(i64::from(*b)),
+                        serde_json::Value::Number(n) => {
+                            V::Integer(n.as_i64().ok_or("STANDARD_TASK_SHAPE")?)
+                        }
+                        _ => return Err("STANDARD_TASK_SHAPE".into()),
+                    };
+                    if raw != &expected {
+                        return Err("STANDARD_TASK_BINDING".into());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    fn validate_standard(
+        o: &StandardObservation,
+        w: &ActualDecodeTimeWitness,
+        export: &str,
+    ) -> Result<usize, String> {
+        use rusqlite::types::Value as V;
+        w.verify(export, o.epoch)?;
+        if !native_event_schema(&o.schema_before) || o.schema_before != o.schema_after {
+            return Err("STANDARD_SCHEMA".into());
+        }
+        if o.old.len() != w.records.len()
+            || o.accepted.len() != o.old.len()
+            || o.old
+                .iter()
+                .map(|t| &t.task_id)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != o.old.len()
+            || o.accepted
+                .iter()
+                .map(|t| &t.task_id)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != o.accepted.len()
+        {
+            return Err("STANDARD_INVENTORY".into());
+        }
+        bind_task_rows(&o.before, &o.columns, &o.old, false)?;
+        bind_task_rows(&o.after, &o.columns, &o.accepted, true)?;
+        let old_events = event_rows(o.before.get("task_events").ok_or("STANDARD_READ")?)?;
+        let new_events = event_rows(o.after.get("task_events").ok_or("STANDARD_READ")?)?;
+        let old_alloc = allocator_rows(&o.allocator_before)?;
+        let new_alloc = allocator_rows(&o.allocator_after)?;
+        for (image, rows) in [(&o.before, &old_alloc), (&o.after, &new_alloc)] {
+            let projected = rows.iter().map(|r| r[1..].to_vec()).collect::<Vec<_>>();
+            if image.get("sqlite_sequence") != Some(&projected) {
+                return Err("STANDARD_ALLOCATOR_BINDING".into());
+            }
+        }
+        let name = V::Text("task_events".into());
+        let prior = old_alloc.iter().find(|r| r[1] == name);
+        let high = match prior {
+            Some(r) => match r[2] {
+                V::Integer(n) => n,
+                _ => return Err("STANDARD_ALLOCATOR".into()),
+            },
+            None => 0,
+        };
+        let max = old_events
+            .last()
+            .and_then(|r| match r[0] {
+                V::Integer(n) => Some(n),
+                _ => None,
+            })
+            .unwrap_or(0);
+        if high < max || (prior.is_none() && !old_events.is_empty()) {
+            return Err("STANDARD_ALLOCATOR".into());
+        }
+        let mut expected = old_events.clone();
+        let mut next = high;
+        let mut count = 0usize;
+        for incoming in &w.records {
+            let old = o
+                .old
+                .iter()
+                .find(|t| t.task_id == incoming.task_id)
+                .ok_or("STANDARD_INVENTORY")?;
+            let t = o
+                .accepted
+                .iter()
+                .find(|t| t.task_id == incoming.task_id)
+                .ok_or("STANDARD_INVENTORY")?;
+            if old.repository != incoming.repository
+                || old.status != incoming.status
+                || t.repository != old.repository
+                || t.status != old.status
+                || t.task_group != incoming.task_group
+                || t.updated_epoch != incoming.updated_epoch
+            {
+                return Err("STANDARD_OWNER_BINDING".into());
+            }
+            if old.weight == t.weight {
+                continue;
+            }
+            let from = known_weight(&old.weight).ok_or("STANDARD_WEIGHT")?;
+            let to = known_weight(&t.weight).ok_or("STANDARD_WEIGHT")?;
+            if !matches!(t.status.as_str(), "Done" | "Cancelled")
+                || to <= from
+                || t.weight != incoming.weight
+            {
+                return Err("STANDARD_WEIGHT".into());
+            }
+            next = next.checked_add(1).ok_or("STANDARD_EVENT_OVERFLOW")?;
+            expected.push(vec![
+                V::Integer(next),
+                V::Text(t.task_id.clone()),
+                V::Text(t.task_group.clone()),
+                V::Integer(t.updated_epoch),
+                V::Text("WEIGHT_ESCALATED".into()),
+                V::Text(
+                    serde_json::to_string(
+                        &serde_json::json!({"from_weight":old.weight,"to_weight":t.weight}),
+                    )
+                    .map_err(|_| "STANDARD_EVENT_SHAPE")?,
+                ),
+            ]);
+            count += 1;
+        }
+        if new_events != expected {
+            return Err("STANDARD_EVENTS".into());
+        }
+        let mut expected_alloc = old_alloc;
+        if count > 0 {
+            if let Some(row) = expected_alloc.iter_mut().find(|r| r[1] == name) {
+                row[2] = V::Integer(next);
+            } else {
+                let id = expected_alloc
+                    .last()
+                    .and_then(|r| match r[0] {
+                        V::Integer(n) => Some(n),
+                        _ => None,
+                    })
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or("STANDARD_EVENT_OVERFLOW")?;
+                expected_alloc.push(vec![V::Integer(id), name, V::Integer(next)]);
+            }
+        }
+        if new_alloc != expected_alloc {
+            return Err("STANDARD_ALLOCATOR".into());
+        }
+        if o.before.keys().ne(o.after.keys()) {
+            return Err("STANDARD_HISTORY".into());
+        }
+        for (table, rows) in &o.before {
+            let actual = o.after.get(table).ok_or("STANDARD_HISTORY")?;
+            if matches!(table.as_str(), "tasks" | "task_events" | "sqlite_sequence") {
                 continue;
             }
             if table == "daemon_meta" {
-                let clean = |r: &Vec<Vec<rusqlite::types::Value>>| {
+                let clean = |r: &Vec<SqlRow>| {
                     r.iter()
-                        .filter(|r| {
-                            r.first()
-                                != Some(&rusqlite::types::Value::Text("last_sync_epoch".into()))
-                        })
+                        .filter(|r| r.first() != Some(&V::Text("last_sync_epoch".into())))
                         .cloned()
                         .collect::<Vec<_>>()
                 };
@@ -4710,18 +5139,6 @@ mod tests {
                 return Err("STANDARD_HISTORY".into());
             }
         }
-        if before.keys().ne(after.keys()) {
-            return Err("STANDARD_HISTORY".into());
-        }
-        let columns = c
-            .store
-            .connection_mut()
-            .prepare("SELECT * FROM tasks LIMIT 0")
-            .map_err(|_| "STANDARD_READ")?
-            .column_names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>();
         let allowed = [
             "task_group",
             "title",
@@ -4742,36 +5159,631 @@ mod tests {
             "updated_epoch",
             "memory_json",
         ];
-        let b = before.get("tasks").ok_or("STANDARD_READ")?;
-        let a = after.get("tasks").ok_or("STANDARD_READ")?;
+        let b = o.before.get("tasks").ok_or("STANDARD_READ")?;
+        let a = o.after.get("tasks").ok_or("STANDARD_READ")?;
         if b.len() != a.len() {
             return Err("STANDARD_INVENTORY".into());
         }
         for (b, a) in b.iter().zip(a) {
-            for ((name, b), a) in columns.iter().zip(b).zip(a) {
+            for ((name, b), a) in o.columns.iter().zip(b).zip(a) {
                 if b != a && !allowed.contains(&name.as_str()) {
                     return Err("STANDARD_RUNTIME".into());
                 }
             }
         }
-        for t in c.store.list_tasks(None).map_err(|_| "STANDARD_READ")? {
-            let o = old
+        for t in &o.accepted {
+            let previous = o
+                .old
                 .iter()
                 .find(|o| o.task_id == t.task_id)
                 .ok_or("STANDARD_INVENTORY")?;
-            let incoming = export
+            let incoming = w
+                .records
                 .iter()
                 .find(|i| i.task_id == t.task_id)
                 .ok_or("STANDARD_INVENTORY")?;
-            let mut memory = o.memory.clone();
+            let mut memory = previous.memory.clone();
             memory.governance_terminal_observed |=
                 matches!(incoming.status.as_str(), "Done" | "Cancelled");
             memory.governance_started |= incoming.memory.governance_started;
-            if t.memory != memory || t.version != o.version + 1 {
+            if t.memory != memory
+                || t.version != previous.version.checked_add(1).ok_or("STANDARD_RUNTIME")?
+            {
                 return Err("STANDARD_RUNTIME".into());
             }
         }
-        Ok(())
+        Ok(count)
+    }
+    fn rehearsal_standard(
+        c: &mut Coordinator,
+        w: &ActualDecodeTimeWitness,
+        export: &str,
+    ) -> Result<usize, String> {
+        let observation = observe_standard(c, w, export)?;
+        validate_standard(&observation, w, export)
+    }
+
+    fn weight_fixture(
+        changes: &[(&str, &str, &str, &str)],
+        history: usize,
+    ) -> (TestDirectory, Coordinator, String, ActualDecodeTimeWitness) {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        c.controller = Arc::new(RehearsalUnits::default());
+        c.submission_probe = Some(BTreeMap::new());
+        let mut incoming = Vec::new();
+        for (id, from, to, status) in changes {
+            let raw = serde_json::json!({"schema_version":2,"tasks":[{"id":id,"repository":id,"status":status,"weight":from,"executor":"external","autonomous_consent":false}]});
+            let mut old = intake::decode_export_records(&raw.to_string())
+                .unwrap()
+                .remove(0);
+            old.memory.recent_attempts = vec!["retained native memory".into()];
+            c.store.upsert_task(&old).unwrap();
+            incoming.push(serde_json::json!({"id":id,"repository":id,"task_group":"accepted-group","status":status,"weight":to,"executor":"external","autonomous_consent":false}));
+        }
+        for i in 0..history {
+            c.store
+                .append_event(
+                    changes[0].0,
+                    "historical-group",
+                    "HISTORY",
+                    &serde_json::json!({"ordinal":i,"literal":"preserve\\n\\\"raw\\\""}),
+                )
+                .unwrap();
+        }
+        let raw = serde_json::json!({"schema_version":2,"tasks":incoming}).to_string();
+        let witness = actual_decode(&raw).unwrap();
+        (dir, c, raw, witness)
+    }
+    fn refresh_allocator_image(o: &mut StandardObservation) {
+        for (image, rows) in [
+            (&mut o.before, &o.allocator_before),
+            (&mut o.after, &o.allocator_after),
+        ] {
+            let sorted = allocator_rows(rows).unwrap();
+            image.insert(
+                "sqlite_sequence".into(),
+                sorted.iter().map(|r| r[1..].to_vec()).collect(),
+            );
+        }
+    }
+
+    #[test]
+    fn standard_weight_real_owner_appends_exact_terminal_metadata_and_repeat_is_quiet() {
+        use rusqlite::types::Value as V;
+        for status in ["Done", "Cancelled"] {
+            for history in [0, 14] {
+                let (_dir, mut c, raw, w) =
+                    weight_fixture(&[("weight-terminal", "M", "L", status)], history);
+                let o = observe_standard(&mut c, &w, &raw).unwrap();
+                assert_eq!(validate_standard(&o, &w, &raw).unwrap(), 1);
+                let events = event_rows(o.after.get("task_events").unwrap()).unwrap();
+                let last = events.last().unwrap();
+                assert_eq!(last[2], V::Text("accepted-group".into()));
+                assert_eq!(last[3], V::Integer(o.accepted[0].updated_epoch));
+                assert_eq!(
+                    last[5],
+                    V::Text("{\"from_weight\":\"M\",\"to_weight\":\"L\"}".into())
+                );
+                let second = observe_standard(&mut c, &w, &raw).unwrap();
+                assert_eq!(validate_standard(&second, &w, &raw).unwrap(), 0);
+                assert_eq!(
+                    second.before.get("task_events"),
+                    second.after.get("task_events")
+                );
+                assert_eq!(second.allocator_before, second.allocator_after);
+                rehearsal_startup(&mut c).unwrap();
+                rehearsal_pass(&mut c, &mut RehearsalDelivery::default()).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn standard_weight_reverse_export_order_and_numerical_sequence_preserve_history() {
+        use rusqlite::types::Value as V;
+        let (_dir, mut c, raw, w) = weight_fixture(
+            &[
+                ("z-first", "M", "L", "Done"),
+                ("a-second", "XS", "S", "Cancelled"),
+            ],
+            14,
+        );
+        let mut o = observe_standard(&mut c, &w, &raw).unwrap();
+        assert_eq!(validate_standard(&o, &w, &raw).unwrap(), 2);
+        let events = event_rows(o.after.get("task_events").unwrap()).unwrap();
+        assert_eq!(events[14][1], V::Text("z-first".into()));
+        assert_eq!(events[15][1], V::Text("a-second".into()));
+        // Simulate canonical JSON transport sorting, which orders 10 before2.
+        for image in [&mut o.before, &mut o.after] {
+            image
+                .get_mut("task_events")
+                .unwrap()
+                .sort_by_key(|r| format!("{:?}", r[0]));
+        }
+        assert_eq!(validate_standard(&o, &w, &raw).unwrap(), 2);
+    }
+
+    #[test]
+    fn standard_weight_actual_delayed_decode_retains_selected_time() {
+        let (_dir, mut c, raw, w) = weight_fixture(&[("delayed-native", "M", "L", "Done")], 0);
+        let selected = w.records[0].updated_epoch;
+        let earliest = Instant::now() + Duration::from_millis(1100);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while now_epoch() <= selected || Instant::now() < earliest {
+            assert!(
+                Instant::now() < deadline,
+                "synthetic clock did not cross a second"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let batch_start = now_epoch();
+        assert!(batch_start > selected);
+        let o = observe_standard(&mut c, &w, &raw).unwrap();
+        assert_eq!(validate_standard(&o, &w, &raw).unwrap(), 1);
+        assert_eq!(o.accepted[0].updated_epoch, selected);
+        assert!(o.accepted[0].updated_epoch < batch_start);
+    }
+
+    #[test]
+    fn standard_weight_direct_owner_positive_supplied_and_nonpositive_fallback() {
+        for supplied in [123, 0, -1] {
+            let (_dir, mut c, _raw, w) = weight_fixture(&[("owner-time", "M", "L", "Done")], 0);
+            let mut incoming = w.records[0].clone();
+            incoming.updated_epoch = supplied;
+            let start = now_epoch();
+            let result = c.store.sync_task(&incoming).unwrap();
+            let end = now_epoch();
+            assert_eq!(c.store.get_task(&result.task_id).unwrap().unwrap(), result);
+            if supplied > 0 {
+                assert_eq!(result.updated_epoch, supplied);
+                assert!(result.updated_epoch < start);
+            } else {
+                assert!(start > 0 && start <= result.updated_epoch && result.updated_epoch <= end);
+            }
+            let event = c.store.list_events_since(None, 0, 100).unwrap().remove(0);
+            assert_eq!(event.ts_epoch, result.updated_epoch);
+        }
+        // Standard TASK_DONE semantics are unchanged and outside this allowance.
+        let (_dir, mut c, _raw, w) = weight_fixture(&[("normal-completion", "M", "M", "Ready")], 0);
+        let mut incoming = w.records[0].clone();
+        incoming.status = "Done".into();
+        let returned = c.store.sync_task(&incoming).unwrap();
+        assert_eq!(
+            returned,
+            c.store.get_task(&returned.task_id).unwrap().unwrap()
+        );
+        assert_eq!(
+            c.store.list_events_since(None, 0, 100).unwrap()[0].event_type,
+            "TASK_DONE"
+        );
+    }
+
+    #[test]
+    fn standard_weight_witness_rejects_unbound_records_bytes_ids_and_clock() {
+        let (_dir, mut c, raw, w) = weight_fixture(&[("witness", "M", "L", "Done")], 0);
+        let o = observe_standard(&mut c, &w, &raw).unwrap();
+        assert_eq!(validate_standard(&o, &w, &raw).unwrap(), 1);
+        for case in [
+            "bytes",
+            "record",
+            "id",
+            "duplicate",
+            "order",
+            "start-zero",
+            "backward",
+            "future",
+            "selected-before",
+            "selected-after",
+            "observed-before",
+        ] {
+            let mut bad = w.clone();
+            let mut raw = raw.clone();
+            let mut o = o.clone();
+            match case {
+                "bytes" => raw.push(' '),
+                "record" => bad.records[0].weight = "S".into(),
+                "id" => bad.records[0].task_id = "unbound".into(),
+                "duplicate" => bad.records.push(bad.records[0].clone()),
+                "order" => bad.records[0].task_group = "different".into(),
+                "start-zero" => bad.start = 0,
+                "backward" => bad.end = bad.start - 1,
+                "future" => {
+                    bad.start = o.epoch + 1;
+                    bad.end = o.epoch + 2;
+                }
+                "selected-before" => bad.start = bad.records[0].updated_epoch + 1,
+                "selected-after" => bad.end = bad.records[0].updated_epoch - 1,
+                "observed-before" => o.epoch = bad.end - 1,
+                _ => unreachable!(),
+            }
+            assert!(validate_standard(&o, &bad, &raw).is_err(), "{case}");
+        }
+    }
+
+    #[test]
+    fn standard_weight_observation_rejects_each_event_identity_payload_and_old_row_mutation() {
+        use rusqlite::types::Value as V;
+        let (_dir, mut c, raw, w) = weight_fixture(&[("exact-event", "M", "L", "Done")], 14);
+        let o = observe_standard(&mut c, &w, &raw).unwrap();
+        for case in [
+            "task",
+            "group",
+            "time",
+            "sequence",
+            "sequence-text",
+            "time-text",
+            "done",
+            "unknown",
+            "payload-keys",
+            "payload-extra",
+            "payload-duplicate",
+            "payload-order",
+            "payload-space",
+            "payload-value",
+            "payload-type",
+            "missing",
+            "extra",
+            "duplicate-sequence",
+            "old-edit",
+            "old-drop",
+            "old-identities-swapped",
+            "accepted-group",
+            "accepted-time",
+            "canonical-weight",
+            "trigger",
+            "schema",
+        ] {
+            let mut bad = o.clone();
+            let rows = bad.after.get_mut("task_events").unwrap();
+            let n = rows.len() - 1;
+            match case {
+                "task" => rows[n][1] = V::Text("other".into()),
+                "group" => rows[n][2] = V::Text("other".into()),
+                "time" => rows[n][3] = V::Integer(w.records[0].updated_epoch + 1),
+                "sequence" => rows[n][0] = V::Integer(77),
+                "sequence-text" => rows[n][0] = V::Text("15".into()),
+                "time-text" => rows[n][3] = V::Text("1".into()),
+                "done" => rows[n][4] = V::Text("TASK_DONE".into()),
+                "unknown" => rows[n][4] = V::Text("UNKNOWN".into()),
+                "payload-keys" => rows[n][5] = V::Text("{\"from\":\"M\",\"to\":\"L\"}".into()),
+                "payload-extra" => {
+                    rows[n][5] =
+                        V::Text("{\"from_weight\":\"M\",\"to_weight\":\"L\",\"extra\":true}".into())
+                }
+                "payload-duplicate" => {
+                    rows[n][5] = V::Text(
+                        "{\"from_weight\":\"M\",\"from_weight\":\"M\",\"to_weight\":\"L\"}".into(),
+                    )
+                }
+                "payload-order" => {
+                    rows[n][5] = V::Text("{\"to_weight\":\"L\",\"from_weight\":\"M\"}".into())
+                }
+                "payload-space" => {
+                    rows[n][5] = V::Text("{ \"from_weight\":\"M\",\"to_weight\":\"L\" }".into())
+                }
+                "payload-value" => {
+                    rows[n][5] = V::Text("{\"from_weight\":\"S\",\"to_weight\":\"L\"}".into())
+                }
+                "payload-type" => {
+                    rows[n][5] = V::Text("{\"from_weight\":3,\"to_weight\":4}".into())
+                }
+                "missing" => {
+                    rows.pop();
+                }
+                "extra" => {
+                    let mut r = rows[n].clone();
+                    r[0] = V::Integer(16);
+                    rows.push(r);
+                }
+                "duplicate-sequence" => rows.push(rows[n].clone()),
+                "old-edit" => rows[0][5] = V::Text("{}".into()),
+                "old-drop" => {
+                    rows.remove(0);
+                }
+                "old-identities-swapped" => {
+                    rows[0].swap(1, 2);
+                }
+                "accepted-group" => bad.accepted[0].task_group = "unbound".into(),
+                "accepted-time" => bad.accepted[0].updated_epoch += 1,
+                "canonical-weight" => bad.accepted[0].weight = "S".into(),
+                "trigger" => bad
+                    .schema_after
+                    .push("trigger:unexplained:synthetic".into()),
+                "schema" => bad.schema_before[1].push_str(" UNSUPPORTED"),
+                _ => unreachable!(),
+            }
+            assert!(validate_standard(&bad, &w, &raw).is_err(), "{case}");
+        }
+        let (_dir, mut c, raw, w) = weight_fixture(&[("canonical-binding", "XS", "S", "Done")], 0);
+        let mut bad = observe_standard(&mut c, &w, &raw).unwrap();
+        bad.accepted[0].weight = "M".into();
+        let column = bad.columns.iter().position(|c| c == "weight").unwrap();
+        bad.after.get_mut("tasks").unwrap()[0][column] = V::Text("M".into());
+        bad.after.get_mut("task_events").unwrap()[0][5] =
+            V::Text("{\"from_weight\":\"XS\",\"to_weight\":\"M\"}".into());
+        assert_eq!(
+            validate_standard(&bad, &w, &raw).unwrap_err(),
+            "STANDARD_WEIGHT"
+        );
+        // A swapped owner-call suffix is different from transport row order.
+        let (_dir, mut c, raw, w) = weight_fixture(
+            &[("z-call", "M", "L", "Done"), ("a-call", "S", "M", "Done")],
+            0,
+        );
+        let mut bad = observe_standard(&mut c, &w, &raw).unwrap();
+        assert_eq!(validate_standard(&bad, &w, &raw).unwrap(), 2);
+        let rows = bad.after.get_mut("task_events").unwrap();
+        let first = rows[0][1].clone();
+        rows[0][1] = rows[1][1].clone();
+        rows[1][1] = first;
+        assert!(validate_standard(&bad, &w, &raw).is_err());
+    }
+
+    #[test]
+    fn standard_weight_allocator_exact_row_identity_high_water_and_other_rows() {
+        use rusqlite::types::Value as V;
+        let (_dir, mut c, raw, w) = weight_fixture(&[("allocator", "M", "L", "Done")], 2);
+        let o = observe_standard(&mut c, &w, &raw).unwrap();
+        let mut supported = o.clone();
+        supported.allocator_before[0][2] = V::Integer(50);
+        supported.allocator_after[0][2] = V::Integer(51);
+        supported
+            .after
+            .get_mut("task_events")
+            .unwrap()
+            .last_mut()
+            .unwrap()[0] = V::Integer(51);
+        for rows in [
+            &mut supported.allocator_before,
+            &mut supported.allocator_after,
+        ] {
+            rows.push(vec![
+                V::Integer(2),
+                V::Text("unrelated".into()),
+                V::Integer(9),
+            ]);
+        }
+        refresh_allocator_image(&mut supported);
+        assert_eq!(validate_standard(&supported, &w, &raw).unwrap(), 1);
+        for case in [
+            "rowid",
+            "missing",
+            "duplicate-name",
+            "duplicate-id",
+            "high-text",
+            "high-negative",
+            "high-behind",
+            "advance",
+            "gap",
+            "overflow",
+            "unrelated",
+            "projection",
+        ] {
+            let mut bad = supported.clone();
+            match case {
+                "rowid" => bad.allocator_after[0][0] = V::Integer(3),
+                "missing" => {
+                    bad.allocator_before.remove(0);
+                }
+                "duplicate-name" => bad.allocator_before.push(vec![
+                    V::Integer(3),
+                    V::Text("task_events".into()),
+                    V::Integer(50),
+                ]),
+                "duplicate-id" => bad.allocator_before[1][0] = V::Integer(1),
+                "high-text" => bad.allocator_before[0][2] = V::Text("50".into()),
+                "high-negative" => bad.allocator_before[0][2] = V::Integer(-1),
+                "high-behind" => bad.allocator_before[0][2] = V::Integer(0),
+                "advance" => bad.allocator_after[0][2] = V::Integer(52),
+                "gap" => {
+                    bad.after
+                        .get_mut("task_events")
+                        .unwrap()
+                        .last_mut()
+                        .unwrap()[0] = V::Integer(52)
+                }
+                "overflow" => bad.allocator_before[0][2] = V::Integer(i64::MAX),
+                "unrelated" => bad.allocator_after[1][2] = V::Integer(10),
+                "projection" => {
+                    bad.after.get_mut("sqlite_sequence").unwrap()[0][1] = V::Integer(999)
+                }
+                _ => unreachable!(),
+            }
+            // Keep valid projection when testing semantics; malformed rows must
+            // be refused before any projection is guessed or normalized.
+            if case != "projection"
+                && allocator_rows(&bad.allocator_before).is_ok()
+                && allocator_rows(&bad.allocator_after).is_ok()
+            {
+                refresh_allocator_image(&mut bad);
+            }
+            assert!(validate_standard(&bad, &w, &raw).is_err(), "{case}");
+        }
+        let (_dir, mut c, raw, w) = weight_fixture(&[("no-event", "M", "M", "Done")], 0);
+        let mut no_event = observe_standard(&mut c, &w, &raw).unwrap();
+        assert_eq!(validate_standard(&no_event, &w, &raw).unwrap(), 0);
+        no_event.allocator_after.push(vec![
+            V::Integer(1),
+            V::Text("task_events".into()),
+            V::Integer(1),
+        ]);
+        refresh_allocator_image(&mut no_event);
+        assert!(validate_standard(&no_event, &w, &raw).is_err());
+    }
+
+    #[test]
+    fn standard_weight_real_unreviewed_events_and_unrelated_effects_stay_refused() {
+        for (from, to, status) in [
+            ("L", "M", "Done"),
+            ("M", "L", "Backlog"),
+            ("unknown", "L", "Done"),
+            ("M", "unknown", "Done"),
+        ] {
+            let (_dir, mut c, raw, w) = weight_fixture(&[("unreviewed", from, to, status)], 0);
+            let o = observe_standard(&mut c, &w, &raw).unwrap();
+            assert_eq!(
+                c.store.list_events_since(None, 0, 100).unwrap()[0].event_type,
+                "WEIGHT_ESCALATED"
+            );
+            assert!(validate_standard(&o, &w, &raw).is_err());
+        }
+        for event in ["TASK_DONE", "UNKNOWN", "WEIGHT_ESCALATED"] {
+            let (_dir, mut c, raw, w) = weight_fixture(&[("extra-event", "M", "L", "Done")], 0);
+            let mut o = observe_standard(&mut c, &w, &raw).unwrap();
+            c.store
+                .append_event(
+                    "extra-event",
+                    "accepted-group",
+                    event,
+                    &serde_json::json!({"from_weight":"M","to_weight":"L"}),
+                )
+                .unwrap();
+            o.after = database_image(&mut c.store).unwrap();
+            o.allocator_after = standard_allocator(&mut c.store).unwrap();
+            assert!(validate_standard(&o, &w, &raw).is_err());
+        }
+        let (_dir, mut c, raw, w) = weight_fixture(&[("runtime-invariant", "M", "L", "Done")], 0);
+        let o = observe_standard(&mut c, &w, &raw).unwrap();
+        for table in [
+            "stage_attempts",
+            "lifecycle_ops",
+            "pending_decisions",
+            "path_locks",
+            "merge_queue",
+            "post_merge_deliveries",
+        ] {
+            let mut bad = o.clone();
+            bad.after
+                .get_mut(table)
+                .unwrap()
+                .push(vec![rusqlite::types::Value::Text(
+                    "synthetic forbidden effect".into(),
+                )]);
+            assert!(validate_standard(&bad, &w, &raw).is_err(), "{table}");
+        }
+        for key in ["retry_count", "memory_json", "active_attempt_id"] {
+            let mut bad = o.clone();
+            let col = bad.columns.iter().position(|c| c == key).unwrap();
+            bad.after.get_mut("tasks").unwrap()[0][col] =
+                rusqlite::types::Value::Text("mutated".into());
+            assert!(validate_standard(&bad, &w, &raw).is_err(), "{key}");
+        }
+        // Actual native policy may retain a higher accepted weight. Incoming
+        // difference alone must never manufacture an expected metadata event.
+        let (_dir, mut c, raw, w) = weight_fixture(&[("owner-keeps", "L", "S", "In Progress")], 0);
+        let mut old = c.task("owner-keeps").unwrap();
+        old.executor = Some("zach".into());
+        old.memory.governance_started = true;
+        c.save(&old).unwrap();
+        assert_eq!(rehearsal_standard(&mut c, &w, &raw).unwrap(), 0);
+        assert_eq!(c.task("owner-keeps").unwrap().weight, "L");
+    }
+
+    #[test]
+    fn standard_weight_exact_legacy_labels_and_writer_scope_fail_closed() {
+        for legacy in ["m", " M", "M ", "xs", ""] {
+            let (_dir, mut c, raw, w) = weight_fixture(&[("legacy-label", "M", "L", "Done")], 0);
+            let mut old = c.task("legacy-label").unwrap();
+            old.weight = legacy.into();
+            c.store.upsert_task(&old).unwrap();
+            let o = observe_standard(&mut c, &w, &raw).unwrap();
+            assert_eq!(
+                validate_standard(&o, &w, &raw).unwrap_err(),
+                "STANDARD_WEIGHT"
+            );
+        }
+        let (_dir, mut c, raw, w) = weight_fixture(&[("writer-scope", "M", "L", "Done")], 0);
+        let before = database_image(&mut c.store).unwrap();
+        c.jobs.insert("synthetic-writer".into());
+        assert!(observe_standard(&mut c, &w, &raw).is_err());
+        assert_eq!(database_image(&mut c.store).unwrap(), before);
+        let (_dir, mut c, raw, w) = weight_fixture(
+            &[
+                ("first-record", "M", "L", "Done"),
+                ("second-record", "S", "M", "Done"),
+            ],
+            0,
+        );
+        let mut swapped = w.clone();
+        swapped.records.swap(0, 1);
+        assert!(observe_standard(&mut c, &swapped, &raw).is_err());
+    }
+
+    #[test]
+    fn standard_weight_finished_offline_history_is_strict_before_real_standard() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        c.controller = Arc::new(RehearsalUnits::default());
+        c.submission_probe = Some(BTreeMap::new());
+        let mut old = task("finished-weight");
+        old.weight = "M".into();
+        old.status = "Queued for Merge".into();
+        old.stages_completed = vec!["impl".into()];
+        old.active_attempt_id = Some("finished-weight-attempt".into());
+        c.save(&old).unwrap();
+        let mut a = attempt(&old, "finished-weight-attempt");
+        a.status = "PASSED".into();
+        a.phase = "COMPLETE".into();
+        a.ended_epoch = Some(now_epoch());
+        c.store.record_stage_attempt(&a).unwrap();
+        c.store
+            .append_event(
+                &old.task_id,
+                "test",
+                "HISTORY",
+                &serde_json::json!({"keep":true}),
+            )
+            .unwrap();
+        let raw=serde_json::json!({"schema_version":2,"tasks":[{"id":old.task_id,"repository":old.repository,"status":"Done","weight":"L","executor":"external","autonomous_consent":false}]}).to_string();
+        let w = actual_decode(&raw).unwrap();
+        let events = c.store.list_events_since(None, 0, 100).unwrap();
+        let allocator = standard_allocator(&mut c.store).unwrap();
+        for _ in 0..2 {
+            c.store
+                .sync_task_with_mode(
+                    &w.records[0],
+                    crate::v2::store::SyncMode::ReconcileFinishedLegacy,
+                )
+                .unwrap();
+            assert_eq!(c.task(&old.task_id).unwrap().weight, "M");
+            assert_eq!(c.store.list_events_since(None, 0, 100).unwrap(), events);
+            assert_eq!(standard_allocator(&mut c.store).unwrap(), allocator);
+            assert_eq!(
+                c.store.list_stage_attempts(&old.task_id).unwrap(),
+                vec![a.clone()]
+            );
+        }
+        rehearsal_startup(&mut c).unwrap();
+        assert_eq!(rehearsal_standard(&mut c, &w, &raw).unwrap(), 1);
+        let baseline = database_image(&mut c.store).unwrap();
+        rehearsal_pass(&mut c, &mut RehearsalDelivery::default()).unwrap();
+        rehearsal_startup(&mut c).unwrap();
+        assert_eq!(database_image(&mut c.store).unwrap(), baseline);
+    }
+
+    #[test]
+    fn standard_weight_offline_scope_never_emits_metadata_event() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        let raw=serde_json::json!({"schema_version":2,"tasks":[{"id":"offline-empty","repository":"synthetic","status":"Ready","weight":"M","autonomous_consent":false}]}).to_string();
+        let old = actual_decode(&raw).unwrap().records.remove(0);
+        c.store.upsert_task(&old).unwrap();
+        let mut incoming = old.clone();
+        incoming.status = "Done".into();
+        incoming.weight = "L".into();
+        for _ in 0..2 {
+            let history = c.store.list_events_since(None, 0, 100).unwrap();
+            let allocator = standard_allocator(&mut c.store).unwrap();
+            c.store
+                .sync_task_with_mode(
+                    &incoming,
+                    crate::v2::store::SyncMode::ReconcileFinishedLegacy,
+                )
+                .unwrap();
+            assert_eq!(c.task(&old.task_id).unwrap().weight, "M");
+            assert_eq!(c.store.list_events_since(None, 0, 100).unwrap(), history);
+            assert_eq!(standard_allocator(&mut c.store).unwrap(), allocator);
+        }
     }
 
     fn rehearsal_result(marker: &RehearsalMarker, binary: &str) -> serde_json::Value {
@@ -4905,6 +5917,17 @@ mod tests {
                 rehearsal_barrier_and_fake_mutations_are_non_vacuous();
                 real_coordinator_positive_controls_detect_jobs_and_direct_database_effects();
                 terminal_offline_then_real_standard_and_restart_never_replays_native_history();
+                standard_weight_real_owner_appends_exact_terminal_metadata_and_repeat_is_quiet();
+                standard_weight_actual_delayed_decode_retains_selected_time();
+                standard_weight_direct_owner_positive_supplied_and_nonpositive_fallback();
+                standard_weight_observation_rejects_each_event_identity_payload_and_old_row_mutation();
+                standard_weight_allocator_exact_row_identity_high_water_and_other_rows();
+                standard_weight_reverse_export_order_and_numerical_sequence_preserve_history();
+                standard_weight_witness_rejects_unbound_records_bytes_ids_and_clock();
+                standard_weight_real_unreviewed_events_and_unrelated_effects_stay_refused();
+                standard_weight_exact_legacy_labels_and_writer_scope_fail_closed();
+                standard_weight_finished_offline_history_is_strict_before_real_standard();
+                standard_weight_offline_scope_never_emits_metadata_event();
             })
             .map_err(|_| "POSITIVE_CONTROL")?;
             for key in [
@@ -4915,13 +5938,14 @@ mod tests {
                 result["positive_controls"][key] = true.into();
             }
             let export = std::str::from_utf8(&export_bytes).map_err(|_| "EXPORT_SCHEMA")?;
-            let records = intake::decode_export_records(export).map_err(|_| "EXPORT_SCHEMA")?;
+            let records = actual_decode(export)?;
             if records
+                .records
                 .iter()
                 .map(|t| &t.task_id)
                 .collect::<BTreeSet<_>>()
                 .len()
-                != records.len()
+                != records.records.len()
             {
                 return Err("EXPORT_DUPLICATE".into());
             }
@@ -4982,7 +6006,8 @@ mod tests {
                 return Err("EXPORT_BINDING".into());
             }
             let standard_before = database_image(&mut c.store)?;
-            let standard = rehearsal_standard(&mut c, records).map_err(|_| "STANDARD_EFFECT");
+            let standard =
+                rehearsal_standard(&mut c, &records, &exact).map_err(|_| "STANDARD_EFFECT");
             if standard.is_err() {
                 rehearsal_effects(
                     &standard_before,
