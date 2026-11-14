@@ -2876,7 +2876,10 @@ impl V2Store {
             task.status.as_str(),
             "Planning" | "Plan Review" | "In Progress" | "PR Review"
         ) {
-            return Ok(true);
+            // Human active labels reserve their repository, but only native
+            // ownership consumes global execution capacity. This also counts
+            // the scheduler's lock-before-attempt preparation window.
+            return self.native_startup_owned(task);
         }
         let Some(id) = task.active_attempt_id.as_deref() else {
             return Ok(false);
