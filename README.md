@@ -439,8 +439,12 @@ Review metadata without native ownership remains untouched, including multiple
 manual rows in one repository. Invalid raw proof blocks startup rather than
 silently skipping or clearing it. Real workers, attempts, checkpoints, leases and
 pending effects remain recoverable even after consent revocation or an executor
-change. The scheduler's existing human repository lane and task-slot policy are
-unchanged.
+change. The scheduler preserves human repository lanes while counting only
+native ownership toward `max_parallel_tasks`: manual active labels reserve their
+repository without consuming native execution slots. Native preparation locks,
+checkpoints and recovery still count after consent revocation or reassignment.
+The status field `running_task_slots` uses that same ownership proof;
+`in_progress_count` separately includes all tasks with active Governance labels.
 
 This preservation contract applies to the explicit offline operation. The first
 ordinary **Standard** intake after startup can adopt current Governance consent,

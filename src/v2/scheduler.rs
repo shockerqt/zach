@@ -163,7 +163,7 @@ pub fn schedule_scoped_dispatches(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2::store::{ContextPackSpec, TargetFileSpec, TaskMemory};
+    use crate::v2::store::{ContextPackSpec, PipelineCheckpoint, TargetFileSpec, TaskMemory};
 
     fn make_test_task(
         id: &str,
@@ -378,5 +378,212 @@ mod tests {
             .unwrap();
         let dispatches = schedule_next_dispatches(&mut store).unwrap();
         assert_eq!(dispatches[0].task_id, "B");
+    }
+
+    #[test]
+    fn manual_active_rows_reserve_their_repository_without_consuming_native_slots() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        store.set_max_parallel_tasks(1).unwrap();
+        for (i, status) in ["Planning", "Plan Review", "In Progress", "PR Review"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut manual = make_test_task(
+                &format!("MANUAL-{i}"),
+                "human-repo",
+                "M",
+                status,
+                vec![],
+                vec!["plan", "plan-review"],
+            );
+            manual.autonomous_consent = i % 2 == 0;
+            manual.executor = match i {
+                0 => None,
+                1 => Some("external".into()),
+                _ => Some("session".into()),
+            };
+            store.upsert_task(&manual).unwrap();
+        }
+        for (id, repo) in [
+            ("A-SAME", "human-repo"),
+            ("B-OTHER", "other-repo"),
+            ("C-OTHER", "third-repo"),
+        ] {
+            store
+                .upsert_task(&make_test_task(id, repo, "S", "Ready", vec![], vec![]))
+                .unwrap();
+        }
+        let before = store.status_summary().unwrap();
+        assert_eq!(before.in_progress_count, 4);
+        assert_eq!(before.running_task_slots, 0);
+
+        let dispatched = schedule_next_dispatches(&mut store).unwrap();
+        assert_eq!(dispatched.len(), 1);
+        assert_eq!(dispatched[0].task_id, "B-OTHER");
+        assert_eq!(store.get_task("A-SAME").unwrap().unwrap().status, "Ready");
+        assert!(
+            store
+                .list_path_locks(Some("human-repo"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.status_summary().unwrap().running_task_slots, 1);
+        assert_eq!(store.get_task("C-OTHER").unwrap().unwrap().status, "Ready");
+        assert!(
+            store
+                .list_path_locks(Some("third-repo"))
+                .unwrap()
+                .is_empty()
+        );
+        // The native lock counts before an attempt or coordinator checkpoint exists.
+        assert!(schedule_next_dispatches(&mut store).unwrap().is_empty());
+        assert_eq!(store.status_summary().unwrap().running_task_slots, 1);
+        assert_eq!(store.get_task("C-OTHER").unwrap().unwrap().status, "Ready");
+        assert!(
+            store
+                .list_path_locks(Some("third-repo"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn native_reservations_consume_capacity_after_consent_revocation_and_reassignment() {
+        for evidence in ["lock", "preparing", "live"] {
+            let mut store = V2Store::open_in_memory().unwrap();
+            store.set_max_parallel_tasks(1).unwrap();
+            let mut native =
+                make_test_task("NATIVE", "native-repo", "S", "In Progress", vec![], vec![]);
+            native.autonomous_consent = false;
+            native.executor = Some("external".into());
+            if evidence == "preparing" {
+                native.current_stage = Some("impl".into());
+                native.memory.pipeline_checkpoint = Some(PipelineCheckpoint {
+                    attempt_id: "preparing-attempt".into(),
+                    operation: "PREPARING".into(),
+                });
+            } else if evidence == "live" {
+                native.active_attempt_id = Some("live-attempt".into());
+            }
+            store.upsert_task(&native).unwrap();
+            if evidence == "lock" {
+                assert!(
+                    store
+                        .acquire_path_locks("native-repo", &["*".into()], "NATIVE")
+                        .unwrap()
+                );
+            } else if evidence == "live" {
+                store.connection_mut().execute_batch("INSERT INTO stage_attempts(attempt_id,task_id,stage,model,effort,started_epoch,status,phase) VALUES('live-attempt','NATIVE','impl','synthetic','low',1,'RUNNING','RUNNING')").unwrap();
+            }
+            store
+                .upsert_task(&make_test_task(
+                    "READY",
+                    "other-repo",
+                    "S",
+                    "Ready",
+                    vec![],
+                    vec![],
+                ))
+                .unwrap();
+            assert_eq!(store.status_summary().unwrap().running_task_slots, 1);
+            assert!(schedule_next_dispatches(&mut store).unwrap().is_empty());
+            assert_eq!(store.get_task("READY").unwrap().unwrap().status, "Ready");
+        }
+    }
+
+    #[test]
+    fn reopened_native_history_reserves_human_lane_without_consuming_capacity() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        store.set_max_parallel_tasks(1).unwrap();
+        let mut historical = make_test_task(
+            "HISTORY",
+            "human-repo",
+            "S",
+            "In Progress",
+            vec![],
+            vec!["impl"],
+        );
+        historical.autonomous_consent = false;
+        historical.executor = Some("session".into());
+        historical.current_stage = Some("impl".into());
+        historical.memory.governance_started = true;
+        historical.memory.governance_terminal_observed = true;
+        store.upsert_task(&historical).unwrap();
+        store.connection_mut().execute_batch("INSERT INTO stage_attempts(attempt_id,task_id,stage,model,effort,started_epoch,ended_epoch,status,phase) VALUES('historical-attempt','HISTORY','impl','synthetic','low',1,2,'PASSED','COMPLETE')").unwrap();
+        for (id, repo) in [("A-SAME", "human-repo"), ("B-OTHER", "other-repo")] {
+            store
+                .upsert_task(&make_test_task(id, repo, "S", "Ready", vec![], vec![]))
+                .unwrap();
+        }
+        assert_eq!(store.status_summary().unwrap().running_task_slots, 0);
+        let historical_before = store.get_task("HISTORY").unwrap().unwrap();
+        let dispatched = schedule_next_dispatches(&mut store).unwrap();
+        assert_eq!(dispatched.len(), 1);
+        assert_eq!(dispatched[0].task_id, "B-OTHER");
+        assert_eq!(
+            store.get_task("HISTORY").unwrap().unwrap(),
+            historical_before
+        );
+        assert_eq!(store.get_task("A-SAME").unwrap().unwrap().status, "Ready");
+        assert!(
+            store
+                .list_path_locks(Some("human-repo"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn ambiguous_ownership_fails_before_scheduler_mutates_tasks_or_locks() {
+        for memory in [
+            "{\"unknown_native\":false}",
+            "{\"governance_started\":false,\"governance_started\":true}",
+            "{\"halt_requested\":0}",
+        ] {
+            let mut store = V2Store::open_in_memory().unwrap();
+            store
+                .upsert_task(&make_test_task(
+                    "A-READY",
+                    "ready-repo",
+                    "S",
+                    "Ready",
+                    vec![],
+                    vec![],
+                ))
+                .unwrap();
+            store
+                .upsert_task(&make_test_task(
+                    "Z-INVALID",
+                    "manual-repo",
+                    "S",
+                    "In Progress",
+                    vec![],
+                    vec![],
+                ))
+                .unwrap();
+            store
+                .connection_mut()
+                .execute(
+                    "UPDATE tasks SET memory_json=?1 WHERE task_id='Z-INVALID'",
+                    [memory],
+                )
+                .unwrap();
+            let before = store.list_tasks(None).unwrap();
+            let events = store.max_seq_id().unwrap();
+            assert!(store.status_summary().is_err());
+            assert!(schedule_next_dispatches(&mut store).is_err());
+            assert_eq!(store.list_tasks(None).unwrap(), before);
+            assert_eq!(store.max_seq_id().unwrap(), events);
+            assert!(store.list_path_locks(None).unwrap().is_empty());
+            let raw: String = store
+                .connection_mut()
+                .query_row(
+                    "SELECT memory_json FROM tasks WHERE task_id='Z-INVALID'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(raw, memory);
+        }
     }
 }
