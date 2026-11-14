@@ -391,7 +391,11 @@ It is not a way to run tasks or to repair state by starting the daemon.
 Only explicit offline terminal intake (`Done`/`Cancelled`) can retire a reference:
 its persisted attempt must be ended `PASSED`, `COMPLETE`, and its stage already
 completed. Persisted stages, consent, attempt history and receipts are retained
-even if the export omits stage history. All task attempts must be ended recognized
+even if the export omits stage history or includes additional completed Governance
+labels such as human approvals. Exported completion labels are neither imported
+nor used as native completion proof: every persisted PASSED attempt must still
+have its stage completed in the exact persisted list. Additional canonical history
+cannot compensate for an unfinished native stage or any runtime/effect conflict. All task attempts must be ended recognized
 final `COMPLETE` records, with completed stages for passes. Missing/conflicting
 identities, leases, unfinished stages, pipeline/merge/suspended checkpoints,
 pending lifecycle work, unverified deliveries, unresolved/unapplied decisions and
