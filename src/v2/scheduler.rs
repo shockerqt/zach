@@ -404,7 +404,11 @@ mod tests {
             };
             store.upsert_task(&manual).unwrap();
         }
-        for (id, repo) in [("A-SAME", "human-repo"), ("B-OTHER", "other-repo")] {
+        for (id, repo) in [
+            ("A-SAME", "human-repo"),
+            ("B-OTHER", "other-repo"),
+            ("C-OTHER", "third-repo"),
+        ] {
             store
                 .upsert_task(&make_test_task(id, repo, "S", "Ready", vec![], vec![]))
                 .unwrap();
@@ -424,9 +428,23 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(store.status_summary().unwrap().running_task_slots, 1);
+        assert_eq!(store.get_task("C-OTHER").unwrap().unwrap().status, "Ready");
+        assert!(
+            store
+                .list_path_locks(Some("third-repo"))
+                .unwrap()
+                .is_empty()
+        );
         // The native lock counts before an attempt or coordinator checkpoint exists.
         assert!(schedule_next_dispatches(&mut store).unwrap().is_empty());
         assert_eq!(store.status_summary().unwrap().running_task_slots, 1);
+        assert_eq!(store.get_task("C-OTHER").unwrap().unwrap().status, "Ready");
+        assert!(
+            store
+                .list_path_locks(Some("third-repo"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
