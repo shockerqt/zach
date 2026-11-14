@@ -339,3 +339,64 @@ expected-current CAS during apply, and the final receipt must match the entire
 approved tuple. A failed apply requires a fresh plan and approval through Retry.
 Restarting an unknown dispatch outcome requires intervention and never replays
 that dispatch automatically.
+
+### Offline reconciliation of finished legacy supervision
+
+Ordinary `zach sync` and daemon intake retain their existing behavior. A database
+without the supervision `phase` column now classifies only ended `PASSED` and
+`FAILED` attempts as `COMPLETE` when introducing that column, atomically. Existing
+phases, unfinished/unknown attempts, statuses and timestamps are preserved.
+Migration alone does not establish that postprocessing or delivery is finished.
+
+The explicit offline mode below is for a separately reviewed and approved repair
+of the **existing** canonical database, after exact-SHA CI and normal L gates.
+It is not a way to run tasks or to repair state by starting the daemon.
+
+1. Exclude the daemon, other sync writers and independently started workers for
+   the whole operation. Verify no processes, worker services or socket remain;
+   resource slices alone are harmless. Keep this exclusion until verification
+   finishes. A process/unit scan is point-in-time evidence, not a lock on manual
+   worker launches.
+2. Take and privately validate a consistent backup of the intended database,
+   including WAL state, using the approved operational backup mechanism. Do not
+   copy a live SQLite main file alone. Resolve any missing backup/rollback
+   procedure before proceeding; never substitute a new database.
+3. Obtain a fresh canonical Governance `ws-task export --sync --json` into a local
+   private regular file owned by the invoking user, mode `0600`, with no symlink
+   components or additional hard links. The file must be at most 16 MiB and no
+   older than five minutes (future modification times are rejected). The operator
+   is responsible for its authoritative source: file age is not authenticated
+   provenance. Use the retained opened content, not a later replacement file.
+4. Invoke the reviewed binary with the same state directory as the daemon:
+
+   ```sh
+   zach sync --reconcile-finished-legacy --export-file <fresh-private-export> --db <state-dir>/zach-v2.sqlite3
+   ```
+
+   This mode accepts no `--ws-task-bin`. Before any writable database open it
+   acquires and holds the existing native daemon lock, requires canonical DB/state
+   identity, checks worker enumeration and every saved exact unit identity,
+   socket absence and process identity. Existing units, inspection uncertainty,
+   path ambiguity and malformed/stale/nonprivate exports block the operation.
+   The command neither stops units nor harvests outputs. Lock acquisition itself
+   may create/secure native lock metadata; failed preflight does not migrate the
+   database.
+5. Run the separately reviewed read-only activation guard while the daemon is
+   still excluded. Start it only after all active, recoverable and runnable work
+   is accounted for under the activation policy. Keep backups/exports private.
+   Roll back only through the approved consistent-backup restore procedure with
+   all writers excluded, never through SQL repair, consent rewrites, forged
+   receipts or replaying effects.
+
+Only explicit offline terminal intake (`Done`/`Cancelled`) can retire a reference:
+its persisted attempt must be ended `PASSED`, `COMPLETE`, and its stage already
+completed. Persisted stages, consent, attempt history and receipts are retained
+even if the export omits stage history. All task attempts must be ended recognized
+final `COMPLETE` records, with completed stages for passes. Missing/conflicting
+identities, leases, unfinished stages, pipeline/merge/suspended checkpoints,
+pending lifecycle work, unverified deliveries, unresolved/unapplied decisions and
+nonfailed merge entries retain their coordination state. Only the matching inert
+`FAILED` queue entry can be removed in the same native transaction after proof;
+locks and unrelated work remain visible to the activation guard. Repeating sync
+may update normal bookkeeping but cannot replay worker, merge or delivery effects.
+No production repair or activation is performed by the implementation tests.

@@ -1,7 +1,7 @@
 use crate::v2::now_epoch;
 use crate::v2::store::{
-    AcceptanceCriterionSpec, ContextPackSpec, TargetFileSpec, TaskMemory, TaskRecord, V2Store,
-    V2StoreError,
+    AcceptanceCriterionSpec, ContextPackSpec, SyncMode, TargetFileSpec, TaskMemory, TaskRecord,
+    V2Store, V2StoreError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -324,9 +324,18 @@ pub fn ingest_task_records(
     store: &mut V2Store,
     records: Vec<TaskRecord>,
 ) -> Result<IntakeSummary, V2StoreError> {
+    ingest_task_records_with_mode(store, records, SyncMode::Standard)
+}
+
+/// Caller must establish and hold native offline ownership for reconciliation.
+pub fn ingest_task_records_with_mode(
+    store: &mut V2Store,
+    records: Vec<TaskRecord>,
+    mode: SyncMode,
+) -> Result<IntakeSummary, V2StoreError> {
     let ingested_count = records.len();
     for record in records {
-        store.sync_task(&record)?;
+        store.sync_task_with_mode(&record, mode)?;
     }
     store.set_meta("last_sync_epoch", &now_epoch().to_string())?;
     let ready_task_ids = store
@@ -458,6 +467,29 @@ pub fn publish_plan_stage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_offline_intake_preserves_completed_stage_history_from_empty_export() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        let payload = r#"{"schema_version":2,"tasks":[{"id":"SYNTHETIC-INTAKE","repository":"zach","status":"Done","weight":"S","autonomous_consent":true}]}"#;
+        ingest_export_json(&mut store, payload).unwrap();
+        let mut old = store.get_task("SYNTHETIC-INTAKE").unwrap().unwrap();
+        old.active_attempt_id = Some("finished-intake".into());
+        old.stages_completed = vec!["impl".into()];
+        old.current_stage = Some("impl".into());
+        store.upsert_task(&old).unwrap();
+        store.connection_mut().execute_batch("INSERT INTO stage_attempts(attempt_id,task_id,stage,model,effort,started_epoch,ended_epoch,status,phase) VALUES('finished-intake','SYNTHETIC-INTAKE','impl','synthetic','low',1,2,'PASSED','COMPLETE')").unwrap();
+        let records = decode_export_records(payload).unwrap();
+        ingest_task_records_with_mode(&mut store, records, SyncMode::ReconcileFinishedLegacy)
+            .unwrap();
+        let after = store.get_task(&old.task_id).unwrap().unwrap();
+        assert!(after.active_attempt_id.is_none());
+        assert_eq!(after.stages_completed, old.stages_completed);
+        assert_eq!(after.current_stage, old.current_stage);
+        assert_eq!(after.autonomous_consent, old.autonomous_consent);
+        assert!(store.lifecycle_ops().unwrap().is_empty());
+        assert!(store.list_ready_queue(None).unwrap().is_empty());
+    }
 
     #[test]
     fn network_intake_preserves_invalid_values_for_per_task_rejection() {

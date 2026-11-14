@@ -273,7 +273,262 @@ fn run_v2_decide(args: &[String]) {
     }
 }
 
+const OFFLINE_EXPORT_MAX_AGE_SECS: u64 = 300;
+
+fn offline_sync_options(args: &[String]) -> Result<(PathBuf, PathBuf), String> {
+    let mut export = None;
+    let mut db = None;
+    let mut opt_in = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--reconcile-finished-legacy" if !opt_in => opt_in = true,
+            "--export-file" | "--db" => {
+                let target = if args[i] == "--db" {
+                    &mut db
+                } else {
+                    &mut export
+                };
+                if target.is_some() {
+                    return Err("duplicate offline sync option".into());
+                }
+                i += 1;
+                let value = args
+                    .get(i)
+                    .filter(|v| !v.starts_with("--"))
+                    .ok_or("offline sync option requires a value")?;
+                *target = Some(PathBuf::from(value));
+            }
+            _ => {
+                return Err(
+                    "offline sync accepts only --reconcile-finished-legacy, --export-file and --db"
+                        .into(),
+                );
+            }
+        }
+        i += 1;
+    }
+    if !opt_in {
+        return Err("offline reconciliation requires explicit opt-in".into());
+    }
+    Ok((
+        export.ok_or("offline reconciliation requires a fresh local --export-file")?,
+        db.unwrap_or_else(default_db_path),
+    ))
+}
+
+fn read_private_export(path: &std::path::Path) -> Result<(String, std::time::SystemTime), String> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    zach::v2::isolation::reject_symlink_components(path)?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file()
+        || meta.uid() != unsafe { libc::geteuid() }
+        || meta.mode() & 0o077 != 0
+        || meta.nlink() != 1
+        || meta.len() > 16 * 1024 * 1024
+    {
+        return Err(
+            "export must be a private owned regular file without links (at most 16 MiB)".into(),
+        );
+    }
+    let age = std::time::SystemTime::now()
+        .duration_since(meta.modified().map_err(|e| e.to_string())?)
+        .map_err(|_| "export timestamp is in the future")?;
+    if age > std::time::Duration::from_secs(OFFLINE_EXPORT_MAX_AGE_SECS) {
+        return Err("export is older than five minutes".into());
+    }
+    let mut payload = String::new();
+    (&file)
+        .take(16 * 1024 * 1024 + 1)
+        .read_to_string(&mut payload)
+        .map_err(|e| e.to_string())?;
+    if payload.len() > 16 * 1024 * 1024 {
+        return Err("export grew beyond size limit".into());
+    }
+    let modified = meta.modified().map_err(|e| e.to_string())?;
+    let after = file.metadata().map_err(|e| e.to_string())?;
+    if after.modified().map_err(|e| e.to_string())? != modified
+        || after.len() != meta.len()
+        || payload.len() as u64 != meta.len()
+    {
+        return Err("export changed while being read".into());
+    }
+    // Hold the opened content, never reopen a validated pathname for intake.
+    zach::v2::intake::decode_export_records(&payload).map_err(|e| e.to_string())?;
+    Ok((payload, modified))
+}
+
+fn reject_zach_processes(proc_dir: &std::path::Path, own_pid: u32) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    for entry in fs::read_dir(proc_dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if pid == own_pid {
+            continue;
+        }
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("process identity inspection failed: {e}")),
+        };
+        if meta.uid() != unsafe { libc::geteuid() } {
+            continue;
+        }
+        let read_identity = |name| match fs::read_to_string(entry.path().join(name)) {
+            Ok(s) => Ok(Some(s)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if entry.path().exists() {
+                    Err("incomplete process identity inspection".into())
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(e) => Err(format!("process inspection failed: {e}")),
+        };
+        let Some(comm) = read_identity("comm")? else {
+            continue;
+        };
+        let Some(cgroup) = read_identity("cgroup")? else {
+            continue;
+        };
+        if comm.trim().is_empty() || cgroup.trim().is_empty() {
+            return Err("empty process identity".into());
+        }
+        if comm.trim().starts_with("zach")
+            || cgroup.contains("zach-workers.slice/")
+            || cgroup.contains("/zach-stage-")
+            || cgroup.contains("/zach-w-")
+        {
+            return Err("another Zach or worker process exists".into());
+        }
+    }
+    Ok(())
+}
+
+fn offline_absence_check(
+    controller: &dyn zach::v2::runner::UnitController,
+    units: &[String],
+    sockets: &[PathBuf],
+) -> Result<(), String> {
+    use zach::v2::runner::UnitState;
+    for socket in sockets {
+        match fs::symlink_metadata(socket) {
+            Ok(_) => return Err("Zach socket path still exists".into()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(format!("socket inspection failed: {e}")),
+        }
+    }
+    if !controller.list_units()?.is_empty() {
+        return Err("worker units still exist".into());
+    }
+    for unit in units {
+        if controller.inspect(unit)?.state()? != UnitState::Missing {
+            return Err("a persisted worker unit still exists".into());
+        }
+    }
+    Ok(())
+}
+
+fn reconcile_finished_legacy(args: &[String]) -> Result<zach::v2::intake::IntakeSummary, String> {
+    use zach::v2::runner::SystemUnitController;
+    let (export, db) = offline_sync_options(args)?;
+    let (payload, export_modified) = read_private_export(&export)?;
+    let records = zach::v2::intake::decode_export_records(&payload).map_err(|e| e.to_string())?;
+    let state = default_state_dir();
+    zach::v2::isolation::reject_symlink_components(&state)?;
+    zach::v2::isolation::reject_symlink_components(&db)?;
+    let state = fs::canonicalize(state).map_err(|e| e.to_string())?;
+    let db = fs::canonicalize(db).map_err(|e| e.to_string())?;
+    if db != state.join("zach-v2.sqlite3") {
+        return Err(
+            "offline reconciliation requires the canonical state directory's zach-v2.sqlite3"
+                .into(),
+        );
+    }
+    let _lock = zach::v2::coordinator::DaemonLock::acquire(&state)?;
+    let conn =
+        rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| e.to_string())?;
+    let units = conn
+        .prepare("SELECT DISTINCT systemd_unit FROM stage_attempts WHERE systemd_unit IS NOT NULL")
+        .map_err(|e| e.to_string())?
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    if units.iter().any(|u| {
+        u.trim().is_empty() || !u.starts_with("zach-") || u.chars().any(char::is_whitespace)
+    }) {
+        return Err("ambiguous persisted worker unit identity".into());
+    }
+    drop(conn);
+    let sockets = [state.join("zach.sock"), default_socket_path()];
+    // Check old and current worker naming, in addition to exact persisted identities.
+    let broad_units = std::process::Command::new("systemctl")
+        .args([
+            "--user",
+            "list-units",
+            "--all",
+            "zach-*",
+            "--no-legend",
+            "--plain",
+            "--no-pager",
+        ])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !broad_units.status.success() {
+        return Err("cannot enumerate all Zach units".into());
+    }
+    for line in String::from_utf8(broad_units.stdout)
+        .map_err(|e| e.to_string())?
+        .lines()
+    {
+        let unit = line
+            .split_whitespace()
+            .find(|p| p.starts_with("zach-"))
+            .ok_or("ambiguous systemctl unit listing")?;
+        if !matches!(unit, "zach-workers.slice") {
+            return Err("a Zach service/worker unit still exists".into());
+        }
+    }
+    offline_absence_check(&SystemUnitController, &units, &sockets)?;
+    reject_zach_processes(std::path::Path::new("/proc"), std::process::id())?;
+    offline_absence_check(&SystemUnitController, &units, &sockets)?;
+    if std::time::SystemTime::now()
+        .duration_since(export_modified)
+        .map_err(|_| "export timestamp is in the future")?
+        > std::time::Duration::from_secs(OFFLINE_EXPORT_MAX_AGE_SECS)
+    {
+        return Err("export became stale during preflight".into());
+    }
+    let mut store = V2Store::open(&db).map_err(|e| e.to_string())?;
+    zach::v2::intake::ingest_task_records_with_mode(
+        &mut store,
+        records,
+        zach::v2::store::SyncMode::ReconcileFinishedLegacy,
+    )
+    .map_err(|e| e.to_string())
+}
+
 fn run_v2_sync(args: &[String]) {
+    if has_flag(args, "--reconcile-finished-legacy") {
+        match reconcile_finished_legacy(args) {
+            Ok(result) => println!("{}", serde_json::to_string_pretty(&result).unwrap()),
+            Err(error) => {
+                eprintln!("offline reconciliation failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     let mut store = open_store(args);
     let summary = if let Some(export_file) = flag_value(args, "--export-file") {
         let payload = fs::read_to_string(&export_file).unwrap_or_else(|error| {
@@ -807,7 +1062,9 @@ fn print_usage() {
     println!(
         "       zach decide <DECISION_ID> --choice <CHOICE> [--by <ACTOR>] [--note <NOTE>] [--db <PATH>]"
     );
-    println!("       zach sync [--export-file <PATH>] [--ws-task-bin <PATH>] [--db <PATH>]");
+    println!(
+        "       zach sync [--export-file <PATH>] [--ws-task-bin <PATH>] [--db <PATH>] [--reconcile-finished-legacy]"
+    );
     println!("       zach config [--max-parallel <1..16>] [--db <PATH>]");
     println!(
         "       zach run [--task <TASK_ID>] [--group <GROUP>] [--once] [--dry-run] [--json] [--db <PATH>]"
@@ -829,6 +1086,185 @@ fn print_usage() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct OfflineTestDir(PathBuf);
+    impl OfflineTestDir {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let path = env::temp_dir().join(format!(
+                "zach-offline-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for OfflineTestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    struct OfflineUnits {
+        listed: bool,
+        exact: bool,
+        fail: bool,
+    }
+    impl zach::v2::runner::UnitController for OfflineUnits {
+        fn inspect(&self, _: &str) -> Result<zach::v2::runner::UnitObservation, String> {
+            if self.fail {
+                return Err("inspection uncertain".into());
+            }
+            Ok(zach::v2::runner::UnitObservation {
+                load_state: if self.exact { "loaded" } else { "not-found" }.into(),
+                active_state: "inactive".into(),
+                sub_state: "dead".into(),
+                ..Default::default()
+            })
+        }
+        fn list_units(&self) -> Result<Vec<String>, String> {
+            if self.fail {
+                return Err("enumeration uncertain".into());
+            }
+            Ok(if self.listed {
+                vec!["zach-stage-synthetic.service".into()]
+            } else {
+                vec![]
+            })
+        }
+        fn launch(&self, _: &zach::v2::runner::AttemptManifest) -> Result<(), String> {
+            panic!("offline must not launch")
+        }
+        fn stop(&self, _: &str) -> Result<(), String> {
+            panic!("offline must not stop")
+        }
+        fn reset_failed(&self, _: &str) -> Result<(), String> {
+            panic!("offline must not reset")
+        }
+    }
+
+    #[test]
+    fn offline_sync_requires_explicit_unambiguous_local_export() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for bad in [
+            vec!["--reconcile-finished-legacy"],
+            vec![
+                "--reconcile-finished-legacy",
+                "--export-file",
+                "file",
+                "--ws-task-bin",
+                "bin",
+            ],
+            vec!["--export-file", "file"],
+            vec![
+                "--reconcile-finished-legacy",
+                "--export-file",
+                "file",
+                "--export-file",
+                "other",
+            ],
+        ] {
+            assert!(offline_sync_options(&args(&bad)).is_err());
+        }
+        assert!(
+            offline_sync_options(&args(&[
+                "--reconcile-finished-legacy",
+                "--export-file",
+                "file"
+            ]))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn offline_export_is_private_fresh_opened_content_without_path_following() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = OfflineTestDir::new();
+        let path = dir.0.join("export.json");
+        fs::write(&path, r#"{"schema_version":2,"tasks":[]}"#).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_private_export(&path).is_ok());
+        let link = dir.0.join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(read_private_export(&link).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_private_export(&path).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let old = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(OFFLINE_EXPORT_MAX_AGE_SECS + 2);
+        file.set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        assert!(read_private_export(&path).is_err());
+        fs::write(&path, "not json").unwrap();
+        assert!(read_private_export(&path).is_err());
+    }
+
+    #[test]
+    fn offline_preflight_blocks_live_exact_units_sockets_and_uncertainty_without_db_writes() {
+        let dir = OfflineTestDir::new();
+        let db = dir.0.join("zach-v2.sqlite3");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE stage_attempts(systemd_unit TEXT);")
+            .unwrap();
+        drop(conn);
+        let bytes = fs::read(&db).unwrap();
+        let socket = dir.0.join("zach.sock");
+        let units = vec!["zach-stage-synthetic.service".into()];
+        for check in [
+            OfflineUnits {
+                listed: true,
+                exact: false,
+                fail: false,
+            },
+            OfflineUnits {
+                listed: false,
+                exact: true,
+                fail: false,
+            },
+            OfflineUnits {
+                listed: false,
+                exact: false,
+                fail: true,
+            },
+        ] {
+            assert!(offline_absence_check(&check, &units, std::slice::from_ref(&socket)).is_err());
+            assert_eq!(fs::read(&db).unwrap(), bytes);
+        }
+        let safe = OfflineUnits {
+            listed: false,
+            exact: false,
+            fail: false,
+        };
+        assert!(offline_absence_check(&safe, &units, std::slice::from_ref(&socket)).is_ok());
+        fs::write(&socket, "").unwrap();
+        assert!(offline_absence_check(&safe, &units, &[socket]).is_err());
+        let lock = zach::v2::coordinator::DaemonLock::acquire(&dir.0).unwrap();
+        assert!(zach::v2::coordinator::DaemonLock::acquire(&dir.0).is_err());
+        drop(lock);
+        assert_eq!(fs::read(&db).unwrap(), bytes);
+    }
+
+    #[test]
+    fn offline_process_checks_use_identity_not_arguments_and_fail_closed() {
+        let dir = OfflineTestDir::new();
+        let pid = dir.0.join("123");
+        fs::create_dir(&pid).unwrap();
+        fs::write(pid.join("comm"), "zachd\n").unwrap();
+        fs::write(pid.join("cgroup"), "0::/user.slice\n").unwrap();
+        assert!(reject_zach_processes(&dir.0, 999).is_err());
+        assert!(reject_zach_processes(&dir.0, 123).is_ok());
+        fs::write(pid.join("comm"), "codex\n").unwrap();
+        fs::write(
+            pid.join("cgroup"),
+            "0::/zach-workers.slice/worker.service\n",
+        )
+        .unwrap();
+        assert!(reject_zach_processes(&dir.0, 999).is_err());
+        fs::write(pid.join("cgroup"), "0::/user.slice\n").unwrap();
+        assert!(reject_zach_processes(&dir.0, 999).is_ok());
+        assert!(reject_zach_processes(&dir.0.join("missing"), 999).is_err());
+    }
 
     #[test]
     fn default_bind_address_is_loopback() {
