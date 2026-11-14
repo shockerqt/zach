@@ -237,6 +237,12 @@ pub struct Coordinator {
     last_heartbeat: Instant,
     last_seq: i64,
     scope: Option<(Option<String>, Option<String>)>,
+    #[cfg(test)]
+    submission_probe: Option<BTreeMap<&'static str, usize>>,
+    #[cfg(test)]
+    rehearsal_delivery: Option<Arc<Mutex<tests::RehearsalDelivery>>>,
+    #[cfg(test)]
+    rehearsal_poll_progress: Option<Arc<[std::sync::atomic::AtomicUsize; 2]>>,
 }
 
 impl Coordinator {
@@ -290,6 +296,12 @@ impl Coordinator {
             last_heartbeat: Instant::now() - Duration::from_secs(10),
             last_seq: 0,
             scope: None,
+            #[cfg(test)]
+            submission_probe: None,
+            #[cfg(test)]
+            rehearsal_delivery: None,
+            #[cfg(test)]
+            rehearsal_poll_progress: None,
         };
         (
             coordinator,
@@ -301,6 +313,31 @@ impl Coordinator {
     }
 
     fn submit(&mut self, key: String, task_id: Option<String>, pool: u8, job: Job) -> bool {
+        #[cfg(test)]
+        if let Some(probe) = self.submission_probe.as_mut() {
+            // Drop the closure BEFORE it can reach any WorkerPool thread. Never
+            // retain keys/task IDs/payloads in private-rehearsal diagnostics.
+            let class = match key.split(':').next().unwrap_or("") {
+                "prepare" => "preparation",
+                "launch" => "worker",
+                "pipeline" => "pipeline",
+                "lifecycle" | "ws" => "publication",
+                "merge" => "merge",
+                "deploy" => "deploy",
+                "delivery-close" => "delivery",
+                "post-merge-deliveries" => "delivery-poll",
+                "identity" | "observe" => "inspection",
+                "stop" | "cleanup" => "unit-mutation",
+                "reconcile" | "preflight" | "export" => "control",
+                _ => "other",
+            };
+            *probe.entry(class).or_default() += 1;
+            if key != "post-merge-deliveries" || self.rehearsal_delivery.is_none() {
+                drop(job);
+                return false;
+            }
+            // Only the fake-bound read/settled poll can reach a WorkerPool.
+        }
         if self.jobs.contains(&key) {
             return false;
         }
@@ -828,11 +865,25 @@ impl Coordinator {
         Ok(())
     }
 
+    fn startup_ownership(&self) -> Result<BTreeSet<String>, String> {
+        self.store
+            .list_tasks(None)
+            .map_err(|e| e.to_string())?
+            .iter()
+            .filter_map(|task| match self.store.native_startup_owned(task) {
+                Ok(true) => Some(Ok(task.task_id.clone())),
+                Ok(false) => None,
+                Err(e) => Some(Err(e.to_string())),
+            })
+            .collect()
+    }
+
     fn reconcile_startup(&mut self) -> Result<(), String> {
         if self.jobs.contains("reconcile") || self.last_export.elapsed() < Duration::from_secs(2) {
             return Ok(());
         }
         // Enumerate as well as inspect exact persisted identities. Dispatch stays disabled.
+        self.startup_ownership()?;
         let controller = self.controller.clone();
         let snapshots = self
             .store
@@ -1250,6 +1301,7 @@ impl Coordinator {
         match result {
             WorkerResult::Preflight => self.preflight = true,
             WorkerResult::StartupReconciled { adopted, retired } => {
+                self.startup_ownership()?;
                 for attempt in retired {
                     self.store
                         .record_stage_attempt(&attempt)
@@ -1314,6 +1366,8 @@ impl Coordinator {
             }
             WorkerResult::DeliveryPolled => {}
             WorkerResult::Reconciled => {
+                // Prove every exclusion before the first cleanup/lock/failure write.
+                let native = self.startup_ownership()?;
                 self.reconciled = true;
                 for lock in self
                     .store
@@ -1345,22 +1399,23 @@ impl Coordinator {
                     }
                 }
                 for task in self.store.list_tasks(None).map_err(|e| e.to_string())? {
-                    let owns = task.active_attempt_id.is_some()
-                        || matches!(
-                            task.status.as_str(),
-                            "Planning"
-                                | "Plan Review"
-                                | "In Progress"
-                                | "PR Review"
-                                | "Queued for Merge"
-                        )
-                        || (task.memory.merge_checkpoint.is_some()
-                            && !task.memory.merge_lane_released)
-                        || (task.status == "Blocked"
-                            && task
-                                .current_stage
-                                .as_deref()
-                                .is_some_and(|s| s.starts_with("human-")));
+                    let owns = native.contains(&task.task_id)
+                        && (task.active_attempt_id.is_some()
+                            || matches!(
+                                task.status.as_str(),
+                                "Planning"
+                                    | "Plan Review"
+                                    | "In Progress"
+                                    | "PR Review"
+                                    | "Queued for Merge"
+                            )
+                            || (task.memory.merge_checkpoint.is_some()
+                                && !task.memory.merge_lane_released)
+                            || (task.status == "Blocked"
+                                && task
+                                    .current_stage
+                                    .as_deref()
+                                    .is_some_and(|s| s.starts_with("human-"))));
                     if owns
                         && !self
                             .store
@@ -1371,6 +1426,9 @@ impl Coordinator {
                     }
                 }
                 for mut task in self.store.list_tasks(None).map_err(|e| e.to_string())? {
+                    if !native.contains(&task.task_id) {
+                        continue;
+                    }
                     if matches!(
                         task.status.as_str(),
                         "Planning" | "Plan Review" | "In Progress" | "PR Review"
@@ -2969,21 +3027,36 @@ impl Coordinator {
         {
             return Ok(());
         }
+        #[cfg(test)]
+        if let Some(driver) = self.rehearsal_delivery.clone() {
+            self.submit_delivery_poll(tests::SharedRehearsalDelivery(driver));
+            return Ok(());
+        }
         self.submit_delivery_poll(SystemDeliveryDriver);
         Ok(())
     }
 
     fn submit_delivery_poll(&mut self, mut driver: impl delivery::DeliveryDriver + Send + 'static) {
         let commands = self.commands.clone();
+        #[cfg(test)]
+        let progress = self.rehearsal_poll_progress.clone();
         if self.submit(
             "post-merge-deliveries".into(),
             None,
             0,
             Box::new(move || {
+                #[cfg(test)]
+                if let Some(p) = &progress {
+                    p[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 delivery::poll_post_merge_deliveries(
                     &mut CoordinatorDeliveryStore { commands },
                     &mut driver,
                 )?;
+                #[cfg(test)]
+                if let Some(p) = &progress {
+                    p[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 Ok(WorkerResult::DeliveryPolled)
             }),
         ) {
@@ -3593,6 +3666,1578 @@ mod tests {
             output_bytes: 0,
             cpu_usage_usec: Some(100),
         }
+    }
+
+    #[derive(Default)]
+    struct RehearsalUnits {
+        reads: AtomicUsize,
+        mutations: AtomicUsize,
+    }
+    impl UnitController for RehearsalUnits {
+        fn inspect(&self, _: &str) -> Result<UnitObservation, String> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Err("rehearsal unit evidence refused".into())
+        }
+        fn list_units(&self) -> Result<Vec<String>, String> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![])
+        }
+        fn launch(&self, _: &AttemptManifest) -> Result<(), String> {
+            self.mutations.fetch_add(1, Ordering::Relaxed);
+            Err("rehearsal unit mutation refused".into())
+        }
+        fn stop(&self, _: &str) -> Result<(), String> {
+            self.mutations.fetch_add(1, Ordering::Relaxed);
+            Err("rehearsal unit mutation refused".into())
+        }
+        fn reset_failed(&self, _: &str) -> Result<(), String> {
+            self.mutations.fetch_add(1, Ordering::Relaxed);
+            Err("rehearsal unit mutation refused".into())
+        }
+    }
+
+    struct RehearsalWs {
+        export: String,
+        reads: AtomicUsize,
+        mutations: AtomicUsize,
+    }
+    impl WsTaskClient for RehearsalWs {
+        fn execute(&self, args: &[String]) -> Result<String, String> {
+            if args == ["export", "--sync", "--json"] {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                Ok(self.export.clone())
+            } else {
+                self.mutations.fetch_add(1, Ordering::Relaxed);
+                Err("rehearsal publication refused".into())
+            }
+        }
+    }
+
+    #[derive(Default)]
+    pub(super) struct RehearsalDelivery {
+        reads: usize,
+        mutations: usize,
+    }
+    impl delivery::DeliveryDriver for RehearsalDelivery {
+        fn contract(&mut self, _: &str, _: &str) -> delivery::ContractLookup {
+            self.reads += 1;
+            delivery::ContractLookup::FetchError("rehearsal delivery read refused".into())
+        }
+        fn changed_paths(&mut self, _: &str, _: &str) -> Result<Vec<String>, String> {
+            self.reads += 1;
+            Err("rehearsal delivery read refused".into())
+        }
+        fn find_run(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: u64,
+        ) -> Result<Option<delivery::WorkflowRun>, String> {
+            self.reads += 1;
+            Err("rehearsal delivery read refused".into())
+        }
+        fn artifact(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: bool,
+        ) -> Result<Vec<u8>, String> {
+            self.reads += 1;
+            Err("rehearsal delivery read refused".into())
+        }
+        fn failed_logs(&mut self, _: &str, _: &str) -> Result<String, String> {
+            self.reads += 1;
+            Err("rehearsal delivery read refused".into())
+        }
+        fn dispatch(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &BTreeMap<String, String>,
+        ) -> Result<String, String> {
+            self.mutations += 1;
+            Err("rehearsal delivery mutation refused".into())
+        }
+        fn query_run(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<delivery::WorkflowRun>, String> {
+            self.reads += 1;
+            Err("rehearsal delivery read refused".into())
+        }
+        fn get_https(&mut self, _: &str) -> Result<String, String> {
+            self.reads += 1;
+            Err("rehearsal delivery read refused".into())
+        }
+        fn sync_board(&mut self, _: &TaskRecord) -> Result<(), String> {
+            self.mutations += 1;
+            Err("rehearsal delivery mutation refused".into())
+        }
+    }
+
+    pub(super) struct SharedRehearsalDelivery(pub Arc<Mutex<RehearsalDelivery>>);
+    impl delivery::DeliveryDriver for SharedRehearsalDelivery {
+        fn contract(&mut self, a: &str, b: &str) -> delivery::ContractLookup {
+            match self.0.lock() {
+                Ok(mut d) => d.contract(a, b),
+                Err(_) => {
+                    delivery::ContractLookup::FetchError("rehearsal driver unavailable".into())
+                }
+            }
+        }
+        fn changed_paths(&mut self, a: &str, b: &str) -> Result<Vec<String>, String> {
+            self.0
+                .lock()
+                .map_err(|_| "rehearsal driver unavailable")?
+                .changed_paths(a, b)
+        }
+        fn find_run(
+            &mut self,
+            a: &str,
+            b: &str,
+            c: &str,
+            d: &str,
+            e: u64,
+        ) -> Result<Option<delivery::WorkflowRun>, String> {
+            self.0
+                .lock()
+                .map_err(|_| "rehearsal driver unavailable")?
+                .find_run(a, b, c, d, e)
+        }
+        fn artifact(
+            &mut self,
+            a: &str,
+            b: &str,
+            c: &str,
+            d: &str,
+            e: bool,
+        ) -> Result<Vec<u8>, String> {
+            self.0
+                .lock()
+                .map_err(|_| "rehearsal driver unavailable")?
+                .artifact(a, b, c, d, e)
+        }
+        fn failed_logs(&mut self, a: &str, b: &str) -> Result<String, String> {
+            self.0
+                .lock()
+                .map_err(|_| "rehearsal driver unavailable")?
+                .failed_logs(a, b)
+        }
+        fn dispatch(
+            &mut self,
+            a: &str,
+            b: &str,
+            c: &str,
+            d: &BTreeMap<String, String>,
+        ) -> Result<String, String> {
+            self.0
+                .lock()
+                .map_err(|_| "rehearsal driver unavailable")?
+                .dispatch(a, b, c, d)
+        }
+        fn query_run(
+            &mut self,
+            a: &str,
+            b: &str,
+            c: &str,
+        ) -> Result<Option<delivery::WorkflowRun>, String> {
+            self.0
+                .lock()
+                .map_err(|_| "rehearsal driver unavailable")?
+                .query_run(a, b, c)
+        }
+        fn get_https(&mut self, a: &str) -> Result<String, String> {
+            self.0
+                .lock()
+                .map_err(|_| "rehearsal driver unavailable")?
+                .get_https(a)
+        }
+        fn sync_board(&mut self, a: &TaskRecord) -> Result<(), String> {
+            self.0
+                .lock()
+                .map_err(|_| "rehearsal driver unavailable")?
+                .sync_board(a)
+        }
+    }
+
+    type DatabaseImage = BTreeMap<String, Vec<Vec<rusqlite::types::Value>>>;
+    fn database_image(store: &mut V2Store) -> Result<DatabaseImage, String> {
+        database_image_connection(store.connection_mut())
+    }
+    fn database_image_connection(conn: &rusqlite::Connection) -> Result<DatabaseImage, String> {
+        let tables = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .and_then(|mut s| {
+                s.query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(|_| "DATABASE_SNAPSHOT")?;
+        let mut image = BTreeMap::new();
+        for table in tables {
+            // Identifiers come from SQLite, never interpolated as values.
+            let quoted = table.replace('"', "\"\"");
+            let mut stmt = conn
+                .prepare(&format!("SELECT * FROM \"{quoted}\" ORDER BY rowid"))
+                .map_err(|_| "DATABASE_SNAPSHOT")?;
+            let n = stmt.column_count();
+            let rows = stmt
+                .query_map([], |r| (0..n).map(|i| r.get(i)).collect())
+                .and_then(|r| r.collect::<Result<Vec<_>, _>>())
+                .map_err(|_| "DATABASE_SNAPSHOT")?;
+            image.insert(table, rows);
+        }
+        Ok(image)
+    }
+
+    fn rehearsal_startup(c: &mut Coordinator) -> Result<(), String> {
+        c.startup_ownership()?;
+        let snapshots = c
+            .store
+            .list_tasks(None)
+            .map_err(|_| "rehearsal task read failed")?
+            .into_iter()
+            .map(|t| c.store.list_stage_attempts(&t.task_id).map(|a| (t, a)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "rehearsal attempt read failed")?;
+        let result = reconcile_attempt_snapshots(c.controller.as_ref(), &c.state_dir, snapshots)?;
+        c.worker_result(result)
+    }
+
+    // Every real coordinator eligibility pass runs. Only asynchronous closures
+    // are intercepted; synchronous lock/decision/retry/outbox writes remain visible.
+    fn rehearsal_pass(c: &mut Coordinator, _driver: &mut RehearsalDelivery) -> Result<(), String> {
+        let before = database_image(&mut c.store)?;
+        c.monitor_attempts()?;
+        c.reconcile_terminal_tasks()?;
+        c.replay_lifecycle()?;
+        c.resume_pipeline_steps()?;
+        c.resume_decisions()?;
+        c.reconcile_terminal_tasks()?;
+        c.evaluate_gates()?;
+        c.dispatch()?;
+        c.drive_merges()?;
+        c.last_delivery_poll = Instant::now() - Duration::from_secs(10);
+        if c.rehearsal_delivery.is_none() {
+            c.rehearsal_delivery = Some(Arc::new(Mutex::new(RehearsalDelivery::default())));
+            c.rehearsal_poll_progress = Some(Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]));
+        }
+        c.poll_deliveries()?;
+        let probe = c
+            .submission_probe
+            .as_ref()
+            .ok_or("rehearsal barrier absent")?;
+        if probe
+            .iter()
+            .any(|(class, count)| *class != "delivery-poll" && *count != 0)
+        {
+            return Err("rehearsal forbidden job intent".into());
+        }
+        // Service the actual CoordinatorDeliveryStore messages and completion.
+        // A finite event budget and deadline turn every stalled poll into refusal.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut messages = 0;
+        while !c.jobs.is_empty() {
+            if Instant::now() >= deadline || messages >= 1024 {
+                return Err("rehearsal poll did not quiesce".into());
+            }
+            let event =
+                c.rx.recv_timeout(Duration::from_millis(100))
+                    .map_err(|_| "rehearsal poll did not quiesce")?;
+            c.handle_event(event)
+                .map_err(|_| "rehearsal poll completion failed")?;
+            messages += 1;
+        }
+        while let Ok(event) = c.rx.try_recv() {
+            if messages >= 1024 {
+                return Err("rehearsal poll did not quiesce".into());
+            }
+            c.handle_event(event)
+                .map_err(|_| "rehearsal trailing event failed")?;
+            messages += 1;
+        }
+        let driver = c
+            .rehearsal_delivery
+            .as_ref()
+            .ok_or("rehearsal fake absent")?
+            .lock()
+            .map_err(|_| "rehearsal fake unavailable")?;
+        if driver.reads != 0 || driver.mutations != 0 {
+            return Err("rehearsal delivery driver intent".into());
+        }
+        drop(driver);
+        let progress = c
+            .rehearsal_poll_progress
+            .as_ref()
+            .ok_or("rehearsal progress absent")?;
+        let attempts = c
+            .submission_probe
+            .as_ref()
+            .and_then(|p| p.get("delivery-poll"))
+            .copied()
+            .unwrap_or(0);
+        if attempts != progress[0].load(Ordering::Relaxed)
+            || attempts != progress[1].load(Ordering::Relaxed)
+        {
+            return Err("rehearsal poll completion mismatch".into());
+        }
+        if database_image(&mut c.store)? != before {
+            return Err("rehearsal database effect".into());
+        }
+        Ok(())
+    }
+
+    fn manual_task(id: &str, status: &str) -> TaskRecord {
+        let mut t = task(id);
+        t.repository = "human-shared-repo".into();
+        t.status = status.into();
+        t.executor = None;
+        t.autonomous_consent = false;
+        t.current_stage = None;
+        t.memory = TaskMemory::default();
+        // Canonical plan metadata is not an execution identity.
+        t.stages_completed = vec!["human-plan".into()];
+        t
+    }
+
+    #[test]
+    fn startup_manual_metadata_is_inert_in_both_loops_and_actual_passes() {
+        let dir = TestDirectory::new();
+        let (mut c, _handle) =
+            Coordinator::create(V2Store::open_in_memory().unwrap(), dir.0.clone());
+        c.submission_probe = Some(BTreeMap::new());
+        let units = Arc::new(RehearsalUnits::default());
+        c.controller = units.clone();
+        for (i, status) in [
+            "Planning",
+            "Plan Review",
+            "In Progress",
+            "PR Review",
+            "PR Review",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut t = manual_task(&format!("manual-{i}"), status);
+            if i % 2 == 0 {
+                t.executor = Some("external".into());
+            }
+            c.save(&t).unwrap();
+        }
+        let before = database_image(&mut c.store).unwrap();
+        rehearsal_startup(&mut c).unwrap();
+        assert_eq!(database_image(&mut c.store).unwrap(), before);
+        rehearsal_pass(&mut c, &mut RehearsalDelivery::default()).unwrap();
+        assert_eq!(database_image(&mut c.store).unwrap(), before);
+        assert_eq!(units.mutations.load(Ordering::Relaxed), 0);
+        assert_eq!(units.reads.load(Ordering::Relaxed), 1);
+        assert!(c.submission_probe.unwrap().is_empty());
+    }
+
+    #[test]
+    fn startup_ambiguous_raw_proof_fails_before_cleanup_locks_or_orphan_writes() {
+        for memory in [
+            "{\"pipeline_checkpoint\":{\"attempt_id\":\"hidden\",\"operation\":\"PUSH\"},\"halt_requested\":0}",
+            "{\"unknown\":false}",
+            "{\"governance_started\":false,\"governance_started\":true}",
+        ] {
+            let dir = TestDirectory::new();
+            let mut c = coordinator(&dir.0);
+            c.save(&manual_task("manual-invalid", "In Progress"))
+                .unwrap();
+            c.store
+                .connection_mut()
+                .execute("UPDATE tasks SET memory_json=?1", [memory])
+                .unwrap();
+            let before = database_image(&mut c.store).unwrap();
+            assert!(
+                c.worker_result(WorkerResult::StartupReconciled {
+                    adopted: vec![],
+                    retired: vec![]
+                })
+                .is_err()
+            );
+            assert_eq!(database_image(&mut c.store).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn native_startup_evidence_survives_revocation_and_executor_changes() {
+        for evidence in ["attempt", "checkpoint", "start", "outbox", "merge", "lease"] {
+            let dir = TestDirectory::new();
+            let mut c = coordinator(&dir.0);
+            let mut t = manual_task(evidence, "In Progress");
+            t.stages_completed.clear();
+            c.save(&t).unwrap();
+            match evidence {
+                "attempt" => {
+                    t.active_attempt_id = Some("native".into());
+                    let mut fixture = t.clone();
+                    fixture.current_stage = Some("impl".into());
+                    c.store
+                        .record_stage_attempt(&attempt(&fixture, "native"))
+                        .unwrap();
+                }
+                "checkpoint" => {
+                    t.memory.pipeline_checkpoint = Some(PipelineCheckpoint {
+                        attempt_id: "native".into(),
+                        operation: "PREPARING".into(),
+                    })
+                }
+                "start" => t.memory.governance_started = true,
+                "outbox" => c
+                    .store
+                    .enqueue_lifecycle(&op(&t, "native-start", "start"))
+                    .unwrap(),
+                "merge" => {
+                    t.status = "Queued for Merge".into();
+                    t.memory.merge_checkpoint = Some(MergeCheckpoint {
+                        phase: "MERGE_PENDING".into(),
+                        ..Default::default()
+                    })
+                }
+                "lease" => t.lease_expires_epoch = Some(0),
+                _ => unreachable!(),
+            }
+            c.save(&t).unwrap();
+            assert!(c.store.native_startup_owned(&t).unwrap(), "{evidence}");
+            c.worker_result(WorkerResult::Reconciled).unwrap();
+            if evidence == "start" || evidence == "outbox" || evidence == "lease" {
+                assert_eq!(
+                    c.store.list_stage_attempts(&t.task_id).unwrap().len(),
+                    1,
+                    "{evidence}"
+                );
+                assert!(c.task(&t.task_id).unwrap().retry_count > 0);
+            } else if evidence == "checkpoint" {
+                assert!(
+                    c.task(&t.task_id)
+                        .unwrap()
+                        .memory
+                        .pipeline_checkpoint
+                        .is_none()
+                );
+            } else {
+                assert!(!c.store.list_path_locks(None).unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn reopened_manual_task_keeps_completed_native_markers_as_history() {
+        for (stage, aborted) in [
+            ("impl", false),
+            ("merge_queue", false),
+            ("merge_queue", true),
+        ] {
+            let dir = TestDirectory::new();
+            let mut c = coordinator(&dir.0);
+            c.controller = Arc::new(RehearsalUnits::default());
+            c.submission_probe = Some(BTreeMap::new());
+            let mut t = task("reopened-manual");
+            t.status = "Done".into();
+            t.stages_completed = vec!["impl".into()];
+            t.memory.governance_terminal_observed = true;
+            t.current_stage = Some("impl".into());
+            c.save(&t).unwrap();
+            let mut a = attempt(&t, "historical-complete");
+            a.phase = "COMPLETE".into();
+            a.status = "PASSED".into();
+            a.ended_epoch = Some(now_epoch());
+            c.store.record_stage_attempt(&a).unwrap();
+            t.current_stage = Some(stage.into());
+            c.save(&t).unwrap();
+            if aborted {
+                let mut row = delivery_rows(&t).remove(0);
+                row.state = "aborted".into();
+                c.store.upsert_delivery(&row).unwrap();
+            }
+            let export = serde_json::json!({"schema_version":2,"tasks":[{"id":t.task_id,"repository":t.repository,"status":"In Progress","executor":"external","autonomous_consent":false,"stages_completed":[]}]});
+            c.worker_result(WorkerResult::Export(
+                intake::decode_export_records(&export.to_string()).unwrap(),
+            ))
+            .unwrap();
+            let reopened = c.task(&t.task_id).unwrap();
+            assert!(
+                reopened.memory.governance_started && reopened.memory.governance_terminal_observed
+            );
+            assert_eq!(reopened.current_stage.as_deref(), Some(stage));
+            assert!(!c.store.native_startup_owned(&reopened).unwrap());
+            let before = database_image(&mut c.store).unwrap();
+            rehearsal_startup(&mut c).unwrap();
+            rehearsal_pass(&mut c, &mut RehearsalDelivery::default()).unwrap();
+            assert_eq!(database_image(&mut c.store).unwrap(), before);
+            assert_eq!(c.store.list_stage_attempts(&t.task_id).unwrap(), vec![a]);
+        }
+    }
+
+    #[test]
+    fn conflicting_active_status_and_native_checkpoint_refuses_without_fabricated_attempt() {
+        for suspended in [false, true] {
+            let dir = TestDirectory::new();
+            let mut c = coordinator(&dir.0);
+            let mut t = manual_task("ambiguous-native", "In Progress");
+            if suspended {
+                t.memory.suspended_impl_attempt_id = Some("native".into());
+            } else {
+                t.memory.merge_checkpoint = Some(MergeCheckpoint {
+                    phase: "MERGE_PENDING".into(),
+                    ..Default::default()
+                });
+            }
+            c.save(&t).unwrap();
+            let before = database_image(&mut c.store).unwrap();
+            assert!(
+                c.worker_result(WorkerResult::StartupReconciled {
+                    adopted: vec![],
+                    retired: vec![]
+                })
+                .is_err()
+            );
+            assert_eq!(database_image(&mut c.store).unwrap(), before);
+            assert!(c.store.list_stage_attempts(&t.task_id).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn terminal_offline_then_real_standard_and_restart_never_replays_native_history() {
+        for executor in ["external", "zach"] {
+            for labels in [
+                Some(vec!["impl"]),
+                Some(vec!["impl", "manual-extra"]),
+                Some(vec![]),
+                None,
+            ] {
+                let dir = TestDirectory::new();
+                let db = dir.0.join("synthetic.sqlite3");
+                let (mut c, _handle) =
+                    Coordinator::create(V2Store::open(&db).unwrap(), dir.0.clone());
+                c.controller = Arc::new(RehearsalUnits::default());
+                c.submission_probe = Some(BTreeMap::new());
+                let mut t = task("terminal-native");
+                t.status = "Queued for Merge".into();
+                t.stages_completed = vec!["impl".into()];
+                t.memory.applied_decisions = vec!["already-applied".into()];
+                t.memory.recent_attempts = vec!["preserved history".into()];
+                t.active_attempt_id = Some("complete-native".into());
+                c.save(&t).unwrap();
+                let mut a = attempt(&t, "complete-native");
+                a.phase = "COMPLETE".into();
+                a.status = "PASSED".into();
+                a.ended_epoch = Some(now_epoch());
+                c.store.record_stage_attempt(&a).unwrap();
+                c.store
+                    .open_decision(
+                        "already-applied",
+                        &t.task_id,
+                        "test",
+                        "human-plan-approval",
+                        "q",
+                        &["Approve".into()],
+                        None,
+                        "ctx",
+                        Some("base"),
+                    )
+                    .unwrap();
+                c.store
+                    .resolve_decision("already-applied", "Approve", "synthetic", None)
+                    .unwrap();
+                let mut receipt = delivery_rows(&t).remove(0);
+                receipt.state = "verified".into();
+                receipt.evidence_json["board_synced_status"] = "Done".into();
+                c.store.upsert_delivery(&receipt).unwrap();
+                let mut export = serde_json::json!({"schema_version":2,"tasks":[{"id":t.task_id,"repository":t.repository,"status":"Done","executor":executor,"autonomous_consent":true,"weight":"S"}]});
+                if let Some(labels) = labels {
+                    export["tasks"][0]["stages_completed"] = serde_json::json!(labels);
+                }
+                let input = intake::decode_export_records(&export.to_string()).unwrap();
+                assert_eq!(input[0].memory, TaskMemory::default());
+                c.store
+                    .sync_task_with_mode(
+                        &input[0],
+                        crate::v2::store::SyncMode::ReconcileFinishedLegacy,
+                    )
+                    .unwrap();
+                let before = database_image(&mut c.store).unwrap();
+                rehearsal_startup(&mut c).unwrap();
+                rehearsal_pass(&mut c, &mut RehearsalDelivery::default()).unwrap();
+                assert_eq!(database_image(&mut c.store).unwrap(), before);
+                let progress = c.rehearsal_poll_progress.as_ref().unwrap();
+                assert!(progress[0].load(Ordering::Relaxed) >= 1);
+                assert_eq!(
+                    progress[0].load(Ordering::Relaxed),
+                    progress[1].load(Ordering::Relaxed)
+                );
+                rehearsal_standard(&mut c, input).unwrap();
+                let standard = database_image(&mut c.store).unwrap();
+                for (table, rows) in &before {
+                    if table == "daemon_meta" {
+                        let clean = |r: &Vec<Vec<rusqlite::types::Value>>| {
+                            r.iter()
+                                .filter(|row| {
+                                    row.first()
+                                        != Some(&rusqlite::types::Value::Text(
+                                            "last_sync_epoch".into(),
+                                        ))
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>()
+                        };
+                        assert_eq!(clean(standard.get(table).unwrap()), clean(rows));
+                    } else if table != "tasks" {
+                        assert_eq!(standard.get(table), Some(rows), "{table}");
+                    }
+                }
+                assert!(c.task(&t.task_id).unwrap().active_attempt_id.is_none());
+                assert!(
+                    c.task(&t.task_id)
+                        .unwrap()
+                        .memory
+                        .applied_decisions
+                        .contains(&"already-applied".into())
+                );
+                rehearsal_pass(&mut c, &mut RehearsalDelivery::default()).unwrap();
+                let messages = c
+                    .socket_command(ClientCommand::Subscribe {
+                        group: None,
+                        since_seq: None,
+                        once: None,
+                    })
+                    .unwrap();
+                assert!(messages.iter().any(|m| matches!(m,ServerMessage::Snapshot{tasks,..} if tasks.iter().any(|t| t.status == "Done"))));
+                drop(c);
+                let (mut reopened, _handle) =
+                    Coordinator::create(V2Store::open(&db).unwrap(), dir.0.clone());
+                reopened.controller = Arc::new(RehearsalUnits::default());
+                reopened.submission_probe = Some(BTreeMap::new());
+                rehearsal_startup(&mut reopened).unwrap();
+                rehearsal_pass(&mut reopened, &mut RehearsalDelivery::default()).unwrap();
+                assert_eq!(database_image(&mut reopened.store).unwrap(), standard);
+            }
+        }
+    }
+
+    #[test]
+    fn real_coordinator_positive_controls_detect_jobs_and_direct_database_effects() {
+        for case in [
+            "pipeline",
+            "publication",
+            "worker",
+            "merge",
+            "decision",
+            "dispatch",
+            "delivery",
+            "orphan",
+        ] {
+            let dir = TestDirectory::new();
+            let mut c = coordinator(&dir.0);
+            c.submission_probe = Some(BTreeMap::new());
+            c.controller = Arc::new(RehearsalUnits::default());
+            let mut t = task("positive");
+            c.save(&t).unwrap();
+            match case {
+                "pipeline" => {
+                    t.memory.pipeline_checkpoint = Some(PipelineCheckpoint {
+                        attempt_id: "positive-attempt".into(),
+                        operation: "CHECKS".into(),
+                    });
+                    let mut a = attempt(&t, "positive-attempt");
+                    a.phase = "POSTPROCESSING".into();
+                    a.status = "PASSED".into();
+                    a.ended_epoch = Some(now_epoch());
+                    c.store.record_stage_attempt(&a).unwrap();
+                }
+                "publication" => c
+                    .store
+                    .enqueue_lifecycle(&op(&t, "positive-op", "stage"))
+                    .unwrap(),
+                "worker" => {
+                    t.active_attempt_id = Some("positive-attempt".into());
+                    c.store
+                        .record_stage_attempt(&attempt(&t, "positive-attempt"))
+                        .unwrap();
+                }
+                "merge" => {
+                    t.status = "Queued for Merge".into();
+                    t.memory.merge_checkpoint = Some(MergeCheckpoint {
+                        phase: "MERGE_DEFAULT".into(),
+                        target_sha: "head".into(),
+                        pr_number: 9,
+                        ..Default::default()
+                    });
+                    c.store
+                        .enqueue_merge_queue(&t.repository, &t.task_id, 9, "head")
+                        .unwrap();
+                }
+                "decision" => {
+                    t.weight = "L".into();
+                    t.required_stages = vec!["human-plan-approval".into()];
+                }
+                "dispatch" => {}
+                "delivery" => {
+                    t.status = "Done".into();
+                    let mut row = delivery_rows(&t).remove(0);
+                    row.state = "verified".into();
+                    c.store.upsert_delivery(&row).unwrap();
+                }
+                "orphan" => {
+                    t.status = "In Progress".into();
+                }
+                _ => unreachable!(),
+            }
+            c.save(&t).unwrap();
+            let before = database_image(&mut c.store).unwrap();
+            if case == "orphan" {
+                c.worker_result(WorkerResult::Reconciled).unwrap();
+                assert_ne!(database_image(&mut c.store).unwrap(), before);
+            } else {
+                assert!(
+                    rehearsal_pass(&mut c, &mut RehearsalDelivery::default()).is_err(),
+                    "{case}"
+                );
+                let p = c.submission_probe.as_ref().unwrap();
+                match case {
+                    "pipeline" => assert!(p.contains_key("pipeline")),
+                    "publication" => assert!(p.contains_key("publication")),
+                    "worker" => assert!(p.contains_key("inspection")),
+                    "merge" => assert!(p.contains_key("merge")),
+                    "decision" | "dispatch" => {
+                        assert_ne!(database_image(&mut c.store).unwrap(), before)
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rehearsal_barrier_and_fake_mutations_are_non_vacuous() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        c.submission_probe = Some(BTreeMap::new());
+        let ran = Arc::new(AtomicUsize::new(0));
+        for key in [
+            "prepare:synthetic",
+            "launch:synthetic",
+            "pipeline:synthetic",
+            "ws:synthetic",
+            "merge:synthetic",
+            "delivery-close:synthetic",
+            "deploy:synthetic",
+            "post-merge-deliveries",
+            "identity:synthetic",
+            "observe:synthetic",
+            "stop:synthetic",
+            "cleanup:synthetic",
+            "unexpected",
+        ] {
+            let ran = ran.clone();
+            assert!(!c.submit(
+                key.into(),
+                None,
+                0,
+                Box::new(move || {
+                    ran.fetch_add(1, Ordering::Relaxed);
+                    Ok(WorkerResult::DeliveryPolled)
+                })
+            ));
+        }
+        assert_eq!(ran.load(Ordering::Relaxed), 0);
+        let p = c.submission_probe.as_ref().unwrap();
+        for class in [
+            "worker",
+            "preparation",
+            "pipeline",
+            "deploy",
+            "publication",
+            "merge",
+            "delivery",
+            "delivery-poll",
+            "inspection",
+            "unit-mutation",
+            "other",
+        ] {
+            assert!(p.get(class).copied().unwrap_or(0) > 0, "{class}");
+        }
+        assert!(rehearsal_pass(&mut c, &mut RehearsalDelivery::default()).is_err());
+        let units = RehearsalUnits::default();
+        assert!(units.stop("synthetic").is_err());
+        assert!(units.reset_failed("synthetic").is_err());
+        assert!(
+            units
+                .launch(&manifest(&dir.0, &task("synthetic"), "synthetic"))
+                .is_err()
+        );
+        assert_eq!(units.mutations.load(Ordering::Relaxed), 3);
+        let ws = RehearsalWs {
+            export: String::new(),
+            reads: AtomicUsize::new(0),
+            mutations: AtomicUsize::new(0),
+        };
+        assert!(ws.execute(&["stage".into()]).is_err());
+        assert_eq!(ws.mutations.load(Ordering::Relaxed), 1);
+        let mut d = RehearsalDelivery::default();
+        assert!(
+            delivery::DeliveryDriver::dispatch(
+                &mut d,
+                "synthetic",
+                "synthetic",
+                "synthetic",
+                &BTreeMap::new()
+            )
+            .is_err()
+        );
+        assert!(delivery::DeliveryDriver::sync_board(&mut d, &task("synthetic")).is_err());
+        assert_eq!(d.mutations, 2);
+        // Direct writes must also be caught, independently of submission counts.
+        let before = database_image(&mut c.store).unwrap();
+        c.save(&task("synthetic-effect")).unwrap();
+        assert_ne!(database_image(&mut c.store).unwrap(), before);
+    }
+
+    // Test-only hashing avoids subprocesses and new production dependencies.
+    fn rehearsal_sha256(bytes: &[u8]) -> String {
+        const K: [u32; 64] = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+            0xc67178f2,
+        ];
+        let mut state: [u32; 8] = [
+            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+            0x5be0cd19,
+        ];
+        let mut padded = bytes.to_vec();
+        padded.push(0x80);
+        while padded.len() % 64 != 56 {
+            padded.push(0);
+        }
+        padded.extend_from_slice(&((bytes.len() as u64) * 8).to_be_bytes());
+        for block in padded.chunks_exact(64) {
+            let mut w = [0u32; 64];
+            for (i, chunk) in block.chunks_exact(4).enumerate() {
+                w[i] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            }
+            for i in 16..64 {
+                let a = w[i - 15];
+                let b = w[i - 2];
+                w[i] = w[i - 16]
+                    .wrapping_add(a.rotate_right(7) ^ a.rotate_right(18) ^ (a >> 3))
+                    .wrapping_add(w[i - 7])
+                    .wrapping_add(b.rotate_right(17) ^ b.rotate_right(19) ^ (b >> 10));
+            }
+            let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
+            for i in 0..64 {
+                let t1 = h
+                    .wrapping_add(e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25))
+                    .wrapping_add((e & f) ^ (!e & g))
+                    .wrapping_add(K[i])
+                    .wrapping_add(w[i]);
+                let t2 = (a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22))
+                    .wrapping_add((a & b) ^ (a & c) ^ (b & c));
+                h = g;
+                g = f;
+                f = e;
+                e = d.wrapping_add(t1);
+                d = c;
+                c = b;
+                b = a;
+                a = t1.wrapping_add(t2);
+            }
+            for (v, n) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+                *v = v.wrapping_add(n);
+            }
+        }
+        state.iter().map(|v| format!("{v:08x}")).collect()
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RehearsalMarker {
+        schema_version: u32,
+        purpose: String,
+        run_id: String,
+        database_sha256: String,
+        export_sha256: String,
+        native_candidate_sha256: String,
+        infra_candidate_sha256: String,
+    }
+    fn digest_shape(s: &str) -> bool {
+        s.len() == 64
+            && s.bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    }
+    type FileIdentity = (u64, u64, u32, u32, u64);
+    fn rehearsal_file(path: &Path, uid: u32) -> Result<(File, FileIdentity), String> {
+        use std::os::unix::fs::MetadataExt;
+        isolation::reject_symlink_components(path).map_err(|_| "UNSAFE_INPUT")?;
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|_| "UNSAFE_INPUT")?;
+        let m = file.metadata().map_err(|_| "UNSAFE_INPUT")?;
+        if !m.is_file() || m.uid() != uid || m.mode() & 0o7777 != 0o600 || m.nlink() != 1 {
+            return Err("UNSAFE_INPUT".into());
+        }
+        Ok((file, (m.dev(), m.ino(), m.uid(), m.mode(), m.nlink())))
+    }
+    fn rehearsal_bytes(mut file: File, limit: usize) -> Result<Vec<u8>, String> {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(limit as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "INPUT_READ")?;
+        if bytes.len() > limit {
+            return Err("INPUT_SIZE".into());
+        }
+        Ok(bytes)
+    }
+    fn rehearsal_directory() -> Result<(PathBuf, u32, (u64, u64)), String> {
+        use std::os::unix::fs::MetadataExt;
+        let dir = PathBuf::from(std::env::var_os("ZACH039_REHEARSAL_DIR").ok_or("NO_SELECTOR")?);
+        // Root means the orchestrating role. The reviewed operator is ubuntu,
+        // running with its own UID and real user bus, never sudo/root.
+        let uid = unsafe { libc::geteuid() };
+        let account = unsafe { libc::getpwnam(c"ubuntu".as_ptr()) };
+        if uid == 0
+            || uid != unsafe { libc::getuid() }
+            || account.is_null()
+            || unsafe { (*account).pw_uid } != uid
+        {
+            return Err("OPERATOR_IDENTITY".into());
+        }
+        let runtime = format!("/run/user/{uid}");
+        if std::env::var("XDG_RUNTIME_DIR").ok().as_deref() != Some(&runtime)
+            || std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().as_deref()
+                != Some(&format!("unix:path={runtime}/bus"))
+        {
+            return Err("OPERATOR_BUS".into());
+        }
+        isolation::reject_symlink_components(&dir).map_err(|_| "UNSAFE_DIRECTORY")?;
+        let canonical = std::fs::canonicalize(&dir).map_err(|_| "UNSAFE_DIRECTORY")?;
+        if canonical != dir
+            || dir.parent() != Some(Path::new("/var/tmp"))
+            || !dir.file_name().and_then(|s| s.to_str()).is_some_and(|s| {
+                s.starts_with("zach039-rehearsal-")
+                    && s.len() > 26
+                    && s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+            })
+        {
+            return Err("UNSAFE_DIRECTORY".into());
+        }
+        let m = std::fs::symlink_metadata(&dir).map_err(|_| "UNSAFE_DIRECTORY")?;
+        if !m.is_dir() || m.uid() != uid || m.mode() & 0o7777 != 0o700 {
+            return Err("UNSAFE_DIRECTORY".into());
+        }
+        rehearsal_entries(&dir, uid, false)?;
+        Ok((dir, uid, (m.dev(), m.ino())))
+    }
+    fn rehearsal_entries(dir: &Path, uid: u32, after_open: bool) -> Result<(), String> {
+        for entry in std::fs::read_dir(dir).map_err(|_| "UNSAFE_DIRECTORY")? {
+            let entry = entry.map_err(|_| "UNSAFE_DIRECTORY")?;
+            let name = entry.file_name();
+            let name = name.to_str().ok_or("UNEXPECTED_ENTRY")?;
+            let input = matches!(
+                name,
+                "zach-v2.sqlite3" | "canonical-export.json" | "copy-only.json"
+            );
+            let sidecar =
+                after_open && matches!(name, "zach-v2.sqlite3-wal" | "zach-v2.sqlite3-shm");
+            let log = name.ends_with(".log")
+                && name
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'));
+            if !input && !sidecar && !log {
+                return Err("UNEXPECTED_ENTRY".into());
+            }
+            rehearsal_file(&entry.path(), uid)?;
+        }
+        Ok(())
+    }
+
+    // Standard's one named metadata allowance is checked by key, never a blanket
+    // exclusion of daemon_meta or task history. Every task column is inspected.
+    fn rehearsal_standard(c: &mut Coordinator, export: Vec<TaskRecord>) -> Result<(), String> {
+        let before = database_image(&mut c.store)?;
+        let old = c.store.list_tasks(None).map_err(|_| "STANDARD_READ")?;
+        if old.len() != export.len()
+            || export.iter().any(|t| {
+                !old.iter().any(|o| {
+                    o.task_id == t.task_id && o.repository == t.repository && o.status == t.status
+                })
+            })
+        {
+            return Err("STANDARD_INVENTORY".into());
+        }
+        c.worker_result(WorkerResult::Export(export.clone()))
+            .map_err(|_| "STANDARD_INTAKE")?;
+        let after = database_image(&mut c.store)?;
+        for (table, rows) in &before {
+            let Some(actual) = after.get(table) else {
+                return Err("STANDARD_HISTORY".into());
+            };
+            if table == "tasks" {
+                continue;
+            }
+            if table == "daemon_meta" {
+                let clean = |r: &Vec<Vec<rusqlite::types::Value>>| {
+                    r.iter()
+                        .filter(|r| {
+                            r.first()
+                                != Some(&rusqlite::types::Value::Text("last_sync_epoch".into()))
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                };
+                if clean(rows) != clean(actual) {
+                    return Err("STANDARD_HISTORY".into());
+                }
+            } else if rows != actual {
+                return Err("STANDARD_HISTORY".into());
+            }
+        }
+        if before.keys().ne(after.keys()) {
+            return Err("STANDARD_HISTORY".into());
+        }
+        let columns = c
+            .store
+            .connection_mut()
+            .prepare("SELECT * FROM tasks LIMIT 0")
+            .map_err(|_| "STANDARD_READ")?
+            .column_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        let allowed = [
+            "task_group",
+            "title",
+            "github_repo",
+            "issue_number",
+            "weight",
+            "worktree_path",
+            "branch",
+            "context_pack_json",
+            "depends_on_json",
+            "required_stages_json",
+            "stages_completed_json",
+            "plan_base_sha",
+            "reviewed_sha",
+            "executor",
+            "autonomous_consent",
+            "version",
+            "updated_epoch",
+            "memory_json",
+        ];
+        let b = before.get("tasks").ok_or("STANDARD_READ")?;
+        let a = after.get("tasks").ok_or("STANDARD_READ")?;
+        if b.len() != a.len() {
+            return Err("STANDARD_INVENTORY".into());
+        }
+        for (b, a) in b.iter().zip(a) {
+            for ((name, b), a) in columns.iter().zip(b).zip(a) {
+                if b != a && !allowed.contains(&name.as_str()) {
+                    return Err("STANDARD_RUNTIME".into());
+                }
+            }
+        }
+        for t in c.store.list_tasks(None).map_err(|_| "STANDARD_READ")? {
+            let o = old
+                .iter()
+                .find(|o| o.task_id == t.task_id)
+                .ok_or("STANDARD_INVENTORY")?;
+            let incoming = export
+                .iter()
+                .find(|i| i.task_id == t.task_id)
+                .ok_or("STANDARD_INVENTORY")?;
+            let mut memory = o.memory.clone();
+            memory.governance_terminal_observed |=
+                matches!(incoming.status.as_str(), "Done" | "Cancelled");
+            memory.governance_started |= incoming.memory.governance_started;
+            if t.memory != memory || t.version != o.version + 1 {
+                return Err("STANDARD_RUNTIME".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn rehearsal_result(marker: &RehearsalMarker, binary: &str) -> serde_json::Value {
+        serde_json::json!({"schema_version":1,"run_id":marker.run_id,"status":"REFUSED","failure_class":"INCOMPLETE",
+            "identity":{"native_candidate_sha256":marker.native_candidate_sha256,"infra_candidate_sha256":marker.infra_candidate_sha256,"harness_binary_sha256":binary,"database_input_sha256":marker.database_sha256,"export_input_sha256":marker.export_sha256},
+            "phases":{"startup_before_export_completed":false,"standard_intake_completed":false,"restart_completed":false,"terminal_reconciliation_completed":false,"lifecycle_completed":false,"decisions_completed":false,"gates_completed":false,"dispatch_completed":false,"merge_completed":false,"delivery_completed":false,"quiescent":false},
+            "delivery_poll":{"attempted":0,"executed":0,"completed":0,"fake_reads":0,"fake_mutation_attempts":0},
+            "forbidden_intents":{"stage_launch":0,"preparation_apply":0,"lifecycle_mutation":0,"publication":0,"pr_merge":0,"deploy":0,"delivery_apply":0,"other":0},
+            "effects":{"unexpected_task_changes":0,"attempts":0,"retries_or_failures":0,"locks":0,"decisions":0,"lifecycle":0,"queue":0,"delivery":0,"other":0},
+            "checks":{"raw_inventory_and_history_compared":false,"only_reviewed_differences":false,"input_identity_rechecked":false,"system_driver_executions":0},
+            "positive_controls":{"poll_completed_with_fake":false,"mutation_intercepted":false,"forbidden_classes_intercepted":false}})
+    }
+    fn rehearsal_counts(c: &Coordinator, result: &mut serde_json::Value) -> Result<(), String> {
+        let p = c.submission_probe.as_ref().ok_or("BARRIER_ABSENT")?;
+        let n = |key| p.get(key).copied().unwrap_or(0);
+        let progress = c.rehearsal_poll_progress.as_ref();
+        let executed = progress.map(|p| p[0].load(Ordering::Relaxed)).unwrap_or(0);
+        let completed = progress.map(|p| p[1].load(Ordering::Relaxed)).unwrap_or(0);
+        let (reads, mutations) = if let Some(d) = &c.rehearsal_delivery {
+            let d = d.lock().map_err(|_| "FAKE_UNAVAILABLE")?;
+            (d.reads, d.mutations)
+        } else {
+            (0, 0)
+        };
+        for (key, value) in [
+            ("attempted", n("delivery-poll")),
+            ("executed", executed),
+            ("completed", completed),
+            ("fake_reads", reads),
+            ("fake_mutation_attempts", mutations),
+        ] {
+            let old = result["delivery_poll"][key]
+                .as_u64()
+                .ok_or("RESULT_SCHEMA")?;
+            result["delivery_poll"][key] = serde_json::json!(old + value as u64);
+        }
+        for (key, value) in [
+            ("stage_launch", n("worker")),
+            ("preparation_apply", n("preparation") + n("pipeline")),
+            ("lifecycle_mutation", n("publication")),
+            ("deploy", n("deploy")),
+            ("publication", n("publication")),
+            ("pr_merge", n("merge")),
+            ("delivery_apply", n("delivery")),
+            (
+                "other",
+                n("other") + n("inspection") + n("unit-mutation") + n("control"),
+            ),
+        ] {
+            result["forbidden_intents"][key] = serde_json::json!(
+                result["forbidden_intents"][key]
+                    .as_u64()
+                    .ok_or("RESULT_SCHEMA")?
+                    + value as u64
+            );
+        }
+        Ok(())
+    }
+    fn rehearsal_effects(
+        before: &DatabaseImage,
+        after: &DatabaseImage,
+        result: &mut serde_json::Value,
+    ) {
+        for table in before.keys().chain(after.keys()).collect::<BTreeSet<_>>() {
+            if before.get(table) == after.get(table) {
+                continue;
+            }
+            let key = match table.as_str() {
+                "tasks" => "unexpected_task_changes",
+                "stage_attempts" => "attempts",
+                "path_locks" => "locks",
+                "pending_decisions" => "decisions",
+                "lifecycle_ops" => "lifecycle",
+                "merge_queue" => "queue",
+                "post_merge_deliveries" => "delivery",
+                _ => "other",
+            };
+            result["effects"][key] =
+                serde_json::json!(result["effects"][key].as_u64().unwrap_or(0) + 1);
+            if table == "tasks" {
+                result["effects"]["retries_or_failures"] = serde_json::json!(1);
+            }
+        }
+    }
+
+    /// ROOT ORCHESTRATOR ONLY. Never invoke from a worker, ordinary cargo test,
+    /// production CLI or daemon. Inputs are exclusive operator-owned copies.
+    #[test]
+    #[ignore = "root orchestrator only: reviewed binary and exclusive private copied inputs required"]
+    fn private_copy_activation_rehearsal() -> Result<(), String> {
+        use std::io::Write;
+        use std::os::unix::fs::MetadataExt;
+        let (dir, uid, dir_identity) = rehearsal_directory()?;
+        let (db, db_id) = rehearsal_file(&dir.join("zach-v2.sqlite3"), uid)?;
+        let (export, export_id) = rehearsal_file(&dir.join("canonical-export.json"), uid)?;
+        let (marker_file, marker_id) = rehearsal_file(&dir.join("copy-only.json"), uid)?;
+        let db_hash = rehearsal_sha256(&rehearsal_bytes(db, 256 * 1024 * 1024)?);
+        let export_bytes = rehearsal_bytes(export, 16 * 1024 * 1024)?;
+        let marker_bytes = rehearsal_bytes(marker_file, 16 * 1024)?;
+        let marker: RehearsalMarker =
+            serde_json::from_slice(&marker_bytes).map_err(|_| "MARKER_SCHEMA")?;
+        if marker.schema_version != 1
+            || marker.purpose != "zach039-exclusive-copy"
+            || !(8..=128).contains(&marker.run_id.len())
+            || !marker
+                .run_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+            || [
+                &marker.database_sha256,
+                &marker.export_sha256,
+                &marker.native_candidate_sha256,
+                &marker.infra_candidate_sha256,
+            ]
+            .iter()
+            .any(|s| !digest_shape(s))
+            || marker.database_sha256 != db_hash
+            || marker.export_sha256 != rehearsal_sha256(&export_bytes)
+        {
+            return Err("INPUT_BINDING".into());
+        }
+        let binary = rehearsal_sha256(&rehearsal_bytes(
+            File::open("/proc/self/exe").map_err(|_| "BINARY_IDENTITY")?,
+            256 * 1024 * 1024,
+        )?);
+        let mut result = rehearsal_result(&marker, &binary);
+        let mut driver_counters = None;
+        let mut outcome = (|| -> Result<(), String> {
+            // No private input enters synthetic controls or their diagnostics.
+            std::panic::catch_unwind(|| {
+                rehearsal_barrier_and_fake_mutations_are_non_vacuous();
+                real_coordinator_positive_controls_detect_jobs_and_direct_database_effects();
+                terminal_offline_then_real_standard_and_restart_never_replays_native_history();
+            })
+            .map_err(|_| "POSITIVE_CONTROL")?;
+            for key in [
+                "poll_completed_with_fake",
+                "mutation_intercepted",
+                "forbidden_classes_intercepted",
+            ] {
+                result["positive_controls"][key] = true.into();
+            }
+            let export = std::str::from_utf8(&export_bytes).map_err(|_| "EXPORT_SCHEMA")?;
+            let records = intake::decode_export_records(export).map_err(|_| "EXPORT_SCHEMA")?;
+            if records
+                .iter()
+                .map(|t| &t.task_id)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != records.len()
+            {
+                return Err("EXPORT_DUPLICATE".into());
+            }
+            let check = rusqlite::Connection::open_with_flags(
+                dir.join("zach-v2.sqlite3"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .map_err(|_| "DATABASE_OPEN")?;
+            let version: String = check
+                .query_row(
+                    "SELECT value FROM daemon_meta WHERE key='schema_version'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|_| "DATABASE_SCHEMA")?;
+            if version != "4" {
+                return Err("DATABASE_SCHEMA".into());
+            }
+            let opened_before = database_image_connection(&check)?;
+            drop(check);
+            if rehearsal_file(&dir.join("zach-v2.sqlite3"), uid)?.1 != db_id {
+                return Err("IDENTITY_CHANGED".into());
+            }
+            let store = V2Store::open(&dir.join("zach-v2.sqlite3")).map_err(|_| "DATABASE_OPEN")?;
+            let (mut c, _handle) = Coordinator::create(store, dir.clone());
+            let units = Arc::new(RehearsalUnits::default());
+            let ws = Arc::new(RehearsalWs {
+                export: export.to_string(),
+                reads: AtomicUsize::new(0),
+                mutations: AtomicUsize::new(0),
+            });
+            driver_counters = Some((units.clone(), ws.clone()));
+            c.controller = units.clone();
+            c.ws = ws.clone();
+            c.submission_probe = Some(BTreeMap::new());
+            let before = database_image(&mut c.store)?;
+            if before != opened_before {
+                return Err("DATABASE_OPEN_EFFECT".into());
+            }
+            let startup = rehearsal_startup(&mut c).map_err(|_| "STARTUP_REFUSED");
+            rehearsal_effects(&before, &database_image(&mut c.store)?, &mut result);
+            startup?;
+            if before != database_image(&mut c.store)? {
+                return Err("STARTUP_EFFECT".into());
+            }
+            result["phases"]["startup_before_export_completed"] = true.into();
+            let pass = rehearsal_pass(&mut c, &mut RehearsalDelivery::default())
+                .map_err(|_| "COORDINATOR_EFFECT");
+            rehearsal_effects(&before, &database_image(&mut c.store)?, &mut result);
+            if pass.is_err() {
+                rehearsal_counts(&c, &mut result)?;
+            }
+            pass?;
+            let exact =
+                c.ws.execute(&["export".into(), "--sync".into(), "--json".into()])
+                    .map_err(|_| "EXPORT_FAKE")?;
+            if exact.as_bytes() != export_bytes {
+                return Err("EXPORT_BINDING".into());
+            }
+            let standard_before = database_image(&mut c.store)?;
+            let standard = rehearsal_standard(&mut c, records).map_err(|_| "STANDARD_EFFECT");
+            if standard.is_err() {
+                rehearsal_effects(
+                    &standard_before,
+                    &database_image(&mut c.store)?,
+                    &mut result,
+                );
+                rehearsal_counts(&c, &mut result)?;
+            }
+            standard?;
+            result["phases"]["standard_intake_completed"] = true.into();
+            let baseline = database_image(&mut c.store)?;
+            let pass = rehearsal_pass(&mut c, &mut RehearsalDelivery::default())
+                .map_err(|_| "COORDINATOR_EFFECT");
+            rehearsal_effects(&baseline, &database_image(&mut c.store)?, &mut result);
+            rehearsal_counts(&c, &mut result)?;
+            pass?;
+            if units.mutations.load(Ordering::Relaxed) != 0
+                || ws.mutations.load(Ordering::Relaxed) != 0
+            {
+                return Err("FAKE_MUTATION".into());
+            }
+            drop(c);
+            let (mut c, _restart_handle) = Coordinator::create(
+                V2Store::open(&dir.join("zach-v2.sqlite3")).map_err(|_| "DATABASE_REOPEN")?,
+                dir.clone(),
+            );
+            c.controller = units.clone();
+            c.ws = ws.clone();
+            c.submission_probe = Some(BTreeMap::new());
+            let startup = rehearsal_startup(&mut c).map_err(|_| "RESTART_REFUSED");
+            rehearsal_effects(&baseline, &database_image(&mut c.store)?, &mut result);
+            startup?;
+            if baseline != database_image(&mut c.store)? {
+                return Err("RESTART_EFFECT".into());
+            }
+            let pass = rehearsal_pass(&mut c, &mut RehearsalDelivery::default())
+                .map_err(|_| "COORDINATOR_EFFECT");
+            rehearsal_effects(&baseline, &database_image(&mut c.store)?, &mut result);
+            rehearsal_counts(&c, &mut result)?;
+            pass?;
+            if !c.jobs.is_empty()
+                || units.mutations.load(Ordering::Relaxed) != 0
+                || ws.mutations.load(Ordering::Relaxed) != 0
+            {
+                return Err("NOT_QUIESCENT".into());
+            }
+            for key in [
+                "restart_completed",
+                "terminal_reconciliation_completed",
+                "lifecycle_completed",
+                "decisions_completed",
+                "gates_completed",
+                "dispatch_completed",
+                "merge_completed",
+                "delivery_completed",
+                "quiescent",
+            ] {
+                result["phases"][key] = true.into();
+            }
+            result["checks"]["raw_inventory_and_history_compared"] = true.into();
+            result["checks"]["only_reviewed_differences"] = true.into();
+            Ok(())
+        })();
+        if let Some((units, ws)) = driver_counters {
+            let unit_mutations = units.mutations.load(Ordering::Relaxed);
+            let publications = ws.mutations.load(Ordering::Relaxed);
+            for (key, n) in [
+                ("other", unit_mutations),
+                ("publication", publications),
+                ("lifecycle_mutation", publications),
+            ] {
+                result["forbidden_intents"][key] = serde_json::json!(
+                    result["forbidden_intents"][key].as_u64().unwrap_or(0) + n as u64
+                );
+            }
+            if unit_mutations != 0 || publications != 0 {
+                outcome = Err("FAKE_MUTATION".into());
+            }
+        }
+        let recheck = (|| -> Result<(), String> {
+            rehearsal_entries(&dir, uid, true)?;
+            let m = std::fs::symlink_metadata(&dir).map_err(|_| "IDENTITY_CHANGED")?;
+            if (m.dev(), m.ino()) != dir_identity || m.uid() != uid || m.mode() & 0o7777 != 0o700 {
+                return Err("IDENTITY_CHANGED".into());
+            }
+            for (name, id, hash) in [
+                ("zach-v2.sqlite3", db_id, None),
+                (
+                    "canonical-export.json",
+                    export_id,
+                    Some(rehearsal_sha256(&export_bytes)),
+                ),
+                (
+                    "copy-only.json",
+                    marker_id,
+                    Some(rehearsal_sha256(&marker_bytes)),
+                ),
+            ] {
+                let (file, current) = rehearsal_file(&dir.join(name), uid)?;
+                if id != current {
+                    return Err("IDENTITY_CHANGED".into());
+                }
+                if let Some(hash) = hash {
+                    if rehearsal_sha256(&rehearsal_bytes(file, 16 * 1024 * 1024)?) != hash {
+                        return Err("IDENTITY_CHANGED".into());
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if recheck.is_ok() {
+            result["checks"]["input_identity_rechecked"] = true.into();
+        }
+        let mut outcome = outcome.and(recheck);
+        if outcome.is_ok() {
+            let zero = |section: &str| {
+                result[section]
+                    .as_object()
+                    .is_some_and(|o| o.values().all(|n| n.as_u64() == Some(0)))
+            };
+            let all_true = |section: &str| {
+                result[section]
+                    .as_object()
+                    .is_some_and(|o| o.values().all(|n| n.as_bool() == Some(true)))
+            };
+            let poll = &result["delivery_poll"];
+            if !zero("forbidden_intents")
+                || !zero("effects")
+                || !all_true("phases")
+                || !all_true("positive_controls")
+                || poll["attempted"] != poll["executed"]
+                || poll["executed"] != poll["completed"]
+                || poll["fake_mutation_attempts"] != 0
+            {
+                outcome = Err("RESULT_INVARIANT".into());
+            }
+        }
+        match &outcome {
+            Ok(()) => {
+                result["status"] = "PASS".into();
+                result["failure_class"] = "NONE".into();
+            }
+            Err(class) => result["failure_class"] = class.clone().into(),
+        }
+        let output = dir.join("result.json");
+        let temporary = dir.join(".result.tmp");
+        if output.exists() || temporary.exists() {
+            return Err("OUTPUT_EXISTS".into());
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&temporary)
+            .map_err(|_| "OUTPUT_WRITE")?;
+        file.write_all(&serde_json::to_vec(&result).map_err(|_| "RESULT_SCHEMA")?)
+            .map_err(|_| "OUTPUT_WRITE")?;
+        file.sync_all().map_err(|_| "OUTPUT_WRITE")?;
+        use std::os::unix::ffi::OsStrExt;
+        let from =
+            std::ffi::CString::new(temporary.as_os_str().as_bytes()).map_err(|_| "OUTPUT_WRITE")?;
+        let to =
+            std::ffi::CString::new(output.as_os_str().as_bytes()).map_err(|_| "OUTPUT_WRITE")?;
+        if unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        } != 0
+        {
+            return Err("OUTPUT_WRITE".into());
+        }
+        rehearsal_file(&output, uid)?;
+        outcome
+    }
+
+    #[test]
+    fn rehearsal_input_open_rejects_links_and_nonprivate_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TestDirectory::new();
+        let file = dir.0.join("synthetic-input");
+        runner::write_secure_file(&file, b"synthetic").unwrap();
+        let uid = unsafe { libc::geteuid() };
+        assert!(rehearsal_file(&file, uid).is_ok());
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(rehearsal_file(&file, uid).is_err());
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let hard = dir.0.join("hard");
+        std::fs::hard_link(&file, &hard).unwrap();
+        assert!(rehearsal_file(&file, uid).is_err());
+        std::fs::remove_file(hard).unwrap();
+        let link = dir.0.join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(rehearsal_file(&link, uid).is_err());
+    }
+
+    #[test]
+    fn offline_empty_terminal_is_visible_in_actual_snapshot_without_event() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        let payload = serde_json::json!({"schema_version":2,"tasks":[{"id":"empty-snapshot","repository":"synthetic","status":"In Progress","autonomous_consent":false}]});
+        let old = intake::decode_export_records(&payload.to_string())
+            .unwrap()
+            .remove(0);
+        c.save(&old).unwrap();
+        let mut incoming = old.clone();
+        incoming.status = "Done".into();
+        c.store
+            .sync_task_with_mode(
+                &incoming,
+                crate::v2::store::SyncMode::ReconcileFinishedLegacy,
+            )
+            .unwrap();
+        assert!(c.store.list_events_since(None, 0, 100).unwrap().is_empty());
+        let messages = c
+            .socket_command(ClientCommand::Subscribe {
+                group: None,
+                since_seq: None,
+                once: None,
+            })
+            .unwrap();
+        assert!(
+            matches!(&messages[0],ServerMessage::Snapshot{tasks,..} if tasks.len()==1 && tasks[0].status=="Done")
+        );
+    }
+
+    #[test]
+    fn rehearsal_sha_and_strict_marker_contract() {
+        assert_eq!(
+            rehearsal_sha256(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            rehearsal_sha256(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let marker = serde_json::json!({"schema_version":1,"purpose":"zach039-exclusive-copy","run_id":"synthetic-run","database_sha256":"a".repeat(64),"export_sha256":"b".repeat(64),"native_candidate_sha256":"c".repeat(64),"infra_candidate_sha256":"d".repeat(64)});
+        assert!(serde_json::from_value::<RehearsalMarker>(marker.clone()).is_ok());
+        let mut extra = marker.clone();
+        extra["unexpected"] = true.into();
+        assert!(serde_json::from_value::<RehearsalMarker>(extra).is_err());
+        let raw = marker.to_string();
+        assert!(
+            serde_json::from_str::<RehearsalMarker>(&raw.replacen(
+                '{',
+                "{\"schema_version\":1,",
+                1
+            ))
+            .is_err()
+        );
+        assert!(!digest_shape(&"A".repeat(64)));
     }
 
     #[test]

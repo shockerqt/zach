@@ -340,7 +340,7 @@ approved tuple. A failed apply requires a fresh plan and approval through Retry.
 Restarting an unknown dispatch outcome requires intervention and never replays
 that dispatch automatically.
 
-### Offline reconciliation of finished legacy supervision
+### Offline terminal reconciliation
 
 Ordinary `zach sync` and daemon intake retain their existing behavior. A database
 without the supervision `phase` column now classifies only ended `PASSED` and
@@ -388,22 +388,110 @@ It is not a way to run tasks or to repair state by starting the daemon.
    all writers excluded, never through SQL repair, consent rewrites, forged
    receipts or replaying effects.
 
-Only explicit offline terminal intake (`Done`/`Cancelled`) can retire a reference:
-its persisted attempt must be ended `PASSED`, `COMPLETE`, and its stage already
-completed. Persisted stages, consent, attempt history and receipts are retained
-even if the export omits stage history or includes additional completed Governance
-labels such as human approvals. Exported completion labels are neither imported
-nor used as native completion proof: every persisted PASSED attempt must still
-have its stage completed in the exact persisted list. Additional canonical history
-cannot compensate for an unfinished native stage or any runtime/effect conflict. All task attempts must be ended recognized
-final `COMPLETE` records, with completed stages for passes. Missing/conflicting
-identities, leases, unfinished stages, pipeline/merge/suspended checkpoints,
-pending lifecycle work, unverified deliveries, unresolved/unapplied decisions and
-nonfailed merge entries retain their coordination state. A rejected terminal
-reconciliation preserves the entire persisted task unchanged, including its
-repository, lease, active reference and version; a stale/conflicting export cannot
-remove the blocker and make a later retry eligible. Only the matching inert
-`FAILED` queue entry can be removed in the same native transaction after proof;
-locks and unrelated work remain visible to the activation guard. Repeating sync
-may update normal bookkeeping but cannot replay worker, merge or delivery effects.
-No production repair or activation is performed by the implementation tests.
+The opt-in transaction validates the **original persisted JSON** before either
+terminal admission. Invalid JSON, duplicate object keys (including nested keys),
+unknown native fields and wrong types fail closed. Standard intake keeps its
+existing decoder. Identity conflicts or real incoming runtime references, leases,
+checkpoints and retry control state reject the repair. Incoming completion labels,
+base/review metadata, executor and planned branch/worktree strings are metadata;
+they neither prove execution nor replace the preserved native values.
+
+There are two distinct admissions for authoritative `Done`/`Cancelled`:
+
+- **Empty native history:** all execution references, leases, retry controls and
+  native history/effect tables (including task events and locks) must be empty,
+  with strictly typed default memory and empty completed stages. Only status and,
+  when status changes, version/time are updated. Every original JSON byte, consent
+  and other task column is preserved. No terminal marker or execution history is
+  manufactured. Planned branch/worktree strings remain metadata.
+- **Finished native history:** all attempts must be ended recognized `PASSED` or
+  `FAILED` records in `COMPLETE`, and every passed stage must already appear in
+  the persisted completed-stage vector. An active reference may be cleared only
+  if it points to a qualifying passed attempt. All old completion, identity,
+  lease, checkpoint, lifecycle, delivery and applied-decision barriers remain.
+  Only terminal status, the proven finished reference, the top-level memory
+  marker `governance_terminal_observed=true`, and changed-row version/time may
+  change. Other memory keys, values and types are preserved without expanding
+  missing defaults; other JSON columns retain their original bytes. Memory bytes
+  also remain unchanged when the marker is already true. Only a matching inert
+  `FAILED` queue row may be removed, after successful task-update readback.
+
+Both paths preserve old consent, all attempts, receipts, lifecycle operations,
+decisions, events and locks. Historical retry counters are retained. Pending
+lifecycle work, unverified deliveries, unresolved/unapplied decisions, nonfailed
+or conflicting-repository merge rows and runtime ambiguity retain their blockers.
+Rejected proofs do not change the task or its version. Successful repeats/reopens
+are no-ops, including bookkeeping; queue-only retirement does not rewrite the
+task. Each task has its own transaction; the multi-task CLI batch is not atomic.
+
+Offline reconciliation emits **no synthetic `TASK_DONE` or other event**, including
+when status changes to Done. Existing event history is preserved. After restart,
+the persisted task snapshot reports the repaired classification; event-only
+consumers cannot reconstruct this offline change from a completion event. Socket
+subscriptions send a fresh snapshot before replay. Standard Done transitions
+continue to emit their existing `TASK_DONE` event. Lifecycle and delivery recovery
+read persisted task/attempt/checkpoint/outbox/receipt state, rather than depending
+on a fabricated completion event.
+
+Startup proves native ownership before acquiring repository locks or failing an
+interrupted pre-attempt transition. Manual Planning/Plan Review/In Progress/PR
+Review metadata without native ownership remains untouched, including multiple
+manual rows in one repository. Invalid raw proof blocks startup rather than
+silently skipping or clearing it. Real workers, attempts, checkpoints, leases and
+pending effects remain recoverable even after consent revocation or an executor
+change. The scheduler's existing human repository lane and task-slot policy are
+unchanged.
+
+This preservation contract applies to the explicit offline operation. The first
+ordinary **Standard** intake after startup can adopt current Governance consent,
+status and completed-label metadata under its existing rules. Cleared references
+and COMPLETE attempt phases remain essential to preventing historical execution
+replay. Offline consent preservation is not a promise that Standard will preserve
+that consent forever.
+
+Before either native or Infrastructure candidate merges, the root orchestrator
+must freeze both candidate identities and run the full fresh-copy classification,
+consent, raw-value/history inventory, real candidate activation guard, and actual
+startup → Standard → restart rehearsal. Any candidate change invalidates that
+gate. The ignored test-only `private_copy_activation_rehearsal` uses strict fakes
+and a submission barrier before the WorkerPool; no daemon, socket or system driver
+is started. Operators must review its exact binary and copied-input contract
+before providing exclusive private copies. Workers must never receive private
+DB/export paths or execute private mode. These tests do not claim a production
+repair, activation, guard pass or completed private-copy gate. Infrastructure
+installation/exposure and later production acceptance remain separately governed.
+
+The private rehearsal selector is `ZACH039_REHEARSAL_DIR`, with no fallback. Only
+the root orchestration role may supply or run it, as the intended Ubuntu daemon
+operator with its own UID and user bus. It refuses OS root, unsafe ownership,
+symlinks, hard-linked inputs, pre-existing output and unexpected directory entries.
+Use a new canonical direct child `/var/tmp/zach039-rehearsal-<opaque-suffix>` owned
+by that operator, mode `0700`, containing single-link regular `0600` files
+`zach-v2.sqlite3`, `canonical-export.json` and `copy-only.json`. Initial SQLite
+sidecars are refused; any sidecars created by the rehearsal receive the same
+privacy/identity checks. Private `*.log` files may be captured there. The harness
+never creates the copy, changes input permissions or recursively removes it.
+
+The strict v1 marker contains exactly `schema_version: 1`,
+`purpose: "zach039-exclusive-copy"`, an opaque fresh `run_id`, and lowercase SHA-256
+fields `database_sha256`, `export_sha256`, `native_candidate_sha256` and
+`infra_candidate_sha256`. Root independently proves copy lineage and constructs
+both frozen candidate identity records; the marker alone does not prove that a
+DB is a copy. The harness validates input hashes and independently hashes its
+binary, echoes the supplied candidate bindings, and rechecks retained input
+identities before atomically writing private `result.json`. Missing/refused output
+fails the gate. Marker/export content must remain exact; the disposable DB may
+change only through the reviewed Standard metadata transition.
+
+The fake delivery driver is bound before an allowed polling job is submitted.
+That job executes the actual delivery poll and services bounded coordinator/store
+messages through completion. Settled-history polls must leave the complete DB
+unchanged and request no external read or mutation. Poll attempts, executions and
+completions are counted separately from forbidden worker/preparation/publication/
+merge/deployment/delivery intents. Synthetic controls prove those intents are
+intercepted and fake mutations refused. Every SQLite table is compared; Standard
+alone may update its named canonical task metadata, terminal observation and
+`daemon_meta.last_sync_epoch` under existing rules. Native runtime controls and
+all histories remain checked. After native integration, the final matching
+native/panel artifact pair and the full fresh-copy gate must be repeated before
+Infrastructure integration and any separately approved production operation.
