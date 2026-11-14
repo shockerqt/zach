@@ -438,39 +438,17 @@ fn offline_absence_check(
 }
 
 fn reconcile_finished_legacy(args: &[String]) -> Result<zach::v2::intake::IntakeSummary, String> {
+    reconcile_finished_legacy_in(
+        args,
+        &default_state_dir(),
+        default_socket_path(),
+        check_offline_host,
+        |_| Ok(()),
+    )
+}
+
+fn check_offline_host(units: &[String], sockets: &[PathBuf]) -> Result<(), String> {
     use zach::v2::runner::SystemUnitController;
-    let (export, db) = offline_sync_options(args)?;
-    let (payload, export_modified) = read_private_export(&export)?;
-    let records = zach::v2::intake::decode_export_records(&payload).map_err(|e| e.to_string())?;
-    let state = default_state_dir();
-    zach::v2::isolation::reject_symlink_components(&state)?;
-    zach::v2::isolation::reject_symlink_components(&db)?;
-    let state = fs::canonicalize(state).map_err(|e| e.to_string())?;
-    let db = fs::canonicalize(db).map_err(|e| e.to_string())?;
-    if db != state.join("zach-v2.sqlite3") {
-        return Err(
-            "offline reconciliation requires the canonical state directory's zach-v2.sqlite3"
-                .into(),
-        );
-    }
-    let _lock = zach::v2::coordinator::DaemonLock::acquire(&state)?;
-    let conn =
-        rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|e| e.to_string())?;
-    let units = conn
-        .prepare("SELECT DISTINCT systemd_unit FROM stage_attempts WHERE systemd_unit IS NOT NULL")
-        .map_err(|e| e.to_string())?
-        .query_map([], |r| r.get::<_, String>(0))
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    if units.iter().any(|u| {
-        u.trim().is_empty() || !u.starts_with("zach-") || u.chars().any(char::is_whitespace)
-    }) {
-        return Err("ambiguous persisted worker unit identity".into());
-    }
-    drop(conn);
-    let sockets = [state.join("zach.sock"), default_socket_path()];
     // Check old and current worker naming, in addition to exact persisted identities.
     let broad_units = std::process::Command::new("systemctl")
         .args([
@@ -499,9 +477,51 @@ fn reconcile_finished_legacy(args: &[String]) -> Result<zach::v2::intake::Intake
             return Err("a Zach service/worker unit still exists".into());
         }
     }
-    offline_absence_check(&SystemUnitController, &units, &sockets)?;
+    offline_absence_check(&SystemUnitController, units, sockets)?;
     reject_zach_processes(std::path::Path::new("/proc"), std::process::id())?;
-    offline_absence_check(&SystemUnitController, &units, &sockets)?;
+    offline_absence_check(&SystemUnitController, units, sockets)?;
+    Ok(())
+}
+
+fn reconcile_finished_legacy_in(
+    args: &[String],
+    state: &std::path::Path,
+    configured_socket: PathBuf,
+    preflight: impl FnOnce(&[String], &[PathBuf]) -> Result<(), String>,
+    after_sync: impl FnOnce(&V2Store) -> Result<(), String>,
+) -> Result<zach::v2::intake::IntakeSummary, String> {
+    let (export, db) = offline_sync_options(args)?;
+    let (payload, export_modified) = read_private_export(&export)?;
+    let records = zach::v2::intake::decode_export_records(&payload).map_err(|e| e.to_string())?;
+    zach::v2::isolation::reject_symlink_components(state)?;
+    zach::v2::isolation::reject_symlink_components(&db)?;
+    let state = fs::canonicalize(state).map_err(|e| e.to_string())?;
+    let db = fs::canonicalize(db).map_err(|e| e.to_string())?;
+    if db != state.join("zach-v2.sqlite3") {
+        return Err(
+            "offline reconciliation requires the canonical state directory's zach-v2.sqlite3"
+                .into(),
+        );
+    }
+    let _lock = zach::v2::coordinator::DaemonLock::acquire(&state)?;
+    let conn =
+        rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| e.to_string())?;
+    let units = conn
+        .prepare("SELECT DISTINCT systemd_unit FROM stage_attempts WHERE systemd_unit IS NOT NULL")
+        .map_err(|e| e.to_string())?
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    if units.iter().any(|u| {
+        u.trim().is_empty() || !u.starts_with("zach-") || u.chars().any(char::is_whitespace)
+    }) {
+        return Err("ambiguous persisted worker unit identity".into());
+    }
+    drop(conn);
+    let sockets = [state.join("zach.sock"), configured_socket];
+    preflight(&units, &sockets)?;
     if std::time::SystemTime::now()
         .duration_since(export_modified)
         .map_err(|_| "export timestamp is in the future")?
@@ -510,12 +530,14 @@ fn reconcile_finished_legacy(args: &[String]) -> Result<zach::v2::intake::Intake
         return Err("export became stale during preflight".into());
     }
     let mut store = V2Store::open(&db).map_err(|e| e.to_string())?;
-    zach::v2::intake::ingest_task_records_with_mode(
+    let summary = zach::v2::intake::ingest_task_records_with_mode(
         &mut store,
         records,
         zach::v2::store::SyncMode::ReconcileFinishedLegacy,
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    after_sync(&store)?;
+    Ok(summary)
 }
 
 fn run_v2_sync(args: &[String]) {
@@ -1123,7 +1145,7 @@ mod tests {
             })
         }
         fn list_units(&self) -> Result<Vec<String>, String> {
-            if self.fail {
+            if self.fail && self.listed {
                 return Err("enumeration uncertain".into());
             }
             Ok(if self.listed {
@@ -1141,6 +1163,182 @@ mod tests {
         fn reset_failed(&self, _: &str) -> Result<(), String> {
             panic!("offline must not reset")
         }
+    }
+
+    fn offline_entry_fixture(dir: &OfflineTestDir) -> (PathBuf, Vec<String>) {
+        use std::os::unix::fs::PermissionsExt;
+        let db = dir.0.join("zach-v2.sqlite3");
+        let export = dir.0.join("export.json");
+        let payload = r#"{"schema_version":2,"tasks":[{"id":"SYNTHETIC-CLI","repository":"zach","status":"Done","weight":"S","autonomous_consent":true}]}"#;
+        fs::write(&export, payload).unwrap();
+        fs::set_permissions(&export, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut store = V2Store::open(&db).unwrap();
+        ingest_export_json(&mut store, payload).unwrap();
+        let mut task = store.get_task("SYNTHETIC-CLI").unwrap().unwrap();
+        task.status = "Queued for Merge".into();
+        task.stages_completed = vec!["impl".into()];
+        task.current_stage = Some("impl".into());
+        task.active_attempt_id = Some("finished-cli".into());
+        store.upsert_task(&task).unwrap();
+        store.connection_mut().execute_batch("INSERT INTO stage_attempts(attempt_id,task_id,stage,model,effort,systemd_unit,started_epoch,ended_epoch,status,phase) VALUES('finished-cli','SYNTHETIC-CLI','impl','synthetic','low','zach-stage-finished-cli',1,2,'PASSED','COMPLETE'); INSERT INTO merge_queue(repo,task_id,pr_number,reviewed_sha,enqueued_epoch,state) VALUES('zach','SYNTHETIC-CLI',1,'sha',2,'FAILED'); ALTER TABLE stage_attempts DROP COLUMN phase; UPDATE daemon_meta SET value='2' WHERE key='schema_version'; PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        drop(store);
+        let args = vec![
+            "--reconcile-finished-legacy".into(),
+            "--export-file".into(),
+            export.to_string_lossy().into_owned(),
+            "--db".into(),
+            db.to_string_lossy().into_owned(),
+        ];
+        (db, args)
+    }
+    fn assert_legacy_schema(db: &std::path::Path) {
+        let conn =
+            rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM pragma_table_info('stage_attempts') WHERE name='phase'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn offline_entry_preopen_failures_preserve_real_legacy_database_bytes_and_schema() {
+        for case in [
+            "lock",
+            "enumeration",
+            "exact-unit",
+            "exact-error",
+            "process",
+            "process-error",
+            "socket",
+            "malformed-export",
+            "path",
+        ] {
+            let dir = OfflineTestDir::new();
+            let (db, mut args) = offline_entry_fixture(&dir);
+            let bytes = fs::read(&db).unwrap();
+            let socket = dir.0.join("zach.sock");
+            let _held = if case == "lock" {
+                Some(zach::v2::coordinator::DaemonLock::acquire(&dir.0).unwrap())
+            } else {
+                None
+            };
+            if case == "socket" {
+                fs::write(&socket, "").unwrap();
+            }
+            if case == "malformed-export" {
+                fs::write(&args[2], "not json").unwrap();
+            }
+            if case == "path" {
+                let other = dir.0.join("other.sqlite3");
+                fs::copy(&db, &other).unwrap();
+                args[4] = other.to_string_lossy().into_owned();
+            }
+            let reached = std::cell::Cell::new(false);
+            let result = reconcile_finished_legacy_in(
+                &args,
+                &dir.0,
+                socket,
+                |units, sockets| {
+                    reached.set(true);
+                    // This is the actual orchestration entry point: the native lock
+                    // is already held and writable initialization has not occurred.
+                    assert!(zach::v2::coordinator::DaemonLock::acquire(&dir.0).is_err());
+                    assert_legacy_schema(&db);
+                    assert_eq!(units, &["zach-stage-finished-cli".to_owned()]);
+                    let controller = OfflineUnits {
+                        listed: case == "enumeration",
+                        exact: case == "exact-unit",
+                        fail: matches!(case, "enumeration" | "exact-error"),
+                    };
+                    offline_absence_check(&controller, units, sockets)?;
+                    let proc_dir = dir.0.join("proc");
+                    if case == "process-error" {
+                        return reject_zach_processes(&proc_dir, 999);
+                    }
+                    fs::create_dir(&proc_dir).unwrap();
+                    if case == "process" {
+                        let process = proc_dir.join("123");
+                        fs::create_dir(&process).unwrap();
+                        fs::write(process.join("comm"), "zachd\n").unwrap();
+                        fs::write(process.join("cgroup"), "0::/user.slice\n").unwrap();
+                    }
+                    reject_zach_processes(&proc_dir, 999)
+                },
+                |_| panic!("failed preflight must not reach writable sync"),
+            );
+            assert!(result.is_err(), "{case}");
+            assert_eq!(
+                reached.get(),
+                !matches!(case, "lock" | "malformed-export" | "path"),
+                "{case}"
+            );
+            assert_eq!(
+                fs::read(&db).unwrap(),
+                bytes,
+                "database bytes changed on {case}"
+            );
+            assert_legacy_schema(&db);
+        }
+    }
+
+    #[test]
+    fn offline_entry_success_routes_opt_in_and_holds_native_lock_through_sync() {
+        let dir = OfflineTestDir::new();
+        let (db, args) = offline_entry_fixture(&dir);
+        let before = std::cell::Cell::new(false);
+        let after = std::cell::Cell::new(false);
+        let result = reconcile_finished_legacy_in(
+            &args,
+            &dir.0,
+            dir.0.join("zach.sock"),
+            |units, sockets| {
+                before.set(true);
+                assert!(zach::v2::coordinator::DaemonLock::acquire(&dir.0).is_err());
+                assert_legacy_schema(&db);
+                offline_absence_check(
+                    &OfflineUnits {
+                        listed: false,
+                        exact: false,
+                        fail: false,
+                    },
+                    units,
+                    sockets,
+                )?;
+                // Path replacement after validation cannot replace the retained content.
+                fs::remove_file(&args[2]).unwrap();
+                fs::write(&args[2], "replacement is not JSON").unwrap();
+                Ok(())
+            },
+            |store| {
+                after.set(true);
+                assert!(zach::v2::coordinator::DaemonLock::acquire(&dir.0).is_err());
+                let task = store.get_task("SYNTHETIC-CLI").unwrap().unwrap();
+                assert_eq!(task.status, "Done");
+                assert!(task.active_attempt_id.is_none());
+                assert_eq!(task.stages_completed, vec!["impl"]);
+                assert_eq!(
+                    store
+                        .get_stage_attempt("finished-cli")
+                        .unwrap()
+                        .unwrap()
+                        .phase,
+                    "COMPLETE"
+                );
+                assert!(store.list_merge_queue(None).unwrap().is_empty());
+                assert!(store.lifecycle_ops().unwrap().is_empty());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(result.ingested_count, 1);
+        assert!(before.get() && after.get());
+        assert!(zach::v2::coordinator::DaemonLock::acquire(&dir.0).is_ok());
     }
 
     #[test]

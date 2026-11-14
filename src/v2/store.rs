@@ -1228,6 +1228,12 @@ impl V2Store {
                 let offline_terminal = mode == SyncMode::ReconcileFinishedLegacy
                     && matches!(incoming.status.as_str(), "Done" | "Cancelled");
                 let retire = offline_terminal && Self::can_retire_finished_tx(&tx, &old, incoming)?;
+                if offline_terminal && !retire {
+                    // A rejected proof must retain the blocker itself, including
+                    // identity, lease, references and version. Export defaults
+                    // must not make a subsequent reconciliation appear eligible.
+                    return Ok(old);
+                }
                 if offline_terminal {
                     // An export is not the owner of completed stage or receipt history.
                     next.stages_completed = old.stages_completed.clone();
@@ -2961,6 +2967,7 @@ mod tests {
             "repository",
             "incoming-stage",
             "incoming-checkpoint",
+            "incoming-reference",
             "other-attempt",
         ] {
             let db = LegacyTestDb::new();
@@ -3052,6 +3059,7 @@ mod tests {
                         .unwrap();
                 }
                 "repository" => input.repository = "other".into(),
+                "incoming-reference" => input.active_attempt_id = Some("conflicting".into()),
                 "incoming-stage" => input.stages_completed = vec!["unproven".into()],
                 "other-attempt" => {
                     store.conn.execute_batch("INSERT INTO stage_attempts(attempt_id,task_id,stage,model,effort,started_epoch,status) VALUES('other','SYNTHETIC-1','impl','synthetic','low',1,'RUNNING')").unwrap();
@@ -3060,16 +3068,28 @@ mod tests {
             }
             store.upsert_task(&old).unwrap();
             let attempts = store.list_stage_attempts(&old.task_id).unwrap();
-            let out = store
-                .sync_task_with_mode(&input, SyncMode::ReconcileFinishedLegacy)
-                .unwrap();
-            assert!(out.active_attempt_id.is_some(), "{case}");
-            assert_eq!(store.list_merge_queue(None).unwrap().len(), 1, "{case}");
-            assert_eq!(
-                store.list_stage_attempts(&old.task_id).unwrap(),
-                attempts,
-                "{case}"
-            );
+            let persisted = store.get_task(&old.task_id).unwrap().unwrap();
+            let queue = store.list_merge_queue(None).unwrap();
+            for _ in 0..2 {
+                let out = store
+                    .sync_task_with_mode(&input, SyncMode::ReconcileFinishedLegacy)
+                    .unwrap();
+                assert!(out.active_attempt_id.is_some(), "{case}");
+                if case != "nonterminal" {
+                    assert_eq!(out, persisted, "rejected proof mutated {case}");
+                    assert_eq!(
+                        store.get_task(&old.task_id).unwrap().unwrap(),
+                        persisted,
+                        "repeated rejected proof mutated {case}"
+                    );
+                }
+                assert_eq!(store.list_merge_queue(None).unwrap(), queue, "{case}");
+                assert_eq!(
+                    store.list_stage_attempts(&old.task_id).unwrap(),
+                    attempts,
+                    "{case}"
+                );
+            }
         }
     }
 

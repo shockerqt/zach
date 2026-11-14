@@ -395,7 +395,10 @@ even if the export omits stage history. All task attempts must be ended recogniz
 final `COMPLETE` records, with completed stages for passes. Missing/conflicting
 identities, leases, unfinished stages, pipeline/merge/suspended checkpoints,
 pending lifecycle work, unverified deliveries, unresolved/unapplied decisions and
-nonfailed merge entries retain their coordination state. Only the matching inert
+nonfailed merge entries retain their coordination state. A rejected terminal
+reconciliation preserves the entire persisted task unchanged, including its
+repository, lease, active reference and version; a stale/conflicting export cannot
+remove the blocker and make a later retry eligible. Only the matching inert
 `FAILED` queue entry can be removed in the same native transaction after proof;
 locks and unrelated work remain visible to the activation guard. Repeating sync
 may update normal bookkeeping but cannot replay worker, merge or delivery effects.
