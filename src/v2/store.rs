@@ -156,6 +156,143 @@ pub struct MergeCheckpoint {
     pub phase_started_epoch: i64,
 }
 
+// These proofs deliberately do not change the permissive Standard decoder.
+// Deserialize through a visitor first: Value/derived structs alone erase duplicates.
+struct UniqueJson(serde_json::Value);
+impl<'de> Deserialize<'de> for UniqueJson {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = UniqueJson;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("unambiguous JSON")
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(UniqueJson(v.into()))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(UniqueJson(v.into()))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(UniqueJson(v.into()))
+            }
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+                serde_json::Number::from_f64(v)
+                    .map(|n| UniqueJson(n.into()))
+                    .ok_or_else(|| E::custom("number"))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(UniqueJson(v.into()))
+            }
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(UniqueJson(v.into()))
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(UniqueJson(serde_json::Value::Null))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(UniqueJson(v)) = a.next_element()? {
+                    values.push(v);
+                }
+                Ok(UniqueJson(values.into()))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut values = serde_json::Map::new();
+                while let Some(key) = a.next_key::<String>()? {
+                    if values.contains_key(&key) {
+                        return Err(serde::de::Error::custom("duplicate"));
+                    }
+                    let UniqueJson(value) = a.next_value()?;
+                    values.insert(key, value);
+                }
+                Ok(UniqueJson(values.into()))
+            }
+        }
+        d.deserialize_any(Visitor)
+    }
+}
+
+fn raw_proof_error() -> V2StoreError {
+    V2StoreError("ambiguous persisted task JSON".into())
+}
+
+fn known_object(value: &serde_json::Value, model: serde_json::Value) -> Result<(), V2StoreError> {
+    let object = value.as_object().ok_or_else(raw_proof_error)?;
+    let keys = model.as_object().ok_or_else(raw_proof_error)?;
+    if object.keys().any(|key| !keys.contains_key(key)) {
+        return Err(raw_proof_error());
+    }
+    Ok(())
+}
+
+// A complete raw row also makes trigger side effects visible to the postcondition.
+type RawTask = BTreeMap<String, rusqlite::types::Value>;
+fn raw_task(conn: &Connection, id: &str) -> Result<RawTask, V2StoreError> {
+    let mut stmt = conn.prepare("SELECT * FROM tasks WHERE task_id=?1")?;
+    let names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    Ok(stmt.query_row([id], |row| {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| Ok((n.clone(), row.get(i)?)))
+            .collect()
+    })?)
+}
+
+fn strict_task_json(conn: &Connection, task: &mut TaskRecord) -> Result<RawTask, V2StoreError> {
+    let raw = raw_task(conn, &task.task_id)?;
+    let parse = |column: &str| -> Result<serde_json::Value, V2StoreError> {
+        let Some(rusqlite::types::Value::Text(s)) = raw.get(column) else {
+            return Err(raw_proof_error());
+        };
+        serde_json::from_str::<UniqueJson>(s)
+            .map(|v| v.0)
+            .map_err(|_| raw_proof_error())
+    };
+    let memory = parse("memory_json")?;
+    known_object(&memory, serde_json::to_value(TaskMemory::default())?)?;
+    if let Some(cp) = memory.get("pipeline_checkpoint").filter(|v| !v.is_null()) {
+        known_object(cp, serde_json::to_value(PipelineCheckpoint::default())?)?;
+    }
+    if let Some(cp) = memory.get("merge_checkpoint").filter(|v| !v.is_null()) {
+        known_object(cp, serde_json::to_value(MergeCheckpoint::default())?)?;
+    }
+    task.memory = serde_json::from_value(memory).map_err(|_| raw_proof_error())?;
+    let context = parse("context_pack_json")?;
+    known_object(&context, serde_json::to_value(ContextPackSpec::default())?)?;
+    for (name, model) in [
+        (
+            "target_files",
+            serde_json::to_value(TargetFileSpec::default())?,
+        ),
+        (
+            "acceptance_criteria",
+            serde_json::to_value(AcceptanceCriterionSpec::default())?,
+        ),
+    ] {
+        if let Some(items) = context.get(name).and_then(|v| v.as_array()) {
+            for item in items {
+                known_object(item, model.clone())?;
+            }
+        }
+    }
+    task.context_pack = serde_json::from_value(context).map_err(|_| raw_proof_error())?;
+    task.depends_on =
+        serde_json::from_value(parse("depends_on_json")?).map_err(|_| raw_proof_error())?;
+    task.required_stages =
+        serde_json::from_value(parse("required_stages_json")?).map_err(|_| raw_proof_error())?;
+    task.stages_completed =
+        serde_json::from_value(parse("stages_completed_json")?).map_err(|_| raw_proof_error())?;
+    Ok(raw)
+}
+
 pub struct FailureDecision {
     pub decision_id: String,
     pub kind: String,
@@ -1172,7 +1309,15 @@ impl V2Store {
             now_epoch()
         };
         let result = match Self::get_task_tx(&tx, &incoming.task_id)? {
-            Some(old) => {
+            Some(mut old) => {
+                if mode == SyncMode::ReconcileFinishedLegacy
+                    && matches!(incoming.status.as_str(), "Done" | "Cancelled")
+                {
+                    let raw = strict_task_json(&tx, &mut old)?;
+                    let saved = Self::reconcile_offline_tx(&tx, &old, incoming, raw, now)?;
+                    tx.commit()?;
+                    return Ok(saved);
+                }
                 let mut next = incoming.clone();
                 let verified_delivery: bool = old.status == "Done" && tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM post_merge_deliveries WHERE task_id=?1)
@@ -1225,45 +1370,9 @@ impl V2Store {
                     coalesce_runtime_fields(&old, &mut next);
                     next.retry_count = old.retry_count.max(next.retry_count);
                 }
-                let offline_terminal = mode == SyncMode::ReconcileFinishedLegacy
-                    && matches!(incoming.status.as_str(), "Done" | "Cancelled");
-                let retire = offline_terminal && Self::can_retire_finished_tx(&tx, &old, incoming)?;
-                if offline_terminal && !retire {
-                    // A rejected proof must retain the blocker itself, including
-                    // identity, lease, references and version. Export defaults
-                    // must not make a subsequent reconciliation appear eligible.
-                    return Ok(old);
-                }
-                if offline_terminal {
-                    // An export is not the owner of completed stage or receipt history.
-                    next.stages_completed = old.stages_completed.clone();
-                    next.memory = old.memory.clone();
-                    next.autonomous_consent = old.autonomous_consent;
-                    next.current_stage = old.current_stage.clone();
-                    next.retry_count = old.retry_count;
-                    if retire {
-                        next.active_attempt_id = None;
-                    }
-                }
                 next.memory.governance_terminal_observed |= old.memory.governance_terminal_observed
                     || is_terminal_task_status(&incoming.status);
-                let saved = Self::update_task_tx(&tx, &old, &next, now)?;
-                if retire {
-                    // BEGIN IMMEDIATE excludes competing writers. Check the result
-                    // before deleting coordination state, including trigger failures.
-                    let persisted = Self::get_task_tx(&tx, &old.task_id)?
-                        .ok_or_else(|| V2StoreError("reconciliation task disappeared".into()))?;
-                    if persisted.version != saved.version || persisted.active_attempt_id.is_some() {
-                        return Err(V2StoreError(
-                            "reconciliation task update did not succeed".into(),
-                        ));
-                    }
-                    tx.execute(
-                        "DELETE FROM merge_queue WHERE repo=?1 AND task_id=?2 AND state='FAILED'",
-                        params![old.repository, old.task_id],
-                    )?;
-                }
-                saved
+                Self::update_task_tx(&tx, &old, &next, now)?
             }
             None => {
                 let mut next = incoming.clone();
@@ -1274,6 +1383,244 @@ impl V2Store {
         };
         tx.commit()?;
         Ok(result)
+    }
+
+    fn reconcile_offline_tx(
+        tx: &rusqlite::Transaction<'_>,
+        old: &TaskRecord,
+        incoming: &TaskRecord,
+        mut raw: RawTask,
+        now: i64,
+    ) -> Result<TaskRecord, V2StoreError> {
+        let conflicting = old.repository != incoming.repository
+            || old
+                .github_repo
+                .as_ref()
+                .zip(incoming.github_repo.as_ref())
+                .is_some_and(|(a, b)| !a.is_empty() && !b.is_empty() && a != b)
+            || old
+                .issue_number
+                .zip(incoming.issue_number)
+                .is_some_and(|(a, b)| a != b)
+            || incoming.current_stage.is_some()
+            || incoming.lease_owner.is_some()
+            || incoming.lease_expires_epoch.is_some()
+            || incoming.retry_count != 0
+            || incoming.next_retry_epoch != 0
+            || incoming.memory.halt_requested
+            || incoming.memory.retry_generation != 0
+            || incoming.memory.retry_reset_epoch != 0
+            || incoming.memory.merge_retry_count != 0
+            || incoming.memory.merge_retry_generation != 0
+            || incoming.memory.plan_rework_count != 0
+            || incoming.memory.plan_rework_generation != 0
+            || incoming.memory.review_rework_count != 0
+            || incoming.memory.review_rework_generation != 0;
+        if conflicting {
+            return Ok(old.clone());
+        }
+        let empty = Self::can_classify_empty_tx(tx, old, incoming)?;
+        if !empty && !Self::can_retire_finished_tx(tx, old, incoming)? {
+            return Ok(old.clone());
+        }
+        let mut memory = match raw.get("memory_json") {
+            Some(rusqlite::types::Value::Text(s)) => s.clone(),
+            _ => return Err(raw_proof_error()),
+        };
+        if !empty && !old.memory.governance_terminal_observed {
+            let UniqueJson(mut value) =
+                serde_json::from_str(&memory).map_err(|_| raw_proof_error())?;
+            value
+                .as_object_mut()
+                .ok_or_else(raw_proof_error)?
+                .insert("governance_terminal_observed".into(), true.into());
+            memory = serde_json::to_string(&value)?;
+        }
+        let active = if empty {
+            old.active_attempt_id.clone()
+        } else {
+            None
+        };
+        let changed = old.status != incoming.status
+            || old.active_attempt_id != active
+            || raw.get("memory_json") != Some(&rusqlite::types::Value::Text(memory.clone()));
+        if changed {
+            let version = old
+                .version
+                .checked_add(1)
+                .ok_or_else(|| V2StoreError("offline version overflow".into()))?;
+            let affected = if empty {
+                tx.execute("UPDATE tasks SET status=?1,version=?2,updated_epoch=?3 WHERE task_id=?4 AND version=?5", params![incoming.status,version,now,old.task_id,old.version])?
+            } else {
+                tx.execute("UPDATE tasks SET status=?1,active_attempt_id=NULL,memory_json=?2,version=?3,updated_epoch=?4 WHERE task_id=?5 AND version=?6", params![incoming.status,memory,version,now,old.task_id,old.version])?
+            };
+            raw.insert("status".into(), incoming.status.clone().into());
+            raw.insert("version".into(), version.into());
+            raw.insert("updated_epoch".into(), now.into());
+            if !empty {
+                raw.insert("active_attempt_id".into(), rusqlite::types::Value::Null);
+                raw.insert("memory_json".into(), memory.into());
+            }
+            if affected != 1 || raw_task(tx, &old.task_id)? != raw {
+                return Err(V2StoreError(
+                    "offline task update postcondition failed".into(),
+                ));
+            }
+        }
+        if !empty {
+            tx.execute(
+                "DELETE FROM merge_queue WHERE repo=?1 AND task_id=?2 AND state='FAILED'",
+                params![old.repository, old.task_id],
+            )?;
+            let remaining: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM merge_queue WHERE task_id=?1)",
+                [&old.task_id],
+                |r| r.get(0),
+            )?;
+            if remaining {
+                return Err(V2StoreError(
+                    "offline queue cleanup postcondition failed".into(),
+                ));
+            }
+        }
+        if raw_task(tx, &old.task_id)? != raw {
+            return Err(V2StoreError("offline task changed during cleanup".into()));
+        }
+        Self::get_task_tx(tx, &old.task_id)?
+            .ok_or_else(|| V2StoreError("offline task disappeared".into()))
+    }
+
+    fn can_classify_empty_tx(
+        tx: &rusqlite::Transaction<'_>,
+        old: &TaskRecord,
+        incoming: &TaskRecord,
+    ) -> Result<bool, V2StoreError> {
+        if old.current_stage.is_some()
+            || old.active_attempt_id.is_some()
+            || old.plan_base_sha.is_some()
+            || old.reviewed_sha.is_some()
+            || old.pr_number.is_some()
+            || old.executor.is_some()
+            || old.lease_owner.is_some()
+            || old.lease_expires_epoch.is_some()
+            || old.retry_count != 0
+            || old.next_retry_epoch != 0
+            || !old.stages_completed.is_empty()
+            || old.memory != TaskMemory::default()
+            || incoming.active_attempt_id.is_some()
+            || incoming.memory.pipeline_checkpoint.is_some()
+            || incoming.memory.merge_checkpoint.is_some()
+            || incoming.memory.suspended_impl_attempt_id.is_some()
+        {
+            return Ok(false);
+        }
+        for table in [
+            "stage_attempts",
+            "lifecycle_ops",
+            "post_merge_deliveries",
+            "pending_decisions",
+            "merge_queue",
+            "path_locks",
+            "task_events",
+        ] {
+            let exists: bool = tx.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE task_id=?1)"),
+                [&old.task_id],
+                |r| r.get(0),
+            )?;
+            if exists {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Status/consent alone never proves that Zach owns startup recovery. Validate
+    /// raw data before a manual exclusion, including rows the ordinary reader defaults.
+    pub(crate) fn native_startup_owned(&self, task: &TaskRecord) -> Result<bool, V2StoreError> {
+        let mut task = task.clone();
+        strict_task_json(&self.conn, &mut task)?;
+        if matches!(
+            task.status.as_str(),
+            "Planning" | "Plan Review" | "In Progress" | "PR Review"
+        ) && task.active_attempt_id.is_none()
+            && task.memory.pipeline_checkpoint.is_none()
+            && (task.memory.merge_checkpoint.is_some()
+                || task.memory.suspended_impl_attempt_id.is_some())
+        {
+            return Err(V2StoreError(
+                "ambiguous native startup checkpoint status".into(),
+            ));
+        }
+        if is_zach_executor(task.executor.as_deref())
+            || task.active_attempt_id.is_some()
+            || task.next_retry_epoch != 0
+            || task.lease_owner.is_some()
+            || task.lease_expires_epoch.is_some()
+            || task.memory.pipeline_checkpoint.is_some()
+            || task.memory.merge_checkpoint.is_some()
+            || task.memory.suspended_impl_attempt_id.is_some()
+        {
+            return Ok(true);
+        }
+        for table in [
+            "lifecycle_ops",
+            "post_merge_deliveries",
+            "merge_queue",
+            "path_locks",
+        ] {
+            let filter = match table {
+                "lifecycle_ops" => " AND state!='ACKNOWLEDGED'",
+                "post_merge_deliveries" => " AND state NOT IN ('verified','aborted')",
+                _ => "",
+            };
+            let exists: bool = self.conn.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE task_id=?1{filter})"),
+                [&task.task_id],
+                |r| r.get(0),
+            )?;
+            if exists {
+                return Ok(true);
+            }
+        }
+        let attempts = self.list_stage_attempts(&task.task_id)?;
+        if attempts
+            .iter()
+            .any(|a| a.ended_epoch.is_none() || a.phase != "COMPLETE")
+        {
+            return Ok(true);
+        }
+        if attempts.iter().any(|a| {
+            !matches!(a.status.as_str(), "PASSED" | "FAILED")
+                || (a.status == "PASSED"
+                    && !task.memory.governance_terminal_observed
+                    && !task.stages_completed.contains(&a.stage))
+        }) {
+            return Err(V2StoreError("ambiguous native startup history".into()));
+        }
+        if self.list_decisions(false, None)?.iter().any(|d| {
+            d.task_id == task.task_id
+                && (d.status != "RESOLVED"
+                    || !task.memory.applied_decisions.contains(&d.decision_id))
+        }) {
+            return Ok(true);
+        }
+        // A terminal observation can outlive a later human reopen. With every
+        // current native reference/effect excluded above, completed worker stages
+        // and merge-stage labels are historical, even if Standard replaced labels.
+        if task.memory.governance_terminal_observed {
+            if task.current_stage.as_deref().is_some_and(|stage| {
+                !matches!(stage, "merge" | "merge_queue")
+                    && !task.stages_completed.iter().any(|s| s == stage)
+                    && !attempts.iter().any(|a| a.stage == stage)
+            }) {
+                return Err(V2StoreError(
+                    "ambiguous native historical startup stage".into(),
+                ));
+            }
+            return Ok(false);
+        }
+        Ok(task.memory.governance_started || task.current_stage.is_some())
     }
 
     fn can_retire_finished_tx(
@@ -1300,7 +1647,7 @@ impl V2Store {
         {
             return Ok(false);
         }
-        let effects: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_ops WHERE task_id=?1 AND state!='ACKNOWLEDGED') OR EXISTS(SELECT 1 FROM post_merge_deliveries WHERE task_id=?1 AND state!='verified') OR EXISTS(SELECT 1 FROM merge_queue WHERE task_id=?1 AND state!='FAILED')", [&old.task_id], |r| r.get(0))?;
+        let effects: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_ops WHERE task_id=?1 AND state!='ACKNOWLEDGED') OR EXISTS(SELECT 1 FROM post_merge_deliveries WHERE task_id=?1 AND state!='verified') OR EXISTS(SELECT 1 FROM merge_queue WHERE task_id=?1 AND (state!='FAILED' OR repo!=?2))", params![old.task_id,old.repository], |r| r.get(0))?;
         if effects {
             return Ok(false);
         }
@@ -2831,6 +3178,380 @@ mod tests {
         let mut t = sample_task("SYNTHETIC-1", "Done", vec![]);
         t.autonomous_consent = false; // stale export is not consent/history ownership
         t
+    }
+
+    fn table_rows(store: &V2Store, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut stmt = store
+            .conn
+            .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+            .unwrap();
+        let count = stmt.column_count();
+        stmt.query_map([], |r| (0..count).map(|i| r.get(i)).collect())
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn offline_empty_metadata_preserves_raw_rows_events_and_repeats_after_reopen() {
+        for terminal in ["Done", "Cancelled"] {
+            for status in ["Backlog", "Ready", "In Progress", terminal] {
+                for memory in [
+                    " { } ",
+                    "{ \"halt_requested\": false, \"retry_generation\":0, \"pipeline_checkpoint\":null }",
+                ] {
+                    let db = LegacyTestDb::new();
+                    let mut store = V2Store::open(&db.0).unwrap();
+                    let mut t = sample_task("SYNTHETIC-1", status, vec![]);
+                    t.autonomous_consent = status == "Ready";
+                    store.upsert_task(&t).unwrap();
+                    // Native upsert emits Done only on UPDATE, not this initial INSERT.
+                    store.conn.execute("UPDATE tasks SET memory_json=?1, context_pack_json=' { } ', stages_completed_json=' [ ] ', depends_on_json=' [ ] '",[memory]).unwrap();
+                    let before = raw_task(&store.conn, &t.task_id).unwrap();
+                    let events = table_rows(&store, "task_events");
+                    let export = serde_json::json!({"schema_version":2,"tasks":[{"id":t.task_id,"repository":t.repository,"status":terminal,"executor":"external","reviewed_sha":"canonical-review","context_pack":{"base_sha":"canonical-base"},"stages_completed":["manual-complete"],"branch":"task/planned","worktree":"/predeclared","autonomous_consent":!t.autonomous_consent}]});
+                    let incoming = crate::v2::intake::decode_export_records(&export.to_string())
+                        .unwrap()
+                        .remove(0);
+                    let out = store
+                        .sync_task_with_mode(&incoming, SyncMode::ReconcileFinishedLegacy)
+                        .unwrap();
+                    let mut expected = before;
+                    expected.insert("status".into(), terminal.to_string().into());
+                    if status != terminal {
+                        expected.insert("version".into(), out.version.into());
+                        expected.insert("updated_epoch".into(), out.updated_epoch.into());
+                    }
+                    assert_eq!(raw_task(&store.conn, &t.task_id).unwrap(), expected);
+                    assert_eq!(table_rows(&store, "task_events"), events);
+                    for table in [
+                        "stage_attempts",
+                        "lifecycle_ops",
+                        "post_merge_deliveries",
+                        "pending_decisions",
+                        "merge_queue",
+                        "path_locks",
+                    ] {
+                        assert!(table_rows(&store, table).is_empty());
+                    }
+                    drop(store);
+                    let mut reopened = V2Store::open(&db.0).unwrap();
+                    reopened
+                        .sync_task_with_mode(&incoming, SyncMode::ReconcileFinishedLegacy)
+                        .unwrap();
+                    assert_eq!(raw_task(&reopened.conn, &t.task_id).unwrap(), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn both_offline_admissions_reject_original_json_ambiguities_without_mutation() {
+        let memory_invalid = [
+            "",
+            "{",
+            "[]",
+            "null",
+            "3",
+            "true",
+            "{\"unknown_native\":null}",
+            "{\"halt_requested\":0}",
+            "{\"retry_generation\":1.0}",
+            "{\"merge_retry_count\":4294967296}",
+            "{\"retry_generation\":18446744073709551616}",
+            "{\"retry_reset_epoch\":9223372036854775808}",
+            "{\"token_usage_by_stage\":{\"impl\":-1}}",
+            "{\"applied_decisions\":[0]}",
+            "{\"pipeline_checkpoint\":{\"attempt_id\":\"hidden\",\"operation\":\"PUSH\"},\"halt_requested\":0}",
+            "{\"pipeline_checkpoint\":{\"attempt_id\":\"hidden\",\"operation\":\"PUSH\",\"future\":true}}",
+            "{\"halt_requested\":false,\"halt_requested\":true}",
+            "{\"token_usage_by_stage\":{\"impl\":1,\"impl\":2}}",
+            "{\"merge_checkpoint\":{}}",
+            "{\"suspended_impl_attempt_id\":false}",
+        ];
+        for finished in [false, true] {
+            for (column, invalid) in memory_invalid
+                .into_iter()
+                .map(|v| ("memory_json", v))
+                .chain([
+                    ("context_pack_json", "{\"future\":false}"),
+                    (
+                        "context_pack_json",
+                        "{\"target_files\":[{\"path\":\"x\",\"future\":false}]}",
+                    ),
+                    ("context_pack_json", "{\"target_files\":[{}]}"),
+                    (
+                        "context_pack_json",
+                        "{\"acceptance_criteria\":[{\"id\":\"a\",\"id\":\"b\"}]}",
+                    ),
+                    (
+                        "context_pack_json",
+                        "{\"acceptance_criteria\":[{\"id\":\"a\",\"description\":false}]}",
+                    ),
+                    ("context_pack_json", "null"),
+                    ("context_pack_json", "{\"weight\":1}"),
+                    ("depends_on_json", "{}"),
+                    ("required_stages_json", "[false]"),
+                    ("stages_completed_json", "null"),
+                    ("stages_completed_json", "[1]"),
+                ])
+            {
+                let mut store = V2Store::open_in_memory().unwrap();
+                if finished {
+                    finished_fixture(&mut store);
+                } else {
+                    store
+                        .upsert_task(&sample_task("SYNTHETIC-1", "In Progress", vec![]))
+                        .unwrap();
+                }
+                store
+                    .conn
+                    .execute(&format!("UPDATE tasks SET {column}=?1"), [invalid])
+                    .unwrap();
+                let before = raw_task(&store.conn, "SYNTHETIC-1").unwrap();
+                let queue = table_rows(&store, "merge_queue");
+                for _ in 0..2 {
+                    let error = store
+                        .sync_task_with_mode(&terminal_input(), SyncMode::ReconcileFinishedLegacy)
+                        .unwrap_err();
+                    assert_eq!(error.0, "ambiguous persisted task JSON");
+                    assert_eq!(raw_task(&store.conn, "SYNTHETIC-1").unwrap(), before);
+                    assert_eq!(table_rows(&store, "merge_queue"), queue);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn finished_offline_changes_only_named_columns_and_memory_marker() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        let mut old = finished_fixture(&mut store);
+        old.retry_count = 7;
+        old.memory.applied_decisions = vec!["applied".into()];
+        store.upsert_task(&old).unwrap();
+        store
+            .open_decision(
+                "applied",
+                &old.task_id,
+                "synthetic",
+                "test",
+                "q",
+                &["yes".into()],
+                None,
+                "ctx",
+                None,
+            )
+            .unwrap();
+        store
+            .resolve_decision("applied", "yes", "actor", None)
+            .unwrap();
+        let memory = r#" { "token_usage_by_stage":{"impl":18446744073709551615}, "retry_generation":18446744073709551615, "retry_reset_epoch":-9223372036854775808, "applied_decisions":["applied"],"approved_plan":"line\n\"quoted\"", "last_check_failure":null } "#;
+        store.conn.execute("UPDATE tasks SET memory_json=?1, stages_completed_json=' [ \"impl\" ] ',context_pack_json=' { } '",[memory]).unwrap();
+        let mut expected = raw_task(&store.conn, &old.task_id).unwrap();
+        let mut history = BTreeMap::new();
+        for table in [
+            "stage_attempts",
+            "task_events",
+            "pending_decisions",
+            "post_merge_deliveries",
+            "lifecycle_ops",
+            "path_locks",
+        ] {
+            history.insert(table, table_rows(&store, table));
+        }
+        let out = store
+            .sync_task_with_mode(&terminal_input(), SyncMode::ReconcileFinishedLegacy)
+            .unwrap();
+        expected.insert("status".into(), "Done".to_string().into());
+        expected.insert("active_attempt_id".into(), rusqlite::types::Value::Null);
+        expected.insert("version".into(), out.version.into());
+        expected.insert("updated_epoch".into(), out.updated_epoch.into());
+        let after = raw_task(&store.conn, &old.task_id).unwrap();
+        let Some(rusqlite::types::Value::Text(after_memory)) = after.get("memory_json") else {
+            panic!("missing memory")
+        };
+        let mut value: serde_json::Value = serde_json::from_str(after_memory).unwrap();
+        assert_eq!(
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("governance_terminal_observed"),
+            Some(true.into())
+        );
+        assert_eq!(
+            value,
+            serde_json::from_str::<serde_json::Value>(memory).unwrap()
+        );
+        expected.insert("memory_json".into(), after_memory.clone().into());
+        assert_eq!(after, expected);
+        for (table, rows) in history {
+            assert_eq!(table_rows(&store, table), rows, "{table}");
+        }
+        store
+            .sync_task_with_mode(&terminal_input(), SyncMode::ReconcileFinishedLegacy)
+            .unwrap();
+        assert_eq!(raw_task(&store.conn, &old.task_id).unwrap(), expected);
+    }
+
+    #[test]
+    fn empty_admission_rejects_each_native_history_table_and_runtime_or_identity_conflict() {
+        let inserts = [
+            "INSERT INTO stage_attempts(attempt_id,task_id,stage,model,effort,started_epoch,status,phase) VALUES('native','SYNTHETIC-1','impl','synthetic','low',1,'RUNNING','RUNNING')",
+            "INSERT INTO lifecycle_ops(operation_id,task_id,kind,args_json,state,created_epoch,updated_epoch) VALUES('ack','SYNTHETIC-1','start','[]','ACKNOWLEDGED',1,1)",
+            "INSERT INTO post_merge_deliveries(delivery_id,task_id,repository,github_repo,merge_sha,kind,name,state,workflow,updated_epoch) VALUES('verified','SYNTHETIC-1','zach','owner/repo','sha','test','test','verified','test',1)",
+            "INSERT INTO merge_queue(repo,task_id,pr_number,reviewed_sha,enqueued_epoch,state) VALUES('zach','SYNTHETIC-1',1,'sha',1,'FAILED')",
+            "INSERT INTO path_locks(repo,path,task_id,acquired_epoch) VALUES('zach','*','SYNTHETIC-1',1)",
+            "INSERT INTO task_events(task_id,task_group,ts_epoch,event_type,payload_json) VALUES('SYNTHETIC-1','test',1,'HISTORY','{}')",
+        ];
+        for sql in inserts {
+            let mut store = V2Store::open_in_memory().unwrap();
+            store
+                .upsert_task(&sample_task("SYNTHETIC-1", "In Progress", vec![]))
+                .unwrap();
+            store.conn.execute_batch(sql).unwrap();
+            let before = raw_task(&store.conn, "SYNTHETIC-1").unwrap();
+            let mut tables = BTreeMap::new();
+            for t in [
+                "stage_attempts",
+                "lifecycle_ops",
+                "post_merge_deliveries",
+                "merge_queue",
+                "path_locks",
+                "task_events",
+            ] {
+                tables.insert(t, table_rows(&store, t));
+            }
+            store
+                .sync_task_with_mode(&terminal_input(), SyncMode::ReconcileFinishedLegacy)
+                .unwrap();
+            assert_eq!(raw_task(&store.conn, "SYNTHETIC-1").unwrap(), before);
+            for (t, rows) in tables {
+                assert_eq!(table_rows(&store, t), rows);
+            }
+        }
+        for finished in [false, true] {
+            for case in [
+                "github",
+                "issue",
+                "incoming-stage",
+                "incoming-lease-zero",
+                "incoming-retry",
+                "incoming-generation",
+                "incoming-halt",
+                "old-lease-zero",
+                "old-checkpoint",
+                "queue-owner",
+            ] {
+                let mut store = V2Store::open_in_memory().unwrap();
+                if finished {
+                    finished_fixture(&mut store);
+                } else {
+                    store
+                        .upsert_task(&sample_task("SYNTHETIC-1", "Ready", vec![]))
+                        .unwrap();
+                }
+                let mut incoming = terminal_input();
+                match case {
+                    "github" => incoming.github_repo = Some("other/owner".into()),
+                    "issue" => incoming.issue_number = Some(2),
+                    "incoming-stage" => incoming.current_stage = Some("impl".into()),
+                    "incoming-lease-zero" => incoming.lease_expires_epoch = Some(0),
+                    "incoming-retry" => incoming.next_retry_epoch = 1,
+                    "incoming-generation" => incoming.memory.retry_generation = 1,
+                    "incoming-halt" => incoming.memory.halt_requested = true,
+                    "old-lease-zero" => {
+                        store
+                            .conn
+                            .execute("UPDATE tasks SET lease_expires_epoch=0", [])
+                            .unwrap();
+                    }
+                    "old-checkpoint" => {
+                        store.conn.execute_batch(r#"UPDATE tasks SET memory_json='{"pipeline_checkpoint":{"attempt_id":"native","operation":"PUSH"}}'"#).unwrap();
+                    }
+                    "queue-owner" => {
+                        store.conn.execute_batch("DELETE FROM merge_queue;INSERT INTO merge_queue(repo,task_id,pr_number,reviewed_sha,enqueued_epoch,state) VALUES('another-repository','SYNTHETIC-1',1,'sha',1,'FAILED')").unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                let before = raw_task(&store.conn, "SYNTHETIC-1").unwrap();
+                let queue = table_rows(&store, "merge_queue");
+                store
+                    .sync_task_with_mode(&incoming, SyncMode::ReconcileFinishedLegacy)
+                    .unwrap();
+                assert_eq!(
+                    raw_task(&store.conn, "SYNTHETIC-1").unwrap(),
+                    before,
+                    "{case}"
+                );
+                assert_eq!(table_rows(&store, "merge_queue"), queue);
+            }
+        }
+    }
+
+    #[test]
+    fn failed_queue_delete_is_transactional_and_queue_only_cleanup_does_not_rewrite_task() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        finished_fixture(&mut store);
+        let before = raw_task(&store.conn, "SYNTHETIC-1").unwrap();
+        store.conn.execute_batch("CREATE TRIGGER refuse_delete BEFORE DELETE ON merge_queue BEGIN SELECT RAISE(IGNORE); END;").unwrap();
+        assert!(
+            store
+                .sync_task_with_mode(&terminal_input(), SyncMode::ReconcileFinishedLegacy)
+                .is_err()
+        );
+        assert_eq!(raw_task(&store.conn, "SYNTHETIC-1").unwrap(), before);
+        assert_eq!(store.list_merge_queue(None).unwrap().len(), 1);
+        store
+            .conn
+            .execute_batch("DROP TRIGGER refuse_delete")
+            .unwrap();
+        store
+            .sync_task_with_mode(&terminal_input(), SyncMode::ReconcileFinishedLegacy)
+            .unwrap();
+        let before = raw_task(&store.conn, "SYNTHETIC-1").unwrap();
+        store.conn.execute_batch("INSERT INTO merge_queue(repo,task_id,pr_number,reviewed_sha,enqueued_epoch,state) VALUES('zach','SYNTHETIC-1',1,'sha',1,'FAILED')").unwrap();
+        store
+            .sync_task_with_mode(&terminal_input(), SyncMode::ReconcileFinishedLegacy)
+            .unwrap();
+        assert_eq!(raw_task(&store.conn, "SYNTHETIC-1").unwrap(), before);
+        assert!(store.list_merge_queue(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn offline_updates_roll_back_ignored_aborted_and_trigger_modified_rows() {
+        for finished in [false, true] {
+            for trigger in [
+                "BEFORE UPDATE ON tasks BEGIN SELECT RAISE(IGNORE); END",
+                "BEFORE UPDATE ON tasks BEGIN SELECT RAISE(ABORT,'synthetic'); END",
+                "AFTER UPDATE ON tasks BEGIN UPDATE tasks SET title='unexpected'; END",
+                "AFTER UPDATE ON tasks BEGIN UPDATE tasks SET version=version+1; END",
+            ] {
+                let db = LegacyTestDb::new();
+                let mut store = V2Store::open(&db.0).unwrap();
+                if finished {
+                    finished_fixture(&mut store);
+                } else {
+                    store
+                        .upsert_task(&sample_task("SYNTHETIC-1", "Ready", vec![]))
+                        .unwrap();
+                }
+                let before = raw_task(&store.conn, "SYNTHETIC-1").unwrap();
+                let queue = table_rows(&store, "merge_queue");
+                store
+                    .conn
+                    .execute_batch(&format!("CREATE TRIGGER synthetic {trigger};"))
+                    .unwrap();
+                assert!(
+                    store
+                        .sync_task_with_mode(&terminal_input(), SyncMode::ReconcileFinishedLegacy)
+                        .is_err()
+                );
+                drop(store);
+                let reopened = V2Store::open(&db.0).unwrap();
+                assert_eq!(raw_task(&reopened.conn, "SYNTHETIC-1").unwrap(), before);
+                assert_eq!(table_rows(&reopened, "merge_queue"), queue);
+            }
+        }
     }
 
     #[test]
