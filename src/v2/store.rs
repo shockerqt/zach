@@ -70,6 +70,13 @@ pub struct ContextPackSpec {
     pub acceptance_criteria: Vec<AcceptanceCriterionSpec>,
 }
 
+/// Reconciliation is an explicit offline operation, never ordinary daemon sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncMode {
+    Standard,
+    ReconcileFinishedLegacy,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct TaskMemory {
     /// An authoritative Governance export observed a terminal task. Local
@@ -683,6 +690,11 @@ impl V2Store {
     }
 
     fn migrate_supervision(&mut self) -> Result<(), V2StoreError> {
+        // Column introduction and compatibility classification are indivisible:
+        // a reopen must never mistake a partially classified legacy DB for current state.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         for (table, columns) in [
             (
                 "tasks",
@@ -706,20 +718,22 @@ impl V2Store {
                 ],
             ),
         ] {
-            let present: BTreeSet<String> = self
-                .conn
+            let present: BTreeSet<String> = tx
                 .prepare(&format!("PRAGMA table_info({table})"))?
                 .query_map([], |r| r.get(1))?
                 .collect::<Result<_, _>>()?;
             for (name, declaration) in columns {
                 if !present.contains(name) {
-                    self.conn.execute_batch(&format!(
+                    tx.execute_batch(&format!(
                         "ALTER TABLE {table} ADD COLUMN {name} {declaration}"
                     ))?;
+                    if table == "stage_attempts" && name == "phase" {
+                        tx.execute("UPDATE stage_attempts SET phase='COMPLETE' WHERE ended_epoch IS NOT NULL AND status IN ('PASSED','FAILED')", [])?;
+                    }
                 }
             }
         }
-        self.conn.execute_batch("UPDATE stage_attempts SET last_liveness_epoch=started_epoch WHERE last_liveness_epoch=0;
+        tx.execute_batch("UPDATE stage_attempts SET last_liveness_epoch=started_epoch WHERE last_liveness_epoch=0;
             CREATE TABLE IF NOT EXISTS lifecycle_ops (
                 operation_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id),
                 kind TEXT NOT NULL, args_json TEXT NOT NULL, body_path TEXT, depends_on TEXT, attempt_id TEXT, decision_id TEXT,
@@ -727,17 +741,16 @@ impl V2Store {
                 attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT,
                 created_epoch INTEGER NOT NULL, updated_epoch INTEGER NOT NULL
             );")?;
-        let columns: BTreeSet<String> = self
-            .conn
+        let columns: BTreeSet<String> = tx
             .prepare("PRAGMA table_info(lifecycle_ops)")?
             .query_map([], |r| r.get(1))?
             .collect::<Result<_, _>>()?;
         for name in ["attempt_id", "decision_id"] {
             if !columns.contains(name) {
-                self.conn
-                    .execute_batch(&format!("ALTER TABLE lifecycle_ops ADD COLUMN {name} TEXT"))?;
+                tx.execute_batch(&format!("ALTER TABLE lifecycle_ops ADD COLUMN {name} TEXT"))?;
             }
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1140,6 +1153,16 @@ impl V2Store {
     /// Syncs a board-exported task record into the store while preserving Zach-owned
     /// runtime state for active (non-terminal) tasks unless the board status is terminal.
     pub fn sync_task(&mut self, incoming: &TaskRecord) -> Result<TaskRecord, V2StoreError> {
+        self.sync_task_with_mode(incoming, SyncMode::Standard)
+    }
+
+    /// Offline mode requires the caller to hold DaemonLock and exclude all workers
+    /// before opening this store. Ordinary daemon intake must use Standard.
+    pub fn sync_task_with_mode(
+        &mut self,
+        incoming: &TaskRecord,
+        mode: SyncMode,
+    ) -> Result<TaskRecord, V2StoreError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1202,9 +1225,45 @@ impl V2Store {
                     coalesce_runtime_fields(&old, &mut next);
                     next.retry_count = old.retry_count.max(next.retry_count);
                 }
+                let offline_terminal = mode == SyncMode::ReconcileFinishedLegacy
+                    && matches!(incoming.status.as_str(), "Done" | "Cancelled");
+                let retire = offline_terminal && Self::can_retire_finished_tx(&tx, &old, incoming)?;
+                if offline_terminal && !retire {
+                    // A rejected proof must retain the blocker itself, including
+                    // identity, lease, references and version. Export defaults
+                    // must not make a subsequent reconciliation appear eligible.
+                    return Ok(old);
+                }
+                if offline_terminal {
+                    // An export is not the owner of completed stage or receipt history.
+                    next.stages_completed = old.stages_completed.clone();
+                    next.memory = old.memory.clone();
+                    next.autonomous_consent = old.autonomous_consent;
+                    next.current_stage = old.current_stage.clone();
+                    next.retry_count = old.retry_count;
+                    if retire {
+                        next.active_attempt_id = None;
+                    }
+                }
                 next.memory.governance_terminal_observed |= old.memory.governance_terminal_observed
                     || is_terminal_task_status(&incoming.status);
-                Self::update_task_tx(&tx, &old, &next, now)?
+                let saved = Self::update_task_tx(&tx, &old, &next, now)?;
+                if retire {
+                    // BEGIN IMMEDIATE excludes competing writers. Check the result
+                    // before deleting coordination state, including trigger failures.
+                    let persisted = Self::get_task_tx(&tx, &old.task_id)?
+                        .ok_or_else(|| V2StoreError("reconciliation task disappeared".into()))?;
+                    if persisted.version != saved.version || persisted.active_attempt_id.is_some() {
+                        return Err(V2StoreError(
+                            "reconciliation task update did not succeed".into(),
+                        ));
+                    }
+                    tx.execute(
+                        "DELETE FROM merge_queue WHERE repo=?1 AND task_id=?2 AND state='FAILED'",
+                        params![old.repository, old.task_id],
+                    )?;
+                }
+                saved
             }
             None => {
                 let mut next = incoming.clone();
@@ -1215,6 +1274,70 @@ impl V2Store {
         };
         tx.commit()?;
         Ok(result)
+    }
+
+    fn can_retire_finished_tx(
+        tx: &rusqlite::Transaction<'_>,
+        old: &TaskRecord,
+        incoming: &TaskRecord,
+    ) -> Result<bool, V2StoreError> {
+        let pending_memory = |t: &TaskRecord| {
+            t.memory.pipeline_checkpoint.is_some()
+                || t.memory.merge_checkpoint.is_some()
+                || t.memory.suspended_impl_attempt_id.is_some()
+        };
+        if old.repository != incoming.repository
+            || pending_memory(old)
+            || pending_memory(incoming)
+            || incoming
+                .active_attempt_id
+                .as_ref()
+                .is_some_and(|id| Some(id) != old.active_attempt_id.as_ref())
+            || incoming
+                .stages_completed
+                .iter()
+                .any(|stage| !old.stages_completed.contains(stage))
+            || old.lease_owner.is_some()
+            || old.lease_expires_epoch.is_some()
+            || incoming.lease_owner.is_some()
+            || incoming.lease_expires_epoch.is_some()
+        {
+            return Ok(false);
+        }
+        let effects: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_ops WHERE task_id=?1 AND state!='ACKNOWLEDGED') OR EXISTS(SELECT 1 FROM post_merge_deliveries WHERE task_id=?1 AND state!='verified') OR EXISTS(SELECT 1 FROM merge_queue WHERE task_id=?1 AND state!='FAILED')", [&old.task_id], |r| r.get(0))?;
+        if effects {
+            return Ok(false);
+        }
+        let decisions = tx
+            .prepare("SELECT decision_id,status FROM pending_decisions WHERE task_id=?1")?
+            .query_map([&old.task_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if decisions
+            .iter()
+            .any(|(id, status)| status != "RESOLVED" || !old.memory.applied_decisions.contains(id))
+        {
+            return Ok(false);
+        }
+        let attempts = tx.prepare("SELECT attempt_id,stage,status,phase,ended_epoch FROM stage_attempts WHERE task_id=?1")?
+            .query_map([&old.task_id], |r| Ok((r.get::<_, String>(0)?,r.get::<_, String>(1)?,r.get::<_, String>(2)?,r.get::<_, String>(3)?,r.get::<_, Option<i64>>(4)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if attempts.is_empty()
+            || attempts.iter().any(|(_, stage, status, phase, end)| {
+                end.is_none()
+                    || phase != "COMPLETE"
+                    || !matches!(status.as_str(), "PASSED" | "FAILED")
+                    || (status == "PASSED" && !old.stages_completed.contains(stage))
+            })
+        {
+            return Ok(false);
+        }
+        Ok(old.active_attempt_id.as_ref().is_none_or(|id| {
+            attempts.iter().any(|(a, stage, status, _, _)| {
+                a == id && status == "PASSED" && old.stages_completed.contains(stage)
+            })
+        }))
     }
 
     fn upsert_delivery_tx(
@@ -2675,6 +2798,365 @@ fn should_preserve_zach_state(existing: &TaskRecord, incoming: &TaskRecord) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct LegacyTestDb(std::path::PathBuf);
+    impl LegacyTestDb {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "zach-legacy-{}-{}.sqlite3",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            Self(path)
+        }
+    }
+    impl Drop for LegacyTestDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_file(self.0.with_extension("sqlite3-wal"));
+            let _ = std::fs::remove_file(self.0.with_extension("sqlite3-shm"));
+        }
+    }
+    fn finished_fixture(store: &mut V2Store) -> TaskRecord {
+        let mut task = sample_task("SYNTHETIC-1", "Queued for Merge", vec![]);
+        task.stages_completed = vec!["impl".into()];
+        task.current_stage = Some("impl".into());
+        task.active_attempt_id = Some("finished".into());
+        task.memory.recent_attempts = vec!["history".into()];
+        let task = store.upsert_task(&task).unwrap();
+        store.conn.execute_batch("INSERT INTO stage_attempts(attempt_id,task_id,stage,model,effort,started_epoch,ended_epoch,status,phase,last_liveness_epoch,summary,input_tokens,sha_after) VALUES('finished','SYNTHETIC-1','impl','synthetic','low',10,20,'PASSED','COMPLETE',15,'preserve',42,'sha'); INSERT INTO merge_queue(repo,task_id,pr_number,reviewed_sha,enqueued_epoch,state) VALUES('zach','SYNTHETIC-1',1,'sha',30,'FAILED');").unwrap();
+        task
+    }
+    fn terminal_input() -> TaskRecord {
+        let mut t = sample_task("SYNTHETIC-1", "Done", vec![]);
+        t.autonomous_consent = false; // stale export is not consent/history ownership
+        t
+    }
+
+    #[test]
+    fn finished_legacy_missing_phase_is_atomic_and_history_preserving_on_reopen() {
+        let db = LegacyTestDb::new();
+        let mut store = V2Store::open(&db.0).unwrap();
+        finished_fixture(&mut store);
+        for (id, status, end) in [
+            ("failed", "FAILED", Some(20)),
+            ("unknown", "OTHER", Some(20)),
+            ("unended", "PASSED", None),
+        ] {
+            store.conn.execute("INSERT INTO stage_attempts(attempt_id,task_id,stage,model,effort,started_epoch,ended_epoch,status,phase,last_liveness_epoch) VALUES(?1,'SYNTHETIC-1','impl','synthetic','low',10,?2,?3,'RUNNING',15)",params![id,end,status]).unwrap();
+        }
+        let before = store.list_stage_attempts("SYNTHETIC-1").unwrap();
+        store.conn.execute_batch("ALTER TABLE stage_attempts DROP COLUMN phase; UPDATE daemon_meta SET value='2' WHERE key='schema_version'; CREATE TRIGGER refuse_phase BEFORE UPDATE OF phase ON stage_attempts BEGIN SELECT RAISE(ABORT,'synthetic migration failure'); END;").unwrap();
+        drop(store);
+        assert!(V2Store::open(&db.0).is_err());
+        let conn = Connection::open(&db.0).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM pragma_table_info('stage_attempts') WHERE name='phase'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        conn.execute_batch("DROP TRIGGER refuse_phase;").unwrap();
+        drop(conn);
+        for _ in 0..2 {
+            let store = V2Store::open(&db.0).unwrap();
+            let after = store.list_stage_attempts("SYNTHETIC-1").unwrap();
+            for original in &before {
+                let mut expected = original.clone();
+                expected.phase = if original.ended_epoch.is_some()
+                    && matches!(original.status.as_str(), "PASSED" | "FAILED")
+                {
+                    "COMPLETE"
+                } else {
+                    "RUNNING"
+                }
+                .into();
+                assert_eq!(
+                    after
+                        .iter()
+                        .find(|a| a.attempt_id == original.attempt_id)
+                        .unwrap(),
+                    &expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn finished_legacy_current_phases_are_never_reclassified() {
+        let db = LegacyTestDb::new();
+        let mut store = V2Store::open(&db.0).unwrap();
+        finished_fixture(&mut store);
+        for phase in ["RUNNING", "POSTPROCESSING", "HARVESTED", "COMPLETE"] {
+            store
+                .conn
+                .execute("UPDATE stage_attempts SET phase=?1", [phase])
+                .unwrap();
+            let before = store.get_stage_attempt("finished").unwrap().unwrap();
+            drop(store);
+            store = V2Store::open(&db.0).unwrap();
+            assert_eq!(
+                store.get_stage_attempt("finished").unwrap().unwrap(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn finished_legacy_opt_in_retires_only_coordination_and_preserves_stale_export_history() {
+        for terminal in ["Done", "Cancelled"] {
+            let db = LegacyTestDb::new();
+            let mut store = V2Store::open(&db.0).unwrap();
+            let old = finished_fixture(&mut store);
+            let attempts = store.list_stage_attempts(&old.task_id).unwrap();
+            store.conn.execute_batch("ALTER TABLE stage_attempts DROP COLUMN phase; UPDATE daemon_meta SET value='2' WHERE key='schema_version'").unwrap();
+            drop(store);
+            store = V2Store::open(&db.0).unwrap();
+            let mut incoming = terminal_input();
+            incoming.status = terminal.into();
+            let ordinary = store.sync_task(&incoming).unwrap();
+            assert!(ordinary.active_attempt_id.is_some());
+            // Restore history lost under normal legacy terminal coalescing; the
+            // opted-in path itself must preserve an empty incoming stages list.
+            store.upsert_task(&old).unwrap();
+            for _ in 0..2 {
+                let result = store
+                    .sync_task_with_mode(&incoming, SyncMode::ReconcileFinishedLegacy)
+                    .unwrap();
+                assert!(result.active_attempt_id.is_none());
+                assert_eq!(result.stages_completed, old.stages_completed);
+                assert_eq!(result.current_stage, old.current_stage);
+                assert_eq!(result.autonomous_consent, old.autonomous_consent);
+                assert_eq!(result.memory.recent_attempts, old.memory.recent_attempts);
+                assert!(result.memory.governance_terminal_observed);
+                assert!(store.list_merge_queue(None).unwrap().is_empty());
+                assert_eq!(store.list_stage_attempts(&old.task_id).unwrap(), attempts);
+                assert!(store.lifecycle_ops().unwrap().is_empty());
+                assert!(store.list_decisions(false, None).unwrap().is_empty());
+                assert!(store.list_deliveries(None).unwrap().is_empty());
+                drop(store);
+                store = V2Store::open(&db.0).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn finished_legacy_ambiguous_or_recoverable_work_is_retained() {
+        for case in [
+            "nonterminal",
+            "missing",
+            "running",
+            "postprocessing",
+            "harvested",
+            "unended",
+            "unknown",
+            "failed-ref",
+            "stage",
+            "pipeline",
+            "merge",
+            "suspended",
+            "lease",
+            "lifecycle",
+            "decision",
+            "delivery",
+            "queue",
+            "repository",
+            "incoming-stage",
+            "incoming-checkpoint",
+            "incoming-reference",
+            "other-attempt",
+        ] {
+            let db = LegacyTestDb::new();
+            let mut store = V2Store::open(&db.0).unwrap();
+            let mut old = finished_fixture(&mut store);
+            let mut input = terminal_input();
+            match case {
+                "nonterminal" => input.status = "Backlog".into(),
+                "missing" => {
+                    store
+                        .conn
+                        .execute("DELETE FROM stage_attempts", [])
+                        .unwrap();
+                }
+                "running" | "postprocessing" | "harvested" => {
+                    store
+                        .conn
+                        .execute("UPDATE stage_attempts SET phase=?1", [case.to_uppercase()])
+                        .unwrap();
+                }
+                "unended" => {
+                    store
+                        .conn
+                        .execute("UPDATE stage_attempts SET ended_epoch=NULL", [])
+                        .unwrap();
+                }
+                "unknown" => {
+                    store
+                        .conn
+                        .execute("UPDATE stage_attempts SET status='OTHER'", [])
+                        .unwrap();
+                }
+                "failed-ref" => {
+                    store
+                        .conn
+                        .execute("UPDATE stage_attempts SET status='FAILED'", [])
+                        .unwrap();
+                }
+                "stage" => old.stages_completed.clear(),
+                "pipeline" => {
+                    old.memory.pipeline_checkpoint = Some(PipelineCheckpoint {
+                        attempt_id: "finished".into(),
+                        operation: "VALIDATE".into(),
+                    })
+                }
+                "incoming-checkpoint" => {
+                    input.memory.pipeline_checkpoint = Some(PipelineCheckpoint {
+                        attempt_id: "finished".into(),
+                        operation: "VALIDATE".into(),
+                    })
+                }
+                "merge" => {
+                    old.memory.merge_checkpoint = Some(MergeCheckpoint {
+                        phase: "MERGE_PENDING".into(),
+                        target_sha: "sha".into(),
+                        pr_number: 1,
+                        merge_sha: None,
+                        post_merge_verified: false,
+                        phase_started_epoch: 1,
+                    })
+                }
+                "suspended" => old.memory.suspended_impl_attempt_id = Some("finished".into()),
+                "lease" => old.lease_owner = Some("live".into()),
+                "lifecycle" => {
+                    store.conn.execute_batch("INSERT INTO lifecycle_ops(operation_id,task_id,kind,args_json,state,created_epoch,updated_epoch) VALUES('pending','SYNTHETIC-1','close','[]','PENDING',1,1)").unwrap();
+                }
+                "decision" => {
+                    store
+                        .open_decision(
+                            "decision",
+                            &old.task_id,
+                            "synthetic",
+                            "test",
+                            "test",
+                            &["wait".into()],
+                            None,
+                            "test",
+                            None,
+                        )
+                        .unwrap();
+                }
+                "delivery" => {
+                    store.conn.execute_batch("INSERT INTO post_merge_deliveries(delivery_id,task_id,repository,github_repo,merge_sha,kind,name,state,workflow,updated_epoch) VALUES('receipt','SYNTHETIC-1','zach','owner/repo','sha','test','test','pending','test',1)").unwrap();
+                }
+                "queue" => {
+                    store
+                        .conn
+                        .execute("UPDATE merge_queue SET state='QUEUED'", [])
+                        .unwrap();
+                }
+                "repository" => input.repository = "other".into(),
+                "incoming-reference" => input.active_attempt_id = Some("conflicting".into()),
+                "incoming-stage" => input.stages_completed = vec!["unproven".into()],
+                "other-attempt" => {
+                    store.conn.execute_batch("INSERT INTO stage_attempts(attempt_id,task_id,stage,model,effort,started_epoch,status) VALUES('other','SYNTHETIC-1','impl','synthetic','low',1,'RUNNING')").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            store.upsert_task(&old).unwrap();
+            let attempts = store.list_stage_attempts(&old.task_id).unwrap();
+            let persisted = store.get_task(&old.task_id).unwrap().unwrap();
+            let queue = store.list_merge_queue(None).unwrap();
+            for _ in 0..2 {
+                let out = store
+                    .sync_task_with_mode(&input, SyncMode::ReconcileFinishedLegacy)
+                    .unwrap();
+                assert!(out.active_attempt_id.is_some(), "{case}");
+                if case != "nonterminal" {
+                    assert_eq!(out, persisted, "rejected proof mutated {case}");
+                    assert_eq!(
+                        store.get_task(&old.task_id).unwrap().unwrap(),
+                        persisted,
+                        "repeated rejected proof mutated {case}"
+                    );
+                }
+                assert_eq!(store.list_merge_queue(None).unwrap(), queue, "{case}");
+                assert_eq!(
+                    store.list_stage_attempts(&old.task_id).unwrap(),
+                    attempts,
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn finished_legacy_verified_receipts_survive_without_replay() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        let old = finished_fixture(&mut store);
+        let mut receipt = sample_delivery(&old);
+        receipt.state = "verified".into();
+        store.upsert_delivery(&receipt).unwrap();
+        store
+            .sync_task_with_mode(&terminal_input(), SyncMode::ReconcileFinishedLegacy)
+            .unwrap();
+        assert_eq!(
+            store.list_deliveries(Some(&old.task_id)).unwrap(),
+            vec![receipt]
+        );
+        assert!(store.lifecycle_ops().unwrap().is_empty());
+        assert!(
+            store
+                .get_task(&old.task_id)
+                .unwrap()
+                .unwrap()
+                .active_attempt_id
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn finished_legacy_transaction_observes_new_checkpoint_and_rolls_back_failed_update() {
+        let db = LegacyTestDb::new();
+        let mut store = V2Store::open(&db.0).unwrap();
+        finished_fixture(&mut store);
+        let other = Connection::open(&db.0).unwrap();
+        store
+            .conn
+            .busy_timeout(std::time::Duration::from_millis(10))
+            .unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(
+            store
+                .sync_task_with_mode(&terminal_input(), SyncMode::ReconcileFinishedLegacy)
+                .is_err()
+        );
+        assert_eq!(store.list_merge_queue(None).unwrap().len(), 1);
+        other.execute_batch("ROLLBACK").unwrap();
+        other.execute_batch(r#"BEGIN IMMEDIATE; UPDATE tasks SET memory_json='{"pipeline_checkpoint":{"attempt_id":"finished","operation":"PUSH"}}',version=version+1; COMMIT;"#).unwrap();
+        let result = store
+            .sync_task_with_mode(&terminal_input(), SyncMode::ReconcileFinishedLegacy)
+            .unwrap();
+        assert!(result.active_attempt_id.is_some());
+        store.conn.execute_batch("UPDATE tasks SET memory_json='{}'; CREATE TRIGGER refuse_task BEFORE UPDATE ON tasks BEGIN SELECT RAISE(IGNORE); END;").unwrap();
+        assert!(
+            store
+                .sync_task_with_mode(&terminal_input(), SyncMode::ReconcileFinishedLegacy)
+                .is_err()
+        );
+        assert_eq!(store.list_merge_queue(None).unwrap().len(), 1);
+        assert!(
+            store
+                .get_task("SYNTHETIC-1")
+                .unwrap()
+                .unwrap()
+                .active_attempt_id
+                .is_some()
+        );
+    }
 
     fn sample_task(id: &str, status: &str, deps: Vec<String>) -> TaskRecord {
         TaskRecord {
