@@ -1293,10 +1293,6 @@ impl V2Store {
                 .active_attempt_id
                 .as_ref()
                 .is_some_and(|id| Some(id) != old.active_attempt_id.as_ref())
-            || incoming
-                .stages_completed
-                .iter()
-                .any(|stage| !old.stages_completed.contains(stage))
             || old.lease_owner.is_some()
             || old.lease_expires_epoch.is_some()
             || incoming.lease_owner.is_some()
@@ -1320,6 +1316,9 @@ impl V2Store {
         {
             return Ok(false);
         }
+        // Canonical completed labels (including human approvals) are metadata,
+        // not native completion proof. Only persisted stages prove a passed
+        // attempt finished; successful sync retains that exact persisted vector.
         let attempts = tx.prepare("SELECT attempt_id,stage,status,phase,ended_epoch FROM stage_attempts WHERE task_id=?1")?
             .query_map([&old.task_id], |r| Ok((r.get::<_, String>(0)?,r.get::<_, String>(1)?,r.get::<_, String>(2)?,r.get::<_, String>(3)?,r.get::<_, Option<i64>>(4)?)))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2907,39 +2906,55 @@ mod tests {
     }
 
     #[test]
-    fn finished_legacy_opt_in_retires_only_coordination_and_preserves_stale_export_history() {
+    fn finished_legacy_opt_in_preserves_native_history_despite_export_completion_differences() {
         for terminal in ["Done", "Cancelled"] {
-            let db = LegacyTestDb::new();
-            let mut store = V2Store::open(&db.0).unwrap();
-            let old = finished_fixture(&mut store);
-            let attempts = store.list_stage_attempts(&old.task_id).unwrap();
-            store.conn.execute_batch("ALTER TABLE stage_attempts DROP COLUMN phase; UPDATE daemon_meta SET value='2' WHERE key='schema_version'").unwrap();
-            drop(store);
-            store = V2Store::open(&db.0).unwrap();
-            let mut incoming = terminal_input();
-            incoming.status = terminal.into();
-            let ordinary = store.sync_task(&incoming).unwrap();
-            assert!(ordinary.active_attempt_id.is_some());
-            // Restore history lost under normal legacy terminal coalescing; the
-            // opted-in path itself must preserve an empty incoming stages list.
-            store.upsert_task(&old).unwrap();
-            for _ in 0..2 {
-                let result = store
-                    .sync_task_with_mode(&incoming, SyncMode::ReconcileFinishedLegacy)
-                    .unwrap();
-                assert!(result.active_attempt_id.is_none());
-                assert_eq!(result.stages_completed, old.stages_completed);
-                assert_eq!(result.current_stage, old.current_stage);
-                assert_eq!(result.autonomous_consent, old.autonomous_consent);
-                assert_eq!(result.memory.recent_attempts, old.memory.recent_attempts);
-                assert!(result.memory.governance_terminal_observed);
-                assert!(store.list_merge_queue(None).unwrap().is_empty());
-                assert_eq!(store.list_stage_attempts(&old.task_id).unwrap(), attempts);
-                assert!(store.lifecycle_ops().unwrap().is_empty());
-                assert!(store.list_decisions(false, None).unwrap().is_empty());
-                assert!(store.list_deliveries(None).unwrap().is_empty());
+            for history in [
+                vec![],
+                vec!["impl"],
+                vec!["impl", "human-plan", "human-merge"],
+                vec!["external-completed-label"],
+            ] {
+                let db = LegacyTestDb::new();
+                let mut store = V2Store::open(&db.0).unwrap();
+                let old = finished_fixture(&mut store);
+                let attempts = store.list_stage_attempts(&old.task_id).unwrap();
+                let mut receipt = sample_delivery(&old);
+                receipt.state = "verified".into();
+                store.upsert_delivery(&receipt).unwrap();
+                store.conn.execute_batch("ALTER TABLE stage_attempts DROP COLUMN phase; UPDATE daemon_meta SET value='2' WHERE key='schema_version'").unwrap();
                 drop(store);
                 store = V2Store::open(&db.0).unwrap();
+                let mut incoming = terminal_input();
+                incoming.status = terminal.into();
+                incoming.stages_completed = history.iter().map(|s| s.to_string()).collect();
+                let ordinary = store.sync_task(&incoming).unwrap();
+                assert!(ordinary.active_attempt_id.is_some());
+                assert_eq!(ordinary.stages_completed, incoming.stages_completed);
+                // Ordinary sync behavior is unchanged. Restore its fixture so
+                // only the opt-in path is responsible for native preservation.
+                store.upsert_task(&old).unwrap();
+                for _ in 0..2 {
+                    let result = store
+                        .sync_task_with_mode(&incoming, SyncMode::ReconcileFinishedLegacy)
+                        .unwrap();
+                    let mut expected = old.clone();
+                    expected.status = terminal.into();
+                    expected.active_attempt_id = None;
+                    expected.memory.governance_terminal_observed = true;
+                    expected.version = result.version;
+                    expected.updated_epoch = result.updated_epoch;
+                    assert_eq!(result, expected, "{terminal}: {history:?}");
+                    assert!(store.list_merge_queue(None).unwrap().is_empty());
+                    assert_eq!(store.list_stage_attempts(&old.task_id).unwrap(), attempts);
+                    assert!(store.lifecycle_ops().unwrap().is_empty());
+                    assert!(store.list_decisions(false, None).unwrap().is_empty());
+                    assert_eq!(store.list_deliveries(None).unwrap(), vec![receipt.clone()]);
+                    drop(store);
+                    store = V2Store::open(&db.0).unwrap();
+                    assert_eq!(store.get_task(&old.task_id).unwrap().unwrap(), result);
+                    assert_eq!(store.list_stage_attempts(&old.task_id).unwrap(), attempts);
+                    assert_eq!(store.list_deliveries(None).unwrap(), vec![receipt.clone()]);
+                }
             }
         }
     }
@@ -2960,12 +2975,15 @@ mod tests {
             "merge",
             "suspended",
             "lease",
+            "lease-expiry",
+            "incoming-lease",
+            "incoming-merge",
+            "incoming-suspended",
             "lifecycle",
             "decision",
             "delivery",
             "queue",
             "repository",
-            "incoming-stage",
             "incoming-checkpoint",
             "incoming-reference",
             "other-attempt",
@@ -2974,6 +2992,9 @@ mod tests {
             let mut store = V2Store::open(&db.0).unwrap();
             let mut old = finished_fixture(&mut store);
             let mut input = terminal_input();
+            // Even canonical completion of impl cannot satisfy a missing old
+            // native completion. Extra labels must not mask any runtime conflict.
+            input.stages_completed = vec!["impl".into(), "human-plan".into(), "human-merge".into()];
             match case {
                 "nonterminal" => input.status = "Backlog".into(),
                 "missing" => {
@@ -3031,6 +3052,21 @@ mod tests {
                 }
                 "suspended" => old.memory.suspended_impl_attempt_id = Some("finished".into()),
                 "lease" => old.lease_owner = Some("live".into()),
+                "lease-expiry" => old.lease_expires_epoch = Some(9999999999),
+                "incoming-lease" => input.lease_owner = Some("incoming-live".into()),
+                "incoming-merge" => {
+                    input.memory.merge_checkpoint = Some(MergeCheckpoint {
+                        phase: "MERGE_PENDING".into(),
+                        target_sha: "sha".into(),
+                        pr_number: 1,
+                        merge_sha: None,
+                        post_merge_verified: false,
+                        phase_started_epoch: 1,
+                    })
+                }
+                "incoming-suspended" => {
+                    input.memory.suspended_impl_attempt_id = Some("finished".into())
+                }
                 "lifecycle" => {
                     store.conn.execute_batch("INSERT INTO lifecycle_ops(operation_id,task_id,kind,args_json,state,created_epoch,updated_epoch) VALUES('pending','SYNTHETIC-1','close','[]','PENDING',1,1)").unwrap();
                 }
@@ -3060,9 +3096,8 @@ mod tests {
                 }
                 "repository" => input.repository = "other".into(),
                 "incoming-reference" => input.active_attempt_id = Some("conflicting".into()),
-                "incoming-stage" => input.stages_completed = vec!["unproven".into()],
                 "other-attempt" => {
-                    store.conn.execute_batch("INSERT INTO stage_attempts(attempt_id,task_id,stage,model,effort,started_epoch,status) VALUES('other','SYNTHETIC-1','impl','synthetic','low',1,'RUNNING')").unwrap();
+                    store.conn.execute_batch("INSERT INTO stage_attempts(attempt_id,task_id,stage,model,effort,started_epoch,status,last_liveness_epoch) VALUES('other','SYNTHETIC-1','impl','synthetic','low',1,'RUNNING',1)").unwrap();
                 }
                 _ => unreachable!(),
             }
@@ -3089,6 +3124,15 @@ mod tests {
                     attempts,
                     "{case}"
                 );
+                drop(store);
+                store = V2Store::open(&db.0).unwrap();
+                if case != "nonterminal" {
+                    assert_eq!(
+                        store.get_task(&old.task_id).unwrap().unwrap(),
+                        persisted,
+                        "reopen changed {case}"
+                    );
+                }
             }
         }
     }
