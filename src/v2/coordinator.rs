@@ -4608,8 +4608,11 @@ mod tests {
         Ok(bytes)
     }
     fn rehearsal_directory() -> Result<(PathBuf, u32, (u64, u64)), String> {
+        rehearsal_directory_for("ZACH039_REHEARSAL_DIR")
+    }
+    fn rehearsal_directory_for(env_var: &str) -> Result<(PathBuf, u32, (u64, u64)), String> {
         use std::os::unix::fs::MetadataExt;
-        let dir = PathBuf::from(std::env::var_os("ZACH039_REHEARSAL_DIR").ok_or("NO_SELECTOR")?);
+        let dir = PathBuf::from(std::env::var_os(env_var).ok_or("NO_SELECTOR")?);
         // Root means the orchestrating role. The reviewed operator is ubuntu,
         // running with its own UID and real user bus, never sudo/root.
         let uid = unsafe { libc::geteuid() };
@@ -4791,6 +4794,31 @@ mod tests {
         w: &ActualDecodeTimeWitness,
         export: &str,
     ) -> Result<StandardObservation, String> {
+        observe_standard_for_profile(c, w, export, None)
+    }
+    fn profile_status_matches(
+        old: &TaskRecord,
+        incoming: &TaskRecord,
+        retained: Option<&BTreeSet<String>>,
+    ) -> bool {
+        if retained.is_some_and(|ids| ids.contains(&old.task_id)) {
+            matches!(
+                (old.status.as_str(), incoming.status.as_str()),
+                ("Ready", "Ready") | ("Blocked", "Blocked") | ("Ready", "Blocked")
+            ) && !old.autonomous_consent
+                && !incoming.autonomous_consent
+                && old.executor.as_deref() == Some("zach")
+                && incoming.executor.as_deref() == Some("zach")
+        } else {
+            old.status == incoming.status
+        }
+    }
+    fn observe_standard_for_profile(
+        c: &mut Coordinator,
+        w: &ActualDecodeTimeWitness,
+        export: &str,
+        retained: Option<&BTreeSet<String>>,
+    ) -> Result<StandardObservation, String> {
         w.verify(export, now_epoch())?;
         if !c.jobs.is_empty()
             || c.submission_probe.is_none()
@@ -4805,7 +4833,9 @@ mod tests {
         if old.len() != w.records.len()
             || w.records.iter().any(|t| {
                 !old.iter().any(|o| {
-                    o.task_id == t.task_id && o.repository == t.repository && o.status == t.status
+                    o.task_id == t.task_id
+                        && o.repository == t.repository
+                        && profile_status_matches(o, t, retained)
                 })
             })
         {
@@ -4991,6 +5021,14 @@ mod tests {
         w: &ActualDecodeTimeWitness,
         export: &str,
     ) -> Result<usize, String> {
+        validate_standard_for_profile(o, w, export, None)
+    }
+    fn validate_standard_for_profile(
+        o: &StandardObservation,
+        w: &ActualDecodeTimeWitness,
+        export: &str,
+        retained: Option<&BTreeSet<String>>,
+    ) -> Result<usize, String> {
         use rusqlite::types::Value as V;
         w.verify(export, o.epoch)?;
         if !native_event_schema(&o.schema_before) || o.schema_before != o.schema_after {
@@ -5059,7 +5097,7 @@ mod tests {
                 .find(|t| t.task_id == incoming.task_id)
                 .ok_or("STANDARD_INVENTORY")?;
             if old.repository != incoming.repository
-                || old.status != incoming.status
+                || !profile_status_matches(old, incoming, retained)
                 || t.repository != old.repository
                 || t.status != old.status
                 || t.task_group != incoming.task_group
@@ -5869,12 +5907,48 @@ mod tests {
         }
     }
 
+    fn write_rehearsal_result(dir: &Path, uid: u32, bytes: &[u8]) -> Result<(), String> {
+        use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
+        let output = dir.join("result.json");
+        let temporary = dir.join(".result.tmp");
+        if output.exists() || temporary.exists() {
+            return Err("OUTPUT_EXISTS".into());
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&temporary)
+            .map_err(|_| "OUTPUT_WRITE")?;
+        file.write_all(bytes).map_err(|_| "OUTPUT_WRITE")?;
+        file.sync_all().map_err(|_| "OUTPUT_WRITE")?;
+        let from =
+            std::ffi::CString::new(temporary.as_os_str().as_bytes()).map_err(|_| "OUTPUT_WRITE")?;
+        let to =
+            std::ffi::CString::new(output.as_os_str().as_bytes()).map_err(|_| "OUTPUT_WRITE")?;
+        if unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        } != 0
+        {
+            return Err("OUTPUT_WRITE".into());
+        }
+        rehearsal_file(&output, uid)?;
+        Ok(())
+    }
+
     /// ROOT ORCHESTRATOR ONLY. Never invoke from a worker, ordinary cargo test,
     /// production CLI or daemon. Inputs are exclusive operator-owned copies.
     #[test]
     #[ignore = "root orchestrator only: reviewed binary and exclusive private copied inputs required"]
     fn private_copy_activation_rehearsal() -> Result<(), String> {
-        use std::io::Write;
         use std::os::unix::fs::MetadataExt;
         let (dir, uid, dir_identity) = rehearsal_directory()?;
         let (db, db_id) = rehearsal_file(&dir.join("zach-v2.sqlite3"), uid)?;
@@ -6152,39 +6226,8 @@ mod tests {
             }
             Err(class) => result["failure_class"] = class.clone().into(),
         }
-        let output = dir.join("result.json");
-        let temporary = dir.join(".result.tmp");
-        if output.exists() || temporary.exists() {
-            return Err("OUTPUT_EXISTS".into());
-        }
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&temporary)
-            .map_err(|_| "OUTPUT_WRITE")?;
-        file.write_all(&serde_json::to_vec(&result).map_err(|_| "RESULT_SCHEMA")?)
-            .map_err(|_| "OUTPUT_WRITE")?;
-        file.sync_all().map_err(|_| "OUTPUT_WRITE")?;
-        use std::os::unix::ffi::OsStrExt;
-        let from =
-            std::ffi::CString::new(temporary.as_os_str().as_bytes()).map_err(|_| "OUTPUT_WRITE")?;
-        let to =
-            std::ffi::CString::new(output.as_os_str().as_bytes()).map_err(|_| "OUTPUT_WRITE")?;
-        if unsafe {
-            libc::renameat2(
-                libc::AT_FDCWD,
-                from.as_ptr(),
-                libc::AT_FDCWD,
-                to.as_ptr(),
-                libc::RENAME_NOREPLACE,
-            )
-        } != 0
-        {
-            return Err("OUTPUT_WRITE".into());
-        }
-        rehearsal_file(&output, uid)?;
+        let bytes = serde_json::to_vec(&result).map_err(|_| "RESULT_SCHEMA")?;
+        write_rehearsal_result(&dir, uid, &bytes)?;
         outcome
     }
 
@@ -7854,6 +7897,1933 @@ mod tests {
                     }]
                 );
             }
+        }
+    }
+
+    /// ROOT ORCHESTRATOR ONLY. Never invoke from a worker, ordinary cargo test,
+    /// production CLI or daemon. Inputs are exclusive operator-owned copies.
+    #[test]
+    #[ignore = "root orchestrator only: reviewed binary and exclusive private copied inputs required"]
+    fn private_copy_retained_revoked_rehearsal() -> Result<(), String> {
+        retained_rehearsal::run_private()
+    }
+
+    mod retained_rehearsal {
+        use super::*;
+        use serde::{Deserialize, Serialize};
+        use serde_json::{Value, json};
+
+        const PROFILE: &str = "retained-revoked-v1";
+        const PHASES: [&str; 10] = [
+            "startup_1",
+            "pass_1",
+            "standard_1",
+            "pass_2",
+            "startup_2",
+            "pass_3",
+            "standard_2",
+            "pass_4",
+            "startup_3",
+            "pass_5",
+        ];
+        const HISTORY: [&str; 7] = [
+            "stage_attempts",
+            "task_events",
+            "lifecycle_ops",
+            "post_merge_deliveries",
+            "pending_decisions",
+            "merge_queue",
+            "path_locks",
+        ];
+        const FORBIDDEN: [&str; 8] = [
+            "stage_launch",
+            "preparation_apply",
+            "lifecycle_mutation",
+            "publication",
+            "pr_merge",
+            "deploy",
+            "delivery_apply",
+            "other",
+        ];
+        const EFFECTS: [&str; 9] = [
+            "unexpected_task_changes",
+            "attempts",
+            "retries_or_failures",
+            "locks",
+            "decisions",
+            "lifecycle",
+            "queue",
+            "delivery",
+            "other",
+        ];
+        const POLL: [&str; 5] = [
+            "attempted",
+            "executed",
+            "completed",
+            "fake_reads",
+            "fake_mutation_attempts",
+        ];
+        const CONTROLS: [&str; 3] = [
+            "poll_completed_with_fake",
+            "mutation_intercepted",
+            "forbidden_classes_intercepted",
+        ];
+
+        fn need(ok: bool, reason: &str) -> Result<(), String> {
+            if ok { Ok(()) } else { Err(reason.into()) }
+        }
+        fn hash<T: Serialize>(value: &T) -> Result<String, String> {
+            serde_json::to_vec(value)
+                .map(|v| rehearsal_sha256(&v))
+                .map_err(|_| "PROFILE_ENCODING".into())
+        }
+
+        // Deserialize every nested object ourselves before typed decoding, including Values.
+        struct Unique(Value);
+        impl<'de> Deserialize<'de> for Unique {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                struct Visitor;
+                impl<'de> serde::de::Visitor<'de> for Visitor {
+                    type Value = Unique;
+                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        f.write_str("unique finite JSON")
+                    }
+                    fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Unique, E> {
+                        Ok(Unique(json!(v)))
+                    }
+                    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Unique, E> {
+                        Ok(Unique(json!(v)))
+                    }
+                    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Unique, E> {
+                        Ok(Unique(json!(v)))
+                    }
+                    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Unique, E> {
+                        serde_json::Number::from_f64(v)
+                            .map(|n| Unique(Value::Number(n)))
+                            .ok_or_else(|| E::custom("nonfinite"))
+                    }
+                    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Unique, E> {
+                        Ok(Unique(json!(v)))
+                    }
+                    fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Unique, E> {
+                        Ok(Unique(json!(v)))
+                    }
+                    fn visit_unit<E: serde::de::Error>(self) -> Result<Unique, E> {
+                        Ok(Unique(Value::Null))
+                    }
+                    fn visit_none<E: serde::de::Error>(self) -> Result<Unique, E> {
+                        Ok(Unique(Value::Null))
+                    }
+                    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                        self,
+                        mut seq: A,
+                    ) -> Result<Unique, A::Error> {
+                        let mut values = Vec::new();
+                        while let Some(Unique(v)) = seq.next_element()? {
+                            values.push(v);
+                        }
+                        Ok(Unique(Value::Array(values)))
+                    }
+                    fn visit_map<A: serde::de::MapAccess<'de>>(
+                        self,
+                        mut map: A,
+                    ) -> Result<Unique, A::Error> {
+                        let mut values = serde_json::Map::new();
+                        while let Some((k, Unique(v))) = map.next_entry::<String, Unique>()? {
+                            if values.insert(k, v).is_some() {
+                                return Err(serde::de::Error::custom("duplicate"));
+                            }
+                        }
+                        Ok(Unique(Value::Object(values)))
+                    }
+                }
+                d.deserialize_any(Visitor)
+            }
+        }
+        fn strict<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
+            let Unique(v) = serde_json::from_slice(bytes).map_err(|_| "PROFILE_JSON")?;
+            serde_json::from_value(v).map_err(|_| "PROFILE_SHAPE".into())
+        }
+
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        struct Binding {
+            task_id: String,
+            attempt_count: u64,
+            attempt_rows_sha256: String,
+        }
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        struct Marker {
+            schema_version: u32,
+            profile: String,
+            purpose: String,
+            run_id: String,
+            database_sha256: String,
+            export_sha256: String,
+            native_candidate_sha256: String,
+            infra_candidate_sha256: String,
+            export_task_ids: Vec<String>,
+            retained_tasks: Vec<Binding>,
+        }
+        impl Marker {
+            fn ids(&self) -> BTreeSet<String> {
+                self.retained_tasks
+                    .iter()
+                    .map(|b| b.task_id.clone())
+                    .collect()
+            }
+            fn validate(&self) -> Result<(), String> {
+                need(
+                    self.schema_version == 2
+                        && self.profile == PROFILE
+                        && self.purpose == "exclusive-native-copy",
+                    "PROFILE_MARKER",
+                )?;
+                need(
+                    (8..=128).contains(&self.run_id.len())
+                        && self
+                            .run_id
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')),
+                    "PROFILE_RUN",
+                )?;
+                need(
+                    [
+                        &self.database_sha256,
+                        &self.export_sha256,
+                        &self.native_candidate_sha256,
+                        &self.infra_candidate_sha256,
+                    ]
+                    .iter()
+                    .all(|s| digest_shape(s)),
+                    "PROFILE_HASH",
+                )?;
+                need(
+                    !self.export_task_ids.is_empty()
+                        && self.export_task_ids.len() <= 10000
+                        && self
+                            .export_task_ids
+                            .iter()
+                            .all(|id| !id.is_empty() && id.len() <= 128)
+                        && self.export_task_ids.iter().collect::<BTreeSet<_>>().len()
+                            == self.export_task_ids.len(),
+                    "PROFILE_IDS",
+                )?;
+                need(
+                    !self.retained_tasks.is_empty()
+                        && self.retained_tasks.len() <= 10000
+                        && self
+                            .retained_tasks
+                            .windows(2)
+                            .all(|w| w[0].task_id < w[1].task_id),
+                    "PROFILE_RETAINED_ORDER",
+                )?;
+                for b in &self.retained_tasks {
+                    need(
+                        self.export_task_ids.contains(&b.task_id)
+                            && b.attempt_count > 0
+                            && digest_shape(&b.attempt_rows_sha256),
+                        "PROFILE_BINDING",
+                    )?;
+                }
+                Ok(())
+            }
+        }
+
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        struct Row {
+            rowid: i64,
+            values: Vec<Value>,
+        }
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        struct Table {
+            columns: Vec<Vec<Value>>,
+            rows: Vec<Row>,
+        }
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        struct Image {
+            master: Vec<Vec<Value>>,
+            tables: BTreeMap<String, Table>,
+        }
+        fn cell(v: rusqlite::types::Value) -> Value {
+            use rusqlite::types::Value as V;
+            match v {
+                V::Null => json!(["null", null]),
+                V::Integer(n) => json!(["integer", n]),
+                V::Real(n) => json!(["real", format!("{:016x}", n.to_bits())]),
+                V::Text(s) => json!(["text", s]),
+                V::Blob(b) => json!([
+                    "blob",
+                    b.iter().map(|n| format!("{n:02x}")).collect::<String>()
+                ]),
+            }
+        }
+        fn sql_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<Value>>, String> {
+            let mut statement = conn.prepare(sql).map_err(|_| "PROFILE_SNAPSHOT")?;
+            let count = statement.column_count();
+            statement
+                .query_map([], |r| {
+                    (0..count)
+                        .map(|i| r.get(i).map(cell))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .and_then(|r| r.collect::<rusqlite::Result<Vec<_>>>())
+                .map_err(|_| "PROFILE_SNAPSHOT".into())
+        }
+        fn quote(s: &str) -> String {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        }
+        fn text(cell: &Value) -> Result<&str, String> {
+            need(cell[0] == "text", "PROFILE_CELL")?;
+            cell[1].as_str().ok_or("PROFILE_CELL".into())
+        }
+        fn number(cell: &Value) -> Result<i64, String> {
+            need(cell[0] == "integer", "PROFILE_CELL")?;
+            cell[1].as_i64().ok_or("PROFILE_CELL".into())
+        }
+        fn image(conn: &rusqlite::Connection) -> Result<Image, String> {
+            let master = sql_rows(
+                conn,
+                "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
+            )?;
+            let mut tables = BTreeMap::new();
+            for entry in &master {
+                if text(&entry[0])? != "table" {
+                    continue;
+                }
+                let name = text(&entry[1])?;
+                let columns = sql_rows(conn, &format!("PRAGMA table_info({})", quote(name)))?;
+                let raw = sql_rows(
+                    conn,
+                    &format!("SELECT rowid,* FROM {} ORDER BY rowid", quote(name)),
+                )?;
+                need(raw.len() <= 100000, "PROFILE_ROWS")?;
+                let rows = raw
+                    .into_iter()
+                    .map(|mut r| {
+                        let id = number(&r.remove(0))?;
+                        Ok(Row {
+                            rowid: id,
+                            values: r,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                tables.insert(name.into(), Table { columns, rows });
+            }
+            Ok(Image { master, tables })
+        }
+        fn schema(i: &Image) -> Result<String, String> {
+            hash(&(
+                &i.master,
+                i.tables
+                    .iter()
+                    .map(|(n, t)| (n, &t.columns))
+                    .collect::<BTreeMap<_, _>>(),
+            ))
+        }
+        fn known_schema(i: &Image) -> Result<(), String> {
+            let mut fresh = V2Store::open_in_memory().map_err(|_| "PROFILE_SCHEMA")?;
+            need(
+                schema(i)? == schema(&image(fresh.connection_mut())?)?,
+                "PROFILE_SCHEMA",
+            )
+        }
+        fn column(t: &Table, name: &str) -> Result<usize, String> {
+            t.columns
+                .iter()
+                .position(|r| r.get(1).is_some_and(|c| text(c).ok() == Some(name)))
+                .ok_or("PROFILE_COLUMN".into())
+        }
+        fn field<'a>(t: &Table, r: &'a Row, name: &str) -> Result<&'a Value, String> {
+            r.values
+                .get(column(t, name)?)
+                .ok_or("PROFILE_COLUMN".into())
+        }
+        fn task_row<'a>(i: &'a Image, id: &str) -> Result<&'a Row, String> {
+            let t = i.tables.get("tasks").ok_or("PROFILE_TABLE")?;
+            let col = column(t, "task_id")?;
+            let rows = t
+                .rows
+                .iter()
+                .filter(|r| text(&r.values[col]).ok() == Some(id))
+                .collect::<Vec<_>>();
+            need(rows.len() == 1, "PROFILE_INVENTORY")?;
+            Ok(rows[0])
+        }
+        fn selected(i: &Image, table: &str, id: &str) -> Result<Table, String> {
+            let t = i.tables.get(table).ok_or("PROFILE_TABLE")?;
+            let col = column(t, "task_id")?;
+            Ok(Table {
+                columns: t.columns.clone(),
+                rows: t
+                    .rows
+                    .iter()
+                    .filter(|r| text(&r.values[col]).ok() == Some(id))
+                    .cloned()
+                    .collect(),
+            })
+        }
+        fn history(i: &Image, id: &str) -> Result<String, String> {
+            hash(
+                &HISTORY
+                    .iter()
+                    .map(|name| Ok((*name, selected(i, name, id)?)))
+                    .collect::<Result<BTreeMap<_, _>, String>>()?,
+            )
+        }
+        fn task_hash(i: &Image, id: &str) -> Result<String, String> {
+            hash(&(&i.tables["tasks"].columns, task_row(i, id)?))
+        }
+
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        struct Decoder {
+            phase_seq: u32,
+            export_sha256: String,
+            records_sha256: String,
+            provenance_sha256: String,
+            profile_witness_sha256: String,
+            started_epoch: i64,
+            ended_epoch: i64,
+        }
+        struct Witness {
+            decoder: Decoder,
+            actual: ActualDecodeTimeWitness,
+        }
+        impl Witness {
+            fn new(seq: u32, export: &str) -> Result<Self, String> {
+                need(matches!(seq, 1 | 2), "PROFILE_PHASE")?;
+                let actual = actual_decode(export)?;
+                let decoder = Decoder {
+                    phase_seq: seq,
+                    export_sha256: actual.export_hash.clone(),
+                    records_sha256: actual.records_hash.clone(),
+                    provenance_sha256: actual.provenance_hash.clone(),
+                    profile_witness_sha256: hash(&(PROFILE, seq, &actual.provenance_hash))?,
+                    started_epoch: actual.start,
+                    ended_epoch: actual.end,
+                };
+                Ok(Self { decoder, actual })
+            }
+            fn verify(&self, seq: u32, export: &str) -> Result<(), String> {
+                self.actual.verify(export, now_epoch())?;
+                need(
+                    self.decoder.phase_seq == seq
+                        && self.decoder.export_sha256 == self.actual.export_hash
+                        && self.decoder.records_sha256 == self.actual.records_hash
+                        && self.decoder.provenance_sha256 == self.actual.provenance_hash
+                        && self.decoder.started_epoch == self.actual.start
+                        && self.decoder.ended_epoch == self.actual.end
+                        && self.decoder.profile_witness_sha256
+                            == hash(&(PROFILE, seq, &self.actual.provenance_hash))?,
+                    "PROFILE_DECODER",
+                )
+            }
+        }
+
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        struct Identity {
+            native_candidate_sha256: String,
+            infra_candidate_sha256: String,
+            harness_binary_sha256: String,
+            database_input_sha256: String,
+            export_input_sha256: String,
+            marker_input_sha256: String,
+        }
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        struct Schema {
+            before_sha256: String,
+            after_sha256: String,
+        }
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        struct Phase {
+            name: String,
+            started_epoch: i64,
+            ended_epoch: i64,
+            before_schema_sha256: String,
+            after_schema_sha256: String,
+            before_image_sha256: String,
+            after_image_sha256: String,
+            decoder: Option<Decoder>,
+        }
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        struct Receipt {
+            phase_seq: u32,
+            task_id: String,
+            old_status: String,
+            canonical_status: String,
+            accepted_status: String,
+            before_row_sha256: String,
+            canonical_record_sha256: String,
+            after_row_sha256: String,
+            before_history_sha256: String,
+            after_history_sha256: String,
+            changed_columns: Vec<String>,
+        }
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        struct Checks {
+            raw_inventory_and_history_compared: bool,
+            only_reviewed_differences: bool,
+            input_identity_rechecked: bool,
+            system_driver_executions: u64,
+        }
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        struct ResultRecord {
+            schema_version: u32,
+            profile: String,
+            run_id: String,
+            status: String,
+            failure_class: String,
+            identity: Identity,
+            schema: Schema,
+            phases: Vec<Phase>,
+            retained_receipts: Vec<Receipt>,
+            delivery_poll: BTreeMap<String, u64>,
+            forbidden_intents: BTreeMap<String, u64>,
+            effects: BTreeMap<String, u64>,
+            checks: Checks,
+            positive_controls: BTreeMap<String, bool>,
+        }
+
+        fn zero(keys: &[&str]) -> BTreeMap<String, u64> {
+            keys.iter().map(|s| ((*s).into(), 0)).collect()
+        }
+        fn exact_keys<V>(map: &BTreeMap<String, V>, keys: &[&str]) -> bool {
+            map.keys().map(String::as_str).collect::<BTreeSet<_>>()
+                == keys.iter().copied().collect()
+        }
+        fn initial(
+            m: &Marker,
+            marker_hash: &str,
+            binary: &str,
+            i: &Image,
+        ) -> Result<ResultRecord, String> {
+            Ok(ResultRecord {
+                schema_version: 2,
+                profile: PROFILE.into(),
+                run_id: m.run_id.clone(),
+                status: "REFUSED".into(),
+                failure_class: "INCOMPLETE".into(),
+                identity: Identity {
+                    native_candidate_sha256: m.native_candidate_sha256.clone(),
+                    infra_candidate_sha256: m.infra_candidate_sha256.clone(),
+                    harness_binary_sha256: binary.into(),
+                    database_input_sha256: m.database_sha256.clone(),
+                    export_input_sha256: m.export_sha256.clone(),
+                    marker_input_sha256: marker_hash.into(),
+                },
+                schema: Schema {
+                    before_sha256: schema(i)?,
+                    after_sha256: schema(i)?,
+                },
+                phases: vec![],
+                retained_receipts: vec![],
+                delivery_poll: zero(&POLL),
+                forbidden_intents: zero(&FORBIDDEN),
+                effects: zero(&EFFECTS),
+                checks: Checks {
+                    raw_inventory_and_history_compared: false,
+                    only_reviewed_differences: false,
+                    input_identity_rechecked: false,
+                    system_driver_executions: 0,
+                },
+                positive_controls: CONTROLS.iter().map(|s| ((*s).into(), false)).collect(),
+            })
+        }
+
+        #[derive(Clone, Default)]
+        struct Counters {
+            poll: BTreeMap<String, u64>,
+            forbidden: BTreeMap<String, u64>,
+        }
+        fn snapshot_counters(c: &Coordinator) -> Result<Counters, String> {
+            let p = c.submission_probe.as_ref().ok_or("BARRIER_ABSENT")?;
+            let n = |key| p.get(key).copied().unwrap_or(0) as u64;
+            let progress = c.rehearsal_poll_progress.as_ref();
+            let executed = progress
+                .map(|p| p[0].load(Ordering::Relaxed) as u64)
+                .unwrap_or(0);
+            let completed = progress
+                .map(|p| p[1].load(Ordering::Relaxed) as u64)
+                .unwrap_or(0);
+            let (reads, mutations) = if let Some(d) = &c.rehearsal_delivery {
+                let d = d.lock().map_err(|_| "FAKE_UNAVAILABLE")?;
+                (d.reads as u64, d.mutations as u64)
+            } else {
+                (0, 0)
+            };
+            let mut poll = BTreeMap::new();
+            poll.insert("attempted".into(), n("delivery-poll"));
+            poll.insert("executed".into(), executed);
+            poll.insert("completed".into(), completed);
+            poll.insert("fake_reads".into(), reads);
+            poll.insert("fake_mutation_attempts".into(), mutations);
+            let mut forbidden = BTreeMap::new();
+            forbidden.insert("stage_launch".into(), n("worker"));
+            forbidden.insert("preparation_apply".into(), n("preparation") + n("pipeline"));
+            forbidden.insert("lifecycle_mutation".into(), n("publication"));
+            forbidden.insert("deploy".into(), n("deploy"));
+            forbidden.insert("publication".into(), n("publication"));
+            forbidden.insert("pr_merge".into(), n("merge"));
+            forbidden.insert("delivery_apply".into(), n("delivery"));
+            forbidden.insert(
+                "other".into(),
+                n("other") + n("inspection") + n("unit-mutation") + n("control"),
+            );
+            Ok(Counters { poll, forbidden })
+        }
+        fn accumulate_delta(
+            before: &Counters,
+            after: &Counters,
+            result: &mut ResultRecord,
+        ) -> Result<(), String> {
+            for k in POLL {
+                let delta = after.poll[k]
+                    .checked_sub(before.poll[k])
+                    .ok_or("COUNTER_UNDERFLOW")?;
+                *result.delivery_poll.get_mut(k).ok_or("RESULT_SCHEMA")? += delta;
+            }
+            for k in FORBIDDEN {
+                let delta = after.forbidden[k]
+                    .checked_sub(before.forbidden[k])
+                    .ok_or("COUNTER_UNDERFLOW")?;
+                *result.forbidden_intents.get_mut(k).ok_or("RESULT_SCHEMA")? += delta;
+            }
+            Ok(())
+        }
+        fn record_image_effects(before: &Image, after: &Image, result: &mut ResultRecord) {
+            for table in before
+                .tables
+                .keys()
+                .chain(after.tables.keys())
+                .collect::<BTreeSet<_>>()
+            {
+                if before.tables.get(table) == after.tables.get(table) {
+                    continue;
+                }
+                let key = match table.as_str() {
+                    "tasks" => "unexpected_task_changes",
+                    "stage_attempts" => "attempts",
+                    "path_locks" => "locks",
+                    "pending_decisions" => "decisions",
+                    "lifecycle_ops" => "lifecycle",
+                    "merge_queue" => "queue",
+                    "post_merge_deliveries" => "delivery",
+                    _ => "other",
+                };
+                if let Some(v) = result.effects.get_mut(key) {
+                    *v += 1;
+                }
+                if table == "tasks" {
+                    if let Some(v) = result.effects.get_mut("retries_or_failures") {
+                        *v += 1;
+                    }
+                }
+            }
+        }
+
+        fn validate_retained_domain(
+            initial: &Image,
+            marker: &Marker,
+            old_tasks: &[TaskRecord],
+            incoming_records: &[TaskRecord],
+        ) -> Result<(), String> {
+            let export_ids: Vec<&str> = incoming_records
+                .iter()
+                .map(|r| r.task_id.as_str())
+                .collect();
+            let marker_ids: Vec<&str> = marker.export_task_ids.iter().map(String::as_str).collect();
+            need(export_ids == marker_ids, "PROFILE_EXPORT_ORDER")?;
+            let meta = initial.tables.get("daemon_meta").ok_or("PROFILE_TABLE")?;
+            let meta_key_col = column(meta, "key")?;
+            need(
+                meta.rows
+                    .iter()
+                    .filter(|r| text(&r.values[meta_key_col]).ok() == Some("last_sync_epoch"))
+                    .count()
+                    == 1,
+                "PROFILE_META_LAST_SYNC",
+            )?;
+            let attempts_tbl = initial
+                .tables
+                .get("stage_attempts")
+                .ok_or("PROFILE_TABLE")?;
+            let decisions_tbl = initial
+                .tables
+                .get("pending_decisions")
+                .ok_or("PROFILE_TABLE")?;
+            for b in &marker.retained_tasks {
+                let old = old_tasks
+                    .iter()
+                    .find(|t| t.task_id == b.task_id)
+                    .ok_or("PROFILE_INVENTORY")?;
+                let incoming = incoming_records
+                    .iter()
+                    .find(|t| t.task_id == b.task_id)
+                    .ok_or("PROFILE_INVENTORY")?;
+                need(
+                    old.repository == incoming.repository
+                        && old.github_repo == incoming.github_repo
+                        && old.issue_number == incoming.issue_number
+                        && old.branch == incoming.branch
+                        && old.worktree_path == incoming.worktree_path
+                        && old.branch.as_deref().is_some_and(|s| !s.is_empty())
+                        && old.worktree_path.as_deref().is_some_and(|s| !s.is_empty()),
+                    "PROFILE_IDENTITY",
+                )?;
+                need(
+                    old.executor.as_deref() == Some("zach")
+                        && incoming.executor.as_deref() == Some("zach")
+                        && !old.autonomous_consent
+                        && !incoming.autonomous_consent,
+                    "PROFILE_CONSENT_OR_EXECUTOR",
+                )?;
+                need(
+                    matches!(
+                        (old.status.as_str(), incoming.status.as_str()),
+                        ("Ready", "Ready") | ("Blocked", "Blocked") | ("Ready", "Blocked")
+                    ),
+                    "PROFILE_STATUS_MATRIX",
+                )?;
+                need(
+                    old.current_stage.as_deref() == Some("impl")
+                        && known_weight(&old.weight).is_some()
+                        && old.weight == incoming.weight
+                        && old.context_pack.weight == old.weight
+                        && old.version.checked_add(2).is_some(),
+                    "PROFILE_STAGE_OR_WEIGHT",
+                )?;
+                let mut expected_req = crate::v2::intake::default_required_stages(&old.weight);
+                for s in &old.required_stages {
+                    if !expected_req.contains(s) {
+                        expected_req.push(s.clone());
+                    }
+                }
+                need(
+                    expected_req == old.required_stages
+                        && old.required_stages == incoming.required_stages
+                        && old.stages_completed == incoming.stages_completed
+                        && old.depends_on == incoming.depends_on
+                        && old.context_pack == incoming.context_pack
+                        && old.task_group == incoming.task_group
+                        && old.title == incoming.title
+                        && old.reviewed_sha == incoming.reviewed_sha
+                        && old.plan_base_sha == incoming.plan_base_sha,
+                    "PROFILE_METADATA_DRIFT",
+                )?;
+                need(
+                    old.memory.governance_started
+                        && !old.memory.governance_terminal_observed
+                        && !incoming.memory.governance_terminal_observed
+                        && old.active_attempt_id.is_none()
+                        && old.lease_owner.is_none()
+                        && old.lease_expires_epoch.is_none()
+                        && old.memory.suspended_impl_attempt_id.is_none()
+                        && old.memory.pipeline_checkpoint.is_none()
+                        && old.memory.merge_checkpoint.is_none(),
+                    "PROFILE_ACTIVE_OR_CHECKPOINT",
+                )?;
+                let attempts = selected(initial, "stage_attempts", &b.task_id)?;
+                need(
+                    !attempts.rows.is_empty()
+                        && attempts.rows.len() as u64 == b.attempt_count
+                        && hash(&attempts)? == b.attempt_rows_sha256,
+                    "PROFILE_ATTEMPT_BINDING",
+                )?;
+                for row in &attempts.rows {
+                    let stage = text(field(attempts_tbl, row, "stage")?)?;
+                    let status = text(field(attempts_tbl, row, "status")?)?;
+                    let phase = text(field(attempts_tbl, row, "phase")?)?;
+                    let started = number(field(attempts_tbl, row, "started_epoch")?)?;
+                    let ended = number(field(attempts_tbl, row, "ended_epoch")?)?;
+                    let aid = text(field(attempts_tbl, row, "attempt_id")?)?;
+                    let model = text(field(attempts_tbl, row, "model")?)?;
+                    let effort = text(field(attempts_tbl, row, "effort")?)?;
+                    need(
+                        stage == "impl"
+                            && status == "FAILED"
+                            && phase == "COMPLETE"
+                            && started > 0
+                            && ended > 0
+                            && !aid.is_empty()
+                            && !model.is_empty()
+                            && !effort.is_empty(),
+                        "PROFILE_ATTEMPT_STATE",
+                    )?;
+                }
+                need(
+                    selected(initial, "path_locks", &b.task_id)?.rows.is_empty()
+                        && selected(initial, "merge_queue", &b.task_id)?
+                            .rows
+                            .is_empty(),
+                    "PROFILE_EFFECT_ROWS",
+                )?;
+                let decisions = selected(initial, "pending_decisions", &b.task_id)?;
+                for row in &decisions.rows {
+                    let d_id = text(field(decisions_tbl, row, "decision_id")?)?;
+                    let d_status = text(field(decisions_tbl, row, "status")?)?;
+                    match d_status {
+                        "OPEN" => {}
+                        "RESOLVED" => {
+                            need(
+                                old.memory.applied_decisions.iter().any(|id| id == d_id),
+                                "PROFILE_UNAPPLIED_DECISION",
+                            )?;
+                        }
+                        _ => return Err("PROFILE_DECISION_STATUS".into()),
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn validate_retained_standard(
+            phase_seq: u32,
+            before_img: &Image,
+            after_img: &Image,
+            obs: &StandardObservation,
+            witness: &Witness,
+            export: &str,
+            intake_start: i64,
+            intake_end: i64,
+            retained_ids: &BTreeSet<String>,
+        ) -> Result<Vec<Receipt>, String> {
+            need(schema(before_img)? == schema(after_img)?, "PROFILE_SCHEMA")?;
+            known_schema(before_img)?;
+            witness.verify(phase_seq, export)?;
+            validate_standard_for_profile(obs, &witness.actual, export, Some(retained_ids))?;
+            // Require canonical deterministic JSON serialization for retained rows before intake.
+            let old_retained: Vec<TaskRecord> = obs
+                .old
+                .iter()
+                .filter(|t| retained_ids.contains(&t.task_id))
+                .cloned()
+                .collect();
+            let before_tasks_tbl = before_img.tables.get("tasks").ok_or("PROFILE_TABLE")?;
+            let after_tasks_tbl = after_img.tables.get("tasks").ok_or("PROFILE_TABLE")?;
+            let id_col = column(before_tasks_tbl, "task_id")?;
+            let retained_before_rows: Vec<Vec<rusqlite::types::Value>> = obs
+                .before
+                .get("tasks")
+                .ok_or("PROFILE_TABLE")?
+                .iter()
+                .filter(
+                    |r| match &r[obs.columns.iter().position(|c| c == "task_id").unwrap()] {
+                        rusqlite::types::Value::Text(id) => retained_ids.contains(id),
+                        _ => false,
+                    },
+                )
+                .cloned()
+                .collect();
+            let mut retained_db_img = DatabaseImage::new();
+            retained_db_img.insert("tasks".into(), retained_before_rows);
+            bind_task_rows(&retained_db_img, &obs.columns, &old_retained, true)?;
+
+            // Every table other than tasks, task_events, sqlite_sequence, daemon_meta must be identical (rows + rowids).
+            need(
+                before_img.tables.keys().eq(after_img.tables.keys()),
+                "PROFILE_TABLES",
+            )?;
+            for (name, b_tbl) in &before_img.tables {
+                let a_tbl = after_img.tables.get(name).ok_or("PROFILE_TABLE")?;
+                need(b_tbl.columns == a_tbl.columns, "PROFILE_SCHEMA")?;
+                if matches!(
+                    name.as_str(),
+                    "tasks" | "task_events" | "sqlite_sequence" | "daemon_meta"
+                ) {
+                    continue;
+                }
+                need(b_tbl == a_tbl, "PROFILE_EFFECT_TABLE")?;
+            }
+
+            // daemon_meta: only existing last_sync_epoch row may change, preserving rowid/key, to decimal epoch in [intake_start, intake_end].
+            let b_meta = before_img
+                .tables
+                .get("daemon_meta")
+                .ok_or("PROFILE_TABLE")?;
+            let a_meta = after_img.tables.get("daemon_meta").ok_or("PROFILE_TABLE")?;
+            need(b_meta.rows.len() == a_meta.rows.len(), "PROFILE_META_ROWS")?;
+            let mut saw_last_sync = false;
+            for (br, ar) in b_meta.rows.iter().zip(&a_meta.rows) {
+                need(br.rowid == ar.rowid, "PROFILE_META_ROWID")?;
+                if text(field(b_meta, br, "key")?)? == "last_sync_epoch" {
+                    need(
+                        text(field(a_meta, ar, "key")?)? == "last_sync_epoch",
+                        "PROFILE_META_KEY",
+                    )?;
+                    let val = text(field(a_meta, ar, "value")?)?;
+                    let parsed: i64 = val.parse().map_err(|_| "PROFILE_META_VALUE")?;
+                    need(
+                        parsed.to_string() == val && parsed >= intake_start && parsed <= intake_end,
+                        "PROFILE_META_BOUNDS",
+                    )?;
+                    saw_last_sync = true;
+                } else {
+                    need(br == ar, "PROFILE_META_OTHER")?;
+                }
+            }
+            need(saw_last_sync, "PROFILE_META_LAST_SYNC")?;
+
+            // sqlite_sequence rowid & no-event preservation.
+            let b_ev = before_img
+                .tables
+                .get("task_events")
+                .ok_or("PROFILE_TABLE")?;
+            let a_ev = after_img.tables.get("task_events").ok_or("PROFILE_TABLE")?;
+            let b_seq = before_img
+                .tables
+                .get("sqlite_sequence")
+                .ok_or("PROFILE_TABLE")?;
+            let a_seq = after_img
+                .tables
+                .get("sqlite_sequence")
+                .ok_or("PROFILE_TABLE")?;
+            if b_ev.rows == a_ev.rows {
+                need(b_seq == a_seq, "PROFILE_ALLOCATOR")?;
+            }
+            for (br, ar) in b_seq.rows.iter().zip(&a_seq.rows) {
+                need(br.rowid == ar.rowid, "PROFILE_ALLOCATOR_ROWID")?;
+            }
+
+            // tasks rowid preservation + exact retained allowlist & receipt generation.
+            need(
+                before_tasks_tbl.rows.len() == after_tasks_tbl.rows.len(),
+                "PROFILE_TASK_COUNT",
+            )?;
+            for (br, ar) in before_tasks_tbl.rows.iter().zip(&after_tasks_tbl.rows) {
+                need(br.rowid == ar.rowid, "PROFILE_TASK_ROWID")?;
+                let b_id = text(&br.values[id_col])?;
+                let a_id = text(&ar.values[id_col])?;
+                need(b_id == a_id, "PROFILE_TASK_ROWID_ORDER")?;
+            }
+
+            let mut receipts = Vec::new();
+            let mut sorted_ids: Vec<&String> = retained_ids.iter().collect();
+            sorted_ids.sort();
+            for id in sorted_ids {
+                let old = obs
+                    .old
+                    .iter()
+                    .find(|t| &t.task_id == id)
+                    .ok_or("PROFILE_INVENTORY")?;
+                let incoming = witness
+                    .actual
+                    .records
+                    .iter()
+                    .find(|t| &t.task_id == id)
+                    .ok_or("PROFILE_INVENTORY")?;
+                let accepted = obs
+                    .accepted
+                    .iter()
+                    .find(|t| &t.task_id == id)
+                    .ok_or("PROFILE_INVENTORY")?;
+                need(
+                    profile_status_matches(old, incoming, Some(retained_ids))
+                        && accepted.status == old.status
+                        && old.version.checked_add(1) == Some(accepted.version)
+                        && accepted.updated_epoch == incoming.updated_epoch
+                        && accepted.updated_epoch > 0
+                        && accepted.updated_epoch >= witness.decoder.started_epoch
+                        && accepted.updated_epoch <= witness.decoder.ended_epoch
+                        && old.memory == accepted.memory
+                        && old.task_group == incoming.task_group
+                        && old.title == incoming.title
+                        && old.repository == incoming.repository
+                        && old.github_repo == incoming.github_repo
+                        && old.issue_number == incoming.issue_number
+                        && old.weight == incoming.weight
+                        && old.branch == incoming.branch
+                        && old.worktree_path == incoming.worktree_path
+                        && old.context_pack == incoming.context_pack
+                        && old.depends_on == incoming.depends_on
+                        && old.required_stages == incoming.required_stages
+                        && old.stages_completed == incoming.stages_completed
+                        && old.reviewed_sha == incoming.reviewed_sha
+                        && old.plan_base_sha == incoming.plan_base_sha
+                        && old.executor == incoming.executor,
+                    "PROFILE_RETAINED_INVARIANT",
+                )?;
+                let br = task_row(before_img, id)?;
+                let ar = task_row(after_img, id)?;
+                let mut changed_columns = Vec::new();
+                for ((col_meta, bv), av) in before_tasks_tbl
+                    .columns
+                    .iter()
+                    .zip(&br.values)
+                    .zip(&ar.values)
+                {
+                    if bv != av {
+                        let cname = text(&col_meta[1])?;
+                        need(
+                            matches!(cname, "version" | "updated_epoch"),
+                            "PROFILE_DISALLOWED_COLUMN",
+                        )?;
+                        changed_columns.push(cname.to_string());
+                    }
+                }
+                need(
+                    changed_columns.iter().any(|c| c == "version"),
+                    "PROFILE_VERSION_UNCHANGED",
+                )?;
+                let bh = history(before_img, id)?;
+                let ah = history(after_img, id)?;
+                need(bh == ah, "PROFILE_HISTORY_CHANGED")?;
+                receipts.push(Receipt {
+                    phase_seq,
+                    task_id: id.clone(),
+                    old_status: old.status.clone(),
+                    canonical_status: incoming.status.clone(),
+                    accepted_status: accepted.status.clone(),
+                    before_row_sha256: task_hash(before_img, id)?,
+                    canonical_record_sha256: hash(&incoming)?,
+                    after_row_sha256: task_hash(after_img, id)?,
+                    before_history_sha256: bh,
+                    after_history_sha256: ah,
+                    changed_columns,
+                });
+            }
+            Ok(receipts)
+        }
+
+        fn run_phase_noop<F>(
+            name: &str,
+            c: &mut Coordinator,
+            result: &mut ResultRecord,
+            expected_schema: &str,
+            op: F,
+        ) -> Result<(), String>
+        where
+            F: FnOnce(&mut Coordinator) -> Result<(), String>,
+        {
+            let before_img = image(c.store.connection_mut())?;
+            let before_schema = schema(&before_img)?;
+            need(before_schema == expected_schema, "PROFILE_SCHEMA")?;
+            let before_c = snapshot_counters(c)?;
+            let started = now_epoch();
+            let res = op(c);
+            let ended = now_epoch();
+            let after_c = snapshot_counters(c)?;
+            accumulate_delta(&before_c, &after_c, result)?;
+            let after_img = image(c.store.connection_mut())?;
+            let after_schema = schema(&after_img)?;
+            record_image_effects(&before_img, &after_img, result);
+            result.phases.push(Phase {
+                name: name.into(),
+                started_epoch: started,
+                ended_epoch: ended.max(started),
+                before_schema_sha256: before_schema.clone(),
+                after_schema_sha256: after_schema.clone(),
+                before_image_sha256: hash(&before_img)?,
+                after_image_sha256: hash(&after_img)?,
+                decoder: None,
+            });
+            res?;
+            need(before_schema == after_schema, "PROFILE_SCHEMA")?;
+            need(before_img == after_img, "PROFILE_NOOP_EFFECT")?;
+            Ok(())
+        }
+
+        fn run_standard_phase(
+            name: &str,
+            phase_seq: u32,
+            c: &mut Coordinator,
+            export: &str,
+            retained_ids: &BTreeSet<String>,
+            expected_schema: &str,
+            result: &mut ResultRecord,
+        ) -> Result<(), String> {
+            let before_img = image(c.store.connection_mut())?;
+            let before_schema = schema(&before_img)?;
+            need(before_schema == expected_schema, "PROFILE_SCHEMA")?;
+            let before_c = snapshot_counters(c)?;
+            let started = now_epoch();
+            let witness = Witness::new(phase_seq, export)?;
+            let intake_start = now_epoch();
+            let obs = observe_standard_for_profile(c, &witness.actual, export, Some(retained_ids))?;
+            let intake_end = now_epoch();
+            let ended = now_epoch();
+            let after_c = snapshot_counters(c)?;
+            accumulate_delta(&before_c, &after_c, result)?;
+            let after_img = image(c.store.connection_mut())?;
+            let after_schema = schema(&after_img)?;
+            let receipts = validate_retained_standard(
+                phase_seq,
+                &before_img,
+                &after_img,
+                &obs,
+                &witness,
+                export,
+                intake_start,
+                intake_end,
+                retained_ids,
+            )?;
+            result.phases.push(Phase {
+                name: name.into(),
+                started_epoch: started,
+                ended_epoch: ended.max(started),
+                before_schema_sha256: before_schema,
+                after_schema_sha256: after_schema,
+                before_image_sha256: hash(&before_img)?,
+                after_image_sha256: hash(&after_img)?,
+                decoder: Some(witness.decoder),
+            });
+            result.retained_receipts.extend(receipts);
+            Ok(())
+        }
+
+        fn verify_result_invariants(r: &ResultRecord, m: &Marker) -> Result<(), String> {
+            need(
+                r.schema_version == 2
+                    && r.profile == PROFILE
+                    && r.run_id == m.run_id
+                    && r.status == "PASS"
+                    && r.failure_class == "NONE",
+                "RESULT_INVARIANT",
+            )?;
+            need(
+                r.schema.before_sha256 == r.schema.after_sha256
+                    && digest_shape(&r.schema.before_sha256),
+                "RESULT_SCHEMA_HASH",
+            )?;
+            need(
+                r.phases.iter().map(|p| p.name.as_str()).collect::<Vec<_>>() == PHASES,
+                "RESULT_PHASES",
+            )?;
+            for (idx, p) in r.phases.iter().enumerate() {
+                need(
+                    p.started_epoch > 0
+                        && p.ended_epoch >= p.started_epoch
+                        && p.before_schema_sha256 == r.schema.before_sha256
+                        && p.after_schema_sha256 == r.schema.before_sha256,
+                    "RESULT_PHASE_INVARIANT",
+                )?;
+                if idx > 0 {
+                    need(
+                        p.started_epoch >= r.phases[idx - 1].ended_epoch,
+                        "RESULT_PHASE_ORDER",
+                    )?;
+                }
+                match p.name.as_str() {
+                    "standard_1" => {
+                        let d = p.decoder.as_ref().ok_or("RESULT_DECODER")?;
+                        need(
+                            d.phase_seq == 1
+                                && d.started_epoch >= p.started_epoch
+                                && d.ended_epoch <= p.ended_epoch,
+                            "RESULT_DECODER",
+                        )?;
+                    }
+                    "standard_2" => {
+                        let d = p.decoder.as_ref().ok_or("RESULT_DECODER")?;
+                        need(
+                            d.phase_seq == 2
+                                && d.started_epoch >= p.started_epoch
+                                && d.ended_epoch <= p.ended_epoch,
+                            "RESULT_DECODER",
+                        )?;
+                    }
+                    _ => need(p.decoder.is_none(), "RESULT_DECODER")?,
+                }
+            }
+            let expected_receipts = m.retained_tasks.len() * 2;
+            need(
+                r.retained_receipts.len() == expected_receipts,
+                "RESULT_RECEIPTS",
+            )?;
+            let mut sorted_ids: Vec<String> =
+                m.retained_tasks.iter().map(|b| b.task_id.clone()).collect();
+            sorted_ids.sort();
+            for (seq, chunk) in [1u32, 2u32]
+                .into_iter()
+                .zip(r.retained_receipts.chunks_exact(sorted_ids.len()))
+            {
+                for (rcpt, expected_id) in chunk.iter().zip(&sorted_ids) {
+                    need(
+                        rcpt.phase_seq == seq
+                            && &rcpt.task_id == expected_id
+                            && rcpt.before_history_sha256 == rcpt.after_history_sha256
+                            && rcpt
+                                .changed_columns
+                                .iter()
+                                .all(|c| matches!(c.as_str(), "version" | "updated_epoch")),
+                        "RESULT_RECEIPT_INVARIANT",
+                    )?;
+                }
+            }
+            need(
+                exact_keys(&r.delivery_poll, &POLL)
+                    && exact_keys(&r.forbidden_intents, &FORBIDDEN)
+                    && exact_keys(&r.effects, &EFFECTS)
+                    && exact_keys(&r.positive_controls, &CONTROLS)
+                    && r.forbidden_intents.values().all(|v| *v == 0)
+                    && r.effects.values().all(|v| *v == 0)
+                    && r.delivery_poll["attempted"] == r.delivery_poll["executed"]
+                    && r.delivery_poll["executed"] == r.delivery_poll["completed"]
+                    && r.delivery_poll["fake_mutation_attempts"] == 0
+                    && r.checks.raw_inventory_and_history_compared
+                    && r.checks.only_reviewed_differences
+                    && r.checks.input_identity_rechecked
+                    && r.checks.system_driver_executions == 0
+                    && r.positive_controls.values().all(|v| *v),
+                "RESULT_INVARIANT",
+            )?;
+            Ok(())
+        }
+
+        fn execute_rehearsal(
+            dir: &Path,
+            db_path: &Path,
+            export_bytes: &[u8],
+            marker: &Marker,
+            marker_hash: &str,
+            binary_hash: &str,
+        ) -> Result<ResultRecord, String> {
+            let export = std::str::from_utf8(export_bytes).map_err(|_| "EXPORT_SCHEMA")?;
+            let _: Value = strict(export_bytes)?;
+            let probe_witness = actual_decode(export)?;
+            let check = rusqlite::Connection::open_with_flags(
+                db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .map_err(|_| "DATABASE_OPEN")?;
+            let version: String = check
+                .query_row(
+                    "SELECT value FROM daemon_meta WHERE key='schema_version'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|_| "DATABASE_SCHEMA")?;
+            need(version == "4", "DATABASE_SCHEMA")?;
+            let initial_img = image(&check)?;
+            drop(check);
+            known_schema(&initial_img)?;
+            let expected_schema = schema(&initial_img)?;
+            let mut result = initial(marker, marker_hash, binary_hash, &initial_img)?;
+            let retained_ids = marker.ids();
+
+            let store = V2Store::open(db_path).map_err(|_| "DATABASE_OPEN")?;
+            let old_tasks = store.list_tasks(None).map_err(|_| "DATABASE_READ")?;
+            validate_retained_domain(&initial_img, marker, &old_tasks, &probe_witness.records)?;
+
+            let units = Arc::new(RehearsalUnits::default());
+            let ws = Arc::new(RehearsalWs {
+                export: export.to_string(),
+                reads: AtomicUsize::new(0),
+                mutations: AtomicUsize::new(0),
+            });
+
+            let make_coord = |s: V2Store| -> Coordinator {
+                let (mut c, _h) = Coordinator::create(s, dir.to_path_buf());
+                c.controller = units.clone();
+                c.ws = ws.clone();
+                c.submission_probe = Some(BTreeMap::new());
+                c
+            };
+
+            let mut c1 = make_coord(store);
+            need(
+                image(c1.store.connection_mut())? == initial_img,
+                "DATABASE_OPEN_EFFECT",
+            )?;
+            run_phase_noop(
+                "startup_1",
+                &mut c1,
+                &mut result,
+                &expected_schema,
+                rehearsal_startup,
+            )?;
+            run_phase_noop("pass_1", &mut c1, &mut result, &expected_schema, |c| {
+                rehearsal_pass(c, &mut RehearsalDelivery::default())
+            })?;
+            let exact = c1
+                .ws
+                .execute(&["export".into(), "--sync".into(), "--json".into()])
+                .map_err(|_| "EXPORT_FAKE")?;
+            need(exact.as_bytes() == export_bytes, "EXPORT_BINDING")?;
+            run_standard_phase(
+                "standard_1",
+                1,
+                &mut c1,
+                &exact,
+                &retained_ids,
+                &expected_schema,
+                &mut result,
+            )?;
+            run_phase_noop("pass_2", &mut c1, &mut result, &expected_schema, |c| {
+                rehearsal_pass(c, &mut RehearsalDelivery::default())
+            })?;
+            need(
+                c1.jobs.is_empty()
+                    && units.mutations.load(Ordering::Relaxed) == 0
+                    && ws.mutations.load(Ordering::Relaxed) == 0,
+                "FAKE_MUTATION",
+            )?;
+            drop(c1);
+
+            let mut c2 = make_coord(V2Store::open(db_path).map_err(|_| "DATABASE_REOPEN")?);
+            run_phase_noop(
+                "startup_2",
+                &mut c2,
+                &mut result,
+                &expected_schema,
+                rehearsal_startup,
+            )?;
+            run_phase_noop("pass_3", &mut c2, &mut result, &expected_schema, |c| {
+                rehearsal_pass(c, &mut RehearsalDelivery::default())
+            })?;
+            let exact2 = c2
+                .ws
+                .execute(&["export".into(), "--sync".into(), "--json".into()])
+                .map_err(|_| "EXPORT_FAKE")?;
+            need(exact2.as_bytes() == export_bytes, "EXPORT_BINDING")?;
+            run_standard_phase(
+                "standard_2",
+                2,
+                &mut c2,
+                &exact2,
+                &retained_ids,
+                &expected_schema,
+                &mut result,
+            )?;
+            run_phase_noop("pass_4", &mut c2, &mut result, &expected_schema, |c| {
+                rehearsal_pass(c, &mut RehearsalDelivery::default())
+            })?;
+            need(
+                c2.jobs.is_empty()
+                    && units.mutations.load(Ordering::Relaxed) == 0
+                    && ws.mutations.load(Ordering::Relaxed) == 0,
+                "FAKE_MUTATION",
+            )?;
+            drop(c2);
+
+            let mut c3 = make_coord(V2Store::open(db_path).map_err(|_| "DATABASE_REOPEN")?);
+            run_phase_noop(
+                "startup_3",
+                &mut c3,
+                &mut result,
+                &expected_schema,
+                rehearsal_startup,
+            )?;
+            run_phase_noop("pass_5", &mut c3, &mut result, &expected_schema, |c| {
+                rehearsal_pass(c, &mut RehearsalDelivery::default())
+            })?;
+            need(
+                c3.jobs.is_empty()
+                    && units.mutations.load(Ordering::Relaxed) == 0
+                    && ws.mutations.load(Ordering::Relaxed) == 0,
+                "NOT_QUIESCENT",
+            )?;
+            let final_img = image(c3.store.connection_mut())?;
+            result.schema.after_sha256 = schema(&final_img)?;
+            result.checks.raw_inventory_and_history_compared = true;
+            result.checks.only_reviewed_differences = true;
+            Ok(result)
+        }
+
+        pub(super) fn run_private() -> Result<(), String> {
+            use std::os::unix::fs::MetadataExt;
+            let (dir, uid, dir_identity) = rehearsal_directory_for("ZACH_RETAINED_REHEARSAL_DIR")?;
+            let (db, db_id) = rehearsal_file(&dir.join("zach-v2.sqlite3"), uid)?;
+            let (export, export_id) = rehearsal_file(&dir.join("canonical-export.json"), uid)?;
+            let (marker_file, marker_id) = rehearsal_file(&dir.join("copy-only.json"), uid)?;
+            let db_bytes = rehearsal_bytes(db, 256 * 1024 * 1024)?;
+            let db_hash = rehearsal_sha256(&db_bytes);
+            let export_bytes = rehearsal_bytes(export, 16 * 1024 * 1024)?;
+            let marker_bytes = rehearsal_bytes(marker_file, 16 * 1024)?;
+            let marker_hash = rehearsal_sha256(&marker_bytes);
+            let marker: Marker = strict(&marker_bytes)?;
+            marker.validate()?;
+            need(
+                marker.database_sha256 == db_hash
+                    && marker.export_sha256 == rehearsal_sha256(&export_bytes),
+                "INPUT_BINDING",
+            )?;
+            let binary = rehearsal_sha256(&rehearsal_bytes(
+                File::open("/proc/self/exe").map_err(|_| "BINARY_IDENTITY")?,
+                256 * 1024 * 1024,
+            )?);
+
+            // Run positive controls on synthetic in-memory/disposable inputs only.
+            std::panic::catch_unwind(|| {
+                rehearsal_barrier_and_fake_mutations_are_non_vacuous();
+                real_coordinator_positive_controls_detect_jobs_and_direct_database_effects();
+                retained_synthetic_positive_and_negative_controls();
+            })
+            .map_err(|_| "POSITIVE_CONTROL")?;
+
+            need(
+                rehearsal_file(&dir.join("zach-v2.sqlite3"), uid)?.1 == db_id,
+                "IDENTITY_CHANGED",
+            )?;
+            let mut result = execute_rehearsal(
+                &dir,
+                &dir.join("zach-v2.sqlite3"),
+                &export_bytes,
+                &marker,
+                &marker_hash,
+                &binary,
+            )?;
+            for k in CONTROLS {
+                result.positive_controls.insert(k.into(), true);
+            }
+
+            let recheck = (|| -> Result<(), String> {
+                rehearsal_entries(&dir, uid, true)?;
+                let m = std::fs::symlink_metadata(&dir).map_err(|_| "IDENTITY_CHANGED")?;
+                need(
+                    (m.dev(), m.ino()) == dir_identity
+                        && m.uid() == uid
+                        && m.mode() & 0o7777 == 0o700,
+                    "IDENTITY_CHANGED",
+                )?;
+                for (name, id, expected_hash) in [
+                    ("zach-v2.sqlite3", db_id, None),
+                    (
+                        "canonical-export.json",
+                        export_id,
+                        Some(rehearsal_sha256(&export_bytes)),
+                    ),
+                    ("copy-only.json", marker_id, Some(marker_hash.clone())),
+                ] {
+                    let (file, current) = rehearsal_file(&dir.join(name), uid)?;
+                    need(id == current, "IDENTITY_CHANGED")?;
+                    if let Some(h) = expected_hash {
+                        need(
+                            rehearsal_sha256(&rehearsal_bytes(file, 16 * 1024 * 1024)?) == h,
+                            "IDENTITY_CHANGED",
+                        )?;
+                    }
+                }
+                Ok(())
+            })();
+            let mut outcome = Ok(());
+            if recheck.is_ok() {
+                result.checks.input_identity_rechecked = true;
+                result.status = "PASS".into();
+                result.failure_class = "NONE".into();
+                if let Err(e) = verify_result_invariants(&result, &marker) {
+                    result.status = "REFUSED".into();
+                    result.failure_class = e.clone();
+                    outcome = Err(e);
+                }
+            } else if let Err(e) = recheck {
+                result.status = "REFUSED".into();
+                result.failure_class = e.clone();
+                outcome = Err(e);
+            }
+            let out_bytes = serde_json::to_vec(&result).map_err(|_| "RESULT_SCHEMA")?;
+            write_rehearsal_result(&dir, uid, &out_bytes)?;
+            outcome
+        }
+
+        fn retained_fixture(
+            native_status: &str,
+            canonical_status: &str,
+            include_open_decision: bool,
+        ) -> (TestDirectory, PathBuf, Vec<u8>, Marker) {
+            let dir = TestDirectory::new();
+            let db_path = dir.0.join("zach-v2.sqlite3");
+            let mut store = V2Store::open(&db_path).unwrap();
+            let export_json = serde_json::json!({
+                "schema_version": 2,
+                "tasks": [
+                    {
+                        "id": "T-RET-1",
+                        "repository": "repo-a",
+                        "github_repo": "owner/repo-a",
+                        "issue_number": 10,
+                        "task_group": "grp-a",
+                        "title": "Retained revoked task",
+                        "weight": "L",
+                        "status": canonical_status,
+                        "branch": "task/T-RET-1-demo",
+                        "worktree": "/tmp/ws/repo-a--T-RET-1-demo",
+                        "executor": "zach",
+                        "autonomous_consent": false,
+                        "memory": {"governance_started": true, "governance_terminal_observed": false}
+                    },
+                    {
+                        "id": "T-UNL-1",
+                        "repository": "repo-a",
+                        "task_group": "grp-a",
+                        "title": "Unlisted settled task",
+                        "weight": "S",
+                        "status": "Done",
+                        "executor": "external",
+                        "autonomous_consent": false
+                    }
+                ]
+            });
+            let export_bytes = serde_json::to_vec(&export_json).unwrap();
+            let records =
+                intake::decode_export_records(std::str::from_utf8(&export_bytes).unwrap()).unwrap();
+            let mut ret = records[0].clone();
+            ret.status = native_status.into();
+            ret.current_stage = Some("impl".into());
+            ret.retry_count = 3;
+            ret.next_retry_epoch = 123456;
+            ret.memory.governance_started = true;
+            ret.memory.recent_attempts = vec!["failed impl".into()];
+            store.upsert_task(&ret).unwrap();
+            store.upsert_task(&records[1]).unwrap();
+            for i in 1..=3 {
+                store
+                    .connection_mut()
+                    .execute(
+                        "INSERT INTO stage_attempts(attempt_id,task_id,stage,model,effort,started_epoch,ended_epoch,status,phase,last_liveness_epoch,last_output_bytes) VALUES(?1,?2,'impl','gpt-6.1-sol','high',?3,?4,'FAILED','COMPLETE',?4,10)",
+                        rusqlite::params![format!("att-{i}"), "T-RET-1", 100 + i, 200 + i],
+                    )
+                    .unwrap();
+            }
+            if include_open_decision {
+                store
+                    .connection_mut()
+                    .execute(
+                        "INSERT INTO pending_decisions(decision_id,task_id,task_group,kind,question,options_json,context_summary,status,created_seq) VALUES('dec-open-1','T-RET-1','grp-a','plan_approval','Approve?','[\"approve\",\"reject\"]','ctx','OPEN',1)",
+                        [],
+                    )
+                    .unwrap();
+            }
+            store
+                .connection_mut()
+                .execute(
+                    "INSERT OR REPLACE INTO daemon_meta(key,value) VALUES('last_sync_epoch','100')",
+                    [],
+                )
+                .unwrap();
+            let img = image(store.connection_mut()).unwrap();
+            let attempts = selected(&img, "stage_attempts", "T-RET-1").unwrap();
+            let attempt_rows_sha256 = hash(&attempts).unwrap();
+            drop(store);
+            let db_bytes = std::fs::read(&db_path).unwrap();
+            let marker = Marker {
+                schema_version: 2,
+                profile: PROFILE.into(),
+                purpose: "exclusive-native-copy".into(),
+                run_id: "synthetic-run-001".into(),
+                database_sha256: rehearsal_sha256(&db_bytes),
+                export_sha256: rehearsal_sha256(&export_bytes),
+                native_candidate_sha256: "a".repeat(64),
+                infra_candidate_sha256: "b".repeat(64),
+                export_task_ids: vec!["T-RET-1".into(), "T-UNL-1".into()],
+                retained_tasks: vec![Binding {
+                    task_id: "T-RET-1".into(),
+                    attempt_count: 3,
+                    attempt_rows_sha256,
+                }],
+            };
+            (dir, db_path, export_bytes, marker)
+        }
+
+        fn retained_synthetic_positive_and_negative_controls() {
+            // Positive: Ready/Blocked/Ready with 3 FAILED COMPLETE attempts and OPEN decision passes 10 phases.
+            let (dir, db_path, export_bytes, marker) = retained_fixture("Ready", "Blocked", true);
+            let r = execute_rehearsal(
+                &dir.0,
+                &db_path,
+                &export_bytes,
+                &marker,
+                &hash(&marker).unwrap(),
+                &"c".repeat(64),
+            )
+            .unwrap();
+            let mut r = r;
+            r.checks.input_identity_rechecked = true;
+            r.status = "PASS".into();
+            r.failure_class = "NONE".into();
+            for k in CONTROLS {
+                r.positive_controls.insert(k.into(), true);
+            }
+            verify_result_invariants(&r, &marker).unwrap();
+            assert_eq!(r.retained_receipts.len(), 2);
+            assert_eq!(r.retained_receipts[0].old_status, "Ready");
+            assert_eq!(r.retained_receipts[0].canonical_status, "Blocked");
+            assert_eq!(r.retained_receipts[0].accepted_status, "Ready");
+        }
+
+        #[test]
+        fn retained_profile_matrix_and_repeated_standard_pass_while_original_stays_strict() {
+            for (nat, can, open_dec) in [
+                ("Ready", "Ready", false),
+                ("Blocked", "Blocked", false),
+                ("Ready", "Blocked", true),
+            ] {
+                let (dir, db_path, export_bytes, marker) = retained_fixture(nat, can, open_dec);
+                let mut r = execute_rehearsal(
+                    &dir.0,
+                    &db_path,
+                    &export_bytes,
+                    &marker,
+                    &hash(&marker).unwrap(),
+                    &"c".repeat(64),
+                )
+                .unwrap();
+                r.checks.input_identity_rechecked = true;
+                r.status = "PASS".into();
+                r.failure_class = "NONE".into();
+                for k in CONTROLS {
+                    r.positive_controls.insert(k.into(), true);
+                }
+                verify_result_invariants(&r, &marker).unwrap();
+                let store = V2Store::open(&db_path).unwrap();
+                let final_task = store
+                    .list_tasks(None)
+                    .unwrap()
+                    .into_iter()
+                    .find(|t| t.task_id == "T-RET-1")
+                    .unwrap();
+                assert_eq!(final_task.status, nat);
+                assert_eq!(final_task.retry_count, 3);
+                assert_eq!(final_task.version, 3); // 1 + Standard1 + Standard2
+            }
+
+            // Original strict profile must still reject Ready/Blocked mismatch.
+            let (_dir, db_path, export_bytes, _m) = retained_fixture("Ready", "Blocked", false);
+            let export = std::str::from_utf8(&export_bytes).unwrap();
+            let w = actual_decode(export).unwrap();
+            let mut c = coordinator(&db_path.parent().unwrap().to_path_buf());
+            c.store = V2Store::open(&db_path).unwrap();
+            c.controller = Arc::new(RehearsalUnits::default());
+            c.submission_probe = Some(BTreeMap::new());
+            assert_eq!(
+                observe_standard(&mut c, &w, export).err().as_deref(),
+                Some("STANDARD_INVENTORY")
+            );
+        }
+
+        #[test]
+        fn retained_profile_rejects_disallowed_matrix_domain_and_json_duplicates() {
+            // Reversed Blocked/Ready/Blocked refuses.
+            let (dir, db_path, export_bytes, marker) = retained_fixture("Blocked", "Ready", false);
+            assert!(
+                execute_rehearsal(
+                    &dir.0,
+                    &db_path,
+                    &export_bytes,
+                    &marker,
+                    &hash(&marker).unwrap(),
+                    &"c".repeat(64),
+                )
+                .is_err()
+            );
+
+            // Duplicate JSON key in marker refuses.
+            let dup = br#"{"schema_version":2,"schema_version":2,"profile":"retained-revoked-v1"}"#;
+            assert!(strict::<Marker>(dup).is_err());
+
+            // Unapplied resolved decision refuses.
+            let (dir, db_path, export_bytes, marker) = retained_fixture("Ready", "Blocked", true);
+            {
+                let mut store = V2Store::open(&db_path).unwrap();
+                store
+                    .connection_mut()
+                    .execute(
+                        "UPDATE pending_decisions SET status='RESOLVED', choice='approve' WHERE decision_id='dec-open-1'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            assert!(
+                execute_rehearsal(
+                    &dir.0,
+                    &db_path,
+                    &export_bytes,
+                    &marker,
+                    &hash(&marker).unwrap(),
+                    &"c".repeat(64),
+                )
+                .is_err()
+            );
+
+            // PASSED attempt refuses.
+            let (dir, db_path, export_bytes, mut marker) =
+                retained_fixture("Ready", "Blocked", false);
+            {
+                let mut store = V2Store::open(&db_path).unwrap();
+                store
+                    .connection_mut()
+                    .execute(
+                        "UPDATE stage_attempts SET status='PASSED' WHERE attempt_id='att-1'",
+                        [],
+                    )
+                    .unwrap();
+                let img = image(store.connection_mut()).unwrap();
+                marker.retained_tasks[0].attempt_rows_sha256 =
+                    hash(&selected(&img, "stage_attempts", "T-RET-1").unwrap()).unwrap();
+            }
+            assert!(
+                execute_rehearsal(
+                    &dir.0,
+                    &db_path,
+                    &export_bytes,
+                    &marker,
+                    &hash(&marker).unwrap(),
+                    &"c".repeat(64),
+                )
+                .is_err()
+            );
+        }
+
+        #[test]
+        fn retained_profile_paired_schema_and_data_and_witness_controls() {
+            // Paired control 1: row value change with identical schema -> schema equal, image differs.
+            let (dir1, db1, _e1, _m1) = retained_fixture("Ready", "Blocked", false);
+            let mut s1 = V2Store::open(&db1).unwrap();
+            let img_before = image(s1.connection_mut()).unwrap();
+            s1.connection_mut()
+                .execute("UPDATE tasks SET retry_count=4 WHERE task_id='T-RET-1'", [])
+                .unwrap();
+            let img_data_mut = image(s1.connection_mut()).unwrap();
+            assert_eq!(schema(&img_before).unwrap(), schema(&img_data_mut).unwrap());
+            assert_ne!(hash(&img_before).unwrap(), hash(&img_data_mut).unwrap());
+
+            // Paired control 2: extra table/view -> schema differs and known_schema refuses.
+            s1.connection_mut()
+                .execute("CREATE TABLE rogue_table(id INTEGER PRIMARY KEY)", [])
+                .unwrap();
+            let img_schema_mut = image(s1.connection_mut()).unwrap();
+            assert_ne!(
+                schema(&img_before).unwrap(),
+                schema(&img_schema_mut).unwrap()
+            );
+            assert!(known_schema(&img_schema_mut).is_err());
+            drop(s1);
+            drop(dir1);
+
+            // Witness phase-seq substitution refuses.
+            let (_dir, _db, export_bytes, _m) = retained_fixture("Ready", "Blocked", false);
+            let export = std::str::from_utf8(&export_bytes).unwrap();
+            let w1 = Witness::new(1, export).unwrap();
+            let w2 = Witness::new(2, export).unwrap();
+            assert_ne!(
+                w1.decoder.profile_witness_sha256,
+                w2.decoder.profile_witness_sha256
+            );
+            assert!(w1.verify(2, export).is_err());
+
+            // Same-second separate witnesses are both valid for their own phase_seq.
+            assert!(w1.verify(1, export).is_ok());
+            assert!(w2.verify(2, export).is_ok());
+
+            // Effect table mutation in noop phase refuses.
+            let (dir, db_path, _e, _m) = retained_fixture("Ready", "Blocked", false);
+            let mut c = coordinator(&dir.0);
+            c.store = V2Store::open(&db_path).unwrap();
+            c.controller = Arc::new(RehearsalUnits::default());
+            c.submission_probe = Some(BTreeMap::new());
+            let img = image(c.store.connection_mut()).unwrap();
+            let expected_schema = schema(&img).unwrap();
+            let mut r = ResultRecord {
+                schema_version: 2,
+                profile: PROFILE.into(),
+                run_id: "synthetic-run-002".into(),
+                status: "REFUSED".into(),
+                failure_class: "INCOMPLETE".into(),
+                identity: Identity {
+                    native_candidate_sha256: "a".repeat(64),
+                    infra_candidate_sha256: "b".repeat(64),
+                    harness_binary_sha256: "c".repeat(64),
+                    database_input_sha256: "d".repeat(64),
+                    export_input_sha256: "e".repeat(64),
+                    marker_input_sha256: "f".repeat(64),
+                },
+                schema: Schema {
+                    before_sha256: expected_schema.clone(),
+                    after_sha256: expected_schema.clone(),
+                },
+                phases: vec![],
+                retained_receipts: vec![],
+                delivery_poll: zero(&POLL),
+                forbidden_intents: zero(&FORBIDDEN),
+                effects: zero(&EFFECTS),
+                checks: Checks {
+                    raw_inventory_and_history_compared: false,
+                    only_reviewed_differences: false,
+                    input_identity_rechecked: false,
+                    system_driver_executions: 0,
+                },
+                positive_controls: CONTROLS.iter().map(|s| ((*s).into(), false)).collect(),
+            };
+            let err = run_phase_noop("pass_1", &mut c, &mut r, &expected_schema, |coord| {
+                coord
+                    .store
+                    .connection_mut()
+                    .execute(
+                        "INSERT INTO path_locks(repo,path,task_id,acquired_epoch) VALUES('repo-a','src/lib.rs','T-RET-1',100)",
+                        [],
+                    )
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap_err();
+            assert_eq!(err, "PROFILE_NOOP_EFFECT");
+            assert_eq!(r.effects["locks"], 1);
+        }
+
+        #[test]
+        fn retained_profile_rejects_version_time_allocator_rowid_and_restart2_mutations() {
+            // Version overflow (i64::MAX - 1 cannot support +2).
+            let (dir, db_path, export_bytes, marker) = retained_fixture("Ready", "Blocked", false);
+            {
+                let mut store = V2Store::open(&db_path).unwrap();
+                store
+                    .connection_mut()
+                    .execute(
+                        "UPDATE tasks SET version=?1 WHERE task_id='T-RET-1'",
+                        [i64::MAX - 1],
+                    )
+                    .unwrap();
+            }
+            assert!(
+                execute_rehearsal(
+                    &dir.0,
+                    &db_path,
+                    &export_bytes,
+                    &marker,
+                    &hash(&marker).unwrap(),
+                    &"c".repeat(64),
+                )
+                .is_err()
+            );
+
+            // Allocator advance without event refuses in validate_retained_standard / noop.
+            let (dir, db_path, export_bytes, marker) = retained_fixture("Ready", "Blocked", false);
+            let export = std::str::from_utf8(&export_bytes).unwrap();
+            let mut c = coordinator(&dir.0);
+            c.store = V2Store::open(&db_path).unwrap();
+            c.controller = Arc::new(RehearsalUnits::default());
+            c.submission_probe = Some(BTreeMap::new());
+            let before_img = image(c.store.connection_mut()).unwrap();
+            let w = Witness::new(1, export).unwrap();
+            let intake_start = now_epoch();
+            let obs = observe_standard_for_profile(&mut c, &w.actual, export, Some(&marker.ids()))
+                .unwrap();
+            let intake_end = now_epoch();
+            c.store
+                .connection_mut()
+                .execute(
+                    "INSERT INTO sqlite_sequence(name,seq) VALUES('rogue_seq', 42)",
+                    [],
+                )
+                .unwrap();
+            let after_img = image(c.store.connection_mut()).unwrap();
+            assert!(
+                validate_retained_standard(
+                    1,
+                    &before_img,
+                    &after_img,
+                    &obs,
+                    &w,
+                    export,
+                    intake_start,
+                    intake_end,
+                    &marker.ids(),
+                )
+                .is_err()
+            );
+
+            // Restart2 / pass_5 synchronous DB write refuses.
+            let (dir, db_path, _e, _m) = retained_fixture("Ready", "Blocked", false);
+            let mut c3 = coordinator(&dir.0);
+            c3.store = V2Store::open(&db_path).unwrap();
+            c3.controller = Arc::new(RehearsalUnits::default());
+            c3.submission_probe = Some(BTreeMap::new());
+            let img = image(c3.store.connection_mut()).unwrap();
+            let expected_schema = schema(&img).unwrap();
+            let mut r = ResultRecord {
+                schema_version: 2,
+                profile: PROFILE.into(),
+                run_id: "synthetic-run-003".into(),
+                status: "REFUSED".into(),
+                failure_class: "INCOMPLETE".into(),
+                identity: Identity {
+                    native_candidate_sha256: "a".repeat(64),
+                    infra_candidate_sha256: "b".repeat(64),
+                    harness_binary_sha256: "c".repeat(64),
+                    database_input_sha256: "d".repeat(64),
+                    export_input_sha256: "e".repeat(64),
+                    marker_input_sha256: "f".repeat(64),
+                },
+                schema: Schema {
+                    before_sha256: expected_schema.clone(),
+                    after_sha256: expected_schema.clone(),
+                },
+                phases: vec![],
+                retained_receipts: vec![],
+                delivery_poll: zero(&POLL),
+                forbidden_intents: zero(&FORBIDDEN),
+                effects: zero(&EFFECTS),
+                checks: Checks {
+                    raw_inventory_and_history_compared: false,
+                    only_reviewed_differences: false,
+                    input_identity_rechecked: false,
+                    system_driver_executions: 0,
+                },
+                positive_controls: CONTROLS.iter().map(|s| ((*s).into(), false)).collect(),
+            };
+            let err = run_phase_noop("pass_5", &mut c3, &mut r, &expected_schema, |coord| {
+                coord
+                    .store
+                    .connection_mut()
+                    .execute(
+                        "UPDATE daemon_meta SET value='999999' WHERE key='last_sync_epoch'",
+                        [],
+                    )
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap_err();
+            assert_eq!(err, "PROFILE_NOOP_EFFECT");
+            assert_eq!(r.effects["other"], 1);
+        }
+
+        #[test]
+        fn retained_profile_result_strict_json_and_all_zero_forgery_refuse() {
+            let (dir, db_path, export_bytes, marker) = retained_fixture("Ready", "Blocked", false);
+            let mut r = execute_rehearsal(
+                &dir.0,
+                &db_path,
+                &export_bytes,
+                &marker,
+                &hash(&marker).unwrap(),
+                &"c".repeat(64),
+            )
+            .unwrap();
+            r.checks.input_identity_rechecked = true;
+            r.status = "PASS".into();
+            r.failure_class = "NONE".into();
+            for k in CONTROLS {
+                r.positive_controls.insert(k.into(), true);
+            }
+            verify_result_invariants(&r, &marker).unwrap();
+
+            // Missing phase refuses.
+            let mut bad = r.clone();
+            bad.phases.pop();
+            assert!(verify_result_invariants(&bad, &marker).is_err());
+
+            // Forged false positive control refuses.
+            let mut bad2 = r.clone();
+            bad2.positive_controls
+                .insert("mutation_intercepted".into(), false);
+            assert!(verify_result_invariants(&bad2, &marker).is_err());
+
+            // Unknown result field refuses strict decoding.
+            let mut val = serde_json::to_value(&r).unwrap();
+            val.as_object_mut()
+                .unwrap()
+                .insert("extra".into(), json!(true));
+            assert!(strict::<ResultRecord>(&serde_json::to_vec(&val).unwrap()).is_err());
         }
     }
 }
