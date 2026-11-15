@@ -312,8 +312,7 @@ pub fn build_systemd_stage_command_with_env(
                 route.model.clone(),
                 "-c".to_owned(),
                 format!("model_reasoning_effort={}", route.effort.as_str()),
-                "-s".to_owned(),
-                "workspace-write".to_owned(),
+                "--dangerously-bypass-approvals-and-sandbox".to_owned(),
                 "-C".to_owned(),
                 worktree_path.clone(),
                 "--json".to_owned(),
@@ -383,6 +382,32 @@ fn replace_sandbox_args(args: &[String], layout: &SandboxLayout) -> Result<Vec<S
     let mut out = args[..=outer].to_vec();
     out.extend(isolation::bwrap_args(layout, &args[worker_start..]));
     Ok(out)
+}
+
+fn validate_stage_isolation_spec(
+    task: &TaskRecord,
+    route: &StageRoute,
+    spec: &StageCommandSpec,
+) -> Result<(), String> {
+    if spec.program != "systemd-run" {
+        return Err("invalid worker supervisor".into());
+    }
+    let network = NetworkPolicy::resolve(task.context_pack.network.as_deref(), route.family)?;
+    if network != spec.network || spec.writable != (route.stage == "impl") {
+        return Err("stage isolation declaration mismatch".into());
+    }
+    let home = spec
+        .env
+        .get("HOME")
+        .map(String::as_str)
+        .unwrap_or("/home/ubuntu");
+    let declared = SandboxLayout::declared(
+        std::path::Path::new(home),
+        std::path::Path::new(&spec.worktree_path),
+        spec.writable,
+    );
+    // Reuse the pure replacement path to prove wrapper position before staging.
+    replace_sandbox_args(&spec.args, &declared).map(|_| ())
 }
 
 /// Inserts `--output-schema <schema_path>` before the trailing positional prompt/`"-"`
@@ -947,6 +972,14 @@ impl StageExecutor for SystemdStageExecutor {
             );
         }
         self.check_isolation()?;
+        // Test fixture transports are not a production host-transport fallback.
+        #[cfg(test)]
+        let fixture_transport = self.fixture_transport;
+        #[cfg(not(test))]
+        let fixture_transport = false;
+        if !fixture_transport {
+            validate_stage_isolation_spec(task, route, spec)?;
+        }
         let valid_attempt_id = validate_attempt_id(attempt_id)?;
         isolation::secure_parents(&self.state_dir)?;
         let attempts_root = ensure_secure_dir(&self.state_dir.join("attempts"))?;
@@ -965,22 +998,11 @@ impl StageExecutor for SystemdStageExecutor {
             }
         }
 
-        // The checker is injectable, but production can never switch to a host transport.
-        #[cfg(test)]
-        let fixture_transport = self.fixture_transport;
-        #[cfg(not(test))]
-        let fixture_transport = false;
         let _resources = if fixture_transport {
             None
         } else {
-            if spec.program != "systemd-run" {
-                return Err("invalid worker supervisor".into());
-            }
             let network =
                 NetworkPolicy::resolve(task.context_pack.network.as_deref(), route.family)?;
-            if network != spec.network || spec.writable != (route.stage == "impl") {
-                return Err("stage isolation declaration mismatch".into());
-            }
             let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".into());
             let mut resources = PreparedResources::prepare(
                 &attempt_dir,
@@ -2383,6 +2405,7 @@ pub fn prepare_detached_launch(
     route: &StageRoute,
     mut spec: StageCommandSpec,
 ) -> Result<PreparedLaunch, String> {
+    validate_stage_isolation_spec(task, route, &spec)?;
     validate_attempt_id(attempt_id)?;
     isolation::secure_parents(state_dir)?;
     let state = std::fs::canonicalize(ensure_secure_dir(state_dir)?).map_err(|e| e.to_string())?;
@@ -2769,6 +2792,235 @@ mod tests {
         );
     }
 
+    fn codex_test_route(stage: &str) -> StageRoute {
+        let mut route = resolve_stage_route("M", stage, 0, None).unwrap().unwrap();
+        route.family = ModelFamily::OpenAiSol;
+        route.model = "gpt-6.1-sol".into();
+        route
+    }
+
+    fn assert_external_codex_envelope(spec: &StageCommandSpec, stage: &str) {
+        assert_eq!(spec.program, "systemd-run");
+        let outer = spec.args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(spec.args[outer + 1], "/usr/bin/bwrap");
+        assert_eq!(spec.args[outer + 2], "--unshare-all");
+        let codex = spec.args.iter().position(|a| a == "codex").unwrap();
+        let external = spec
+            .args
+            .iter()
+            .position(|a| a == "--dangerously-bypass-approvals-and-sandbox")
+            .unwrap();
+        assert!(external > codex && codex > outer + 2);
+        assert_eq!(
+            spec.args
+                .iter()
+                .filter(|a| *a == "--dangerously-bypass-approvals-and-sandbox")
+                .count(),
+            1
+        );
+        assert!(!spec.args.iter().any(|a| matches!(
+            a.as_str(),
+            "-s" | "--sandbox" | "workspace-write" | "--approve-for-me"
+        )));
+        assert!(spec.args.contains(&"--ignore-user-config".into()));
+        assert!(spec.args.contains(&"--slice=zach-workers.slice".into()));
+        assert!(spec.args.contains(&"KillMode=control-group".into()));
+        assert!(spec.args.windows(2).any(|a| a == ["--tmpfs", "/home"]));
+        assert_eq!(spec.writable, stage == "impl");
+        let bind = if spec.writable { "--bind" } else { "--ro-bind" };
+        assert!(
+            spec.args.windows(3).any(|a| {
+                a[0] == bind && a[1] == spec.worktree_path && a[2] == spec.worktree_path
+            })
+        );
+        assert_eq!(spec.args.last().unwrap(), "-");
+        assert_eq!(
+            spec.output_schema_json.is_some(),
+            matches!(stage, "plan-review" | "pr-review")
+        );
+    }
+
+    #[test]
+    fn codex_external_mode_stays_inside_outer_envelope_for_all_stages() {
+        let task = sample_task();
+        for stage in ["plan", "plan-review", "impl", "pr-review"] {
+            let route = codex_test_route(stage);
+            let spec = build_systemd_stage_command_with_env(
+                &task,
+                stage,
+                &route,
+                "prompt only on stdin",
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            validate_stage_isolation_spec(&task, &route, &spec).unwrap();
+            assert_external_codex_envelope(&spec, stage);
+            assert_eq!(spec.stdin_payload, "prompt only on stdin");
+            assert!(!spec.args.iter().any(|a| a.contains("prompt only on stdin")));
+            let layout = SandboxLayout::declared(
+                std::path::Path::new("/home/ubuntu"),
+                std::path::Path::new(&spec.worktree_path),
+                spec.writable,
+            );
+            let mut replaced = spec.clone();
+            replaced.args = replace_sandbox_args(&spec.args, &layout).unwrap();
+            assert_external_codex_envelope(&replaced, stage);
+        }
+    }
+
+    #[test]
+    fn malformed_stage_specs_fail_both_paths_before_attempt_or_auth_staging() {
+        let root = TempTestDir::new("zach042-preflight");
+        let home = root.path().join("synthetic-home");
+        ensure_secure_dir(&home).unwrap();
+        ensure_secure_dir(&home.join(".codex")).unwrap();
+        write_secure_file(&home.join(".codex/auth.json"), b"synthetic-auth").unwrap();
+        for stage in ["impl", "plan"] {
+            for case in [
+                "supervisor",
+                "write-mode",
+                "network",
+                "missing-wrapper",
+                "misplaced-wrapper",
+                "missing-worker-separator",
+            ] {
+                let mut task = sample_task();
+                task.context_pack.network = Some("none".into());
+                let route = codex_test_route(stage);
+                let env = BTreeMap::from([("HOME".into(), home.display().to_string())]);
+                let mut spec = build_systemd_stage_command_with_env(
+                    &task,
+                    "invalid",
+                    &route,
+                    "must never be staged",
+                    &env,
+                )
+                .unwrap();
+                let outer = spec.args.iter().position(|a| a == "--").unwrap();
+                let expected = match case {
+                    "supervisor" => {
+                        spec.program = "/usr/bin/touch".into();
+                        "invalid worker supervisor"
+                    }
+                    "write-mode" => {
+                        spec.writable = !spec.writable;
+                        "stage isolation declaration mismatch"
+                    }
+                    "network" => {
+                        spec.network = NetworkPolicy::ProviderApi(route.family);
+                        "stage isolation declaration mismatch"
+                    }
+                    "missing-wrapper" => {
+                        spec.args.remove(outer + 1);
+                        "missing bubblewrap wrapper"
+                    }
+                    "misplaced-wrapper" => {
+                        spec.args.insert(outer + 1, "/usr/bin/true".into());
+                        "missing bubblewrap wrapper"
+                    }
+                    _ => {
+                        let separator = spec.args.iter().rposition(|a| a == "--").unwrap();
+                        spec.args.remove(separator);
+                        "missing sandbox separator"
+                    }
+                };
+                let state = root.path().join(format!("uncreated-{stage}-{case}"));
+                let mut direct =
+                    SystemdStageExecutor::with_state_dir(&state).with_isolation_checker(|| Ok(()));
+                assert_eq!(
+                    direct
+                        .execute_stage(&task, "invalid", &route, &spec)
+                        .unwrap_err(),
+                    expected
+                );
+                assert!(!state.exists());
+                let error = prepare_detached_launch(&state, &task, "invalid", &route, spec)
+                    .err()
+                    .expect("invalid detached spec must refuse");
+                assert_eq!(error, expected);
+                assert!(!state.exists());
+                assert_eq!(
+                    std::fs::read(home.join(".codex/auth.json")).unwrap(),
+                    b"synthetic-auth"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn detached_codex_all_stages_preserve_external_mode_mounts_and_schema_without_launch() {
+        let root = TempTestDir::new("zach042-detached");
+        let home = root.path().join("home");
+        ensure_secure_dir(&home).unwrap();
+        ensure_secure_dir(&home.join(".codex")).unwrap();
+        write_secure_file(&home.join(".codex/auth.json"), b"{}").unwrap();
+        let worker = root.path().join("worker");
+        assert!(
+            Command::new("git")
+                .args([
+                    "clone",
+                    "--quiet",
+                    "--shared",
+                    "--no-checkout",
+                    env!("CARGO_MANIFEST_DIR")
+                ])
+                .arg(&worker)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut task = sample_task();
+        task.worktree_path = Some(worker.display().to_string());
+        task.context_pack.network = Some("none".into());
+        let env = BTreeMap::from([("HOME".into(), home.display().to_string())]);
+        for stage in ["plan", "plan-review", "impl", "pr-review"] {
+            let route = codex_test_route(stage);
+            let spec = build_systemd_stage_command_with_env(
+                &task,
+                stage,
+                &route,
+                "synthetic prompt",
+                &env,
+            )
+            .unwrap();
+            let PreparedLaunch {
+                manifest,
+                resources,
+            } = prepare_detached_launch(&root.path().join("state"), &task, stage, &route, spec)
+                .unwrap();
+            assert_external_codex_envelope(&manifest.spec, stage);
+            assert_eq!(manifest.spec.network, NetworkPolicy::None);
+            assert!(manifest.attempt_dir.join("codex-home/auth.json").exists());
+            assert!(manifest.spec.args.windows(3).any(|a| {
+                a[0] == "--ro-bind"
+                    && a[1] == worker.join(".git").display().to_string()
+                    && a[1] == a[2]
+            }));
+            if manifest.spec.output_schema_json.is_some() {
+                let schema = manifest
+                    .attempt_dir
+                    .join("review-schema.json")
+                    .display()
+                    .to_string();
+                assert!(
+                    manifest
+                        .spec
+                        .args
+                        .windows(2)
+                        .any(|a| { a[0] == "--output-schema" && a[1] == schema })
+                );
+                assert!(
+                    manifest
+                        .spec
+                        .args
+                        .windows(3)
+                        .any(|a| { a[0] == "--ro-bind" && a[1] == schema && a[2] == schema })
+                );
+            }
+            resources.cleanup_after_stop().unwrap();
+        }
+    }
+
     #[test]
     fn clean_env_strips_tokens_and_secrets_and_systemd_command_isolates_credentials() {
         let dirty_env = vec![
@@ -2853,6 +3105,12 @@ other-user-unit.service loaded active running
         )
         .expect("build command");
 
+        assert!(
+            !spec
+                .args
+                .iter()
+                .any(|a| a == "--dangerously-bypass-approvals-and-sandbox")
+        );
         assert!(spec.args.contains(&"--no-block".to_owned()));
         assert!(spec.args.contains(&"RemainAfterExit=yes".to_owned()));
         assert!(spec.args.contains(&"CollectMode=inactive".to_owned()));
