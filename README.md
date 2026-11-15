@@ -520,5 +520,30 @@ intercepted and fake mutations refused. Every SQLite table is compared; Standard
 alone may update its named canonical task metadata, terminal observation and
 `daemon_meta.last_sync_epoch` under existing rules. Native runtime controls and
 all histories remain checked. After native integration, the final matching
+All histories remain checked. After native integration, the final matching
 native/panel artifact pair and the full fresh-copy gate must be repeated before
 Infrastructure integration and any separately approved production operation.
+
+#### Retained revoked-consent profile (`retained-revoked-v1`)
+
+For stopped native-owned work whose consent was revoked (`autonomous_consent: false`,
+`executor: "zach"`, `current_stage: "impl"`, ended `FAILED`/`COMPLETE` attempts,
+and native `Ready` or `Blocked` vs. canonical `Ready` or `Blocked`, admitting
+`Ready -> Ready`, `Blocked -> Blocked`, and `Ready -> Blocked` only), the separate
+ignored test `v2::coordinator::tests::private_copy_retained_revoked_rehearsal`
+must be selected explicitly with `--exact ... --ignored --test-threads=1` and
+`ZACH_RETAINED_REHEARSAL_DIR` (with no fallback to `ZACH039_REHEARSAL_DIR`).
+The original `private_copy_activation_rehearsal` and `schema_version: 1` contract
+remain strict and unchanged.
+
+The `schema_version: 2` marker (`purpose: "exclusive-native-copy"`,
+`profile: "retained-revoked-v1"`) binds `export_task_ids` in exact decoded order
+and `retained_tasks` (`task_id`, `attempt_count`, `attempt_rows_sha256`). The
+rehearsal runs `startup_1 -> pass_1 -> standard_1 -> pass_2 -> startup_2 -> pass_3 -> standard_2 -> pass_4 -> startup_3 -> pass_5`
+with fresh actual-decoder witnesses for both Standard phases, verifies schema-only
+hashes remain identical across every phase while typed row/rowid/allocator
+images permit only `tasks.{version, updated_epoch}` and `daemon_meta.last_sync_epoch`
+under Standard, and writes an exclusive `schema_version: 2` `result.json` with
+phase receipts and `retained_receipts`. This copied-state proof is a prerequisite
+only; Infrastructure source-profile binding, upgrade admission, and native
+live-lock handoff remain separately owned and unresolved under `INF-020`.
