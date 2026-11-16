@@ -807,20 +807,46 @@ fn run_v2_daemon(args: &[String]) {
     }
 }
 
-fn gateway_options(args: &[String], daemon: bool) -> Option<GatewayConfig> {
-    let env_bind = match env::var("ZACH_WEB_ADDR") {
+fn env_optional(name: &str) -> Option<String> {
+    match env::var(name) {
         Ok(value) => Some(value),
         Err(env::VarError::NotPresent) => None,
-        Err(_) => usage_error("ZACH_WEB_ADDR must be valid UTF-8"),
-    };
-    parse_gateway_options(args, daemon, env_bind.as_deref())
-        .unwrap_or_else(|error| usage_error(&error))
+        Err(_) => usage_error(&format!("{name} must be valid UTF-8")),
+    }
 }
 
+fn gateway_options(args: &[String], daemon: bool) -> Option<GatewayConfig> {
+    let env_bind = env_optional("ZACH_WEB_ADDR");
+    let env_cf_team = env_optional("ZACH_WEB_CF_ACCESS_TEAM_DOMAIN");
+    let env_cf_aud = env_optional("ZACH_WEB_CF_ACCESS_AUD");
+    let env_cf_email = env_optional("ZACH_WEB_CF_ACCESS_EMAIL");
+    parse_gateway_options_with_env(
+        args,
+        daemon,
+        env_bind.as_deref(),
+        env_cf_team.as_deref(),
+        env_cf_aud.as_deref(),
+        env_cf_email.as_deref(),
+    )
+    .unwrap_or_else(|error| usage_error(&error))
+}
+
+#[cfg(test)]
 fn parse_gateway_options(
     args: &[String],
     daemon: bool,
     env_bind: Option<&str>,
+) -> Result<Option<GatewayConfig>, String> {
+    parse_gateway_options_with_env(args, daemon, env_bind, None, None, None)
+}
+
+fn parse_gateway_options_with_env(
+    args: &[String],
+    daemon: bool,
+    env_bind: Option<&str>,
+    env_cf_team: Option<&str>,
+    env_cf_aud: Option<&str>,
+    env_cf_email: Option<&str>,
 ) -> Result<Option<GatewayConfig>, String> {
     let mut enabled = !daemon;
     let mut port = None;
@@ -828,6 +854,9 @@ fn parse_gateway_options(
     let mut socket = None;
     let mut allowed_origins = Vec::new();
     let mut allowed_decision_kinds = Vec::new();
+    let mut cf_team_domain: Option<String> = None;
+    let mut cf_aud: Option<String> = None;
+    let mut cf_emails: Vec<String> = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     let mut i = 0;
     while i < args.len() {
@@ -837,6 +866,9 @@ fn parse_gateway_options(
             "--db" if daemon => "db",
             "--web-allow-origin" => "origin",
             "--web-allow-decision-kind" => "kind",
+            "--web-cf-team-domain" => "cf_team",
+            "--web-cf-aud" => "cf_aud",
+            "--web-cf-email" => "cf_email",
             "--socket" => "socket",
             "--web-port" => "port",
             "--port" if !daemon => "port",
@@ -844,7 +876,7 @@ fn parse_gateway_options(
             "--web-bind" if daemon => "bind",
             _ => return Err("unsupported web/daemon option; see --help".into()),
         };
-        if !matches!(key, "origin" | "kind") && !seen.insert(key) {
+        if !matches!(key, "origin" | "kind" | "cf_email") && !seen.insert(key) {
             return Err("duplicate web/daemon option".into());
         }
         if key == "web" {
@@ -879,6 +911,14 @@ fn parse_gateway_options(
                     }
                     allowed_decision_kinds.push(value.clone());
                 }
+                "cf_team" => cf_team_domain = Some(value.clone()),
+                "cf_aud" => cf_aud = Some(value.clone()),
+                "cf_email" => {
+                    if cf_emails.len() >= 16 {
+                        return Err("too many Cloudflare Access emails".into());
+                    }
+                    cf_emails.push(value.clone());
+                }
                 _ => {}
             }
         }
@@ -891,6 +931,9 @@ fn parse_gateway_options(
             || bind.is_some()
             || !allowed_origins.is_empty()
             || !allowed_decision_kinds.is_empty()
+            || cf_team_domain.is_some()
+            || cf_aud.is_some()
+            || !cf_emails.is_empty()
         {
             return Err("web binding options require --web".into());
         }
@@ -899,6 +942,46 @@ fn parse_gateway_options(
     if port.is_some() && bind.is_some() {
         return Err("use a bind address with port, or --web-port; do not combine them".into());
     }
+    let resolved_cf_team = cf_team_domain.or_else(|| {
+        env_cf_team
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    });
+    let resolved_cf_aud = cf_aud.or_else(|| {
+        env_cf_aud
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    });
+    let resolved_cf_emails = if !cf_emails.is_empty() {
+        cf_emails
+    } else if let Some(raw) = env_cf_email.map(str::trim).filter(|v| !v.is_empty()) {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let cf_access = match (
+        resolved_cf_team.as_deref(),
+        resolved_cf_aud.as_deref(),
+        resolved_cf_emails.is_empty(),
+    ) {
+        (None, None, true) => None,
+        (Some(team), Some(aud), false) => Some(
+            zach::v2::web_gateway::normalize_cf_access_config(team, aud, &resolved_cf_emails)
+                .map_err(|_| "invalid Cloudflare Access configuration")?,
+        ),
+        _ => {
+            return Err(
+                "Cloudflare Access requires team domain, aud, and at least one allowed email"
+                    .into(),
+            );
+        }
+    };
     let default = format!("127.0.0.1:{DEFAULT_WEB_PORT}");
     let mut addr: std::net::SocketAddr = bind
         .or(env_bind)
@@ -917,6 +1000,7 @@ fn parse_gateway_options(
         state_dir: default_state_dir(),
         allowed_origins,
         allowed_decision_kinds,
+        cf_access,
     }))
 }
 
@@ -1098,6 +1182,9 @@ fn print_usage() {
     println!("       zach web [--socket <PATH>] [--web-port <PORT>] [--bind <IP:PORT>]");
     println!(
         "       Web policy (both forms): [--web-allow-origin <ORIGIN>] [--web-allow-decision-kind <KIND>] (repeatable)"
+    );
+    println!(
+        "       Web Access auth (both forms): [--web-cf-team-domain <DOMAIN>] [--web-cf-aud <AUD>] [--web-cf-email <EMAIL>] (repeatable)"
     );
     println!("       zach attach [--group <GROUP>] [--since-seq <N>] [--once] [--socket <PATH>]");
     println!(
@@ -1640,5 +1727,73 @@ mod tests {
         }
         assert!(web_options(&["--web-allow-origin", "https://a"], true, None).is_err());
         assert!(web_options(&["--web-allow-decision-kind", "merge_approval"], true, None).is_err());
+    }
+
+    #[test]
+    fn web_options_cf_access_cli_and_env_validation() {
+        let config = parse_gateway_options_with_env(
+            &[],
+            false,
+            None,
+            Some("team.cloudflareaccess.com"),
+            Some("aud-tag-123"),
+            Some("op@example.com, backup@example.com"),
+        )
+        .unwrap()
+        .unwrap();
+        let cf = config.cf_access.unwrap();
+        assert_eq!(cf.team_domain, "team.cloudflareaccess.com");
+        assert_eq!(cf.aud, "aud-tag-123");
+        assert_eq!(
+            cf.allowed_emails,
+            vec!["op@example.com", "backup@example.com"]
+        );
+
+        let args = vec![
+            "--web".to_string(),
+            "--web-cf-team-domain".to_string(),
+            "TEAM.cloudflareaccess.com".to_string(),
+            "--web-cf-aud".to_string(),
+            "aud-cli".to_string(),
+            "--web-cf-email".to_string(),
+            "Cli@Example.com".to_string(),
+        ];
+        let daemon_cf = parse_gateway_options_with_env(&args, true, None, None, None, None)
+            .unwrap()
+            .unwrap()
+            .cf_access
+            .unwrap();
+        assert_eq!(daemon_cf.team_domain, "team.cloudflareaccess.com");
+        assert_eq!(daemon_cf.aud, "aud-cli");
+        assert_eq!(daemon_cf.allowed_emails, vec!["cli@example.com"]);
+
+        // Partial configuration fails closed
+        assert!(
+            parse_gateway_options_with_env(
+                &[],
+                false,
+                None,
+                Some("team.cloudflareaccess.com"),
+                Some("aud-tag-123"),
+                None,
+            )
+            .is_err()
+        );
+
+        // --web-cf-* in daemon mode without --web is rejected
+        assert!(
+            parse_gateway_options_with_env(
+                &[
+                    "--web-cf-team-domain".to_string(),
+                    "team.cloudflareaccess.com".to_string(),
+                ],
+                true,
+                None,
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
     }
 }

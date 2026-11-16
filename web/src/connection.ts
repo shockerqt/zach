@@ -9,9 +9,11 @@ import {
 } from "./protocol";
 import { acceptSnapshot, applyEvent, initial, type State } from "./state";
 import { SSEParser } from "./sse";
+export type AuthMode = "none" | "bearer" | "access";
 class Halt extends Error {}
 export class Connection {
   private token = "";
+  private mode: AuthMode = "none";
   private controller?: AbortController;
   private generation = 0;
   private retry?: ReturnType<typeof setTimeout>;
@@ -22,22 +24,41 @@ export class Connection {
     private change: (s: State) => void,
     private notice: (s: string) => void,
     private sound: (kind: string) => void = () => {},
+    private onMode: (mode: AuthMode) => void = () => {},
   ) {}
   get active() {
-    return !!this.token && !!this.controller && !this.controller.signal.aborted;
+    return (
+      this.mode !== "none" &&
+      !!this.controller &&
+      !this.controller.signal.aborted
+    );
+  }
+  get authMode(): AuthMode {
+    return this.mode;
+  }
+  private setMode(mode: AuthMode) {
+    if (this.mode !== mode) {
+      this.mode = mode;
+      this.onMode(mode);
+    }
   }
   private update(s: State) {
     this.state = s;
     this.change(s);
   }
   private options(signal: AbortSignal, extra: RequestInit = {}): RequestInit {
+    const authHeaders: Record<string, string> =
+      this.mode === "bearer" ? { Authorization: `Bearer ${this.token}` } : {};
     return {
       ...extra,
       signal,
       credentials: "same-origin",
       redirect: "error",
       cache: "no-store",
-      headers: { Authorization: `Bearer ${this.token}`, ...extra.headers },
+      headers: {
+        ...authHeaders,
+        ...(extra.headers as Record<string, string> | undefined),
+      },
     };
   }
   disconnect(message = "Desconectado") {
@@ -45,6 +66,7 @@ export class Connection {
     this.controller?.abort();
     clearTimeout(this.retry);
     this.token = "";
+    this.setMode("none");
     this.notice(message);
   }
   private async checked(response: Response, type: string, generation: number) {
@@ -69,17 +91,34 @@ export class Connection {
     this.disconnect();
     if (!token.trim()) return;
     this.token = token;
+    this.setMode("bearer");
+    await this.startSession(false);
+  }
+  async connectAuto() {
+    this.disconnect();
+    this.setMode("access");
+    await this.startSession(true);
+  }
+  private async startSession(silentAuthFailure: boolean) {
     const gen = this.generation;
     this.controller = new AbortController();
     this.update(initial);
     this.attempt = 0;
     this.notice("Conectando");
     try {
-      const r = await this.checked(
-        await fetch("/api/snapshot", this.options(this.controller.signal)),
-        "application/json",
-        gen,
+      const response = await fetch(
+        "/api/snapshot",
+        this.options(this.controller.signal),
       );
+      if (gen !== this.generation) return;
+      if (
+        silentAuthFailure &&
+        (response.status === 401 || response.status === 403)
+      ) {
+        this.disconnect("Desconectado");
+        return;
+      }
+      const r = await this.checked(response, "application/json", gen);
       const value = snapshot(await r.json(), true);
       if (gen !== this.generation) return;
       this.update(acceptSnapshot(initial, value));
@@ -89,7 +128,9 @@ export class Connection {
       this.disconnect(
         e instanceof Halt
           ? e.message || "Acceso denegado"
-          : "No se pudo obtener el snapshot. Conecta de nuevo.",
+          : silentAuthFailure
+            ? "Desconectado"
+            : "No se pudo obtener el snapshot. Conecta de nuevo.",
       );
     }
   }
@@ -218,7 +259,7 @@ export class Connection {
   ): Promise<{ message: string; unknown: boolean; resolved?: Decision }> {
     const gen = this.generation;
     const signal = this.controller?.signal;
-    if (!signal || !this.token)
+    if (!signal || this.mode === "none")
       return { message: "Conecta para decidir", unknown: false };
     try {
       const r = await fetch(
