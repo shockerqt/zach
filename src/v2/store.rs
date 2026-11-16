@@ -137,6 +137,8 @@ pub struct TaskMemory {
     pub last_review_findings: Option<String>,
     #[serde(default)]
     pub review_rework_count: u32,
+    #[serde(default)]
+    pub fallback_stages: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1366,9 +1368,34 @@ impl V2Store {
                     next.next_retry_epoch = old.next_retry_epoch;
                     next.lease_owner = old.lease_owner.clone();
                     next.lease_expires_epoch = old.lease_expires_epoch;
+                    if old.status == "Blocked" && incoming.status == "Ready" {
+                        next.status = "Ready".into();
+                        next.retry_count = 0;
+                        next.next_retry_epoch = 0;
+                        next.memory.halt_requested = false;
+                        if old.retry_count > 0 || old.memory.halt_requested {
+                            next.memory.retry_generation += 1;
+                            next.memory.retry_reset_epoch = now_epoch();
+                        }
+                    }
                 } else {
                     coalesce_runtime_fields(&old, &mut next);
-                    next.retry_count = old.retry_count.max(next.retry_count);
+                    if old.status == "Blocked" && incoming.status == "Ready" {
+                        next.status = "Ready".into();
+                        next.retry_count = 0;
+                        next.next_retry_epoch = 0;
+                        next.memory.halt_requested = false;
+                        if old.retry_count > 0 || old.memory.halt_requested {
+                            next.memory.retry_generation = old
+                                .memory
+                                .retry_generation
+                                .max(next.memory.retry_generation)
+                                + 1;
+                            next.memory.retry_reset_epoch = now_epoch();
+                        }
+                    } else {
+                        next.retry_count = old.retry_count.max(next.retry_count);
+                    }
                 }
                 next.memory.governance_terminal_observed |= old.memory.governance_terminal_observed
                     || is_terminal_task_status(&incoming.status);
@@ -5235,5 +5262,66 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn sync_task_blocked_to_ready_resets_retry_count_and_preserves_runtime_memory() {
+        let mut store = V2Store::open_in_memory().unwrap();
+
+        // Case 1: zach-owned task in Blocked state re-readied via board sync
+        let mut zach_task = sample_task("ZACH-901", "Blocked", vec![]);
+        zach_task.executor = Some("zach".into());
+        zach_task.retry_count = 3;
+        zach_task.next_retry_epoch = 9999;
+        zach_task.stages_completed = vec!["plan".into(), "plan-review".into()];
+        zach_task.current_stage = Some("impl".into());
+        zach_task.reviewed_sha = Some("deadbeef".into());
+        zach_task.memory.halt_requested = true;
+        zach_task.memory.retry_generation = 2;
+        zach_task.memory.fallback_stages = vec!["impl".into()];
+        store.upsert_task(&zach_task).unwrap();
+
+        let mut incoming_zach = sample_task("ZACH-901", "Ready", vec![]);
+        incoming_zach.executor = Some("zach".into());
+        let synced_zach = store
+            .sync_task_with_mode(&incoming_zach, SyncMode::Standard)
+            .unwrap();
+        assert_eq!(synced_zach.status, "Ready");
+        assert_eq!(synced_zach.retry_count, 0);
+        assert_eq!(synced_zach.next_retry_epoch, 0);
+        assert!(!synced_zach.memory.halt_requested);
+        assert_eq!(synced_zach.memory.retry_generation, 3);
+        assert!(synced_zach.memory.retry_reset_epoch > 0);
+        assert_eq!(
+            synced_zach.stages_completed,
+            vec!["plan".to_owned(), "plan-review".to_owned()]
+        );
+        assert_eq!(synced_zach.reviewed_sha.as_deref(), Some("deadbeef"));
+        assert_eq!(synced_zach.memory.fallback_stages, vec!["impl".to_owned()]);
+
+        // Case 2: non-zach task in Blocked state re-readied via board sync
+        let mut ext_task = sample_task("ZACH-902", "Blocked", vec![]);
+        ext_task.executor = None;
+        ext_task.retry_count = 4;
+        ext_task.next_retry_epoch = 8888;
+        ext_task.reviewed_sha = Some("cafebabe".into());
+        ext_task.memory.halt_requested = true;
+        ext_task.memory.retry_generation = 1;
+        ext_task.memory.fallback_stages = vec!["plan".into()];
+        store.upsert_task(&ext_task).unwrap();
+
+        let mut incoming_ext = sample_task("ZACH-902", "Ready", vec![]);
+        incoming_ext.executor = None;
+        let synced_ext = store
+            .sync_task_with_mode(&incoming_ext, SyncMode::Standard)
+            .unwrap();
+        assert_eq!(synced_ext.status, "Ready");
+        assert_eq!(synced_ext.retry_count, 0);
+        assert_eq!(synced_ext.next_retry_epoch, 0);
+        assert!(!synced_ext.memory.halt_requested);
+        assert_eq!(synced_ext.memory.retry_generation, 2);
+        assert!(synced_ext.memory.retry_reset_epoch > 0);
+        assert_eq!(synced_ext.reviewed_sha.as_deref(), Some("cafebabe"));
+        assert_eq!(synced_ext.memory.fallback_stages, vec!["plan".to_owned()]);
     }
 }
