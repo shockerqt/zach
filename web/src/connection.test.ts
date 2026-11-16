@@ -249,3 +249,59 @@ it("an aborted generation late 401 cannot disconnect a newer credential", async 
   });
   c.disconnect();
 });
+
+it("connectAuto connects without Authorization header on 200 and falls back to none on 401", async () => {
+  const modes: string[] = [];
+  const notices: string[] = [];
+  const calls: { url: string; init: RequestInit }[] = [];
+  let allowAccess = true;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string, init: RequestInit) => {
+      calls.push({ url, init });
+      if (!allowAccess) return new Response("", { status: 401 });
+      if (url.endsWith("snapshot")) return Response.json(snap);
+      if (url.endsWith("decide")) {
+        return Response.json({
+          outcome: "RESOLVED",
+          decision: {
+            ...stage.payload,
+            task_id: "t",
+            status: "RESOLVED",
+            choice: "Approve",
+          },
+        });
+      }
+      return new Response(frame("snapshot", { ...snap, status: undefined }), {
+        headers: { "content-type": "text/event-stream" },
+      });
+    }),
+  );
+
+  const c = new Connection(
+    () => {},
+    (msg) => notices.push(msg),
+    () => {},
+    (mode) => modes.push(mode),
+  );
+  await c.connectAuto();
+  await flush();
+  expect(c.active).toBe(true);
+  expect(c.authMode).toBe("access");
+  expect(modes).toEqual(["access"]);
+
+  const res = await c.decide("d", "Approve", "");
+  expect(res.resolved?.choice).toBe("Approve");
+  for (const call of calls) {
+    const headers = call.init.headers as Record<string, string>;
+    expect(headers.Authorization).toBeUndefined();
+    expect(call.init.credentials).toBe("same-origin");
+  }
+
+  allowAccess = false;
+  await c.connectAuto();
+  expect(c.active).toBe(false);
+  expect(c.authMode).toBe("none");
+  expect(notices.at(-1)).toBe("Desconectado");
+  c.disconnect();
+});
