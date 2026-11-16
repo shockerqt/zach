@@ -690,6 +690,129 @@ fn classify_agy_infra_failure(res: &Result<StageExecutionResult, String>) -> Opt
     }
 }
 
+/// Applies durable per-stage fallback routing while never switching family on review stages.
+fn apply_stage_fallback_route(task: &TaskRecord, mut route: StageRoute) -> StageRoute {
+    if matches!(route.stage.as_str(), "plan-review" | "pr-review") {
+        return route;
+    }
+    if task
+        .memory
+        .fallback_stages
+        .iter()
+        .any(|s| s == &route.stage)
+        && let (Some(fb_family), Some(fb_model)) =
+            (route.fallback_family, route.fallback_model.clone())
+    {
+        route.family = fb_family;
+        route.model = fb_model;
+        if let Some(fb_effort) = route.fallback_effort {
+            route.effort = fb_effort;
+        }
+        route.fallback_family = None;
+        route.fallback_model = None;
+        route.fallback_effort = None;
+    }
+    route
+}
+
+fn is_openaisol_fallback_eligible(
+    _stage: &str,
+    res: &Result<StageExecutionResult, String>,
+) -> bool {
+    let (status, msg) = match res {
+        Err(err) => ("FAILED", err.as_str()),
+        Ok(r) if r.status != "PASSED" => (r.status.as_str(), r.summary.as_str()),
+        _ => return false,
+    };
+    if is_quota_or_usage_limit_error(msg) {
+        return true;
+    }
+    let lower_status = status.trim().to_ascii_lowercase();
+    let lower_msg = msg.to_ascii_lowercase();
+    matches!(lower_status.as_str(), "stalled" | "lost" | "timeout")
+        || lower_msg.contains("codex_")
+        || lower_msg.contains("timed out")
+        || lower_msg.contains("runtimemaxsec")
+        || lower_msg.contains("failed to spawn")
+        || lower_msg.contains("empty stdout")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_fallback_openaisol_to_geminiagy(
+    store: &mut V2Store,
+    task: &mut TaskRecord,
+    executor: &mut dyn StageExecutor,
+    stage: &str,
+    route: &StageRoute,
+    prompt: &str,
+    attempt_rec: &mut StageAttemptRecord,
+    author_family: &mut Option<ModelFamily>,
+    res: Result<StageExecutionResult, String>,
+) -> Result<Result<StageExecutionResult, String>, String> {
+    if route.family != ModelFamily::OpenAiSol
+        || route.fallback_family != Some(ModelFamily::GeminiAgy)
+        || !is_openaisol_fallback_eligible(stage, &res)
+    {
+        return Ok(res);
+    }
+    let Some(fb_model) = route.fallback_model.clone() else {
+        return Ok(res);
+    };
+
+    let fb_route = StageRoute {
+        family: ModelFamily::GeminiAgy,
+        model: fb_model,
+        effort: route.fallback_effort.unwrap_or(route.effort),
+        fallback_family: None,
+        fallback_model: None,
+        fallback_effort: None,
+        ..route.clone()
+    };
+    let fb_attempt_id = format!(
+        "{}-{}-fb-{}",
+        task.task_id.to_ascii_lowercase(),
+        stage,
+        task.version
+    );
+    let fb_spec = build_systemd_stage_command(task, &fb_attempt_id, &fb_route, prompt)?;
+
+    if let Ok(ref r) = res {
+        apply_stage_result_usage(task, attempt_rec, stage, r);
+    }
+    let primary_err = match &res {
+        Err(e) => e.clone(),
+        Ok(r) => r.summary.clone(),
+    };
+    attempt_rec.status = "FAILED".to_owned();
+    attempt_rec.ended_epoch = Some(now_epoch());
+    attempt_rec.failure_class = Some(FAILURE_CLASS_INFRA.to_owned());
+    attempt_rec.summary = Some(primary_err);
+    store
+        .record_stage_attempt(attempt_rec)
+        .map_err(|e| e.to_string())?;
+
+    attempt_rec.attempt_id = fb_attempt_id.clone();
+    attempt_rec.model = fb_route.model.clone();
+    attempt_rec.effort = fb_route.effort.as_str().to_owned();
+    attempt_rec.systemd_unit = Some(fb_spec.unit_name.clone());
+    attempt_rec.status = "RUNNING".to_owned();
+    attempt_rec.ended_epoch = None;
+    attempt_rec.failure_class = None;
+    attempt_rec.summary = None;
+    store
+        .record_stage_attempt(attempt_rec)
+        .map_err(|e| e.to_string())?;
+
+    task.active_attempt_id = Some(fb_attempt_id.clone());
+    if !task.memory.fallback_stages.iter().any(|s| s == stage) {
+        task.memory.fallback_stages.push(stage.to_owned());
+    }
+    *task = store.upsert_task(task).map_err(|e| e.to_string())?;
+    *author_family = Some(fb_route.family);
+
+    Ok(executor.execute_stage(task, &fb_attempt_id, &fb_route, &fb_spec))
+}
+
 /// Builds a structured JSON payload for `agent-tooling/plugins/gemini-worker/scripts/worker.mjs --cli`.
 pub fn build_agy_cli_payload(
     task: &TaskRecord,
@@ -1535,6 +1658,26 @@ pub const FAILURE_CLASS_INFRA: &str = "infra";
 pub const FAILURE_CLASS_SEMANTIC: &str = "semantic";
 pub const FAILURE_CLASS_POLICY: &str = "policy";
 
+/// Returns true when an error or summary indicates a provider quota, usage-limit, or rate-limit failure.
+pub fn is_quota_or_usage_limit_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("usage limit")
+        || lower.contains("usage_limit")
+        || lower.contains("hit your limit")
+        || lower.contains("exceeded your current quota")
+        || lower.contains("insufficient_quota")
+        || lower.contains("quota")
+        || lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("ratelimit")
+        || lower.contains("resource_exhausted")
+        || lower.contains("resource exhausted")
+        || lower.contains("too many requests")
+        || lower.contains("http 429")
+        || lower.contains("status 429")
+        || lower.contains("status: 429")
+}
+
 /// Maps a failed stage, execution error, or gate violation to `"infra"`, `"semantic"`, or `"policy"`.
 pub fn classify_failure_class(stage: &str, status: &str, message: &str) -> &'static str {
     if message.starts_with("ISOLATION_PREFLIGHT_FAILED") {
@@ -1545,6 +1688,9 @@ pub fn classify_failure_class(stage: &str, status: &str, message: &str) -> &'sta
     let lower_stage = stage.trim().to_ascii_lowercase();
 
     if lower_status == "stalled" || lower_status == "lost" || lower_status == "timeout" {
+        return FAILURE_CLASS_INFRA;
+    }
+    if is_quota_or_usage_limit_error(message) {
         return FAILURE_CLASS_INFRA;
     }
     if matches!(lower_stage.as_str(), "plan-review" | "pr-review")
@@ -2239,8 +2385,11 @@ pub fn execute_xs_s_pipeline_with_executor_and_ws_task(
         if !task.stages_completed.iter().any(|s| s == "impl")
             && (task.required_stages.is_empty() || task.required_stages.iter().any(|s| s == "impl"))
         {
-            let impl_route = resolve_stage_route(&task.weight, "impl", task.retry_count, None)?
-                .ok_or_else(|| "missing impl route".to_owned())?;
+            let impl_route = apply_stage_fallback_route(
+                &task,
+                resolve_stage_route(&task.weight, "impl", task.retry_count, None)?
+                    .ok_or_else(|| "missing impl route".to_owned())?,
+            );
             impl_author_family = Some(impl_route.family);
             check_token_budget(&task, &impl_route)?;
 
@@ -2292,22 +2441,33 @@ pub fn execute_xs_s_pipeline_with_executor_and_ws_task(
                 .record_stage_attempt(&attempt_rec)
                 .map_err(|e| e.to_string())?;
 
-            let impl_result =
-                match executor.execute_stage(&task, &impl_attempt_id, &impl_route, &impl_spec) {
-                    Ok(res) => res,
-                    Err(err) => {
-                        let class = classify_failure_class("impl", "FAILED", &err);
-                        fail_stage_attempt(
-                            store,
-                            &mut task,
-                            &mut attempt_rec,
-                            class,
-                            err.clone(),
-                            true,
-                        )?;
-                        return Err(format!("impl stage failed for {}: {}", task.task_id, err));
-                    }
-                };
+            let impl_res = executor.execute_stage(&task, &impl_attempt_id, &impl_route, &impl_spec);
+            let impl_res = maybe_fallback_openaisol_to_geminiagy(
+                store,
+                &mut task,
+                executor,
+                "impl",
+                &impl_route,
+                &impl_prompt,
+                &mut attempt_rec,
+                &mut impl_author_family,
+                impl_res,
+            )?;
+            let impl_result = match impl_res {
+                Ok(res) => res,
+                Err(err) => {
+                    let class = classify_failure_class("impl", "FAILED", &err);
+                    fail_stage_attempt(
+                        store,
+                        &mut task,
+                        &mut attempt_rec,
+                        class,
+                        err.clone(),
+                        true,
+                    )?;
+                    return Err(format!("impl stage failed for {}: {}", task.task_id, err));
+                }
+            };
             apply_stage_result_usage(&mut task, &mut attempt_rec, "impl", &impl_result);
             attempt_rec.sha_before = impl_result.sha_before.clone();
             attempt_rec.sha_after = impl_result.sha_after.clone();
@@ -2595,7 +2755,7 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                 resolve_stage_route(&task.weight, "plan", task.retry_count, None)?
                     .ok_or_else(|| "missing plan route".to_owned())?;
 
-            let mut plan_route = plan_route_initial;
+            let mut plan_route = apply_stage_fallback_route(&task, plan_route_initial);
             if plan_route.family == ModelFamily::GeminiAgy && count_agy_infra_failures(&task) >= 2 {
                 plan_route.family = ModelFamily::OpenAiSol;
                 plan_route.model = plan_route
@@ -2712,6 +2872,17 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                     plan_res = executor.execute_stage(&task, &fb_attempt_id, &fb_route, &fb_spec);
                 }
             }
+            plan_res = maybe_fallback_openaisol_to_geminiagy(
+                store,
+                &mut task,
+                executor,
+                "plan",
+                &plan_route,
+                &plan_prompt,
+                &mut plan_rec,
+                &mut plan_author_family,
+                plan_res,
+            )?;
 
             let plan_result = match plan_res {
                 Ok(res) => res,
@@ -3146,7 +3317,7 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                 resolve_stage_route(&task.weight, "impl", task.retry_count, None)?
                     .ok_or_else(|| "missing impl route".to_owned())?;
 
-            let mut impl_route = impl_route_initial;
+            let mut impl_route = apply_stage_fallback_route(&task, impl_route_initial);
             if impl_route.family == ModelFamily::GeminiAgy && count_agy_infra_failures(&task) >= 2 {
                 impl_route.family = ModelFamily::OpenAiSol;
                 impl_route.model = impl_route
@@ -3246,6 +3417,17 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                     impl_res = executor.execute_stage(&task, &fb_attempt_id, &fb_route, &fb_spec);
                 }
             }
+            impl_res = maybe_fallback_openaisol_to_geminiagy(
+                store,
+                &mut task,
+                executor,
+                "impl",
+                &impl_route,
+                &impl_prompt,
+                &mut attempt_rec,
+                &mut impl_author_family,
+                impl_res,
+            )?;
 
             let impl_result = match impl_res {
                 Ok(res) => res,
@@ -3533,8 +3715,11 @@ pub fn prepare_supervised_stage(
     attempt_id: &str,
     author: Option<ModelFamily>,
 ) -> Result<crate::v2::runner::PreparedLaunch, String> {
-    let route = resolve_stage_route(&task.weight, stage, task.retry_count, author)?
-        .ok_or("missing stage route")?;
+    let route = apply_stage_fallback_route(
+        task,
+        resolve_stage_route(&task.weight, stage, task.retry_count, author)?
+            .ok_or("missing stage route")?,
+    );
     check_token_budget(task, &route)?;
     let mut executor = SystemdStageExecutor::with_state_dir(state_dir);
     let worktree = task
@@ -7625,7 +7810,9 @@ print(json.dumps({
         assert!(null_task.memory.token_usage_by_stage.is_empty());
 
         let attempts = store.list_stage_attempts("ZACH-020-NULL").unwrap();
-        assert_eq!(attempts.len(), 1);
+        // codex_exec_failed.jsonl is a usage-limit failure, so OpenAiSol->GeminiAgy fallback
+        // records a second attempt while attempts[0] preserves NULL token counts.
+        assert_eq!(attempts.len(), 2);
         assert_eq!(attempts[0].input_tokens, None);
         assert_eq!(attempts[0].output_tokens, None);
         assert_eq!(attempts[0].total_tokens, None);
@@ -8034,6 +8221,186 @@ raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={
         assert_eq!(
             classify_failure_class("impl", "STALLED", "no output or CPU"),
             "infra"
+        );
+    }
+
+    #[test]
+    fn quota_and_usage_limit_errors_classify_as_infra() {
+        assert!(is_quota_or_usage_limit_error(
+            "You've hit your usage limit for gpt-6.1-sol"
+        ));
+        assert!(is_quota_or_usage_limit_error("HTTP 429 Too Many Requests"));
+        assert!(is_quota_or_usage_limit_error(
+            "insufficient_quota: exceeded your current quota"
+        ));
+        assert!(!is_quota_or_usage_limit_error(
+            "token budget exhausted for task ZACH-015"
+        ));
+        assert_eq!(
+            classify_failure_class(
+                "pr-review",
+                "FAILED",
+                "review verdict failed due to usage limit exceeded"
+            ),
+            FAILURE_CLASS_INFRA
+        );
+    }
+
+    #[test]
+    fn apply_stage_fallback_route_switches_author_stages_but_preserves_review_family() {
+        let mut task = sample_s_task("ZACH-050-FB-ROUTE");
+        task.memory.fallback_stages = vec!["impl".into(), "pr-review".into()];
+
+        let impl_route = resolve_stage_route("S", "impl", 0, None).unwrap().unwrap();
+        let switched_impl = apply_stage_fallback_route(&task, impl_route);
+        assert_eq!(switched_impl.family, ModelFamily::GeminiAgy);
+        assert_eq!(switched_impl.model, "gemini-4-hydrogen-medium");
+        assert!(switched_impl.fallback_model.is_none());
+
+        let rev_route = resolve_stage_route("S", "pr-review", 0, Some(ModelFamily::OpenAiSol))
+            .unwrap()
+            .unwrap();
+        let preserved_rev = apply_stage_fallback_route(&task, rev_route.clone());
+        assert_eq!(preserved_rev.family, rev_route.family);
+        assert_eq!(preserved_rev.model, rev_route.model);
+    }
+
+    #[test]
+    fn openaisol_impl_falls_back_to_geminiagy_and_keeps_pr_review_cross_family() {
+        struct QuotaFallbackExecutor {
+            seen_stages: Vec<(String, ModelFamily, String)>,
+            inner: MockStageExecutor,
+        }
+        impl StageExecutor for QuotaFallbackExecutor {
+            fn execute_stage(
+                &mut self,
+                task: &TaskRecord,
+                attempt_id: &str,
+                route: &StageRoute,
+                spec: &crate::v2::runner::StageCommandSpec,
+            ) -> Result<StageExecutionResult, String> {
+                self.seen_stages
+                    .push((route.stage.clone(), route.family, route.model.clone()));
+                if route.stage == "impl" && route.family == ModelFamily::OpenAiSol {
+                    return Err("You've hit your usage limit for gpt-6.1-sol".into());
+                }
+                self.inner.execute_stage(task, attempt_id, route, spec)
+            }
+            fn run_checks(
+                &mut self,
+                worktree_path: &str,
+                commands: &[String],
+            ) -> Result<(), String> {
+                self.inner.run_checks(worktree_path, commands)
+            }
+            fn commit_worktree(
+                &mut self,
+                task: &TaskRecord,
+                worktree_path: &str,
+            ) -> Result<String, String> {
+                self.inner.commit_worktree(task, worktree_path)
+            }
+            fn collect_reviewed_diff(
+                &mut self,
+                task: &TaskRecord,
+                worktree_path: &str,
+                reviewed_sha: &str,
+            ) -> Result<crate::v2::runner::ReviewedDiffContext, String> {
+                self.inner
+                    .collect_reviewed_diff(task, worktree_path, reviewed_sha)
+            }
+            fn push_and_ensure_pr(
+                &mut self,
+                task: &TaskRecord,
+                worktree_path: &str,
+                reviewed_sha: &str,
+            ) -> Result<i64, String> {
+                self.inner
+                    .push_and_ensure_pr(task, worktree_path, reviewed_sha)
+            }
+        }
+
+        let mut store = V2Store::open_in_memory().unwrap();
+        let mut task = sample_s_task("ZACH-050-XS-FB");
+        task.context_pack.target_files = vec![crate::v2::store::TargetFileSpec {
+            path: "src/v2/router.rs".into(),
+            action: "modify".into(),
+            summary: "update".into(),
+        }];
+        task.context_pack.acceptance_criteria = vec![crate::v2::store::AcceptanceCriterionSpec {
+            id: "AC-1".into(),
+            description: "criterion".into(),
+        }];
+        store.upsert_task(&task).unwrap();
+
+        let mock = MockStageExecutor {
+            staged_results: vec![
+                StageExecutionResult {
+                    status: "PASSED".into(),
+                    summary: "implemented on fallback".into(),
+                    review_markdown: None,
+                    stage_output: None,
+                    review_output: None,
+                    invocation_id: Some("inv-1".into()),
+                    input_tokens: Some(1_000),
+                    output_tokens: Some(200),
+                    total_tokens: Some(1_200),
+                    sha_before: Some("abc1234".into()),
+                    sha_after: Some("abc1234".into()),
+                    diff_files: vec![DiffFileEntry {
+                        path: "src/v2/router.rs".into(),
+                        status: "M".into(),
+                        added_lines: 5,
+                        deleted_lines: 1,
+                    }],
+                },
+                StageExecutionResult {
+                    status: "PASSED".into(),
+                    summary: "approved".into(),
+                    review_markdown: None,
+                    stage_output: None,
+                    review_output: Some(approved_verdict_json("AC-1", "src/v2/router.rs:10")),
+                    invocation_id: Some("inv-2".into()),
+                    input_tokens: Some(1_000),
+                    output_tokens: Some(200),
+                    total_tokens: Some(1_200),
+                    sha_before: Some("def5678".into()),
+                    sha_after: Some("def5678".into()),
+                    diff_files: Vec::new(),
+                },
+            ],
+            committed_sha_to_return: Some("def5678".into()),
+            ..MockStageExecutor::default()
+        };
+        let mut exec = QuotaFallbackExecutor {
+            seen_stages: Vec::new(),
+            inner: mock,
+        };
+
+        let ws_stub = StubWsTask::passthrough_clean("zach-050");
+        let result = execute_xs_s_pipeline_with_executor_and_ws_task(
+            &mut store,
+            &task.task_id,
+            &mut exec,
+            ws_stub.path(),
+        )
+        .unwrap();
+        assert_eq!(result.status, "Queued for Merge");
+        assert_eq!(
+            exec.seen_stages,
+            vec![
+                ("impl".into(), ModelFamily::OpenAiSol, "gpt-6.1-sol".into()),
+                (
+                    "impl".into(),
+                    ModelFamily::GeminiAgy,
+                    "gemini-4-hydrogen-medium".into()
+                ),
+                (
+                    "pr-review".into(),
+                    ModelFamily::OpenAiSol,
+                    "gpt-6.1-sol".into()
+                ),
+            ]
         );
     }
 }

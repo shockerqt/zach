@@ -232,7 +232,7 @@ pub fn resolve_stage_route_with(
                 model: "gpt-6.1-sol".to_owned(),
                 effort,
                 fallback_family: Some(ModelFamily::GeminiAgy),
-                fallback_model: Some("gemini-4-argon-medium".to_owned()),
+                fallback_model: Some("gemini-4-hydrogen-medium".to_owned()),
                 fallback_effort: Some(ReasoningEffort::Medium),
                 max_task_tokens,
                 timeout_secs,
@@ -519,6 +519,10 @@ mod tests {
         assert_eq!(s_impl_0.model, "gpt-6.1-sol");
         assert_eq!(s_impl_0.effort, ReasoningEffort::Medium);
         assert_eq!(s_impl_0.max_task_tokens, 400_000);
+        assert_eq!(
+            s_impl_0.fallback_model.as_deref(),
+            Some("gemini-4-hydrogen-medium")
+        );
 
         let s_impl_1 = resolve_stage_route("S", "impl", 1, None).unwrap().unwrap();
         assert_eq!(s_impl_1.effort, ReasoningEffort::High);

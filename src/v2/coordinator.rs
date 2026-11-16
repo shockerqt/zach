@@ -2034,13 +2034,27 @@ impl Coordinator {
             "semantic" => pipeline::MAX_SEMANTIC_RETRIES,
             _ => pipeline::MAX_POLICY_RETRIES,
         };
-        task.retry_count += 1;
+        let is_quota = pipeline::is_quota_or_usage_limit_error(error);
+        if !is_quota {
+            task.retry_count += 1;
+        }
         task.active_attempt_id = None;
         task.memory.pipeline_checkpoint = None;
         task.lease_owner = None;
         task.lease_expires_epoch = None;
         task.memory.last_check_failure = Some(runner::truncate_utf8_bytes(error, 1024));
-        let decision = if failures <= limit {
+        let has_fallback = !matches!(stage.as_str(), "plan-review" | "pr-review")
+            && !task.memory.fallback_stages.iter().any(|s| s == &stage)
+            && crate::v2::router::resolve_stage_route(&task.weight, &stage, task.retry_count, None)
+                .ok()
+                .flatten()
+                .is_some_and(|r| r.fallback_family.is_some() && r.fallback_model.is_some());
+        let decision = if is_quota && has_fallback {
+            task.memory.fallback_stages.push(stage.clone());
+            task.status = "Ready".into();
+            task.next_retry_epoch = now_epoch();
+            None
+        } else if failures <= limit {
             task.status = "Ready".into();
             task.next_retry_epoch = now_epoch() + pipeline::retry_backoff(failures);
             None
@@ -2051,6 +2065,11 @@ impl Coordinator {
             } else {
                 "retries_exhausted"
             };
+            let mut options = vec!["Retry stage".into()];
+            if kind == "retries_exhausted" && has_fallback {
+                options.push("Retry with fallback model".into());
+            }
+            options.push("Abort task".into());
             Some(crate::v2::store::FailureDecision {
                 decision_id: format!(
                     "{kind}-{}-{}-{}",
@@ -2058,7 +2077,7 @@ impl Coordinator {
                 ),
                 kind: kind.into(),
                 question: format!("{} failed; choose how to proceed", task.task_id),
-                options: vec!["Retry stage".into(), "Abort task".into()],
+                options,
                 context: error.into(),
                 sha: task.reviewed_sha.clone(),
             })
@@ -2767,6 +2786,22 @@ impl Coordinator {
                 task.memory.retry_generation += 1;
                 task.memory.retry_reset_epoch = now_epoch();
                 task.next_retry_epoch = 0;
+                task.retry_count = 0;
+                task.status = "Ready".into();
+            }
+            "Retry with fallback model" => {
+                task.memory.halt_requested = false;
+                if task.active_attempt_id.is_some() {
+                    return Err("cannot retry while an attempt still needs cleanup".into());
+                }
+                let stage = task.current_stage.clone().unwrap_or_else(|| "impl".into());
+                if !task.memory.fallback_stages.iter().any(|s| s == &stage) {
+                    task.memory.fallback_stages.push(stage);
+                }
+                task.memory.retry_generation += 1;
+                task.memory.retry_reset_epoch = now_epoch();
+                task.next_retry_epoch = 0;
+                task.retry_count = 0;
                 task.status = "Ready".into();
             }
             "Retry merge" => {
@@ -2847,6 +2882,7 @@ impl Coordinator {
                 } else {
                     return Err("decision does not authorize review budget reset".into());
                 }
+                task.retry_count = 0;
                 task.status = "Ready".into();
             }
             "Record merge SHA manually" => {
@@ -6410,6 +6446,91 @@ mod tests {
             c.task("decision").unwrap().memory.applied_decisions.len(),
             1
         );
+    }
+
+    #[test]
+    fn fail_task_quota_triggers_immediate_fallback_without_burning_retry_count() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        let mut t = task("quota-fb");
+        t.weight = "S".into();
+        t.current_stage = Some("impl".into());
+        t.retry_count = 1;
+        c.save(&t).unwrap();
+
+        c.fail_task(
+            "quota-fb",
+            "You've hit your usage limit for gpt-6.1-sol",
+            None,
+        )
+        .unwrap();
+
+        let updated = c.task("quota-fb").unwrap();
+        assert_eq!(updated.status, "Ready");
+        assert_eq!(updated.retry_count, 1);
+        assert_eq!(updated.memory.fallback_stages, vec!["impl".to_owned()]);
+        assert!(c.store.list_decisions(true, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn retries_exhausted_offers_fallback_option_and_resets_retry_count_on_decision() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        let mut t = task("exhausted-fb");
+        t.weight = "S".into();
+        t.current_stage = Some("impl".into());
+        c.save(&t).unwrap();
+
+        for i in 0..=pipeline::MAX_INFRA_RETRIES {
+            c.fail_task(
+                "exhausted-fb",
+                &format!("AGY_TIMEOUT: attempt {i}"),
+                Some("infra"),
+            )
+            .unwrap();
+        }
+
+        let blocked = c.task("exhausted-fb").unwrap();
+        assert_eq!(blocked.status, "Blocked");
+        assert!(blocked.retry_count > 0);
+        let decision = c
+            .store
+            .list_decisions(true, None)
+            .unwrap()
+            .into_iter()
+            .find(|d| d.task_id == "exhausted-fb")
+            .unwrap();
+        assert_eq!(decision.kind, "retries_exhausted");
+        assert_eq!(
+            decision.options,
+            vec![
+                "Retry stage".to_owned(),
+                "Retry with fallback model".to_owned(),
+                "Abort task".to_owned(),
+            ]
+        );
+
+        let DecisionResolution::Resolved(resolved) = c
+            .store
+            .resolve_decision(
+                &decision.decision_id,
+                "Retry with fallback model",
+                "alice",
+                None,
+            )
+            .unwrap()
+        else {
+            panic!("expected resolved decision");
+        };
+        c.apply_decision(&resolved).unwrap();
+
+        let retried = c.task("exhausted-fb").unwrap();
+        assert_eq!(retried.status, "Ready");
+        assert_eq!(retried.retry_count, 0);
+        assert_eq!(retried.next_retry_epoch, 0);
+        assert!(!retried.memory.halt_requested);
+        assert_eq!(retried.memory.retry_generation, 1);
+        assert_eq!(retried.memory.fallback_stages, vec!["impl".to_owned()]);
     }
 
     #[test]
