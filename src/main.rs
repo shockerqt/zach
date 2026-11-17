@@ -674,6 +674,96 @@ fn run_v2_sync(args: &[String]) {
 }
 
 fn run_v2_config(args: &[String]) {
+    if let Some(sub) = args.first().map(String::as_str) {
+        match sub {
+            "validate" => {
+                let explicit = flag_value(&args[1..], "--file");
+                let path = explicit
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(zach::v2::router::default_router_config_path);
+                let (cfg, warnings) = if path.exists() {
+                    match zach::v2::router::load_router_config_from_path(&path) {
+                        Ok(res) => res,
+                        Err(err) => {
+                            eprintln!("router config validation failed: {err}");
+                            std::process::exit(1);
+                        }
+                    }
+                } else if explicit.is_some() {
+                    eprintln!("router config file not found: {}", path.display());
+                    std::process::exit(1);
+                } else {
+                    let cfg = zach::v2::router::RouterConfig::default();
+                    let warnings =
+                        zach::v2::router::validate_router_config(&cfg).unwrap_or_else(|err| {
+                            eprintln!("router config validation failed: {err}");
+                            std::process::exit(1);
+                        });
+                    (cfg, warnings)
+                };
+                println!(
+                    "router_config={} ({})",
+                    path.display(),
+                    if path.exists() {
+                        "file"
+                    } else {
+                        "built-in defaults"
+                    }
+                );
+                for w in &warnings {
+                    eprintln!("warning: {w}");
+                }
+                println!("{}", zach::v2::router::format_effective_routes_table(&cfg));
+                return;
+            }
+            "reload" => {
+                let file_path = flag_value(&args[1..], "--file");
+                let socket_path = flag_value(&args[1..], "--socket")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(default_socket_path);
+                let mut stream = std::os::unix::net::UnixStream::connect(&socket_path)
+                    .unwrap_or_else(|error| {
+                        eprintln!("connect to zachd at {}: {error}", socket_path.display());
+                        std::process::exit(1)
+                    });
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap_or_else(|error| {
+                        eprintln!("reload socket timeout: {error}");
+                        std::process::exit(1)
+                    });
+                write_ndjson(
+                    &mut stream,
+                    &ClientCommand::ReloadConfig { path: file_path },
+                )
+                .unwrap_or_else(|error| {
+                    eprintln!("submit reload: {error}");
+                    std::process::exit(1)
+                });
+                use std::io::BufRead;
+                let mut line = String::new();
+                std::io::BufReader::new(stream)
+                    .read_line(&mut line)
+                    .unwrap_or_else(|error| {
+                        eprintln!("reload acknowledgment: {error}");
+                        std::process::exit(1)
+                    });
+                let reply: serde_json::Value =
+                    serde_json::from_str(&line).unwrap_or_else(|error| {
+                        eprintln!("invalid daemon acknowledgment: {error}");
+                        std::process::exit(1)
+                    });
+                println!("{}", line.trim());
+                if reply["type"] == "ERROR" || reply["ok"] == false {
+                    std::process::exit(1);
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
+
     let mut store = open_store(args);
     if let Some(raw_max) = flag_value(args, "--max-parallel") {
         let parsed = raw_max
@@ -685,7 +775,9 @@ fn run_v2_config(args: &[String]) {
         }
     }
     let max_parallel = store.max_parallel_tasks().unwrap_or(2);
+    let router_path = zach::v2::router::default_router_config_path();
     println!("max_parallel_tasks={max_parallel}");
+    println!("router_config={}", router_path.display());
 }
 
 fn run_v2_run(args: &[String]) {
@@ -1267,6 +1359,8 @@ fn print_usage() {
         "       zach sync [--export-file <PATH>] [--ws-task-bin <PATH>] [--db <PATH>] [--reconcile-finished-legacy]"
     );
     println!("       zach config [--max-parallel <1..16>] [--db <PATH>]");
+    println!("       zach config validate [--file <PATH>]");
+    println!("       zach config reload [--file <PATH>] [--socket <PATH>]");
     println!(
         "       zach run [--task <TASK_ID>] [--group <GROUP>] [--once] [--dry-run] [--json] [--db <PATH>]"
     );

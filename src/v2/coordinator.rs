@@ -731,6 +731,28 @@ impl Coordinator {
                 self.last_delivery_poll = Instant::now() - Duration::from_secs(10);
                 vec![ServerMessage::RunAccepted { ready: self.ready }]
             }
+            ClientCommand::ReloadConfig { path } => {
+                match crate::v2::router::reload_router_config(
+                    path.as_deref().map(std::path::Path::new),
+                ) {
+                    Ok((loaded_path, warnings)) => vec![ServerMessage::ConfigReloaded {
+                        ok: true,
+                        path: loaded_path.display().to_string(),
+                        warnings,
+                        error: None,
+                    }],
+                    Err(err) => vec![ServerMessage::ConfigReloaded {
+                        ok: false,
+                        path: path.unwrap_or_else(|| {
+                            crate::v2::router::default_router_config_path()
+                                .display()
+                                .to_string()
+                        }),
+                        warnings: Vec::new(),
+                        error: Some(err),
+                    }],
+                }
+            }
         })
     }
 

@@ -52,6 +52,11 @@ pub enum ClientCommand {
         #[serde(default)]
         note: Option<String>,
     },
+    #[serde(alias = "RELOAD_CONFIG", alias = "ReloadConfig")]
+    ReloadConfig {
+        #[serde(default)]
+        path: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -84,6 +89,13 @@ pub enum ServerMessage {
     ResyncRequired { last_seq_id: i64 },
     #[serde(rename = "RUN_ACCEPTED")]
     RunAccepted { ready: bool },
+    #[serde(rename = "CONFIG_RELOADED")]
+    ConfigReloaded {
+        ok: bool,
+        path: String,
+        warnings: Vec<String>,
+        error: Option<String>,
+    },
     #[serde(rename = "ERROR")]
     Error { error: String },
 }
@@ -455,6 +467,29 @@ impl DaemonServer {
                             error: "run requires coordinator".into(),
                         },
                     );
+                }
+                Ok(ClientCommand::ReloadConfig { path }) => {
+                    let msg = match crate::v2::router::reload_router_config(
+                        path.as_deref().map(std::path::Path::new),
+                    ) {
+                        Ok((loaded_path, warnings)) => ServerMessage::ConfigReloaded {
+                            ok: true,
+                            path: loaded_path.display().to_string(),
+                            warnings,
+                            error: None,
+                        },
+                        Err(err) => ServerMessage::ConfigReloaded {
+                            ok: false,
+                            path: path.unwrap_or_else(|| {
+                                crate::v2::router::default_router_config_path()
+                                    .display()
+                                    .to_string()
+                            }),
+                            warnings: Vec::new(),
+                            error: Some(err),
+                        },
+                    };
+                    let _ = write_ndjson(&mut sub.stream, &msg);
                 }
                 Err(e) => {
                     let msg = ServerMessage::Error {
