@@ -1201,21 +1201,39 @@ impl Coordinator {
         }
         for dispatch in dispatches {
             let mut task = self.task(&dispatch.task_id)?;
-            if !task.memory.governance_started {
+            let missing_worktree = task.repository != "none"
+                && task
+                    .worktree_path
+                    .as_deref()
+                    .is_none_or(|p| !std::path::Path::new(p).is_dir());
+            if !task.memory.governance_started || missing_worktree {
+                let was_started = task.memory.governance_started;
+                let resume = was_started || task.status != "Ready";
                 task.executor = Some("zach".into());
-                task.status = "Ready".into();
+                if !was_started {
+                    task.status = "Ready".into();
+                }
+                let operation_id = if !was_started {
+                    format!("start-{}", task.task_id)
+                } else {
+                    format!("start-{}-v{}", task.task_id, task.version)
+                };
+                let mut args = vec![
+                    "start".into(),
+                    task.task_id.clone(),
+                    "--executor".into(),
+                    "zach".into(),
+                ];
+                if resume {
+                    args.push("--resume".into());
+                }
                 let op = LifecycleOperation {
                     attempt_id: None,
                     decision_id: None,
-                    operation_id: format!("start-{}", task.task_id),
+                    operation_id,
                     task_id: task.task_id.clone(),
                     kind: "start".into(),
-                    args: vec![
-                        "start".into(),
-                        task.task_id.clone(),
-                        "--executor".into(),
-                        "zach".into(),
-                    ],
+                    args,
                     body_path: None,
                     depends_on: None,
                     state: "PENDING".into(),
@@ -2602,6 +2620,7 @@ impl Coordinator {
         let mut completed_attempt = None;
         match op.kind.as_str() {
             "start" => {
+                let was_started = task.memory.governance_started;
                 let value = intake::parse_start_receipt(output, &task.task_id)?;
                 task.branch = Some(
                     value["branch"]
@@ -2624,7 +2643,9 @@ impl Coordinator {
                 }
                 task.memory.governance_started = true;
                 task.executor = Some("zach".into());
-                task.status = "Ready".into();
+                if !was_started || task.status == "Backlog" {
+                    task.status = "Ready".into();
+                }
             }
             "human-plan-approval" | "human-merge-approval" => {
                 let decision_id = id
@@ -7386,7 +7407,10 @@ mod tests {
     fn escalated_impl_is_suspended_until_prerequisites_and_never_relaunched() {
         let dir = TestDirectory::new();
         let mut c = coordinator(&dir.0);
+        let wt = dir.0.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
         let mut t = task("escalated");
+        t.worktree_path = Some(wt.to_string_lossy().into_owned());
         t.lease_owner = Some(c.instance.clone());
         let mut a = seed_attempt(&mut c, t, "saved-impl");
         a.phase = "POSTPROCESSING".into();
@@ -10443,6 +10467,102 @@ mod tests {
         assert!(
             launch_log.contains("spawning /missing/systemd-run"),
             "{launch_log}"
+        );
+    }
+
+    #[test]
+    fn missing_worktree_on_started_task_enqueues_start_resume_instead_of_preparing() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        let missing_wt = dir.0.join("missing-worktree");
+        let mut t = task("ZACH-060-DISPATCH");
+        t.status = "Ready".into();
+        t.worktree_path = Some(missing_wt.to_string_lossy().into_owned());
+        t.memory.governance_started = true;
+        t.version = 3;
+        c.save(&t).unwrap();
+
+        c.dispatch().unwrap();
+
+        let after = c.task("ZACH-060-DISPATCH").unwrap();
+        assert!(after.memory.pipeline_checkpoint.is_none());
+        assert_eq!(after.status, "In Progress");
+
+        let ops = c.store.lifecycle_ops().unwrap();
+        assert_eq!(ops.len(), 1);
+        let op = &ops[0];
+        assert!(
+            op.operation_id.starts_with("start-ZACH-060-DISPATCH-v"),
+            "{}",
+            op.operation_id
+        );
+        assert_eq!(op.kind, "start");
+        assert_eq!(op.state, "PENDING");
+        assert_eq!(
+            op.args,
+            vec![
+                "start",
+                "ZACH-060-DISPATCH",
+                "--executor",
+                "zach",
+                "--resume",
+            ]
+        );
+    }
+
+    #[test]
+    fn acknowledging_resume_start_updates_worktree_and_branch_preserving_in_progress_status() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        let missing_wt = dir.0.join("missing-worktree");
+        let recreated_wt = dir.0.join("recreated-worktree");
+        std::fs::create_dir_all(&recreated_wt).unwrap();
+        let mut t = task("ZACH-060-ACK");
+        t.status = "Ready".into();
+        t.worktree_path = Some(missing_wt.to_string_lossy().into_owned());
+        t.branch = Some("task/old-branch".into());
+        t.memory.governance_started = true;
+        t.version = 4;
+        c.save(&t).unwrap();
+
+        c.dispatch().unwrap();
+
+        let ops = c.store.lifecycle_ops().unwrap();
+        assert_eq!(ops.len(), 1);
+        let op_id = ops[0].operation_id.clone();
+        assert_eq!(c.task("ZACH-060-ACK").unwrap().status, "In Progress");
+
+        let receipt = serde_json::json!({
+            "task_id": "ZACH-060-ACK",
+            "weight": "S",
+            "branch": "task/ZACH-060-ACK-recreated",
+            "worktree": recreated_wt.to_string_lossy(),
+        })
+        .to_string();
+        c.lifecycle_ack(&op_id, &receipt).unwrap();
+
+        let acked = c.task("ZACH-060-ACK").unwrap();
+        assert_eq!(acked.status, "In Progress");
+        assert!(acked.memory.governance_started);
+        assert_eq!(acked.executor.as_deref(), Some("zach"));
+        assert_eq!(acked.branch.as_deref(), Some("task/ZACH-060-ACK-recreated"));
+        assert_eq!(
+            acked.worktree_path.as_deref(),
+            Some(recreated_wt.to_string_lossy().as_ref())
+        );
+
+        let mut ready = acked;
+        ready.status = "Ready".into();
+        c.save(&ready).unwrap();
+        c.dispatch().unwrap();
+        let dispatched = c.task("ZACH-060-ACK").unwrap();
+        assert_eq!(
+            dispatched
+                .memory
+                .pipeline_checkpoint
+                .as_ref()
+                .map(|cp| cp.operation.as_str()),
+            Some("PREPARING")
         );
     }
 }
