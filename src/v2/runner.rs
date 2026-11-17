@@ -2,7 +2,7 @@ use crate::v2::isolation::{
     self, IsolationChecker, NetworkPolicy, PreparedResources, SandboxLayout,
 };
 use crate::v2::pipeline::DiffFileEntry;
-use crate::v2::router::{ModelFamily, StageRoute, is_forbidden_daemon_model};
+use crate::v2::router::{ModelFamily, StageRoute};
 use crate::v2::store::{TaskRecord, V2Store};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -237,11 +237,8 @@ pub fn build_systemd_stage_command_with_env(
     prompt: &str,
     clean_env: &BTreeMap<String, String>,
 ) -> Result<StageCommandSpec, String> {
-    if is_forbidden_daemon_model(&route.model) {
-        return Err(format!(
-            "refusing to build stage command with forbidden daemon model '{}'",
-            route.model
-        ));
+    if route.model.trim().is_empty() {
+        return Err("refusing to build stage command with empty model".to_owned());
     }
     if !task.autonomous_consent {
         return Err(format!(

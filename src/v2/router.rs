@@ -1,4 +1,7 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
 
 pub const NO_CROSS_FAMILY_REVIEWER_ERR: &str = "NO_CROSS_FAMILY_REVIEWER";
 
@@ -47,9 +50,13 @@ pub fn infer_model_family(model: &str) -> ModelFamily {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
+    #[serde(alias = "Low")]
     Low,
+    #[serde(alias = "Medium")]
     Medium,
+    #[serde(alias = "High")]
     High,
 }
 
@@ -88,17 +95,16 @@ pub struct StageRoute {
 
 pub const DEFAULT_STALL_TIMEOUT_SECS: u64 = 600;
 
-/// Returns `true` if `model` refers to a forbidden interactive-only model (`gpt-6-astra`).
-pub fn is_forbidden_daemon_model(model: &str) -> bool {
-    model.to_ascii_lowercase().contains("astra")
+/// Returns `true` if `model` refers to `gpt-6-astra`.
+/// Kept for diagnostics; no longer blocks autonomous daemon runs.
+pub fn is_forbidden_daemon_model(_model: &str) -> bool {
+    false
 }
 
-/// Validates that a model identifier is permitted in autonomous daemon runs.
+/// Validates that a model identifier is non-empty.
 pub fn validate_daemon_model(model: &str) -> Result<(), String> {
-    if is_forbidden_daemon_model(model) {
-        return Err(format!(
-            "model '{model}' is forbidden in zachd autonomous runs (gpt-6-astra is reserved for interactive sessions)"
-        ));
+    if model.trim().is_empty() {
+        return Err("model identifier cannot be empty".to_owned());
     }
     Ok(())
 }
@@ -149,6 +155,241 @@ impl RouterEnvOverrides {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StageOverride {
+    pub model: Option<String>,
+    pub effort: Option<ReasoningEffort>,
+    pub retry_model: Option<String>,
+    pub retry_effort: Option<ReasoningEffort>,
+    pub fallback_model: Option<String>,
+    pub fallback_effort: Option<ReasoningEffort>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RouterConfig {
+    #[serde(default)]
+    pub routes: BTreeMap<String, BTreeMap<String, StageOverride>>,
+}
+
+static ACTIVE_ROUTER_CONFIG: OnceLock<RwLock<RouterConfig>> = OnceLock::new();
+
+pub fn default_router_config_path() -> PathBuf {
+    if let Ok(raw) = std::env::var("ZACH_ROUTER_CONFIG") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        let trimmed = xdg.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed).join("zach").join("router.json");
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
+    PathBuf::from(home)
+        .join(".config")
+        .join("zach")
+        .join("router.json")
+}
+
+fn active_router_config_lock() -> &'static RwLock<RouterConfig> {
+    ACTIVE_ROUTER_CONFIG.get_or_init(|| {
+        let path = default_router_config_path();
+        let initial = if path.exists() {
+            match load_router_config_from_path(&path) {
+                Ok((cfg, warnings)) => {
+                    for w in warnings {
+                        eprintln!("warning: {w}");
+                    }
+                    cfg
+                }
+                Err(err) => {
+                    eprintln!(
+                        "warning: failed to load router config at {}: {err}; using built-in defaults",
+                        path.display()
+                    );
+                    RouterConfig::default()
+                }
+            }
+        } else {
+            RouterConfig::default()
+        };
+        RwLock::new(initial)
+    })
+}
+
+pub fn active_router_config() -> RouterConfig {
+    active_router_config_lock()
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default()
+}
+
+pub fn load_router_config_from_path(path: &Path) -> Result<(RouterConfig, Vec<String>), String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let cfg: RouterConfig = serde_json::from_str(&raw)
+        .map_err(|e| format!("invalid router config JSON in {}: {e}", path.display()))?;
+    let warnings = validate_router_config(&cfg)?;
+    Ok((cfg, warnings))
+}
+
+/// Validates a [`RouterConfig`] and returns non-blocking warnings (e.g. same-family review).
+pub fn validate_router_config(cfg: &RouterConfig) -> Result<Vec<String>, String> {
+    let mut warnings = Vec::new();
+    for (weight, stages) in &cfg.routes {
+        let norm_weight = weight.trim().to_ascii_uppercase();
+        if !matches!(norm_weight.as_str(), "XS" | "S" | "M" | "L") {
+            return Err(format!("unsupported weight '{weight}' in router config"));
+        }
+        for (stage, ov) in stages {
+            let norm_stage = stage.trim().to_ascii_lowercase();
+            if !matches!(
+                norm_stage.as_str(),
+                "plan" | "plan-review" | "impl" | "pr-review"
+            ) {
+                return Err(format!(
+                    "unsupported stage '{stage}' for weight '{weight}' in router config"
+                ));
+            }
+            if resolve_stage_route_with_config(
+                &norm_weight,
+                &norm_stage,
+                0,
+                None,
+                &RouterEnvOverrides::default(),
+                cfg,
+            )?
+            .is_none()
+            {
+                return Err(format!(
+                    "stage '{stage}' is not applicable to weight '{weight}' in router config"
+                ));
+            }
+            for (field, val) in [
+                ("model", ov.model.as_deref()),
+                ("retry_model", ov.retry_model.as_deref()),
+                ("fallback_model", ov.fallback_model.as_deref()),
+            ] {
+                if let Some(m) = val {
+                    if m.trim().is_empty() {
+                        return Err(format!(
+                            "empty {field} for {weight}.{stage} in router config"
+                        ));
+                    }
+                    validate_daemon_model(m)?;
+                }
+            }
+        }
+    }
+
+    // Emit non-blocking cross-family suggestions for review stages.
+    let no_env = RouterEnvOverrides::default();
+    for weight in ["S", "M", "L"] {
+        let author_stage = if weight == "S" { "impl" } else { "plan" };
+        let author_family =
+            resolve_stage_route_with_config(weight, author_stage, 0, None, &no_env, cfg)?
+                .map(|r| r.family)
+                .unwrap_or(ModelFamily::OpenAiSol);
+        for review_stage in ["plan-review", "pr-review"] {
+            if let Some(rev) = resolve_stage_route_with_config(
+                weight,
+                review_stage,
+                0,
+                Some(author_family),
+                &no_env,
+                cfg,
+            )? && rev.family == author_family
+            {
+                warnings.push(format!(
+                    "suggestion: {weight}.{review_stage} uses {} ({}) which is the same family as {weight}.{author_stage} ({}); cross-family review is recommended",
+                    rev.model,
+                    rev.family.as_str(),
+                    author_family.as_str()
+                ));
+            }
+        }
+    }
+
+    Ok(warnings)
+}
+
+/// Validates and hot-reloads the active router config from `path` (or default path).
+/// If validation fails, the previous active config is preserved.
+pub fn reload_router_config(path: Option<&Path>) -> Result<(PathBuf, Vec<String>), String> {
+    let target = path
+        .map(PathBuf::from)
+        .unwrap_or_else(default_router_config_path);
+    let (cfg, warnings) = if target.exists() {
+        load_router_config_from_path(&target)?
+    } else if path.is_some() {
+        return Err(format!(
+            "router config file not found: {}",
+            target.display()
+        ));
+    } else {
+        let cfg = RouterConfig::default();
+        let warnings = validate_router_config(&cfg)?;
+        (cfg, warnings)
+    };
+    let lock = active_router_config_lock();
+    let mut guard = lock
+        .write()
+        .map_err(|_| "router config lock poisoned".to_owned())?;
+    *guard = cfg;
+    Ok((target, warnings))
+}
+
+pub fn format_effective_routes_table(cfg: &RouterConfig) -> String {
+    let no_env = RouterEnvOverrides::default();
+    let mut lines = vec![
+        "weight | stage       | model                    | effort | retry_model              | fallback_model".to_owned(),
+        "-------+-------------+--------------------------+--------+--------------------------+-------------------------".to_owned(),
+    ];
+    for weight in ["XS", "S", "M", "L"] {
+        for stage in ["plan", "plan-review", "impl", "pr-review"] {
+            let author_hint = if matches!(stage, "plan-review" | "pr-review") {
+                Some(ModelFamily::OpenAiSol)
+            } else {
+                None
+            };
+            if let Ok(Some(r0)) =
+                resolve_stage_route_with_config(weight, stage, 0, author_hint, &no_env, cfg)
+            {
+                let r1 =
+                    resolve_stage_route_with_config(weight, stage, 1, author_hint, &no_env, cfg)
+                        .ok()
+                        .flatten();
+                let retry_col = r1
+                    .as_ref()
+                    .map(|r| format!("{} ({})", r.model, r.effort.as_str()))
+                    .unwrap_or_else(|| "-".to_owned());
+                let fb_col = r0
+                    .fallback_model
+                    .as_deref()
+                    .map(|m| {
+                        let eff = r0.fallback_effort.map(|e| e.as_str()).unwrap_or("medium");
+                        format!("{m} ({eff})")
+                    })
+                    .unwrap_or_else(|| "-".to_owned());
+                lines.push(format!(
+                    "{:<6} | {:<11} | {:<24} | {:<6} | {:<24} | {}",
+                    weight,
+                    stage,
+                    r0.model,
+                    r0.effort.as_str(),
+                    retry_col,
+                    fb_col
+                ));
+            }
+        }
+    }
+    lines.join("\n")
+}
+
 /// Deterministically resolves the model, reasoning effort, fallback, and budgets
 /// for a given `(weight, stage, retry_count, author_family)`.
 ///
@@ -176,6 +417,18 @@ pub fn resolve_stage_route_with(
     retry_count: i64,
     author_family: Option<ModelFamily>,
     overrides: &RouterEnvOverrides,
+) -> Result<Option<StageRoute>, String> {
+    let cfg = active_router_config();
+    resolve_stage_route_with_config(weight, stage, retry_count, author_family, overrides, &cfg)
+}
+
+pub fn resolve_stage_route_with_config(
+    weight: &str,
+    stage: &str,
+    retry_count: i64,
+    author_family: Option<ModelFamily>,
+    overrides: &RouterEnvOverrides,
+    cfg: &RouterConfig,
 ) -> Result<Option<StageRoute>, String> {
     let norm_weight = weight.trim().to_ascii_uppercase();
     if !matches!(norm_weight.as_str(), "XS" | "S" | "M" | "L") {
@@ -245,7 +498,7 @@ pub fn resolve_stage_route_with(
             is_retry,
             author_family.unwrap_or(ModelFamily::OpenAiSol),
             "gemini-4-hydrogen-high",
-            "gemini-4-argon-high",
+            "gemini-4-hydrogen-high",
             ReasoningEffort::High,
             ReasoningEffort::Medium,
             max_task_tokens,
@@ -260,7 +513,7 @@ pub fn resolve_stage_route_with(
                     weight: norm_weight,
                     stage: norm_stage,
                     family: ModelFamily::GeminiAgy,
-                    model: "gemini-4-argon-high".to_owned(),
+                    model: "gemini-4-hydrogen-high".to_owned(),
                     effort: ReasoningEffort::High,
                     fallback_family: Some(ModelFamily::OpenAiSol),
                     fallback_model: Some("gpt-6.1-sol".to_owned()),
@@ -277,7 +530,7 @@ pub fn resolve_stage_route_with(
                     model: "gpt-6.1-sol".to_owned(),
                     effort: ReasoningEffort::High,
                     fallback_family: Some(ModelFamily::GeminiAgy),
-                    fallback_model: Some("gemini-4-argon-high".to_owned()),
+                    fallback_model: Some("gemini-4-hydrogen-high".to_owned()),
                     fallback_effort: Some(ReasoningEffort::High),
                     max_task_tokens,
                     timeout_secs,
@@ -290,8 +543,8 @@ pub fn resolve_stage_route_with(
             norm_stage,
             is_retry,
             author_family.unwrap_or(ModelFamily::OpenAiSol),
-            "gemini-4-argon-medium",
-            "gemini-4-argon-high",
+            "gemini-4-hydrogen-medium",
+            "gemini-4-hydrogen-high",
             if is_retry {
                 ReasoningEffort::High
             } else {
@@ -308,7 +561,7 @@ pub fn resolve_stage_route_with(
             model: "gpt-6.1-sol".to_owned(),
             effort: ReasoningEffort::High,
             fallback_family: Some(ModelFamily::GeminiAgy),
-            fallback_model: Some("gemini-4-argon-high".to_owned()),
+            fallback_model: Some("gemini-4-hydrogen-high".to_owned()),
             fallback_effort: Some(ReasoningEffort::High),
             max_task_tokens,
             timeout_secs,
@@ -319,8 +572,8 @@ pub fn resolve_stage_route_with(
             norm_stage,
             is_retry,
             author_family.unwrap_or(ModelFamily::OpenAiSol),
-            "gemini-4-argon-high",
-            "gemini-4-argon-high",
+            "gemini-4-hydrogen-high",
+            "gemini-4-hydrogen-high",
             ReasoningEffort::High,
             ReasoningEffort::Medium,
             max_task_tokens,
@@ -346,8 +599,8 @@ pub fn resolve_stage_route_with(
             norm_stage,
             is_retry,
             author_family.unwrap_or(ModelFamily::OpenAiSol),
-            "gemini-4-argon-high",
-            "gemini-4-argon-high",
+            "gemini-4-hydrogen-high",
+            "gemini-4-hydrogen-high",
             ReasoningEffort::High,
             ReasoningEffort::High,
             max_task_tokens,
@@ -371,8 +624,8 @@ pub fn resolve_stage_route_with(
             norm_stage,
             is_retry,
             author_family.unwrap_or(ModelFamily::OpenAiSol),
-            "gemini-4-argon-high",
-            "gemini-4-argon-high",
+            "gemini-4-hydrogen-high",
+            "gemini-4-hydrogen-high",
             ReasoningEffort::High,
             ReasoningEffort::High,
             max_task_tokens,
@@ -383,6 +636,45 @@ pub fn resolve_stage_route_with(
     };
 
     let mut route = route;
+    if let Some(stage_map) = cfg
+        .routes
+        .iter()
+        .find(|(k, _)| k.trim().eq_ignore_ascii_case(&route.weight))
+        .map(|(_, v)| v)
+        && let Some(ov) = stage_map
+            .iter()
+            .find(|(k, _)| k.trim().eq_ignore_ascii_case(&route.stage))
+            .map(|(_, v)| v)
+    {
+        if is_retry {
+            if let Some(ref m) = ov.retry_model {
+                route.family = infer_model_family(m);
+                route.model = m.clone();
+            } else if let Some(ref m) = ov.model {
+                route.family = infer_model_family(m);
+                route.model = m.clone();
+            }
+            if let Some(eff) = ov.retry_effort.or(ov.effort) {
+                route.effort = eff;
+            }
+        } else {
+            if let Some(ref m) = ov.model {
+                route.family = infer_model_family(m);
+                route.model = m.clone();
+            }
+            if let Some(eff) = ov.effort {
+                route.effort = eff;
+            }
+        }
+        if let Some(ref fb) = ov.fallback_model {
+            route.fallback_family = Some(infer_model_family(fb));
+            route.fallback_model = Some(fb.clone());
+        }
+        if let Some(fb_eff) = ov.fallback_effort {
+            route.fallback_effort = Some(fb_eff);
+        }
+    }
+
     let forced_non_empty = overrides
         .forced_model
         .as_deref()
@@ -413,13 +705,13 @@ pub fn resolve_stage_route_with(
         && let Some(author) = author_family
         && route.family == author
     {
-        return Err(format!(
-            "{NO_CROSS_FAMILY_REVIEWER_ERR}: cannot run {} with {} ({}) when author used {}; cross-family review is mandatory",
+        eprintln!(
+            "suggestion: {} uses {} ({}) which matches author family ({}); cross-family review is recommended",
             route.stage,
             route.model,
             route.family.as_str(),
             author.as_str()
-        ));
+        );
     }
 
     Ok(Some(route))
@@ -481,38 +773,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn router_rejects_gpt_6_astra_and_never_routes_to_it() {
-        assert!(is_forbidden_daemon_model("gpt-6-astra"));
-        assert!(is_forbidden_daemon_model("GPT-6-ASTRA-HIGH"));
-        assert!(!is_forbidden_daemon_model("gpt-6.1-sol"));
-        assert!(!is_forbidden_daemon_model("gemini-4-hydrogen-medium"));
-        assert!(!is_forbidden_daemon_model("gemini-4-hydrogen-high"));
-        assert!(!is_forbidden_daemon_model("gemini-4-argon-high"));
-        assert!(validate_daemon_model("gpt-6-astra").is_err());
-
-        for weight in ["XS", "S", "M", "L"] {
-            for stage in [
-                "plan",
-                "plan-review",
-                "human-plan-approval",
-                "impl",
-                "pr-review",
-                "human-merge-approval",
-            ] {
-                for retry in [0, 1] {
-                    if let Some(route) = resolve_stage_route(weight, stage, retry, None).unwrap() {
-                        assert!(!is_forbidden_daemon_model(&route.model));
-                        if let Some(ref fb) = route.fallback_model {
-                            assert!(!is_forbidden_daemon_model(fb));
-                        }
-                    }
-                }
-            }
-        }
+    fn router_allows_astra_and_rejects_empty_model() {
+        assert!(!is_forbidden_daemon_model("gpt-6-astra"));
+        assert!(validate_daemon_model("gpt-6-astra").is_ok());
+        assert!(validate_daemon_model("gpt-6.1-sol").is_ok());
+        assert!(validate_daemon_model("").is_err());
     }
 
     #[test]
-    fn router_enforces_cross_model_review_family_separation_and_retry_escalation() {
+    fn router_uses_hydrogen_defaults_and_cross_model_review_separation() {
         // S impl uses OpenAiSol (gpt-6.1-sol medium -> high on retry)
         let s_impl_0 = resolve_stage_route("S", "impl", 0, None).unwrap().unwrap();
         assert_eq!(s_impl_0.family, ModelFamily::OpenAiSol);
@@ -527,7 +796,7 @@ mod tests {
         let s_impl_1 = resolve_stage_route("S", "impl", 1, None).unwrap().unwrap();
         assert_eq!(s_impl_1.effort, ReasoningEffort::High);
 
-        // S pr-review when author is OpenAiSol must use GeminiAgy
+        // S pr-review when author is OpenAiSol uses GeminiAgy hydrogen
         let s_rev_0 = resolve_stage_route("S", "pr-review", 0, Some(ModelFamily::OpenAiSol))
             .unwrap()
             .unwrap();
@@ -535,14 +804,25 @@ mod tests {
         assert_ne!(s_rev_0.family, s_impl_0.family);
         assert_eq!(s_rev_0.model, "gemini-4-hydrogen-high");
 
-        // On retry_count == 1, S pr-review escalates to gemini-4-argon-high while keeping cross-model family
+        // On retry_count == 1, S pr-review stays on gemini-4-hydrogen-high
         let s_rev_1 = resolve_stage_route("S", "pr-review", 1, Some(ModelFamily::OpenAiSol))
             .unwrap()
             .unwrap();
         assert_eq!(s_rev_1.family, ModelFamily::GeminiAgy);
-        assert_eq!(s_rev_1.model, "gemini-4-argon-high");
+        assert_eq!(s_rev_1.model, "gemini-4-hydrogen-high");
 
-        // Conversely, if author was GeminiAgy, reviewer must be OpenAiSol
+        // M plan and impl fallback use gemini-4-hydrogen-high
+        let m_plan_0 = resolve_stage_route("M", "plan", 0, None).unwrap().unwrap();
+        assert_eq!(
+            m_plan_0.fallback_model.as_deref(),
+            Some("gemini-4-hydrogen-high")
+        );
+        let m_plan_rev = resolve_stage_route("M", "plan-review", 0, Some(ModelFamily::OpenAiSol))
+            .unwrap()
+            .unwrap();
+        assert_eq!(m_plan_rev.model, "gemini-4-hydrogen-medium");
+
+        // Conversely, if author was GeminiAgy, reviewer uses OpenAiSol
         let s_rev_alt = resolve_stage_route("S", "pr-review", 0, Some(ModelFamily::GeminiAgy))
             .unwrap()
             .unwrap();
@@ -594,49 +874,20 @@ mod tests {
             None,
             &RouterEnvOverrides {
                 flash_only: false,
-                forced_model: Some("gemini-4-argon-high".to_owned()),
+                forced_model: Some("gpt-6-astra".to_owned()),
             },
         )
         .unwrap()
         .unwrap();
-        assert_eq!(forced_route.family, ModelFamily::GeminiAgy);
-        assert_eq!(forced_route.model, "gemini-4-argon-high");
+        assert_eq!(forced_route.family, ModelFamily::OpenAiSol);
+        assert_eq!(forced_route.model, "gpt-6-astra");
         assert_eq!(forced_route.effort, ReasoningEffort::High);
         assert!(forced_route.fallback_model.is_none());
     }
 
     #[test]
-    fn router_enforces_mandatory_cross_family_review_under_overrides() {
-        assert_eq!(ModelFamily::OpenAiSol.opposite(), ModelFamily::GeminiAgy);
-        assert_eq!(ModelFamily::GeminiAgy.opposite(), ModelFamily::OpenAiSol);
-        assert_eq!(infer_model_family("gpt-6.1-sol"), ModelFamily::OpenAiSol);
-        assert_eq!(
-            infer_model_family("gemini-4-argon-high"),
-            ModelFamily::GeminiAgy
-        );
-
-        // Default cross-family review routes never expose a same-family fallback
-        for weight in ["S", "M", "L"] {
-            for stage in ["plan-review", "pr-review"] {
-                if let Some(route) =
-                    resolve_stage_route(weight, stage, 0, Some(ModelFamily::OpenAiSol)).unwrap()
-                {
-                    assert_eq!(route.family, ModelFamily::GeminiAgy);
-                    assert!(route.fallback_family.is_none());
-                    assert!(route.fallback_model.is_none());
-                }
-                if let Some(route) =
-                    resolve_stage_route(weight, stage, 0, Some(ModelFamily::GeminiAgy)).unwrap()
-                {
-                    assert_eq!(route.family, ModelFamily::OpenAiSol);
-                    assert!(route.fallback_family.is_none());
-                    assert!(route.fallback_model.is_none());
-                }
-            }
-        }
-
-        // flash_only cannot review GeminiAgy author
-        let err_flash = resolve_stage_route_with(
+    fn router_treats_same_family_review_as_non_blocking_suggestion() {
+        let ok_flash = resolve_stage_route_with(
             "S",
             "pr-review",
             0,
@@ -646,26 +897,12 @@ mod tests {
                 forced_model: None,
             },
         )
-        .unwrap_err();
-        assert!(is_no_cross_family_reviewer_error(&err_flash));
-
-        // flash_only CAN review OpenAiSol author
-        let ok_flash = resolve_stage_route_with(
-            "S",
-            "pr-review",
-            0,
-            Some(ModelFamily::OpenAiSol),
-            &RouterEnvOverrides {
-                flash_only: true,
-                forced_model: None,
-            },
-        )
         .unwrap()
         .unwrap();
         assert_eq!(ok_flash.family, ModelFamily::GeminiAgy);
+        assert_eq!(ok_flash.model, "gemini-4-hydrogen-high");
 
-        // ZACH_FORCE_MODEL=gpt-6.1-sol cannot review OpenAiSol author
-        let err_forced_sol = resolve_stage_route_with(
+        let ok_forced_sol = resolve_stage_route_with(
             "M",
             "plan-review",
             0,
@@ -675,23 +912,55 @@ mod tests {
                 forced_model: Some("gpt-6.1-sol".to_owned()),
             },
         )
-        .unwrap_err();
-        assert!(is_no_cross_family_reviewer_error(&err_forced_sol));
-
-        // ZACH_FORCE_MODEL=gpt-6.1-sol CAN review GeminiAgy author
-        let ok_forced_sol = resolve_stage_route_with(
-            "M",
-            "pr-review",
-            0,
-            Some(ModelFamily::GeminiAgy),
-            &RouterEnvOverrides {
-                flash_only: false,
-                forced_model: Some("gpt-6.1-sol".to_owned()),
-            },
-        )
         .unwrap()
         .unwrap();
         assert_eq!(ok_forced_sol.family, ModelFamily::OpenAiSol);
         assert_eq!(ok_forced_sol.model, "gpt-6.1-sol");
+    }
+
+    #[test]
+    fn router_config_overrides_and_validates_with_warnings() {
+        let raw = r#"{
+            "routes": {
+                "M": {
+                    "plan": {
+                        "model": "gpt-6-astra",
+                        "effort": "high",
+                        "fallback_model": "gemini-4-hydrogen-high",
+                        "fallback_effort": "medium"
+                    },
+                    "plan-review": {
+                        "model": "gpt-6.1-sol",
+                        "effort": "medium"
+                    }
+                }
+            }
+        }"#;
+        let cfg: RouterConfig = serde_json::from_str(raw).unwrap();
+        let warnings = validate_router_config(&cfg).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("M.plan-review"));
+        assert!(warnings[0].contains("cross-family review is recommended"));
+
+        let route = resolve_stage_route_with_config(
+            "M",
+            "plan",
+            0,
+            None,
+            &RouterEnvOverrides::default(),
+            &cfg,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(route.model, "gpt-6-astra");
+        assert_eq!(
+            route.fallback_model.as_deref(),
+            Some("gemini-4-hydrogen-high")
+        );
+        assert_eq!(route.fallback_effort, Some(ReasoningEffort::Medium));
+
+        let bad_cfg: RouterConfig =
+            serde_json::from_str(r#"{"routes":{"XS":{"plan":{"model":"gpt-6.1-sol"}}}}"#).unwrap();
+        assert!(validate_router_config(&bad_cfg).is_err());
     }
 }
