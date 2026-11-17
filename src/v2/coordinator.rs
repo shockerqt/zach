@@ -235,8 +235,13 @@ pub struct Coordinator {
     last_export: Instant,
     last_delivery_poll: Instant,
     last_heartbeat: Instant,
+    next_tick_deadline: Option<Instant>,
+    in_tick: bool,
+    tick_tasks_cache: Option<Vec<TaskRecord>>,
     last_seq: i64,
     scope: Option<(Option<String>, Option<String>)>,
+    #[cfg(test)]
+    task_list_reads: usize,
     #[cfg(test)]
     submission_probe: Option<BTreeMap<&'static str, usize>>,
     #[cfg(test)]
@@ -294,8 +299,13 @@ impl Coordinator {
             last_export: Instant::now() - Duration::from_secs(3600),
             last_delivery_poll: Instant::now() - Duration::from_secs(10),
             last_heartbeat: Instant::now() - Duration::from_secs(10),
+            next_tick_deadline: None,
+            in_tick: false,
+            tick_tasks_cache: None,
             last_seq: 0,
             scope: None,
+            #[cfg(test)]
+            task_list_reads: 0,
             #[cfg(test)]
             submission_probe: None,
             #[cfg(test)]
@@ -384,29 +394,85 @@ impl Coordinator {
                     .map_err(|e| e.to_string())?;
             }
         }
+        let mut dirty = true;
         loop {
             self.flush_deliveries()?;
+            if dirty {
+                dirty = false;
+                self.tick()?;
+                self.flush_deliveries()?;
+            }
             for _ in 0..64 {
                 if self.pending_deliveries.len() >= 128 {
                     break;
                 }
                 match self.rx.try_recv() {
-                    Ok(CoordinatorEvent::Shutdown) => {
-                        self.ready = false;
-                        self.store
-                            .set_meta("daemon_lease_expires_epoch", "0")
-                            .map_err(|e| e.to_string())?;
-                        let _stopped = self.socket_tx.try_send(SocketDelivery::Stopped);
-                        return Ok(());
+                    Ok(CoordinatorEvent::Shutdown) => return self.shutdown(),
+                    Ok(event) => {
+                        if self.handle_event_dirty(event)? {
+                            dirty = true;
+                        }
                     }
-                    Ok(event) => self.handle_event(event)?,
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
                 }
             }
-            self.tick()?;
-            std::thread::sleep(Duration::from_millis(20));
+            if dirty {
+                continue;
+            }
+            self.maybe_heartbeat()?;
+            let now = Instant::now();
+            if self.next_tick_deadline.is_some_and(|d| now >= d) {
+                dirty = true;
+                continue;
+            }
+            let heartbeat_deadline = self.last_heartbeat + Duration::from_secs(1);
+            let mut wake_at = match self.next_tick_deadline {
+                Some(d) => heartbeat_deadline.min(d),
+                None => heartbeat_deadline,
+            };
+            if !self.pending_deliveries.is_empty() {
+                wake_at = wake_at.min(now + Duration::from_millis(20));
+            }
+            let wait = wake_at.saturating_duration_since(now);
+            if self.pending_deliveries.len() >= 128 {
+                std::thread::sleep(wait);
+                continue;
+            }
+            match self.rx.recv_timeout(wait) {
+                Ok(CoordinatorEvent::Shutdown) => return self.shutdown(),
+                Ok(event) => {
+                    if self.handle_event_dirty(event)? {
+                        dirty = true;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+            self.maybe_heartbeat()?;
         }
+    }
+
+    fn shutdown(&mut self) -> Result<(), String> {
+        self.ready = false;
+        self.store
+            .set_meta("daemon_lease_expires_epoch", "0")
+            .map_err(|e| e.to_string())?;
+        let _stopped = self.socket_tx.try_send(SocketDelivery::Stopped);
+        Ok(())
+    }
+
+    fn handle_event_dirty(&mut self, event: CoordinatorEvent) -> Result<bool, String> {
+        let dirty = match &event {
+            CoordinatorEvent::Completed { .. } | CoordinatorEvent::DeliveryStore(_) => true,
+            CoordinatorEvent::Socket { command, .. } => matches!(
+                command,
+                ClientCommand::Decide { .. } | ClientCommand::Run { .. }
+            ),
+            CoordinatorEvent::Replay { .. } | CoordinatorEvent::Shutdown => false,
+        };
+        self.handle_event(event)?;
+        Ok(dirty)
     }
 
     fn send_delivery(&mut self, delivery: SocketDelivery) -> Result<(), String> {
@@ -584,7 +650,10 @@ impl Coordinator {
                     }
                 }
             }
-            CoordinatorEvent::DeliveryStore(operation) => operation(&mut self.store),
+            CoordinatorEvent::DeliveryStore(operation) => {
+                operation(&mut self.store);
+                self.invalidate_tasks_cache();
+            }
             CoordinatorEvent::Shutdown => {}
         }
         Ok(())
@@ -631,6 +700,7 @@ impl Coordinator {
                         note.as_deref(),
                     )
                     .map_err(|e| e.to_string())?;
+                self.invalidate_tasks_cache();
                 match resolution {
                     DecisionResolution::Resolved(decision) => {
                         self.apply_decision(&decision)?;
@@ -664,7 +734,28 @@ impl Coordinator {
         })
     }
 
-    fn tick(&mut self) -> Result<(), String> {
+    fn invalidate_tasks_cache(&mut self) {
+        self.tick_tasks_cache = None;
+    }
+
+    fn list_all_tasks_cached(&mut self) -> Result<Vec<TaskRecord>, String> {
+        if self.in_tick
+            && let Some(cached) = self.tick_tasks_cache.as_ref()
+        {
+            return Ok(cached.clone());
+        }
+        #[cfg(test)]
+        {
+            self.task_list_reads += 1;
+        }
+        let tasks = self.store.list_tasks(None).map_err(|e| e.to_string())?;
+        if self.in_tick {
+            self.tick_tasks_cache = Some(tasks.clone());
+        }
+        Ok(tasks)
+    }
+
+    fn maybe_heartbeat(&mut self) -> Result<(), String> {
         if self.last_heartbeat.elapsed() >= Duration::from_secs(1) {
             self.store
                 .record_heartbeat(now_epoch())
@@ -677,6 +768,123 @@ impl Coordinator {
                 .map_err(|e| e.to_string())?;
             self.last_heartbeat = Instant::now();
         }
+        Ok(())
+    }
+
+    fn sync_interval_secs() -> u64 {
+        std::env::var("ZACH_SYNC_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(30)
+            .max(1)
+    }
+
+    fn compute_next_tick_deadline(&mut self) -> Result<Option<Instant>, String> {
+        let mut deadline: Option<Instant> = None;
+        let mut min_deadline = |candidate: Instant| {
+            deadline = Some(match deadline {
+                Some(current) => current.min(candidate),
+                None => candidate,
+            });
+        };
+
+        if !self.preflight {
+            return Ok(None);
+        }
+        if !self.reconciled {
+            if !self.jobs.contains("reconcile") {
+                min_deadline(self.last_export + Duration::from_secs(2));
+            }
+            return Ok(deadline);
+        }
+        if !self.jobs.contains("export") {
+            min_deadline(self.last_export + Duration::from_secs(Self::sync_interval_secs()));
+        }
+        if !self.synced {
+            return Ok(deadline);
+        }
+
+        let now_instant = Instant::now();
+        let now = now_epoch();
+
+        let tasks = self.list_all_tasks_cached()?;
+        for task in &tasks {
+            if let Some(attempt_id) = &task.active_attempt_id
+                && !self
+                    .jobs
+                    .iter()
+                    .any(|k| k.ends_with(&format!(":{attempt_id}")))
+                && let Some(polled_at) = self.last_poll.get(attempt_id)
+                && polled_at.elapsed() < Duration::from_secs(1)
+            {
+                min_deadline(*polled_at + Duration::from_secs(1));
+            }
+            if !matches!(task.status.as_str(), "Done" | "Cancelled")
+                && task.autonomous_consent
+                && !task.memory.halt_requested
+                && task.next_retry_epoch > now
+            {
+                let secs = (task.next_retry_epoch - now) as u64;
+                min_deadline(now_instant + Duration::from_secs(secs));
+            }
+            if let Some(cp) = &task.memory.merge_checkpoint
+                && matches!(cp.phase.as_str(), "DELIVERY_PENDING" | "CLOSE_PENDING")
+                && let Some(polled_at) = self.merge_poll.get(&task.task_id)
+                && polled_at.elapsed() < Duration::from_secs(2)
+            {
+                min_deadline(*polled_at + Duration::from_secs(2));
+            }
+        }
+
+        for op in self.store.lifecycle_ops().map_err(|e| e.to_string())? {
+            if op.state == "PENDING" && op.retry_epoch > now {
+                let secs = (op.retry_epoch - now) as u64;
+                min_deadline(now_instant + Duration::from_secs(secs));
+            }
+        }
+
+        if !self.jobs.iter().any(|k| k.starts_with("merge:")) {
+            for entry in self
+                .store
+                .list_merge_queue(None)
+                .map_err(|e| e.to_string())?
+            {
+                if let Some(polled_at) = self.merge_poll.get(&entry.task_id)
+                    && polled_at.elapsed() < Duration::from_secs(2)
+                {
+                    min_deadline(*polled_at + Duration::from_secs(2));
+                }
+            }
+        }
+
+        if !self.jobs.contains("post-merge-deliveries")
+            && !self
+                .store
+                .list_deliveries(None)
+                .map_err(|e| e.to_string())?
+                .is_empty()
+        {
+            min_deadline(self.last_delivery_poll + Duration::from_secs(2));
+        }
+
+        Ok(deadline)
+    }
+
+    fn tick(&mut self) -> Result<(), String> {
+        self.in_tick = true;
+        self.tick_tasks_cache = None;
+        let result = (|| {
+            self.tick_inner()?;
+            self.next_tick_deadline = self.compute_next_tick_deadline()?;
+            Ok(())
+        })();
+        self.in_tick = false;
+        self.tick_tasks_cache = None;
+        result
+    }
+
+    fn tick_inner(&mut self) -> Result<(), String> {
+        self.maybe_heartbeat()?;
         if !self.preflight {
             self.submit(
                 "preflight".into(),
@@ -693,11 +901,7 @@ impl Coordinator {
             self.reconcile_startup()?;
             return self.deliver_events();
         }
-        let sync_secs = std::env::var("ZACH_SYNC_INTERVAL_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(30)
-            .max(1);
+        let sync_secs = Self::sync_interval_secs();
         if self.last_export.elapsed() >= Duration::from_secs(sync_secs)
             && !self.jobs.contains("export")
         {
@@ -727,7 +931,7 @@ impl Coordinator {
         self.resume_decisions()?;
         self.reconcile_terminal_tasks()?;
         let mut recovery_ready = true;
-        for task in self.store.list_tasks(None).map_err(|e| e.to_string())? {
+        for task in self.list_all_tasks_cached()? {
             if let Some(id) = &task.active_attempt_id {
                 let attempt = self
                     .store
@@ -756,12 +960,13 @@ impl Coordinator {
     }
 
     fn reconcile_terminal_tasks(&mut self) -> Result<(), String> {
-        for mut task in self.store.list_tasks(None).map_err(|e| e.to_string())? {
+        for mut task in self.list_all_tasks_cached()? {
             if let Some(recovered) = self
                 .store
                 .recover_unclosed_delivery(&task.task_id)
                 .map_err(|e| e.to_string())?
             {
+                self.invalidate_tasks_cache();
                 task = recovered;
             }
             if !matches!(task.status.as_str(), "Done" | "Cancelled")
@@ -886,9 +1091,7 @@ impl Coordinator {
         self.startup_ownership()?;
         let controller = self.controller.clone();
         let snapshots = self
-            .store
-            .list_tasks(None)
-            .map_err(|e| e.to_string())?
+            .list_all_tasks_cached()?
             .into_iter()
             .map(|task| {
                 let attempts = self.store.list_stage_attempts(&task.task_id)?;
@@ -914,6 +1117,7 @@ impl Coordinator {
     }
     fn save(&mut self, task: &TaskRecord) -> Result<(), String> {
         self.store.upsert_task(task).map_err(|e| e.to_string())?;
+        self.invalidate_tasks_cache();
         Ok(())
     }
 
@@ -924,6 +1128,9 @@ impl Coordinator {
             scope.0.as_deref(),
             scope.1.as_deref(),
         )?;
+        if !dispatches.is_empty() {
+            self.invalidate_tasks_cache();
+        }
         for dispatch in dispatches {
             let mut task = self.task(&dispatch.task_id)?;
             if !task.memory.governance_started {
@@ -951,6 +1158,7 @@ impl Coordinator {
                 self.store
                     .checkpoint_with_lifecycle(&task, &op)
                     .map_err(|e| e.to_string())?;
+                self.invalidate_tasks_cache();
                 continue;
             }
             if dispatch.stage == "impl"
@@ -985,7 +1193,7 @@ impl Coordinator {
     }
 
     fn resume_pipeline_steps(&mut self) -> Result<(), String> {
-        for task in self.store.list_tasks(None).map_err(|e| e.to_string())? {
+        for task in self.list_all_tasks_cached()? {
             if !task.autonomous_consent
                 || matches!(task.status.as_str(), "Done" | "Cancelled" | "Blocked")
             {
@@ -1125,7 +1333,7 @@ impl Coordinator {
     }
 
     fn monitor_attempts(&mut self) -> Result<(), String> {
-        for task in self.store.list_tasks(None).map_err(|e| e.to_string())? {
+        for task in self.list_all_tasks_cached()? {
             let Some(id) = task.active_attempt_id.clone() else {
                 continue;
             };
@@ -1458,6 +1666,7 @@ impl Coordinator {
                 // External terminal changes and consent revocations are observed
                 // before any dispatch. Live attempts keep ownership until stopped.
                 intake::ingest_task_records(&mut self.store, output).map_err(|e| e.to_string())?;
+                self.invalidate_tasks_cache();
                 self.synced = true;
             }
             WorkerResult::Prepared(prepared) => {
@@ -1645,6 +1854,7 @@ impl Coordinator {
                     self.store
                         .transition_attempt(&task, &attempt, false, None)
                         .map_err(|e| e.to_string())?;
+                    self.invalidate_tasks_cache();
                 }
             }
             WorkerResult::Stopped(id) => {
@@ -1671,6 +1881,7 @@ impl Coordinator {
                     self.store
                         .transition_attempt(&task, &attempt, true, None)
                         .map_err(|e| e.to_string())?;
+                    self.invalidate_tasks_cache();
                 } else if attempt.status != "PASSED" {
                     self.fail_task(
                         &attempt.task_id,
@@ -1686,6 +1897,7 @@ impl Coordinator {
                     self.store
                         .transition_attempt(&task, &attempt, false, None)
                         .map_err(|e| e.to_string())?;
+                    self.invalidate_tasks_cache();
                 }
             }
             WorkerResult::Pipeline { attempt_id, step } => {
@@ -2085,6 +2297,7 @@ impl Coordinator {
         self.store
             .transition_attempt(&task, &attempt, true, decision.as_ref())
             .map_err(|e| e.to_string())?;
+        self.invalidate_tasks_cache();
         Ok(())
     }
 
@@ -2544,7 +2757,7 @@ impl Coordinator {
     }
 
     fn evaluate_gates(&mut self) -> Result<(), String> {
-        for mut task in self.store.list_tasks(None).map_err(|e| e.to_string())? {
+        for mut task in self.list_all_tasks_cached()? {
             let stale_gate_wait = task.status == "Blocked"
                 && !task.memory.halt_requested
                 && task
@@ -2978,12 +3191,13 @@ impl Coordinator {
 
     fn poll_deliveries(&mut self) -> Result<(), String> {
         // Recover the small gap between the durable handoff and lane release.
-        for mut task in self.store.list_tasks(None).map_err(|e| e.to_string())? {
+        for mut task in self.list_all_tasks_cached()? {
             if let Some(recovered) = self
                 .store
                 .recover_unclosed_delivery(&task.task_id)
                 .map_err(|e| e.to_string())?
             {
+                self.invalidate_tasks_cache();
                 task = recovered;
             }
             let rows = self
@@ -9946,5 +10160,151 @@ mod tests {
                 .insert("extra".into(), json!(true));
             assert!(strict::<ResultRecord>(&serde_json::to_vec(&val).unwrap()).is_err());
         }
+    }
+
+    #[test]
+    fn idle_coordinator_wakes_immediately_on_socket_and_shutdown() {
+        let dir = TestDirectory::new();
+        let (mut c, handle) =
+            Coordinator::create(V2Store::open_in_memory().unwrap(), dir.0.clone());
+        c.preflight = true;
+        c.reconciled = true;
+        c.synced = true;
+        c.last_export = Instant::now();
+        c.last_heartbeat = Instant::now();
+
+        let thread = std::thread::spawn(move || c.run());
+
+        // Initial tick emits Ready.
+        assert!(matches!(
+            handle
+                .deliveries
+                .recv_timeout(Duration::from_millis(500))
+                .unwrap(),
+            SocketDelivery::Ready
+        ));
+
+        // Socket command wakes recv_timeout immediately without waiting for 1s heartbeat.
+        let started = Instant::now();
+        handle
+            .commands
+            .send(CoordinatorEvent::Socket {
+                client_id: 7,
+                command: ClientCommand::Status,
+            })
+            .unwrap();
+        assert!(matches!(
+            handle
+                .deliveries
+                .recv_timeout(Duration::from_millis(250))
+                .unwrap(),
+            SocketDelivery::Reply { client_id: 7, .. }
+        ));
+        assert!(started.elapsed() < Duration::from_millis(250));
+
+        // Shutdown wakes recv_timeout immediately and exits cleanly.
+        let shutdown_started = Instant::now();
+        handle.commands.send(CoordinatorEvent::Shutdown).unwrap();
+        assert!(matches!(
+            handle
+                .deliveries
+                .recv_timeout(Duration::from_millis(250))
+                .unwrap(),
+            SocketDelivery::Stopped
+        ));
+        assert!(shutdown_started.elapsed() < Duration::from_millis(250));
+        thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn idle_heartbeat_wakeup_does_not_invoke_list_tasks() {
+        let dir = TestDirectory::new();
+        let (mut c, handle) =
+            Coordinator::create(V2Store::open_in_memory().unwrap(), dir.0.clone());
+        c.preflight = true;
+        c.reconciled = true;
+        c.synced = true;
+        c.last_export = Instant::now();
+        c.last_heartbeat = Instant::now() - Duration::from_millis(920);
+
+        let thread = std::thread::spawn(move || {
+            c.run().unwrap();
+            (c.task_list_reads, c.store.meta("heartbeat_epoch").unwrap())
+        });
+
+        assert!(matches!(
+            handle
+                .deliveries
+                .recv_timeout(Duration::from_millis(500))
+                .unwrap(),
+            SocketDelivery::Ready
+        ));
+
+        // Allow the 1s heartbeat deadline to fire (~80ms) plus margin, and also send a read-only Status.
+        std::thread::sleep(Duration::from_millis(180));
+        handle
+            .commands
+            .send(CoordinatorEvent::Socket {
+                client_id: 9,
+                command: ClientCommand::Status,
+            })
+            .unwrap();
+        assert!(matches!(
+            handle
+                .deliveries
+                .recv_timeout(Duration::from_millis(250))
+                .unwrap(),
+            SocketDelivery::Reply { client_id: 9, .. }
+        ));
+
+        handle.commands.send(CoordinatorEvent::Shutdown).unwrap();
+        let (reads, heartbeat_meta) = thread.join().unwrap();
+        assert_eq!(
+            reads, 1,
+            "idle heartbeat and read-only socket commands must not invoke list_tasks(None)"
+        );
+        assert!(heartbeat_meta.is_some());
+    }
+
+    #[test]
+    fn tick_tasks_cache_deduplicates_and_invalidates_on_mutation() {
+        let dir = TestDirectory::new();
+        let (mut c, _handle) =
+            Coordinator::create(V2Store::open_in_memory().unwrap(), dir.0.clone());
+        c.preflight = true;
+        c.reconciled = true;
+        c.synced = true;
+        c.last_export = Instant::now();
+
+        // Inside tick(): multiple list_all_tasks_cached() calls result in a single SQLite read.
+        c.tick().unwrap();
+        assert_eq!(c.task_list_reads, 1);
+        assert!(!c.in_tick);
+        assert!(c.tick_tasks_cache.is_none());
+
+        // Outside tick(): list_all_tasks_cached() reads directly from store without caching.
+        let _ = c.list_all_tasks_cached().unwrap();
+        assert_eq!(c.task_list_reads, 2);
+        assert!(c.tick_tasks_cache.is_none());
+
+        // Inside tick scope: cache hits until a task mutation invalidates it.
+        c.in_tick = true;
+        c.tick_tasks_cache = None;
+        let first = c.list_all_tasks_cached().unwrap();
+        assert!(first.is_empty());
+        assert_eq!(c.task_list_reads, 3);
+        let second = c.list_all_tasks_cached().unwrap();
+        assert!(second.is_empty());
+        assert_eq!(c.task_list_reads, 3);
+
+        c.save(&task("T-CACHE-1")).unwrap();
+        assert!(c.tick_tasks_cache.is_none());
+        let after_save = c.list_all_tasks_cached().unwrap();
+        assert_eq!(after_save.len(), 1);
+        assert_eq!(after_save[0].task_id, "T-CACHE-1");
+        assert_eq!(c.task_list_reads, 4);
+
+        c.in_tick = false;
+        c.tick_tasks_cache = None;
     }
 }
