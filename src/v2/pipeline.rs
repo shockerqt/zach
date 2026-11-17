@@ -4521,7 +4521,7 @@ mod tests {
 
     impl StubWsTask {
         fn from_python(label: &str, body: &str) -> Self {
-            use std::os::unix::fs::PermissionsExt;
+            use std::io::Write;
             use std::sync::atomic::{AtomicU64, Ordering};
             static SEQ: AtomicU64 = AtomicU64::new(0);
             let seq = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -4533,9 +4533,28 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("create stub dir");
             let bin_path = dir.join("ws-task");
-            std::fs::write(&bin_path, body).expect("write stub script");
-            std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod stub script");
+            // Materialize the executable in a short-lived child process so the
+            // multi-threaded test process never holds a writable file descriptor
+            // to `bin_path` that concurrent `fork()` calls could inherit and
+            // trigger `ETXTBSY` when `execve()` runs.
+            let mut writer = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(r#"umask 022 && cat > "$1" && chmod 0755 "$1""#)
+                .arg("sh")
+                .arg(&bin_path)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn stub script writer");
+            {
+                let mut stdin = writer.stdin.take().expect("stub writer stdin");
+                stdin.write_all(body.as_bytes()).expect("write stub script");
+            }
+            let status = writer.wait().expect("wait for stub script writer");
+            assert!(
+                status.success(),
+                "stub script writer failed for {} with {status}",
+                bin_path.display()
+            );
             Self {
                 _dir: dir,
                 bin_path,
@@ -8035,5 +8054,46 @@ raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={
             classify_failure_class("impl", "STALLED", "no output or CPU"),
             "infra"
         );
+    }
+
+    #[test]
+    fn stub_ws_task_parallel_creation_and_execution_does_not_hit_etxtbsy() {
+        let pack = sample_context_pack("XS");
+        let diff = vec![DiffFileEntry {
+            path: "src/v2/router.rs".to_owned(),
+            status: "M".to_owned(),
+            added_lines: 3,
+            deleted_lines: 1,
+        }];
+        let threads = 8usize;
+        let iterations_per_thread = 25usize;
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(threads);
+            for tid in 0..threads {
+                let pack = &pack;
+                let diff = &diff;
+                handles.push(scope.spawn(move || {
+                    for iter in 0..iterations_per_thread {
+                        let stub = StubWsTask::passthrough_clean(&format!("par-{tid}-{iter}"));
+                        let outcome = verify_worktree_diff_with(
+                            "zach",
+                            "XS",
+                            pack,
+                            diff,
+                            stub.path(),
+                        )
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "parallel stub classifier invocation failed on thread {tid} iter {iter}: {e}"
+                            )
+                        });
+                        assert_eq!(outcome, DiffCheckOutcome::Clean);
+                    }
+                }));
+            }
+            for handle in handles {
+                handle.join().expect("parallel stub worker thread panicked");
+            }
+        });
     }
 }
