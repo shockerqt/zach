@@ -480,6 +480,146 @@ pub struct DaemonStatusSummary {
     pub last_sync_epoch: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveTaskDetail {
+    pub task_id: String,
+    pub task_group: String,
+    pub repository: String,
+    pub weight: String,
+    pub status: String,
+    pub title: String,
+    pub executor: Option<String>,
+    pub current_stage: Option<String>,
+    pub attempt_id: Option<String>,
+    pub attempt_phase: Option<String>,
+    pub model: Option<String>,
+    pub occupies_slot: bool,
+    pub target_files: Vec<String>,
+    pub reservation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WaitingTaskDetail {
+    pub task_id: String,
+    pub task_group: String,
+    pub repository: String,
+    pub weight: String,
+    pub status: String,
+    pub title: String,
+    pub wait_reason: String,
+    pub target_files: Vec<String>,
+    pub next_retry_epoch: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DetailedStatusReport {
+    pub summary: DaemonStatusSummary,
+    pub active_tasks: Vec<ActiveTaskDetail>,
+    pub waiting_tasks: Vec<WaitingTaskDetail>,
+    pub merge_queue: Vec<MergeQueueRecord>,
+    pub open_decisions: Vec<PendingDecisionRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoReservation {
+    WholeRepo { task_id: String },
+    ScopedPaths { task_id: String, paths: Vec<String> },
+}
+
+impl RepoReservation {
+    pub fn task_id(&self) -> &str {
+        match self {
+            Self::WholeRepo { task_id } | Self::ScopedPaths { task_id, .. } => task_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoConflict {
+    RepoLocked { owner: String },
+    PathConflict { owner: String, path: String },
+}
+
+pub fn normalize_repo_path(raw: &str) -> String {
+    let mut s = raw.trim().to_owned();
+    while s.contains("//") {
+        s = s.replace("//", "/");
+    }
+    while let Some(rest) = s.strip_prefix("./") {
+        s = rest.to_owned();
+    }
+    let trimmed = s.trim_end_matches('/');
+    if trimmed.is_empty() || trimmed == "." || trimmed == "*" {
+        "*".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+pub fn paths_overlap(a: &str, b: &str) -> bool {
+    let a = normalize_repo_path(a);
+    let b = normalize_repo_path(b);
+    if a == "*" || b == "*" {
+        return true;
+    }
+    a == b || b.starts_with(&format!("{a}/")) || a.starts_with(&format!("{b}/"))
+}
+
+pub fn repo_conflict_for_task(
+    reservations: &[RepoReservation],
+    task: &TaskRecord,
+) -> Option<RepoConflict> {
+    let others: Vec<&RepoReservation> = reservations
+        .iter()
+        .filter(|res| res.task_id() != task.task_id)
+        .collect();
+    if others.is_empty() {
+        return None;
+    }
+
+    for res in &others {
+        if let RepoReservation::WholeRepo { task_id } = res {
+            return Some(RepoConflict::RepoLocked {
+                owner: task_id.clone(),
+            });
+        }
+    }
+
+    let task_paths: Vec<String> = task
+        .context_pack
+        .target_files
+        .iter()
+        .map(|f| normalize_repo_path(&f.path))
+        .collect();
+    if task_paths.is_empty() || task_paths.iter().any(|p| p == "*") {
+        return others.first().map(|res| RepoConflict::RepoLocked {
+            owner: res.task_id().to_owned(),
+        });
+    }
+
+    for res in others {
+        if let RepoReservation::ScopedPaths { task_id, paths } = res {
+            for tp in &task_paths {
+                for rp in paths {
+                    if rp == "*" {
+                        return Some(RepoConflict::RepoLocked {
+                            owner: task_id.clone(),
+                        });
+                    }
+                    if paths_overlap(tp, rp) {
+                        return Some(RepoConflict::PathConflict {
+                            owner: task_id.clone(),
+                            path: tp.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Durable post-merge work. `rule_json` is the immutable contract rule captured
 /// at `merge_sha`; evidence and dispatch identifiers survive process restarts.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3009,6 +3149,218 @@ impl V2Store {
         })
     }
 
+    pub fn repo_reservations(
+        &self,
+        all_tasks: &[TaskRecord],
+    ) -> Result<BTreeMap<String, Vec<RepoReservation>>, V2StoreError> {
+        let mut by_repo: BTreeMap<String, Vec<RepoReservation>> = BTreeMap::new();
+        for lock in self.list_path_locks(None)? {
+            by_repo
+                .entry(lock.repo)
+                .or_default()
+                .push(RepoReservation::WholeRepo {
+                    task_id: lock.task_id,
+                });
+        }
+        for t in all_tasks {
+            if t.status == "Queued for Merge" {
+                by_repo
+                    .entry(t.repository.clone())
+                    .or_default()
+                    .push(RepoReservation::WholeRepo {
+                        task_id: t.task_id.clone(),
+                    });
+            } else if matches!(
+                t.status.as_str(),
+                "Planning" | "Plan Review" | "In Progress" | "PR Review"
+            ) {
+                if t.executor.as_deref() == Some("session") {
+                    let paths: Vec<String> = t
+                        .context_pack
+                        .target_files
+                        .iter()
+                        .map(|f| normalize_repo_path(&f.path))
+                        .collect();
+                    if paths.is_empty() || paths.iter().any(|p| p == "*") {
+                        by_repo.entry(t.repository.clone()).or_default().push(
+                            RepoReservation::WholeRepo {
+                                task_id: t.task_id.clone(),
+                            },
+                        );
+                    } else {
+                        by_repo.entry(t.repository.clone()).or_default().push(
+                            RepoReservation::ScopedPaths {
+                                task_id: t.task_id.clone(),
+                                paths,
+                            },
+                        );
+                    }
+                } else {
+                    by_repo.entry(t.repository.clone()).or_default().push(
+                        RepoReservation::WholeRepo {
+                            task_id: t.task_id.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        for entry in self.list_merge_queue(None)? {
+            by_repo
+                .entry(entry.repo)
+                .or_default()
+                .push(RepoReservation::WholeRepo {
+                    task_id: entry.task_id,
+                });
+        }
+        Ok(by_repo)
+    }
+
+    pub fn detailed_status(
+        &self,
+        group_filter: Option<&str>,
+    ) -> Result<DetailedStatusReport, V2StoreError> {
+        let summary = self.status_summary()?;
+        let all_tasks = self.list_tasks(None)?;
+        let done_ids: BTreeSet<String> = all_tasks
+            .iter()
+            .filter(|t| t.status == "Done")
+            .map(|t| t.task_id.clone())
+            .collect();
+        let all_open_decisions = self.list_decisions(true, None)?;
+        let blocked_by_decision: BTreeSet<String> = all_open_decisions
+            .iter()
+            .map(|d| d.task_id.clone())
+            .collect();
+        let reservations = self.repo_reservations(&all_tasks)?;
+        let max_parallel = self.max_parallel_tasks()?;
+        let active_slot_count = all_tasks
+            .iter()
+            .map(|task| self.occupies_task_slot(task))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|occupied| *occupied)
+            .count();
+        let available_slots = max_parallel.saturating_sub(active_slot_count);
+        let now = now_epoch();
+
+        let mut active_tasks = Vec::new();
+        let mut waiting_tasks = Vec::new();
+        let mut group_task_ids = BTreeSet::new();
+
+        for task in &all_tasks {
+            if let Some(group) = group_filter
+                && !task.task_group.eq_ignore_ascii_case(group)
+            {
+                continue;
+            }
+            group_task_ids.insert(task.task_id.clone());
+
+            let target_files: Vec<String> = task
+                .context_pack
+                .target_files
+                .iter()
+                .map(|f| normalize_repo_path(&f.path))
+                .collect();
+
+            if matches!(
+                task.status.as_str(),
+                "Planning" | "Plan Review" | "In Progress" | "PR Review" | "Queued for Merge"
+            ) {
+                let attempt = if let Some(id) = task.active_attempt_id.as_deref() {
+                    self.get_stage_attempt(id)?
+                } else {
+                    None
+                };
+                let occupies_slot = self.occupies_task_slot(task)?;
+                let reservation = if task.status != "Queued for Merge"
+                    && task.executor.as_deref() == Some("session")
+                    && !target_files.is_empty()
+                    && !target_files.iter().any(|p| p == "*")
+                {
+                    "scoped_paths".to_owned()
+                } else {
+                    "whole_repo".to_owned()
+                };
+                active_tasks.push(ActiveTaskDetail {
+                    task_id: task.task_id.clone(),
+                    task_group: task.task_group.clone(),
+                    repository: task.repository.clone(),
+                    weight: task.weight.clone(),
+                    status: task.status.clone(),
+                    title: task.title.clone(),
+                    executor: task.executor.clone(),
+                    current_stage: task.current_stage.clone(),
+                    attempt_id: task.active_attempt_id.clone(),
+                    attempt_phase: attempt.as_ref().map(|a| a.phase.clone()),
+                    model: attempt.map(|a| a.model),
+                    occupies_slot,
+                    target_files,
+                    reservation,
+                });
+            } else if matches!(task.status.as_str(), "Ready" | "Blocked") {
+                let wait_reason = if !task.autonomous_consent {
+                    "awaiting_consent".to_owned()
+                } else if blocked_by_decision.contains(&task.task_id) {
+                    "open_decision".to_owned()
+                } else if self.has_pending_lifecycle(&task.task_id)? {
+                    "pending_lifecycle".to_owned()
+                } else if task.next_retry_epoch > now {
+                    "retry_backoff".to_owned()
+                } else if let Some(dep) =
+                    task.depends_on.iter().find(|dep| !done_ids.contains(*dep))
+                {
+                    format!("dependency:{dep}")
+                } else if task.status == "Blocked" {
+                    "blocked".to_owned()
+                } else if let Some(conflict) = repo_conflict_for_task(
+                    reservations
+                        .get(&task.repository)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                    task,
+                ) {
+                    match conflict {
+                        RepoConflict::RepoLocked { owner } => format!("repo_locked:{owner}"),
+                        RepoConflict::PathConflict { owner, path } => {
+                            format!("path_conflict:{owner}:{path}")
+                        }
+                    }
+                } else if available_slots == 0 {
+                    "no_free_slots".to_owned()
+                } else {
+                    "eligible".to_owned()
+                };
+
+                waiting_tasks.push(WaitingTaskDetail {
+                    task_id: task.task_id.clone(),
+                    task_group: task.task_group.clone(),
+                    repository: task.repository.clone(),
+                    weight: task.weight.clone(),
+                    status: task.status.clone(),
+                    title: task.title.clone(),
+                    wait_reason,
+                    target_files,
+                    next_retry_epoch: task.next_retry_epoch,
+                });
+            }
+        }
+
+        let merge_queue = self
+            .list_merge_queue(None)?
+            .into_iter()
+            .filter(|entry| group_filter.is_none() || group_task_ids.contains(&entry.task_id))
+            .collect();
+        let open_decisions = self.list_decisions(true, group_filter)?;
+
+        Ok(DetailedStatusReport {
+            summary,
+            active_tasks,
+            waiting_tasks,
+            merge_queue,
+            open_decisions,
+        })
+    }
+
     fn map_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
         let context_pack_str: String = row.get(10)?;
         let depends_on_str: String = row.get(11)?;
@@ -5323,5 +5675,156 @@ mod tests {
         assert!(synced_ext.memory.retry_reset_epoch > 0);
         assert_eq!(synced_ext.reviewed_sha.as_deref(), Some("cafebabe"));
         assert_eq!(synced_ext.memory.fallback_stages, vec!["plan".to_owned()]);
+    }
+
+    #[test]
+    fn normalize_repo_path_and_paths_overlap_are_segment_aware() {
+        assert_eq!(normalize_repo_path(""), "*");
+        assert_eq!(normalize_repo_path("."), "*");
+        assert_eq!(normalize_repo_path("./"), "*");
+        assert_eq!(normalize_repo_path("*"), "*");
+        assert_eq!(normalize_repo_path("./src//v2/"), "src/v2");
+        assert_eq!(
+            normalize_repo_path("././src/v2/store.rs"),
+            "src/v2/store.rs"
+        );
+
+        assert!(paths_overlap("./src/v2/", "src//v2/store.rs"));
+        assert!(paths_overlap("src/v2/store.rs", "src"));
+        assert!(paths_overlap("*", "src/v2/store.rs"));
+        assert!(paths_overlap(".", "src/v2/store.rs"));
+        assert!(!paths_overlap("src", "src2"));
+        assert!(!paths_overlap("src/v2/store.rs", "src/v2/scheduler.rs"));
+    }
+
+    #[test]
+    fn detailed_status_reports_wait_reasons_active_details_and_group_filter() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        store.set_max_parallel_tasks(3).unwrap();
+
+        let mut active_session = sample_task("ZACH-1", "In Progress", vec![]);
+        active_session.repository = "zach".to_owned();
+        active_session.task_group = "ZACH".to_owned();
+        active_session.executor = Some("session".to_owned());
+        active_session.autonomous_consent = false;
+        active_session.current_stage = None;
+        active_session.context_pack.target_files = vec![TargetFileSpec {
+            path: "./src/v2/store.rs".to_owned(),
+            ..Default::default()
+        }];
+        store.upsert_task(&active_session).unwrap();
+
+        let mut done_dep = sample_task("ZACH-0", "Done", vec![]);
+        done_dep.task_group = "ZACH".to_owned();
+        store.upsert_task(&done_dep).unwrap();
+
+        let mut pending_dep = sample_task("ZACH-DEP", "Backlog", vec![]);
+        pending_dep.task_group = "ZACH".to_owned();
+        store.upsert_task(&pending_dep).unwrap();
+
+        let mut w_consent = sample_task("ZACH-2", "Ready", vec![]);
+        w_consent.task_group = "ZACH".to_owned();
+        w_consent.autonomous_consent = false;
+        store.upsert_task(&w_consent).unwrap();
+
+        let mut w_decision = sample_task("ZACH-3", "Ready", vec![]);
+        w_decision.task_group = "ZACH".to_owned();
+        store.upsert_task(&w_decision).unwrap();
+        store
+            .open_decision(
+                "DEC-3",
+                "ZACH-3",
+                "ZACH",
+                "clarification",
+                "Need answer",
+                &["ok".into()],
+                Some(0),
+                "context",
+                None,
+            )
+            .unwrap();
+
+        let mut w_lifecycle = sample_task("ZACH-4", "Ready", vec![]);
+        w_lifecycle.task_group = "ZACH".to_owned();
+        store.upsert_task(&w_lifecycle).unwrap();
+        store
+            .enqueue_lifecycle(&LifecycleOperation {
+                attempt_id: None,
+                decision_id: None,
+                operation_id: "op-4".to_owned(),
+                task_id: "ZACH-4".to_owned(),
+                kind: "label_sync".to_owned(),
+                args: vec![],
+                body_path: None,
+                depends_on: None,
+                state: "PENDING".to_owned(),
+                retry_epoch: 0,
+                attempts: 0,
+                last_error: None,
+            })
+            .unwrap();
+
+        let mut w_backoff = sample_task("ZACH-5", "Ready", vec![]);
+        w_backoff.task_group = "ZACH".to_owned();
+        w_backoff.next_retry_epoch = now_epoch() + 300;
+        store.upsert_task(&w_backoff).unwrap();
+
+        let mut w_dep = sample_task("ZACH-6", "Ready", vec!["ZACH-DEP".to_owned()]);
+        w_dep.task_group = "ZACH".to_owned();
+        store.upsert_task(&w_dep).unwrap();
+
+        let mut w_path_conflict = sample_task("ZACH-7", "Ready", vec!["ZACH-0".to_owned()]);
+        w_path_conflict.repository = "zach".to_owned();
+        w_path_conflict.task_group = "ZACH".to_owned();
+        w_path_conflict.context_pack.target_files = vec![TargetFileSpec {
+            path: "src/v2".to_owned(),
+            ..Default::default()
+        }];
+        store.upsert_task(&w_path_conflict).unwrap();
+
+        let mut w_repo_locked = sample_task("ZACH-8", "Ready", vec![]);
+        w_repo_locked.repository = "zach".to_owned();
+        w_repo_locked.task_group = "ZACH".to_owned();
+        store.upsert_task(&w_repo_locked).unwrap();
+
+        let mut w_eligible = sample_task("OTHER-1", "Ready", vec![]);
+        w_eligible.repository = "other-repo".to_owned();
+        w_eligible.task_group = "OTHER".to_owned();
+        store.upsert_task(&w_eligible).unwrap();
+
+        let report = store.detailed_status(None).unwrap();
+        assert_eq!(report.active_tasks.len(), 1);
+        assert_eq!(report.active_tasks[0].task_id, "ZACH-1");
+        assert_eq!(report.active_tasks[0].reservation, "scoped_paths");
+        assert!(!report.active_tasks[0].occupies_slot);
+
+        let reasons: BTreeMap<String, String> = report
+            .waiting_tasks
+            .iter()
+            .map(|w| (w.task_id.clone(), w.wait_reason.clone()))
+            .collect();
+        assert_eq!(reasons["ZACH-2"], "awaiting_consent");
+        assert_eq!(reasons["ZACH-3"], "open_decision");
+        assert_eq!(reasons["ZACH-4"], "pending_lifecycle");
+        assert_eq!(reasons["ZACH-5"], "retry_backoff");
+        assert_eq!(reasons["ZACH-6"], "dependency:ZACH-DEP");
+        assert_eq!(reasons["ZACH-7"], "path_conflict:ZACH-1:src/v2");
+        assert_eq!(reasons["ZACH-8"], "repo_locked:ZACH-1");
+        assert_eq!(reasons["OTHER-1"], "eligible");
+
+        let filtered = store.detailed_status(Some("OTHER")).unwrap();
+        assert!(filtered.active_tasks.is_empty());
+        assert_eq!(filtered.waiting_tasks.len(), 1);
+        assert_eq!(filtered.waiting_tasks[0].task_id, "OTHER-1");
+        assert!(filtered.open_decisions.is_empty());
+
+        store.set_max_parallel_tasks(1).unwrap();
+        let mut native_active = sample_task("NATIVE-1", "In Progress", vec![]);
+        native_active.repository = "native-repo".to_owned();
+        native_active.task_group = "NATIVE".to_owned();
+        native_active.current_stage = Some("impl".to_owned());
+        store.upsert_task(&native_active).unwrap();
+        let no_slots = store.detailed_status(Some("OTHER")).unwrap();
+        assert_eq!(no_slots.waiting_tasks[0].wait_reason, "no_free_slots");
     }
 }

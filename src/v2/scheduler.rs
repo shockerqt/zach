@@ -1,5 +1,5 @@
 use crate::v2::intake::default_required_stages;
-use crate::v2::store::{TaskRecord, V2Store};
+use crate::v2::store::{RepoReservation, TaskRecord, V2Store, repo_conflict_for_task};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -97,23 +97,9 @@ pub fn schedule_scoped_dispatches(
         .filter(|occupied| **occupied)
         .count();
     let available_slots = max_parallel.saturating_sub(active_count);
-    let mut occupied = std::collections::BTreeMap::new();
-    for lock in store.list_path_locks(None).map_err(|e| e.to_string())? {
-        occupied.insert(lock.repo, lock.task_id);
-    }
-    for t in &all_tasks {
-        if matches!(
-            t.status.as_str(),
-            "Planning" | "Plan Review" | "In Progress" | "PR Review" | "Queued for Merge"
-        ) {
-            occupied
-                .entry(t.repository.clone())
-                .or_insert_with(|| t.task_id.clone());
-        }
-    }
-    for e in store.list_merge_queue(None).map_err(|e| e.to_string())? {
-        occupied.entry(e.repo).or_insert(e.task_id);
-    }
+    let mut reservations = store
+        .repo_reservations(&all_tasks)
+        .map_err(|e| e.to_string())?;
     let ready_tasks = store.list_ready_queue(group).map_err(|e| e.to_string())?;
     let mut dispatches = Vec::new();
     for mut task in ready_tasks {
@@ -123,9 +109,8 @@ pub fn schedule_scoped_dispatches(
         if task_id.is_some_and(|id| id != task.task_id) {
             continue;
         }
-        if occupied
-            .get(&task.repository)
-            .is_some_and(|owner| owner != &task.task_id)
+        if let Some(repo_res) = reservations.get(&task.repository)
+            && repo_conflict_for_task(repo_res, &task).is_some()
         {
             continue;
         }
@@ -149,7 +134,12 @@ pub fn schedule_scoped_dispatches(
         task.status = status.to_owned();
         task.current_stage = Some(stage.clone());
         store.upsert_task(&task).map_err(|e| e.to_string())?;
-        occupied.insert(task.repository.clone(), task.task_id.clone());
+        reservations
+            .entry(task.repository.clone())
+            .or_default()
+            .push(RepoReservation::WholeRepo {
+                task_id: task.task_id.clone(),
+            });
         dispatches.push(ScheduledDispatch {
             task_id: task.task_id,
             repository: task.repository,
@@ -585,5 +575,47 @@ mod tests {
                 .unwrap();
             assert_eq!(raw, memory);
         }
+    }
+
+    #[test]
+    fn scheduler_allows_disjoint_session_target_files_and_blocks_overlapping_or_empty() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        store.set_max_parallel_tasks(2).unwrap();
+
+        let mut active_session = make_test_task(
+            "SESSION-1",
+            "zach",
+            "S",
+            "In Progress",
+            vec!["./src/v2/store.rs"],
+            vec![],
+        );
+        active_session.executor = Some("session".into());
+        store.upsert_task(&active_session).unwrap();
+
+        let ready_overlap =
+            make_test_task("A-OVERLAP", "zach", "S", "Ready", vec!["src/v2"], vec![]);
+        let ready_empty = make_test_task("B-EMPTY", "zach", "S", "Ready", vec![], vec![]);
+        let ready_disjoint = make_test_task(
+            "C-DISJOINT",
+            "zach",
+            "S",
+            "Ready",
+            vec!["src/v2/scheduler.rs"],
+            vec![],
+        );
+        store.upsert_task(&ready_overlap).unwrap();
+        store.upsert_task(&ready_empty).unwrap();
+        store.upsert_task(&ready_disjoint).unwrap();
+
+        let dispatches = schedule_next_dispatches(&mut store).unwrap();
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(dispatches[0].task_id, "C-DISJOINT");
+        assert_eq!(dispatches[0].acquired_paths, vec!["*".to_owned()]);
+        assert_eq!(
+            store.get_task("A-OVERLAP").unwrap().unwrap().status,
+            "Ready"
+        );
+        assert_eq!(store.get_task("B-EMPTY").unwrap().unwrap().status, "Ready");
     }
 }
