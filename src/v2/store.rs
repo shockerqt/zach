@@ -516,6 +516,7 @@ pub struct DetailedStatusReport {
     pub summary: DaemonStatusSummary,
     pub active_tasks: Vec<ActiveTaskDetail>,
     pub waiting_tasks: Vec<WaitingTaskDetail>,
+    pub path_locks: Vec<PathLockRecord>,
     pub merge_queue: Vec<MergeQueueRecord>,
     pub open_decisions: Vec<PendingDecisionRecord>,
 }
@@ -3345,6 +3346,11 @@ impl V2Store {
             }
         }
 
+        let path_locks = self
+            .list_path_locks(None)?
+            .into_iter()
+            .filter(|lock| group_filter.is_none() || group_task_ids.contains(&lock.task_id))
+            .collect();
         let merge_queue = self
             .list_merge_queue(None)?
             .into_iter()
@@ -3356,6 +3362,7 @@ impl V2Store {
             summary,
             active_tasks,
             waiting_tasks,
+            path_locks,
             merge_queue,
             open_decisions,
         })
@@ -5824,7 +5831,16 @@ mod tests {
         native_active.task_group = "NATIVE".to_owned();
         native_active.current_stage = Some("impl".to_owned());
         store.upsert_task(&native_active).unwrap();
+        assert!(
+            store
+                .acquire_path_locks("native-repo", &["*".to_owned()], "NATIVE-1")
+                .unwrap()
+        );
         let no_slots = store.detailed_status(Some("OTHER")).unwrap();
         assert_eq!(no_slots.waiting_tasks[0].wait_reason, "no_free_slots");
+        assert!(no_slots.path_locks.is_empty());
+        let native_report = store.detailed_status(Some("NATIVE")).unwrap();
+        assert_eq!(native_report.path_locks.len(), 1);
+        assert_eq!(native_report.path_locks[0].task_id, "NATIVE-1");
     }
 }

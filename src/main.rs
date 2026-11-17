@@ -155,6 +155,16 @@ fn format_detailed_status(report: &zach::v2::store::DetailedStatusReport) -> Str
         }
     }
 
+    if !report.path_locks.is_empty() {
+        lines.push(format!("Path locks ({}):", report.path_locks.len()));
+        for lock in &report.path_locks {
+            lines.push(format!(
+                "  {:<16} {:<10} path={}",
+                lock.repo, lock.task_id, lock.path
+            ));
+        }
+    }
+
     if !report.merge_queue.is_empty() {
         lines.push(format!("Merge queue ({}):", report.merge_queue.len()));
         for m in &report.merge_queue {
@@ -1944,12 +1954,23 @@ mod tests {
         assert!(formatted.contains("ZACH-11"));
         assert!(formatted.contains("wait=path_conflict:ZACH-10:src/v2/store.rs"));
 
+        assert!(
+            store
+                .acquire_path_locks("zach", &["*".to_owned()], "ZACH-10")
+                .unwrap()
+        );
+        let with_locks = store.detailed_status(Some("ZACH")).unwrap();
+        let formatted_with_locks = format_detailed_status(&with_locks);
+        assert!(formatted_with_locks.contains("Path locks (1):"));
+        assert!(formatted_with_locks.contains("zach             ZACH-10    path=*"));
+
         let json: serde_json::Value =
-            serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+            serde_json::from_str(&serde_json::to_string(&with_locks).unwrap()).unwrap();
         assert_eq!(json["active_tasks"][0]["task_id"], "ZACH-10");
         assert_eq!(
             json["waiting_tasks"][0]["wait_reason"],
-            "path_conflict:ZACH-10:src/v2/store.rs"
+            "repo_locked:ZACH-10"
         );
+        assert_eq!(json["path_locks"][0]["task_id"], "ZACH-10");
     }
 }
