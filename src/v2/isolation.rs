@@ -516,6 +516,7 @@ fn allowed_hosts(family: ModelFamily) -> &'static [&'static str] {
             "generativelanguage.googleapis.com",
             "aiplatform.googleapis.com",
             "oauth2.googleapis.com",
+            "www.googleapis.com",
             "accounts.google.com",
             "play.googleapis.com",
         ],
@@ -1634,6 +1635,7 @@ mod tests {
 
     #[test]
     fn connect_parser_allows_only_exact_family_hosts_and_tls_ports() {
+        assert!(allowed_hosts(ModelFamily::GeminiAgy).contains(&"www.googleapis.com"));
         for family in [ModelFamily::OpenAiSol, ModelFamily::GeminiAgy] {
             for host in allowed_hosts(family) {
                 let header = format!(
