@@ -49,7 +49,8 @@ fn main() {
                 std::process::exit(1);
             }
         },
-        "status" => run_v2_status(&args[2..]),
+        "status" => run_v2_status(&args[2..], false),
+        "ps" => run_v2_status(&args[2..], true),
         "queue" => run_v2_queue(&args[2..]),
         "decisions" => run_v2_decisions(&args[2..]),
         "decide" => run_v2_decide(&args[2..]),
@@ -102,13 +103,117 @@ fn open_store(args: &[String]) -> V2Store {
     })
 }
 
-fn run_v2_status(args: &[String]) {
+fn format_summary_line(summary: &zach::v2::store::DaemonStatusSummary) -> String {
+    format!(
+        "Zach v{} · max_parallel={} · tasks={} · ready_eligible={} · in_progress={} · open_decisions={} · locks={} · merge_queue={} · max_seq={}",
+        summary.schema_version,
+        summary.max_parallel_tasks,
+        summary.total_tasks,
+        summary.ready_eligible_count,
+        summary.in_progress_count,
+        summary.open_decisions_count,
+        summary.active_locks_count,
+        summary.merge_queue_count,
+        summary.max_seq_id
+    )
+}
+
+fn format_detailed_status(report: &zach::v2::store::DetailedStatusReport) -> String {
+    let mut lines = vec![format_summary_line(&report.summary)];
+
+    if report.active_tasks.is_empty() {
+        lines.push("Active: none".to_owned());
+    } else {
+        lines.push(format!("Active ({}):", report.active_tasks.len()));
+        for a in &report.active_tasks {
+            lines.push(format!(
+                "  {:<10} [{:<2}] repo={:<16} group={:<6} status={:<16} exec={:<8} stage={:<11} phase={:<14} slot={} res={} · {}",
+                a.task_id,
+                a.weight,
+                a.repository,
+                a.task_group,
+                a.status,
+                a.executor.as_deref().unwrap_or("-"),
+                a.current_stage.as_deref().unwrap_or("-"),
+                a.attempt_phase.as_deref().unwrap_or("-"),
+                a.occupies_slot,
+                a.reservation,
+                a.title
+            ));
+        }
+    }
+
+    if report.waiting_tasks.is_empty() {
+        lines.push("Waiting: none".to_owned());
+    } else {
+        lines.push(format!("Waiting ({}):", report.waiting_tasks.len()));
+        for w in &report.waiting_tasks {
+            lines.push(format!(
+                "  {:<10} [{:<2}] repo={:<16} group={:<6} status={:<8} wait={:<28} · {}",
+                w.task_id, w.weight, w.repository, w.task_group, w.status, w.wait_reason, w.title
+            ));
+        }
+    }
+
+    if !report.path_locks.is_empty() {
+        lines.push(format!("Path locks ({}):", report.path_locks.len()));
+        for lock in &report.path_locks {
+            lines.push(format!(
+                "  {:<16} {:<10} path={}",
+                lock.repo, lock.task_id, lock.path
+            ));
+        }
+    }
+
+    if !report.merge_queue.is_empty() {
+        lines.push(format!("Merge queue ({}):", report.merge_queue.len()));
+        for m in &report.merge_queue {
+            lines.push(format!(
+                "  {:<16} {:<10} PR #{:<5} state={}",
+                m.repo, m.task_id, m.pr_number, m.state
+            ));
+        }
+    }
+
+    if !report.open_decisions.is_empty() {
+        lines.push(format!("Open decisions ({}):", report.open_decisions.len()));
+        for d in &report.open_decisions {
+            lines.push(format!(
+                "  {:<12} task={:<10} kind={:<16} · {}",
+                d.decision_id, d.task_id, d.kind, d.question
+            ));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn run_v2_status(args: &[String], force_detail: bool) {
     let mut store = open_store(args);
     if has_flag(args, "--sync") {
         let ws_task = default_ws_task_bin();
         if let Err(error) = sync_from_ws_task(&mut store, &ws_task) {
             eprintln!("warning: ws-task sync failed: {error}");
         }
+    }
+    let detail = force_detail || has_flag(args, "--detail");
+    let group = flag_value(args, "--group");
+    if detail {
+        let report = store
+            .detailed_status(group.as_deref())
+            .unwrap_or_else(|error| {
+                eprintln!("status query failed: {error}");
+                std::process::exit(1);
+            });
+        if has_flag(args, "--json") {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_owned())
+            );
+        } else {
+            println!("{}", format_detailed_status(&report));
+        }
+        return;
     }
     let summary = store.status_summary().unwrap_or_else(|error| {
         eprintln!("status query failed: {error}");
@@ -120,18 +225,7 @@ fn run_v2_status(args: &[String]) {
             serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_owned())
         );
     } else {
-        println!(
-            "Zach v{} · max_parallel={} · tasks={} · ready_eligible={} · in_progress={} · open_decisions={} · locks={} · merge_queue={} · max_seq={}",
-            summary.schema_version,
-            summary.max_parallel_tasks,
-            summary.total_tasks,
-            summary.ready_eligible_count,
-            summary.in_progress_count,
-            summary.open_decisions_count,
-            summary.active_locks_count,
-            summary.merge_queue_count,
-            summary.max_seq_id
-        );
+        println!("{}", format_summary_line(&summary));
     }
 }
 
@@ -1162,7 +1256,8 @@ fn print_usage() {
     println!(
         "       zach governance.audit-task-integration --task-id <TASK-ID> --request-id <REQUEST-ID>"
     );
-    println!("       zach status [--sync] [--json] [--db <PATH>]");
+    println!("       zach status [--detail] [--group <GROUP>] [--sync] [--json] [--db <PATH>]");
+    println!("       zach ps [--group <GROUP>] [--sync] [--json] [--db <PATH>]");
     println!("       zach queue [--group <GROUP>] [--merge-queue] [--sync] [--json] [--db <PATH>]");
     println!("       zach decisions [--group <GROUP>] [--all] [--json] [--db <PATH>]");
     println!(
@@ -1795,5 +1890,87 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn detailed_status_formatting_and_flags_preserve_summary_and_render_sections() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        let mut active = zach::v2::store::TaskRecord {
+            task_id: "ZACH-10".to_owned(),
+            task_group: "ZACH".to_owned(),
+            title: "Active session task".to_owned(),
+            repository: "zach".to_owned(),
+            github_repo: None,
+            issue_number: None,
+            weight: "M".to_owned(),
+            status: "In Progress".to_owned(),
+            worktree_path: None,
+            branch: None,
+            context_pack: zach::v2::store::ContextPackSpec {
+                target_files: vec![zach::v2::store::TargetFileSpec {
+                    path: "src/v2/store.rs".to_owned(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            depends_on: vec![],
+            required_stages: vec!["impl".to_owned()],
+            stages_completed: vec![],
+            current_stage: Some("impl".to_owned()),
+            active_attempt_id: None,
+            plan_base_sha: None,
+            reviewed_sha: None,
+            pr_number: None,
+            executor: Some("session".to_owned()),
+            autonomous_consent: true,
+            retry_count: 0,
+            next_retry_epoch: 0,
+            lease_owner: None,
+            lease_expires_epoch: None,
+            memory: zach::v2::store::TaskMemory::default(),
+            version: 1,
+            updated_epoch: 0,
+        };
+        store.upsert_task(&active).unwrap();
+
+        active.task_id = "ZACH-11".to_owned();
+        active.status = "Ready".to_owned();
+        active.executor = None;
+        active.current_stage = None;
+        active.title = "Waiting overlapping task".to_owned();
+        store.upsert_task(&active).unwrap();
+
+        let summary = store.status_summary().unwrap();
+        let summary_line = format_summary_line(&summary);
+        assert!(summary_line.contains("tasks=2"));
+        assert!(summary_line.contains("in_progress=1"));
+
+        let report = store.detailed_status(Some("ZACH")).unwrap();
+        let formatted = format_detailed_status(&report);
+        assert!(formatted.contains("Active (1):"));
+        assert!(formatted.contains("ZACH-10"));
+        assert!(formatted.contains("res=scoped_paths"));
+        assert!(formatted.contains("Waiting (1):"));
+        assert!(formatted.contains("ZACH-11"));
+        assert!(formatted.contains("wait=path_conflict:ZACH-10:src/v2/store.rs"));
+
+        assert!(
+            store
+                .acquire_path_locks("zach", &["*".to_owned()], "ZACH-10")
+                .unwrap()
+        );
+        let with_locks = store.detailed_status(Some("ZACH")).unwrap();
+        let formatted_with_locks = format_detailed_status(&with_locks);
+        assert!(formatted_with_locks.contains("Path locks (1):"));
+        assert!(formatted_with_locks.contains("zach             ZACH-10    path=*"));
+
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&with_locks).unwrap()).unwrap();
+        assert_eq!(json["active_tasks"][0]["task_id"], "ZACH-10");
+        assert_eq!(
+            json["waiting_tasks"][0]["wait_reason"],
+            "repo_locked:ZACH-10"
+        );
+        assert_eq!(json["path_locks"][0]["task_id"], "ZACH-10");
     }
 }
