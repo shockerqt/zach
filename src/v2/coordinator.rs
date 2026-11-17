@@ -508,12 +508,58 @@ impl Coordinator {
         Ok(())
     }
 
-    fn error_event(&mut self, task_id: Option<&str>, message: &str) -> Result<(), String> {
+    fn derive_attempt_id(job_key: Option<&str>, task: Option<&TaskRecord>) -> Option<String> {
+        let key = job_key?;
+        for prefix in ["launch:", "observe:", "pipeline:", "stop:", "cleanup:"] {
+            if let Some(id) = key.strip_prefix(prefix) {
+                return (!id.is_empty()).then(|| id.to_owned());
+            }
+        }
+        if key.starts_with("prepare:") {
+            return task.and_then(|t| {
+                t.memory
+                    .pipeline_checkpoint
+                    .as_ref()
+                    .map(|cp| cp.attempt_id.clone())
+            });
+        }
+        None
+    }
+
+    fn error_event(
+        &mut self,
+        task_id: Option<&str>,
+        job_key: Option<&str>,
+        message: &str,
+    ) -> Result<(), String> {
         let task = task_id
             .map(|id| self.store.get_task(id))
             .transpose()
             .map_err(|e| e.to_string())?
             .flatten();
+        let attempt_id = Self::derive_attempt_id(job_key, task.as_ref());
+        if let Some(key) = job_key
+            && (key.starts_with("prepare:") || key.starts_with("launch:"))
+            && let Some(ref id) = attempt_id
+            && runner::validate_attempt_id(id).is_ok()
+        {
+            let attempt_dir = self.state_dir.join("attempts").join(id);
+            if attempt_dir.is_dir() {
+                let stage = task.as_ref().and_then(|t| t.current_stage.as_deref());
+                runner::write_supervisor_error_log(&attempt_dir, stage, Some(key), message);
+            }
+        }
+        let mut payload = serde_json::Map::new();
+        payload.insert(
+            "error".into(),
+            serde_json::Value::String(runner::truncate_utf8_bytes(message, 1024)),
+        );
+        if let Some(key) = job_key {
+            payload.insert("job_key".into(), serde_json::Value::String(key.to_owned()));
+        }
+        if let Some(id) = attempt_id {
+            payload.insert("attempt_id".into(), serde_json::Value::String(id));
+        }
         self.store
             .append_event(
                 task_id.unwrap_or("daemon"),
@@ -521,7 +567,7 @@ impl Coordinator {
                     .map(|t| t.task_group.as_str())
                     .unwrap_or("daemon"),
                 "SUPERVISOR_ERROR",
-                &serde_json::json!({"error":runner::truncate_utf8_bytes(message,1024)}),
+                &serde_json::Value::Object(payload),
             )
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -566,7 +612,7 @@ impl Coordinator {
                 match handled {
                     Ok(()) => {}
                     Err(error) => {
-                        self.error_event(task_id.as_deref(), &error)?;
+                        self.error_event(task_id.as_deref(), Some(&key), &error)?;
                         if key == "preflight" {
                             return Err(error);
                         }
@@ -2613,6 +2659,7 @@ impl Coordinator {
                         .map_err(|e| e.to_string())?;
                     return self.error_event(
                         Some(&task.task_id),
+                        None,
                         "stale human approval acknowledgment ignored",
                     );
                 }
@@ -2912,7 +2959,7 @@ impl Coordinator {
                     .contains(&decision.decision_id)
                 && let Err(error) = self.apply_decision(&decision)
             {
-                self.error_event(Some(&decision.task_id), &error)?;
+                self.error_event(Some(&decision.task_id), None, &error)?;
             }
         }
         Ok(())
@@ -2970,6 +3017,7 @@ impl Coordinator {
                 self.save(&task)?;
                 return self.error_event(
                     Some(&task.task_id),
+                    None,
                     "stale human decision; current SHA differs",
                 );
             }
@@ -10328,5 +10376,73 @@ mod tests {
 
         c.in_tick = false;
         c.tick_tasks_cache = None;
+    }
+
+    #[test]
+    fn completed_failure_emits_enriched_supervisor_error_and_writes_attempt_log() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        let mut t = task("T-ERR-1");
+        t.current_stage = Some("plan".into());
+        t.memory.pipeline_checkpoint = Some(PipelineCheckpoint {
+            attempt_id: "att-prep-1".into(),
+            operation: "PREPARE".into(),
+        });
+        c.save(&t).unwrap();
+        let prep_dir = dir.0.join("attempts/att-prep-1");
+        std::fs::create_dir_all(&prep_dir).unwrap();
+
+        c.handle_event(CoordinatorEvent::Completed {
+            key: "prepare:T-ERR-1".into(),
+            task_id: Some("T-ERR-1".into()),
+            result: Box::new(Err("canonicalizing worktree /missing: os error 2".into())),
+        })
+        .unwrap();
+
+        let launch_dir = dir.0.join("attempts/att-launch-2");
+        std::fs::create_dir_all(&launch_dir).unwrap();
+        c.handle_event(CoordinatorEvent::Completed {
+            key: "launch:att-launch-2".into(),
+            task_id: Some("T-ERR-1".into()),
+            result: Box::new(Err("spawning /missing/systemd-run: os error 2".into())),
+        })
+        .unwrap();
+
+        let events: Vec<_> = c
+            .store
+            .list_events_since(None, 0, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == "SUPERVISOR_ERROR")
+            .collect();
+        assert_eq!(events.len(), 2);
+
+        let p0 = &events[0].payload;
+        assert_eq!(p0["error"], "canonicalizing worktree /missing: os error 2");
+        assert_eq!(p0["job_key"], "prepare:T-ERR-1");
+        assert_eq!(p0["attempt_id"], "att-prep-1");
+
+        let p1 = &events[1].payload;
+        assert_eq!(p1["error"], "spawning /missing/systemd-run: os error 2");
+        assert_eq!(p1["job_key"], "launch:att-launch-2");
+        assert_eq!(p1["attempt_id"], "att-launch-2");
+
+        let prep_log = std::fs::read_to_string(prep_dir.join("supervisor-error.log")).unwrap();
+        assert!(prep_log.contains("key=prepare:T-ERR-1"), "{prep_log}");
+        assert!(prep_log.contains("stage=plan"), "{prep_log}");
+        assert!(
+            prep_log.contains("canonicalizing worktree /missing"),
+            "{prep_log}"
+        );
+
+        let launch_log = std::fs::read_to_string(launch_dir.join("supervisor-error.log")).unwrap();
+        assert!(
+            launch_log.contains("key=launch:att-launch-2"),
+            "{launch_log}"
+        );
+        assert!(
+            launch_log.contains("spawning /missing/systemd-run"),
+            "{launch_log}"
+        );
     }
 }

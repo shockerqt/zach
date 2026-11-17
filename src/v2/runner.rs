@@ -696,6 +696,32 @@ pub(crate) fn write_secure_file(path: &std::path::Path, bytes: &[u8]) -> Result<
     Ok(())
 }
 
+fn path_io_err(op: &str, path: &std::path::Path, err: impl std::fmt::Display) -> String {
+    format!("{op} {}: {err}", path.display())
+}
+
+fn spawn_output_ctx(cmd: &mut Command, label: &str) -> Result<std::process::Output, String> {
+    cmd.output().map_err(|e| format!("spawning {label}: {e}"))
+}
+
+pub(crate) fn write_supervisor_error_log(
+    attempt_dir: &std::path::Path,
+    stage: Option<&str>,
+    key: Option<&str>,
+    error: &str,
+) {
+    let ts = crate::v2::now_epoch();
+    let content = format!(
+        "timestamp={ts}\nstage={}\nkey={}\nerror={error}\n",
+        stage.unwrap_or("unknown"),
+        key.unwrap_or("none"),
+    );
+    let _ = write_secure_file(
+        &attempt_dir.join("supervisor-error.log"),
+        content.as_bytes(),
+    );
+}
+
 #[derive(Debug, Clone)]
 pub struct SystemdStageExecutor {
     pub state_dir: PathBuf,
@@ -2308,7 +2334,16 @@ pub struct SystemUnitController;
 
 impl UnitController for SystemUnitController {
     fn inspect(&self, unit: &str) -> Result<UnitObservation, String> {
-        let out = Command::new("systemctl").args(["--user","show",unit,"--no-pager","--property=LoadState,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,InvocationID,ControlGroup"]).output().map_err(|e| e.to_string())?;
+        let out = spawn_output_ctx(
+            Command::new("systemctl").args([
+                "--user",
+                "show",
+                unit,
+                "--no-pager",
+                "--property=LoadState,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,InvocationID,ControlGroup",
+            ]),
+            "systemctl show",
+        )?;
         let raw = String::from_utf8_lossy(&out.stdout);
         let observed = UnitObservation::parse(&raw);
         // A manager error is never evidence that a unit is absent.
@@ -2322,13 +2357,14 @@ impl UnitController for SystemUnitController {
         Ok(observed)
     }
     fn launch(&self, manifest: &AttemptManifest) -> Result<(), String> {
-        let out = Command::new(&manifest.spec.program)
-            .args(&manifest.spec.args)
-            .env_clear()
-            .envs(&manifest.spec.env)
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| e.to_string())?;
+        let out = spawn_output_ctx(
+            Command::new(&manifest.spec.program)
+                .args(&manifest.spec.args)
+                .env_clear()
+                .envs(&manifest.spec.env)
+                .stdin(Stdio::null()),
+            &manifest.spec.program,
+        )?;
         write_secure_file(
             &manifest.attempt_dir.join("launcher.log"),
             &[out.stdout.as_slice(), out.stderr.as_slice()].concat(),
@@ -2342,10 +2378,10 @@ impl UnitController for SystemUnitController {
         Ok(())
     }
     fn stop(&self, unit: &str) -> Result<(), String> {
-        let out = Command::new("systemctl")
-            .args(["--user", "stop", unit])
-            .output()
-            .map_err(|e| e.to_string())?;
+        let out = spawn_output_ctx(
+            Command::new("systemctl").args(["--user", "stop", unit]),
+            "systemctl stop",
+        )?;
         let observed = self.inspect(unit)?;
         if !matches!(
             observed.state()?,
@@ -2359,18 +2395,18 @@ impl UnitController for SystemUnitController {
         Ok(())
     }
     fn reset_failed(&self, unit: &str) -> Result<(), String> {
-        let out = Command::new("systemctl")
-            .args(["--user", "reset-failed", unit])
-            .output()
-            .map_err(|e| e.to_string())?;
+        let out = spawn_output_ctx(
+            Command::new("systemctl").args(["--user", "reset-failed", unit]),
+            "systemctl reset-failed",
+        )?;
         if !out.status.success() && self.inspect(unit)?.state()? != UnitState::Missing {
             return Err("reset-failed failed".into());
         }
         Ok(())
     }
     fn list_units(&self) -> Result<Vec<String>, String> {
-        let out = Command::new("systemctl")
-            .args([
+        let out = spawn_output_ctx(
+            Command::new("systemctl").args([
                 "--user",
                 "list-units",
                 "--all",
@@ -2378,9 +2414,9 @@ impl UnitController for SystemUnitController {
                 "--no-legend",
                 "--plain",
                 "--no-pager",
-            ])
-            .output()
-            .map_err(|e| e.to_string())?;
+            ]),
+            "systemctl list-units",
+        )?;
         if !out.status.success() {
             return Err("cannot enumerate worker units".into());
         }
@@ -2400,15 +2436,39 @@ pub fn prepare_detached_launch(
     task: &TaskRecord,
     attempt_id: &str,
     route: &StageRoute,
-    mut spec: StageCommandSpec,
+    spec: StageCommandSpec,
 ) -> Result<PreparedLaunch, String> {
     validate_stage_isolation_spec(task, route, &spec)?;
     validate_attempt_id(attempt_id)?;
     isolation::secure_parents(state_dir)?;
-    let state = std::fs::canonicalize(ensure_secure_dir(state_dir)?).map_err(|e| e.to_string())?;
+    let state_path = ensure_secure_dir(state_dir)?;
+    let state = std::fs::canonicalize(&state_path)
+        .map_err(|e| path_io_err("canonicalizing state dir", &state_path, e))?;
     let root = ensure_secure_dir(&state.join("attempts"))?;
     let dir = ensure_secure_dir(&root.join(attempt_id))?;
-    let worktree = std::fs::canonicalize(&spec.worktree_path).map_err(|e| e.to_string())?;
+    let result = prepare_detached_launch_in_dir(&state, &dir, task, attempt_id, route, spec);
+    if let Err(ref err) = result {
+        write_supervisor_error_log(
+            &dir,
+            task.current_stage.as_deref().or(Some("prepare")),
+            None,
+            err,
+        );
+    }
+    result
+}
+
+fn prepare_detached_launch_in_dir(
+    state: &std::path::Path,
+    dir: &std::path::Path,
+    task: &TaskRecord,
+    attempt_id: &str,
+    route: &StageRoute,
+    mut spec: StageCommandSpec,
+) -> Result<PreparedLaunch, String> {
+    let worktree_input = std::path::Path::new(&spec.worktree_path);
+    let worktree = std::fs::canonicalize(worktree_input)
+        .map_err(|e| path_io_err("canonicalizing worktree", worktree_input, e))?;
     if state.starts_with(&worktree) {
         return Err(
             "isolation policy: daemon state directory must be outside the worker worktree".into(),
@@ -2428,7 +2488,7 @@ pub fn prepare_detached_launch(
     }
     let home = PathBuf::from(spec.env.get("HOME").ok_or("missing HOME")?);
     let mut resources = PreparedResources::prepare(
-        &dir,
+        dir,
         &home,
         &worktree,
         spec.writable,
@@ -2455,7 +2515,9 @@ pub fn prepare_detached_launch(
         ("StandardOutput", "stdout.jsonl"),
         ("StandardError", "stderr.log"),
     ] {
-        let path = std::fs::canonicalize(dir.join(file)).map_err(|e| e.to_string())?;
+        let io_path = dir.join(file);
+        let path = std::fs::canonicalize(&io_path)
+            .map_err(|e| path_io_err("canonicalizing attempt file", &io_path, e))?;
         io.extend([
             "-p".to_owned(),
             format!("{property}=file:{}", path.display()),
@@ -2471,12 +2533,12 @@ pub fn prepare_detached_launch(
         route: route.clone(),
         spec,
         sha_before,
-        attempt_dir: dir.clone(),
+        attempt_dir: dir.to_path_buf(),
     };
-    write_secure_file(
-        &dir.join("manifest.json"),
-        &serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?,
-    )?;
+    let manifest_path = dir.join("manifest.json");
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest)
+        .map_err(|e| path_io_err("serializing attempt manifest", &manifest_path, e))?;
+    write_secure_file(&manifest_path, &manifest_bytes)?;
     // Preparation is not allowed to destroy resources after an uncertain handoff.
     resources.retain();
     Ok(PreparedLaunch {
@@ -2490,14 +2552,17 @@ pub fn read_attempt_manifest(
     attempt_id: &str,
 ) -> Result<AttemptManifest, String> {
     validate_attempt_id(attempt_id)?;
-    let dir = std::fs::canonicalize(state_dir.join("attempts").join(attempt_id))
-        .map_err(|e| e.to_string())?;
+    let attempt_path = state_dir.join("attempts").join(attempt_id);
+    let dir = std::fs::canonicalize(&attempt_path)
+        .map_err(|e| path_io_err("canonicalizing attempt dir", &attempt_path, e))?;
     isolation::reject_symlink_components(&dir)?;
     let path = dir.join("manifest.json");
     isolation::reject_symlink_components(&path)?;
     use std::os::unix::fs::MetadataExt;
-    let directory_meta = std::fs::metadata(&dir).map_err(|e| e.to_string())?;
-    let file_meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+    let directory_meta =
+        std::fs::metadata(&dir).map_err(|e| path_io_err("reading metadata", &dir, e))?;
+    let file_meta =
+        std::fs::symlink_metadata(&path).map_err(|e| path_io_err("reading metadata", &path, e))?;
     if !file_meta.is_file()
         || file_meta.uid() != unsafe { libc::geteuid() }
         || file_meta.mode() & 0o077 != 0
@@ -2506,9 +2571,10 @@ pub fn read_attempt_manifest(
     {
         return Err("unsafe attempt manifest ownership or permissions".into());
     }
-    let manifest: AttemptManifest =
-        serde_json::from_slice(&std::fs::read(&path).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+    let bytes =
+        std::fs::read(&path).map_err(|e| path_io_err("reading attempt manifest", &path, e))?;
+    let manifest: AttemptManifest = serde_json::from_slice(&bytes)
+        .map_err(|e| path_io_err("parsing attempt manifest", &path, e))?;
     if manifest.attempt_id != attempt_id
         || manifest.attempt_dir != dir
         || manifest.mount_layout_version != 1
@@ -2543,10 +2609,12 @@ pub fn harvest_detached(
     manifest: &AttemptManifest,
     observation: &UnitObservation,
 ) -> Result<StageExecutionResult, String> {
-    let stdout = std::fs::read_to_string(manifest.attempt_dir.join("stdout.jsonl"))
-        .map_err(|e| e.to_string())?;
-    let stderr = std::fs::read_to_string(manifest.attempt_dir.join("stderr.log"))
-        .map_err(|e| e.to_string())?;
+    let stdout_path = manifest.attempt_dir.join("stdout.jsonl");
+    let stdout = std::fs::read_to_string(&stdout_path)
+        .map_err(|e| path_io_err("reading stdout", &stdout_path, e))?;
+    let stderr_path = manifest.attempt_dir.join("stderr.log");
+    let stderr = std::fs::read_to_string(&stderr_path)
+        .map_err(|e| path_io_err("reading stderr", &stderr_path, e))?;
     let code = if observation.success() {
         Some(0)
     } else {
@@ -2580,10 +2648,10 @@ pub fn harvest_detached(
     result.invocation_id =
         (!observation.invocation_id.is_empty()).then(|| observation.invocation_id.clone());
     result.diff_files = collect_worktree_diff_entries(&manifest.spec.worktree_path);
-    write_secure_file(
-        &manifest.attempt_dir.join("harvest.json"),
-        &serde_json::to_vec(&result).map_err(|e| e.to_string())?,
-    )?;
+    let harvest_path = manifest.attempt_dir.join("harvest.json");
+    let harvest_bytes = serde_json::to_vec(&result)
+        .map_err(|e| path_io_err("serializing harvest", &harvest_path, e))?;
+    write_secure_file(&harvest_path, &harvest_bytes)?;
     Ok(result)
 }
 
@@ -2609,10 +2677,10 @@ pub fn stop_and_cleanup(
     for name in ["codex-home", "gemini-home", "net"] {
         let path = dir.join(name);
         isolation::reject_symlink_components(&path)?;
-        match std::fs::remove_dir_all(path) {
+        match std::fs::remove_dir_all(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.to_string()),
+            Err(e) => return Err(path_io_err("removing attempt subdir", &path, e)),
         }
     }
     Ok(())
@@ -4328,5 +4396,55 @@ Binary files /dev/null and b/assets/logo.bin differ
         );
         resources.cleanup_after_stop().unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prepare_detached_launch_missing_worktree_contextualizes_and_writes_error_log() {
+        let root = TempTestDir::new("zach059-missing-worktree");
+        let missing_wt = root.path().join("does-not-exist");
+        let state = root.path().join("state");
+        let mut task = sample_task();
+        task.worktree_path = Some(missing_wt.display().to_string());
+        let route = codex_test_route("plan");
+        let env = BTreeMap::from([("HOME".into(), root.path().display().to_string())]);
+        let spec =
+            build_systemd_stage_command_with_env(&task, "plan", &route, "prompt", &env).unwrap();
+        let err = prepare_detached_launch(&state, &task, "attempt-miss", &route, spec)
+            .err()
+            .expect("missing worktree must fail");
+        assert!(err.contains("canonicalizing worktree"), "err={err}");
+        assert!(err.contains(&missing_wt.display().to_string()), "err={err}");
+        let log = std::fs::read_to_string(state.join("attempts/attempt-miss/supervisor-error.log"))
+            .expect("supervisor-error.log should be written");
+        assert!(log.contains("canonicalizing worktree"), "log={log}");
+        assert!(log.contains(&missing_wt.display().to_string()), "log={log}");
+    }
+
+    #[test]
+    fn system_unit_controller_launch_spawn_failure_names_program() {
+        let root = TempTestDir::new("zach059-spawn-fail");
+        let mut task = sample_task();
+        task.worktree_path = Some(root.path().display().to_string());
+        let route = codex_test_route("plan");
+        let env = BTreeMap::from([("HOME".into(), root.path().display().to_string())]);
+        let mut spec =
+            build_systemd_stage_command_with_env(&task, "plan", &route, "prompt", &env).unwrap();
+        let missing_bin = root.path().join("no-such-systemd-run");
+        spec.program = missing_bin.display().to_string();
+        let manifest = AttemptManifest {
+            mount_layout_version: 1,
+            attempt_id: "attempt-spawn".into(),
+            task_id: task.task_id.clone(),
+            route,
+            spec,
+            sha_before: "0000000".into(),
+            attempt_dir: root.path().to_path_buf(),
+        };
+        let err = SystemUnitController.launch(&manifest).unwrap_err();
+        assert!(err.contains("spawning"), "err={err}");
+        assert!(
+            err.contains(&missing_bin.display().to_string()),
+            "err={err}"
+        );
     }
 }
