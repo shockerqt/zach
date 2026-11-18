@@ -1467,8 +1467,31 @@ impl V2Store {
                         AND NOT EXISTS(SELECT 1 FROM post_merge_deliveries WHERE task_id=?1 AND state!='verified')",
                     [&old.task_id], |row| row.get(0),
                 )?;
-                if should_preserve_zach_state(&old, incoming)
-                    || (verified_delivery && !is_terminal_task_status(&incoming.status))
+                let is_blocked_to_ready = old.status == "Blocked" && incoming.status == "Ready";
+                let has_pending_lifecycle_ops: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM lifecycle_ops WHERE task_id=?1 AND state!='ACKNOWLEDGED')",
+                    [&old.task_id],
+                    |row| row.get(0),
+                )?;
+                let has_open_decision: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pending_decisions WHERE task_id=?1 AND status='OPEN')",
+                    [&old.task_id],
+                    |row| row.get(0),
+                )?;
+                let idle_reset_eligible = matches!(incoming.status.as_str(), "Backlog" | "Ready")
+                    && !is_blocked_to_ready
+                    && old.active_attempt_id.is_none()
+                    && old.memory.pipeline_checkpoint.is_none()
+                    && old.memory.merge_checkpoint.is_none()
+                    && !is_post_merge_status(&old.status)
+                    && !verified_delivery
+                    && !has_pending_lifecycle_ops
+                    && !has_open_decision;
+                let idle_reset = idle_reset_eligible
+                    && (old.status != incoming.status || incoming.status == "Backlog");
+                if !idle_reset
+                    && (should_preserve_zach_state(&old, incoming)
+                        || (verified_delivery && !is_terminal_task_status(&incoming.status)))
                 {
                     next.status = old.status.clone();
                     next.stages_completed = old.stages_completed.clone();
@@ -1521,6 +1544,18 @@ impl V2Store {
                     }
                 } else {
                     coalesce_runtime_fields(&old, &mut next);
+                    if idle_reset {
+                        next.status = incoming.status.clone();
+                        next.current_stage = None;
+                        next.memory.governance_started = incoming.memory.governance_started;
+                        tx.execute(
+                            "DELETE FROM lifecycle_ops WHERE task_id=?1 AND kind='start' AND state='ACKNOWLEDGED'",
+                            [&old.task_id],
+                        )?;
+                        if incoming.status == "Backlog" {
+                            tx.execute("DELETE FROM path_locks WHERE task_id=?1", [&old.task_id])?;
+                        }
+                    }
                     if old.status == "Blocked" && incoming.status == "Ready" {
                         next.status = "Ready".into();
                         next.retry_count = 0;
@@ -3496,12 +3531,19 @@ fn coalesce_runtime_fields(old: &TaskRecord, next: &mut TaskRecord) {
     if next.pr_number.is_none() {
         next.pr_number = old.pr_number;
     }
+    let incoming_governance_started = next.memory.governance_started;
     if next.memory == TaskMemory::default() {
         next.memory = old.memory.clone();
     } else if next.memory.merge_checkpoint.is_none() {
         // Board exports cannot replace a durable merge/delivery receipt.
         next.memory.merge_checkpoint = old.memory.merge_checkpoint.clone();
         next.memory.merge_lane_released = old.memory.merge_lane_released;
+    }
+    if matches!(next.status.as_str(), "Backlog" | "Ready")
+        && !incoming_governance_started
+        && !(old.status == "Blocked" && next.status == "Ready")
+    {
+        next.memory.governance_started = false;
     }
 }
 
@@ -5842,5 +5884,186 @@ mod tests {
         let native_report = store.detailed_status(Some("NATIVE")).unwrap();
         assert_eq!(native_report.path_locks.len(), 1);
         assert_eq!(native_report.path_locks[0].task_id, "NATIVE-1");
+    }
+
+    #[test]
+    fn sync_task_idle_reset_resets_backlog_ready_and_preserves_blocked_ready_and_active_guards() {
+        let mut store = V2Store::open_in_memory().unwrap();
+
+        let make_started = |id: &str, status: &str| {
+            let mut t = sample_task(id, status, vec![]);
+            t.executor = Some("zach".into());
+            t.weight = "M".into();
+            t.current_stage = Some("impl".into());
+            t.stages_completed = vec!["plan".into(), "plan-review".into()];
+            t.memory.governance_started = true;
+            t
+        };
+
+        let insert_ack_start = |store: &mut V2Store, id: &str| {
+            let op_id = format!("start-{id}-v1");
+            let op = LifecycleOperation {
+                attempt_id: None,
+                decision_id: None,
+                operation_id: op_id.clone(),
+                task_id: id.into(),
+                kind: "start".into(),
+                args: vec!["start".into(), id.into()],
+                body_path: None,
+                depends_on: None,
+                state: "ACKNOWLEDGED".into(),
+                retry_epoch: 0,
+                attempts: 1,
+                last_error: None,
+            };
+            store.enqueue_lifecycle(&op).unwrap();
+            store
+                .connection_mut()
+                .execute(
+                    "UPDATE lifecycle_ops SET state='ACKNOWLEDGED' WHERE operation_id=?1",
+                    [&op_id],
+                )
+                .unwrap();
+        };
+
+        // 1. Idle In Progress -> Backlog: resets status, current_stage, governance_started, releases path_locks, retires start op.
+        let t1 = make_started("IDLE-BACKLOG", "In Progress");
+        store.upsert_task(&t1).unwrap();
+        assert!(
+            store
+                .acquire_path_locks("zach", &["*".into()], "IDLE-BACKLOG")
+                .unwrap()
+        );
+        insert_ack_start(&mut store, "IDLE-BACKLOG");
+        let mut incoming1 = sample_task("IDLE-BACKLOG", "Backlog", vec![]);
+        incoming1.executor = Some("zach".into());
+        let synced1 = store.sync_task(&incoming1).unwrap();
+        assert_eq!(synced1.status, "Backlog");
+        assert!(synced1.current_stage.is_none());
+        assert!(!synced1.memory.governance_started);
+        assert!(
+            store
+                .lifecycle_ops()
+                .unwrap()
+                .into_iter()
+                .all(|op| op.task_id != "IDLE-BACKLOG")
+        );
+        assert!(
+            store
+                .acquire_path_locks("zach", &["*".into()], "OTHER-TASK")
+                .unwrap()
+        );
+        assert_eq!(store.release_path_locks("OTHER-TASK").unwrap(), 1);
+
+        // 2. Idle In Progress -> Ready: resets status, current_stage, governance_started, retires start op.
+        let t2 = make_started("IDLE-READY", "In Progress");
+        store.upsert_task(&t2).unwrap();
+        insert_ack_start(&mut store, "IDLE-READY");
+        let mut incoming2 = sample_task("IDLE-READY", "Ready", vec![]);
+        incoming2.executor = Some("zach".into());
+        let synced2 = store.sync_task(&incoming2).unwrap();
+        assert_eq!(synced2.status, "Ready");
+        assert!(synced2.current_stage.is_none());
+        assert!(!synced2.memory.governance_started);
+        assert!(
+            store
+                .lifecycle_ops()
+                .unwrap()
+                .into_iter()
+                .all(|op| op.task_id != "IDLE-READY")
+        );
+
+        // 3. Idle Done -> Ready (without verified delivery): resets governance_started.
+        let t3 = make_started("DONE-READY", "Done");
+        store.upsert_task(&t3).unwrap();
+        let mut incoming3 = sample_task("DONE-READY", "Ready", vec![]);
+        incoming3.executor = Some("zach".into());
+        let synced3 = store.sync_task(&incoming3).unwrap();
+        assert_eq!(synced3.status, "Ready");
+        assert!(synced3.current_stage.is_none());
+        assert!(!synced3.memory.governance_started);
+
+        // 4. Idle Blocked -> Backlog: resets governance_started and releases path_locks.
+        let t4 = make_started("BLOCKED-BACKLOG", "Blocked");
+        store.upsert_task(&t4).unwrap();
+        assert!(
+            store
+                .acquire_path_locks("zach", &["*".into()], "BLOCKED-BACKLOG")
+                .unwrap()
+        );
+        let mut incoming4 = sample_task("BLOCKED-BACKLOG", "Backlog", vec![]);
+        incoming4.executor = Some("zach".into());
+        let synced4 = store.sync_task(&incoming4).unwrap();
+        assert_eq!(synced4.status, "Backlog");
+        assert!(synced4.current_stage.is_none());
+        assert!(!synced4.memory.governance_started);
+        assert!(
+            store
+                .acquire_path_locks("zach", &["*".into()], "OTHER-TASK-2")
+                .unwrap()
+        );
+        assert_eq!(store.release_path_locks("OTHER-TASK-2").unwrap(), 1);
+
+        // 5. Blocked -> Ready recovery: preserves stages_completed, weight, context_pack, and governance_started.
+        let mut t5 = make_started("BLOCKED-READY", "Blocked");
+        t5.context_pack.weight = "M".into();
+        store.upsert_task(&t5).unwrap();
+        let mut incoming5 = sample_task("BLOCKED-READY", "Ready", vec![]);
+        incoming5.executor = Some("zach".into());
+        incoming5.weight = "XS".into();
+        let synced5 = store.sync_task(&incoming5).unwrap();
+        assert_eq!(synced5.status, "Ready");
+        assert_eq!(synced5.weight, "M");
+        assert_eq!(synced5.context_pack.weight, "M");
+        assert_eq!(synced5.stages_completed, vec!["plan", "plan-review"]);
+        assert!(synced5.memory.governance_started);
+
+        // 6. Verified delivery Done -> Ready: preserved.
+        let t6 = make_started("VERIFIED-DONE", "Done");
+        store.upsert_task(&t6).unwrap();
+        store
+            .connection_mut()
+            .execute(
+                "INSERT INTO post_merge_deliveries(delivery_id,task_id,repository,github_repo,merge_sha,kind,name,state,workflow,updated_epoch) VALUES('del-1','VERIFIED-DONE','zach','owner/repo','sha','test','test','verified','test',100)",
+                [],
+            )
+            .unwrap();
+        let mut incoming6 = sample_task("VERIFIED-DONE", "Ready", vec![]);
+        incoming6.executor = Some("zach".into());
+        let synced6 = store.sync_task(&incoming6).unwrap();
+        assert_eq!(synced6.status, "Done");
+        assert!(synced6.memory.governance_started);
+
+        // 7. OPEN decision task Blocked -> Backlog: preserved.
+        let t7 = make_started("OPEN-DEC", "In Progress");
+        store.upsert_task(&t7).unwrap();
+        store
+            .open_decision(
+                "DEC-OPEN",
+                "OPEN-DEC",
+                "zach",
+                "plan_approval",
+                "Approve?",
+                &["approve".into()],
+                None,
+                "ctx",
+                None,
+            )
+            .unwrap();
+        let mut incoming7 = sample_task("OPEN-DEC", "Backlog", vec![]);
+        incoming7.executor = Some("zach".into());
+        let synced7 = store.sync_task(&incoming7).unwrap();
+        assert_eq!(synced7.status, "Blocked");
+        assert!(synced7.memory.governance_started);
+
+        // 8. Active attempt In Progress -> Ready: preserved.
+        let mut t8 = make_started("ACTIVE-ATT", "In Progress");
+        t8.active_attempt_id = Some("att-1".into());
+        store.upsert_task(&t8).unwrap();
+        let mut incoming8 = sample_task("ACTIVE-ATT", "Ready", vec![]);
+        incoming8.executor = Some("zach".into());
+        let synced8 = store.sync_task(&incoming8).unwrap();
+        assert_eq!(synced8.status, "In Progress");
+        assert!(synced8.memory.governance_started);
     }
 }

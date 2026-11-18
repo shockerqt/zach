@@ -618,4 +618,31 @@ mod tests {
         );
         assert_eq!(store.get_task("B-EMPTY").unwrap().unwrap().status, "Ready");
     }
+
+    #[test]
+    fn resumed_task_returns_to_ready_and_redispatches_without_stranding_path_locks() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        store.set_max_parallel_tasks(1).unwrap();
+
+        let mut task = make_test_task("RESUME-1", "zach", "S", "Ready", vec![], vec![]);
+        task.memory.governance_started = true;
+        store.upsert_task(&task).unwrap();
+
+        let first = schedule_scoped_dispatches(&mut store, None, None).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].task_id, "RESUME-1");
+
+        // Simulate lifecycle_ack("start") returning an idle task to Ready while keeping path_locks for the same task.
+        let mut acked = store.get_task("RESUME-1").unwrap().unwrap();
+        acked.status = "Ready".into();
+        store.upsert_task(&acked).unwrap();
+
+        let second = schedule_scoped_dispatches(&mut store, None, None).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].task_id, "RESUME-1");
+        assert_eq!(
+            store.get_task("RESUME-1").unwrap().unwrap().status,
+            "In Progress"
+        );
+    }
 }

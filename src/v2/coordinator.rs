@@ -369,7 +369,9 @@ impl Coordinator {
         for op in self.store.lifecycle_ops().map_err(|e| e.to_string())? {
             if op.kind == "start" && op.state == "ACKNOWLEDGED" {
                 let mut task = self.task(&op.task_id)?;
-                if !task.memory.governance_started {
+                if !task.memory.governance_started
+                    && !matches!(task.status.as_str(), "Backlog" | "Ready")
+                {
                     task.memory.governance_started = true;
                     self.save(&task)?;
                 }
@@ -1201,6 +1203,9 @@ impl Coordinator {
         }
         for dispatch in dispatches {
             let mut task = self.task(&dispatch.task_id)?;
+            if task.status == "Backlog" {
+                continue;
+            }
             let missing_worktree = task.repository != "none"
                 && task
                     .worktree_path
@@ -1208,16 +1213,12 @@ impl Coordinator {
                     .is_none_or(|p| !std::path::Path::new(p).is_dir());
             if !task.memory.governance_started || missing_worktree {
                 let was_started = task.memory.governance_started;
-                let resume = was_started || task.status != "Ready";
+                let resume = was_started;
                 task.executor = Some("zach".into());
                 if !was_started {
                     task.status = "Ready".into();
                 }
-                let operation_id = if !was_started {
-                    format!("start-{}", task.task_id)
-                } else {
-                    format!("start-{}-v{}", task.task_id, task.version)
-                };
+                let operation_id = format!("start-{}-v{}", task.task_id, task.version);
                 let mut args = vec![
                     "start".into(),
                     task.task_id.clone(),
@@ -2620,7 +2621,6 @@ impl Coordinator {
         let mut completed_attempt = None;
         match op.kind.as_str() {
             "start" => {
-                let was_started = task.memory.governance_started;
                 let value = intake::parse_start_receipt(output, &task.task_id)?;
                 task.branch = Some(
                     value["branch"]
@@ -2643,7 +2643,7 @@ impl Coordinator {
                 }
                 task.memory.governance_started = true;
                 task.executor = Some("zach".into());
-                if !was_started || task.status == "Backlog" {
+                if task.active_attempt_id.is_none() && task.memory.pipeline_checkpoint.is_none() {
                     task.status = "Ready".into();
                 }
             }
@@ -10542,7 +10542,7 @@ mod tests {
         c.lifecycle_ack(&op_id, &receipt).unwrap();
 
         let acked = c.task("ZACH-060-ACK").unwrap();
-        assert_eq!(acked.status, "In Progress");
+        assert_eq!(acked.status, "Ready");
         assert!(acked.memory.governance_started);
         assert_eq!(acked.executor.as_deref(), Some("zach"));
         assert_eq!(acked.branch.as_deref(), Some("task/ZACH-060-ACK-recreated"));
@@ -10551,9 +10551,6 @@ mod tests {
             Some(recreated_wt.to_string_lossy().as_ref())
         );
 
-        let mut ready = acked;
-        ready.status = "Ready".into();
-        c.save(&ready).unwrap();
         c.dispatch().unwrap();
         let dispatched = c.task("ZACH-060-ACK").unwrap();
         assert_eq!(
@@ -10563,6 +10560,42 @@ mod tests {
                 .as_ref()
                 .map(|cp| cp.operation.as_str()),
             Some("PREPARING")
+        );
+    }
+
+    #[test]
+    fn dispatch_without_governance_started_omits_resume_and_skips_backlog() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+
+        let mut ready = task("ZACH-061-READY");
+        ready.status = "Ready".into();
+        ready.memory.governance_started = false;
+        ready.version = 3;
+        c.save(&ready).unwrap();
+
+        let mut backlog = task("ZACH-061-BACKLOG");
+        backlog.status = "Backlog".into();
+        backlog.memory.governance_started = false;
+        c.save(&backlog).unwrap();
+
+        c.dispatch().unwrap();
+
+        let ops = c.store.lifecycle_ops().unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].task_id, "ZACH-061-READY");
+        assert_eq!(ops[0].kind, "start");
+        assert_eq!(ops[0].operation_id, "start-ZACH-061-READY-v2");
+        assert!(
+            !ops[0].args.iter().any(|a| a == "--resume"),
+            "unexpected --resume in args: {:?}",
+            ops[0].args
+        );
+        assert!(
+            c.store
+                .list_stage_attempts("ZACH-061-BACKLOG")
+                .unwrap()
+                .is_empty()
         );
     }
 }
