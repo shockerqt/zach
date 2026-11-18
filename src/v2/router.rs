@@ -459,7 +459,7 @@ pub fn resolve_stage_route_with_config(
                 weight: norm_weight,
                 stage: norm_stage,
                 family: ModelFamily::OpenAiSol,
-                model: "gpt-6.1-sol".to_owned(),
+                model: "gpt-6.2-sol".to_owned(),
                 effort,
                 fallback_family: Some(ModelFamily::GeminiAgy),
                 fallback_model: Some("gemini-4-hydrogen-medium".to_owned()),
@@ -482,7 +482,7 @@ pub fn resolve_stage_route_with_config(
                 weight: norm_weight,
                 stage: norm_stage,
                 family: ModelFamily::OpenAiSol,
-                model: "gpt-6.1-sol".to_owned(),
+                model: "gpt-6.2-sol".to_owned(),
                 effort,
                 fallback_family: Some(ModelFamily::GeminiAgy),
                 fallback_model: Some("gemini-4-hydrogen-medium".to_owned()),
@@ -516,7 +516,7 @@ pub fn resolve_stage_route_with_config(
                     model: "gemini-4-hydrogen-high".to_owned(),
                     effort: ReasoningEffort::High,
                     fallback_family: Some(ModelFamily::OpenAiSol),
-                    fallback_model: Some("gpt-6.1-sol".to_owned()),
+                    fallback_model: Some("gpt-6.2-sol".to_owned()),
                     fallback_effort: Some(ReasoningEffort::High),
                     max_task_tokens,
                     timeout_secs,
@@ -527,7 +527,7 @@ pub fn resolve_stage_route_with_config(
                     weight: norm_weight,
                     stage: norm_stage,
                     family: ModelFamily::OpenAiSol,
-                    model: "gpt-6.1-sol".to_owned(),
+                    model: "gpt-6.2-sol".to_owned(),
                     effort: ReasoningEffort::High,
                     fallback_family: Some(ModelFamily::GeminiAgy),
                     fallback_model: Some("gemini-4-hydrogen-high".to_owned()),
@@ -558,7 +558,7 @@ pub fn resolve_stage_route_with_config(
             weight: norm_weight,
             stage: norm_stage,
             family: ModelFamily::OpenAiSol,
-            model: "gpt-6.1-sol".to_owned(),
+            model: "gpt-6.2-sol".to_owned(),
             effort: ReasoningEffort::High,
             fallback_family: Some(ModelFamily::GeminiAgy),
             fallback_model: Some("gemini-4-hydrogen-high".to_owned()),
@@ -585,7 +585,7 @@ pub fn resolve_stage_route_with_config(
             weight: norm_weight,
             stage: norm_stage,
             family: ModelFamily::OpenAiSol,
-            model: "gpt-6.1-sol".to_owned(),
+            model: "gpt-6.2-sol".to_owned(),
             effort: ReasoningEffort::High,
             fallback_family: None,
             fallback_model: None,
@@ -610,7 +610,7 @@ pub fn resolve_stage_route_with_config(
             weight: norm_weight,
             stage: norm_stage,
             family: ModelFamily::OpenAiSol,
-            model: "gpt-6.1-sol".to_owned(),
+            model: "gpt-6.2-sol".to_owned(),
             effort: ReasoningEffort::High,
             fallback_family: None,
             fallback_model: None,
@@ -752,7 +752,7 @@ fn build_cross_model_review_route(
             weight,
             stage,
             family: ModelFamily::OpenAiSol,
-            model: "gpt-6.1-sol".to_owned(),
+            model: "gpt-6.2-sol".to_owned(),
             effort: if is_retry {
                 sol_base_effort.escalate()
             } else {
@@ -776,16 +776,17 @@ mod tests {
     fn router_allows_astra_and_rejects_empty_model() {
         assert!(!is_forbidden_daemon_model("gpt-6-astra"));
         assert!(validate_daemon_model("gpt-6-astra").is_ok());
-        assert!(validate_daemon_model("gpt-6.1-sol").is_ok());
+        assert!(validate_daemon_model("gpt-6.2-astra").is_ok());
+        assert!(validate_daemon_model("gpt-6.2-sol").is_ok());
         assert!(validate_daemon_model("").is_err());
     }
 
     #[test]
     fn router_uses_hydrogen_defaults_and_cross_model_review_separation() {
-        // S impl uses OpenAiSol (gpt-6.1-sol medium -> high on retry)
+        // S impl uses OpenAiSol (gpt-6.2-sol medium -> high on retry)
         let s_impl_0 = resolve_stage_route("S", "impl", 0, None).unwrap().unwrap();
         assert_eq!(s_impl_0.family, ModelFamily::OpenAiSol);
-        assert_eq!(s_impl_0.model, "gpt-6.1-sol");
+        assert_eq!(s_impl_0.model, "gpt-6.2-sol");
         assert_eq!(s_impl_0.effort, ReasoningEffort::Medium);
         assert_eq!(s_impl_0.max_task_tokens, 400_000);
         assert_eq!(
@@ -827,7 +828,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(s_rev_alt.family, ModelFamily::OpenAiSol);
-        assert_eq!(s_rev_alt.model, "gpt-6.1-sol");
+        assert_eq!(s_rev_alt.model, "gpt-6.2-sol");
 
         // XS has no plan or pr-review model stages
         assert!(

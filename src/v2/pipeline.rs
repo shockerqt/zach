@@ -2998,7 +2998,7 @@ pub fn execute_m_l_pipeline(store: &mut V2Store, task_id: &str) -> Result<TaskRe
 /// - [For L]: `human-merge-approval` gate (opens `DECISION_REQUIRED`, pauses in `Blocked` until resolved)
 /// - Final: Enqueues pull request into per-repo FIFO `merge_queue` (retaining `path_locks`)
 ///
-/// Automatically falls back to `gpt-6.1-sol` after 2 AGY infrastructure failures.
+/// Automatically falls back to `gpt-6.2-sol` after 2 AGY infrastructure failures.
 pub fn execute_m_l_pipeline_with_executor(
     store: &mut V2Store,
     task_id: &str,
@@ -3080,7 +3080,7 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                 plan_route.model = plan_route
                     .fallback_model
                     .clone()
-                    .unwrap_or_else(|| "gpt-6.1-sol".to_owned());
+                    .unwrap_or_else(|| "gpt-6.2-sol".to_owned());
                 if let Some(effort) = plan_route.fallback_effort {
                     plan_route.effort = effort;
                 }
@@ -3151,7 +3151,7 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                 if count_agy_infra_failures(&task) >= 2 {
                     let fb_route = StageRoute {
                         family: ModelFamily::OpenAiSol,
-                        model: "gpt-6.1-sol".to_owned(),
+                        model: "gpt-6.2-sol".to_owned(),
                         effort: ReasoningEffort::High,
                         fallback_family: None,
                         fallback_model: None,
@@ -3642,7 +3642,7 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                 impl_route.model = impl_route
                     .fallback_model
                     .clone()
-                    .unwrap_or_else(|| "gpt-6.1-sol".to_owned());
+                    .unwrap_or_else(|| "gpt-6.2-sol".to_owned());
                 if let Some(effort) = impl_route.fallback_effort {
                     impl_route.effort = effort;
                 }
@@ -3714,7 +3714,7 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                 if count_agy_infra_failures(&task) >= 2 {
                     let fb_route = StageRoute {
                         family: ModelFamily::OpenAiSol,
-                        model: "gpt-6.1-sol".to_owned(),
+                        model: "gpt-6.2-sol".to_owned(),
                         effort: ReasoningEffort::High,
                         fallback_family: None,
                         fallback_model: None,
@@ -5892,7 +5892,7 @@ print(json.dumps({
         let status_err = parse_agy_cli_response(status_json, "", Some(1)).unwrap_err();
         assert_eq!(status_err.failure_class, "AGY_STATUS");
 
-        // 4. Test automatic fallback to gpt-6.1-sol after 2 AGY infrastructure failures
+        // 4. Test automatic fallback to gpt-6.2-sol after 2 AGY infrastructure failures
         let mut store = V2Store::open_in_memory().expect("open store");
         let mut agy_task = task.clone();
         agy_task.reviewed_sha = Some("plan-sha-008".to_owned());
@@ -5935,10 +5935,10 @@ print(json.dumps({
         .unwrap();
         assert!(completed.stages_completed.contains(&"plan".to_owned()));
 
-        // Verify that route was automatically switched to OpenAiSol (gpt-6.1-sol) instead of GeminiAgy
+        // Verify that route was automatically switched to OpenAiSol (gpt-6.2-sol) instead of GeminiAgy
         assert_eq!(mock.executed_routes.len(), 1);
         assert_eq!(mock.executed_routes[0].family, ModelFamily::OpenAiSol);
-        assert_eq!(mock.executed_routes[0].model, "gpt-6.1-sol");
+        assert_eq!(mock.executed_routes[0].model, "gpt-6.2-sol");
     }
 
     #[test]
@@ -8708,7 +8708,7 @@ raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={
         assert_eq!(
             exec.seen_stages,
             vec![
-                ("impl".into(), ModelFamily::OpenAiSol, "gpt-6.1-sol".into()),
+                ("impl".into(), ModelFamily::OpenAiSol, "gpt-6.2-sol".into()),
                 (
                     "impl".into(),
                     ModelFamily::GeminiAgy,
@@ -8717,7 +8717,7 @@ raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={
                 (
                     "pr-review".into(),
                     ModelFamily::OpenAiSol,
-                    "gpt-6.1-sol".into()
+                    "gpt-6.2-sol".into()
                 ),
             ]
         );
