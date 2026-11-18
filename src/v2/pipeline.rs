@@ -691,7 +691,7 @@ fn classify_agy_infra_failure(res: &Result<StageExecutionResult, String>) -> Opt
 }
 
 /// Applies durable per-stage fallback routing while never switching family on review stages.
-fn apply_stage_fallback_route(task: &TaskRecord, mut route: StageRoute) -> StageRoute {
+pub fn apply_stage_fallback_route(task: &TaskRecord, mut route: StageRoute) -> StageRoute {
     if matches!(route.stage.as_str(), "plan-review" | "pr-review") {
         return route;
     }
@@ -1657,6 +1657,325 @@ fn parse_agy_usage(json: &serde_json::Value) -> (Option<u64>, Option<u64>, Optio
 pub const FAILURE_CLASS_INFRA: &str = "infra";
 pub const FAILURE_CLASS_SEMANTIC: &str = "semantic";
 pub const FAILURE_CLASS_POLICY: &str = "policy";
+pub const DEFAULT_QUOTA_COOLDOWN_SECS: i64 = 1800;
+pub const QUOTA_COOLDOWN_SAFETY_MARGIN_SECS: i64 = 60;
+
+/// Parses a quota/rate-limit reset timestamp or relative duration from `message`,
+/// returning `reset_epoch + QUOTA_COOLDOWN_SAFETY_MARGIN_SECS`, or falling back to
+/// `now + DEFAULT_QUOTA_COOLDOWN_SECS` when unparseable or already in the past.
+pub fn parse_quota_reset_epoch(message: &str, now: i64) -> i64 {
+    let parsed = parse_explicit_timestamp_epoch(message)
+        .or_else(|| parse_relative_duration_secs(message).map(|secs| now.saturating_add(secs)));
+    match parsed {
+        Some(epoch) if epoch > now => epoch.saturating_add(QUOTA_COOLDOWN_SAFETY_MARGIN_SECS),
+        _ => now.saturating_add(DEFAULT_QUOTA_COOLDOWN_SECS),
+    }
+}
+
+fn parse_relative_duration_secs(message: &str) -> Option<i64> {
+    let bytes = message.as_bytes();
+    let mut total_secs: i64 = 0;
+    let mut matched_any = false;
+    let mut just_matched_unit = false;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            just_matched_unit = false;
+            i += 1;
+            continue;
+        }
+        // Require a non-alphanumeric boundary before the number unless continuing a compound duration like "1h30m".
+        if !just_matched_unit
+            && i > 0
+            && (bytes[i - 1].is_ascii_alphanumeric()
+                || bytes[i - 1] == b'-'
+                || bytes[i - 1] == b':')
+        {
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            just_matched_unit = false;
+            continue;
+        }
+        just_matched_unit = false;
+        let num_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        let Ok(value) = message[num_start..i].parse::<i64>() else {
+            continue;
+        };
+        let mut unit_start = i;
+        while unit_start < bytes.len() && bytes[unit_start] == b' ' {
+            unit_start += 1;
+        }
+        let mut unit_end = unit_start;
+        while unit_end < bytes.len() && bytes[unit_end].is_ascii_alphabetic() {
+            unit_end += 1;
+        }
+        if unit_start == unit_end {
+            continue;
+        }
+        let unit = message[unit_start..unit_end].to_ascii_lowercase();
+        let multiplier = match unit.as_str() {
+            "d" | "day" | "days" => 86_400,
+            "h" | "hr" | "hrs" | "hour" | "hours" => 3_600,
+            "m" | "min" | "mins" | "minute" | "minutes" => 60,
+            "s" | "sec" | "secs" | "second" | "seconds" => 1,
+            _ => continue,
+        };
+        if value > 0 {
+            total_secs = total_secs.saturating_add(value.saturating_mul(multiplier));
+            matched_any = true;
+            just_matched_unit = true;
+        }
+        i = unit_end;
+    }
+
+    matched_any.then_some(total_secs)
+}
+
+fn parse_explicit_timestamp_epoch(message: &str) -> Option<i64> {
+    parse_iso_timestamp_epoch(message).or_else(|| parse_named_month_timestamp_epoch(message))
+}
+
+fn parse_iso_timestamp_epoch(message: &str) -> Option<i64> {
+    let bytes = message.as_bytes();
+    for i in 0..bytes.len() {
+        if i + 16 > bytes.len() || !bytes[i].is_ascii_digit() {
+            continue;
+        }
+        // Look for YYYY-MM-DD[T ]HH:MM(:SS)?
+        if bytes.get(i + 4) != Some(&b'-') || bytes.get(i + 7) != Some(&b'-') {
+            continue;
+        }
+        let sep = bytes.get(i + 10).copied()?;
+        if sep != b'T' && sep != b't' && sep != b' ' {
+            continue;
+        }
+        let year: i64 = message.get(i..i + 4)?.parse().ok()?;
+        let month: u32 = message.get(i + 5..i + 7)?.parse().ok()?;
+        let day: u32 = message.get(i + 8..i + 10)?.parse().ok()?;
+        if bytes.get(i + 13) != Some(&b':') {
+            continue;
+        }
+        let hour: i64 = message.get(i + 11..i + 13)?.parse().ok()?;
+        let minute: i64 = message.get(i + 14..i + 16)?.parse().ok()?;
+        let mut cursor = i + 16;
+        let second: i64 = if bytes.get(cursor) == Some(&b':') && cursor + 3 <= bytes.len() {
+            let s = message.get(cursor + 1..cursor + 3)?.parse().ok()?;
+            cursor += 3;
+            s
+        } else {
+            0
+        };
+        // Skip optional fractional seconds
+        if bytes.get(cursor) == Some(&b'.') {
+            cursor += 1;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+                cursor += 1;
+            }
+        }
+        let tz_offset_secs = parse_tz_offset_secs(&message[cursor..]);
+        if let Some(base) = civil_datetime_to_epoch(year, month, day, hour, minute, second) {
+            return Some(base - tz_offset_secs);
+        }
+    }
+    None
+}
+
+fn parse_tz_offset_secs(tail: &str) -> i64 {
+    let trimmed = tail.trim_start();
+    if trimmed.starts_with('Z') || trimmed.starts_with('z') {
+        return 0;
+    }
+    let bytes = trimmed.as_bytes();
+    if bytes.len() >= 5 && (bytes[0] == b'+' || bytes[0] == b'-') {
+        let sign = if bytes[0] == b'-' { -1 } else { 1 };
+        if let Ok(hh) = trimmed[1..3].parse::<i64>() {
+            let mm = if bytes.get(3) == Some(&b':') && bytes.len() >= 6 {
+                trimmed[4..6].parse::<i64>().unwrap_or(0)
+            } else {
+                trimmed[3..5].parse::<i64>().unwrap_or(0)
+            };
+            return sign * (hh * 3600 + mm * 60);
+        }
+    }
+    0
+}
+
+fn parse_named_month_timestamp_epoch(message: &str) -> Option<i64> {
+    let tokens: Vec<&str> = message
+        .split(|c: char| c.is_ascii_whitespace() || c == ',')
+        .filter(|s| !s.is_empty())
+        .collect();
+    for idx in 0..tokens.len() {
+        let Some(month) = parse_month_name(tokens[idx]) else {
+            continue;
+        };
+        let Some(day_tok) = tokens.get(idx + 1) else {
+            continue;
+        };
+        let Some(day) = parse_ordinal_day(day_tok) else {
+            continue;
+        };
+        let Some(year_tok) = tokens.get(idx + 2) else {
+            continue;
+        };
+        let Ok(year) = year_tok.parse::<i64>() else {
+            continue;
+        };
+        if !(1970..=9999).contains(&year) {
+            continue;
+        }
+        let mut time_idx = idx + 3;
+        if tokens
+            .get(time_idx)
+            .is_some_and(|t| t.eq_ignore_ascii_case("at"))
+        {
+            time_idx += 1;
+        }
+        let Some(time_tok) = tokens.get(time_idx) else {
+            continue;
+        };
+        let am_pm = tokens.get(time_idx + 1).copied();
+        if let Some((hour, minute, second)) = parse_time_of_day(time_tok, am_pm)
+            && let Some(epoch) = civil_datetime_to_epoch(year, month, day, hour, minute, second)
+        {
+            return Some(epoch);
+        }
+    }
+    None
+}
+
+fn parse_month_name(token: &str) -> Option<u32> {
+    match token.trim_end_matches('.').to_ascii_lowercase().as_str() {
+        "jan" | "january" => Some(1),
+        "feb" | "february" => Some(2),
+        "mar" | "march" => Some(3),
+        "apr" | "april" => Some(4),
+        "may" => Some(5),
+        "jun" | "june" => Some(6),
+        "jul" | "july" => Some(7),
+        "aug" | "august" => Some(8),
+        "sep" | "sept" | "september" => Some(9),
+        "oct" | "october" => Some(10),
+        "nov" | "november" => Some(11),
+        "dec" | "december" => Some(12),
+        _ => None,
+    }
+}
+
+fn parse_ordinal_day(token: &str) -> Option<u32> {
+    let lower = token.to_ascii_lowercase();
+    let stripped = lower
+        .strip_suffix("st")
+        .or_else(|| lower.strip_suffix("nd"))
+        .or_else(|| lower.strip_suffix("rd"))
+        .or_else(|| lower.strip_suffix("th"))
+        .unwrap_or(&lower);
+    let day = stripped.parse::<u32>().ok()?;
+    (1..=31).contains(&day).then_some(day)
+}
+
+fn parse_time_of_day(token: &str, next_token: Option<&str>) -> Option<(i64, i64, i64)> {
+    let lower = token.to_ascii_lowercase();
+    let (core, inline_ampm) = if let Some(rest) = lower.strip_suffix("am") {
+        (rest, Some("am"))
+    } else if let Some(rest) = lower.strip_suffix("pm") {
+        (rest, Some("pm"))
+    } else {
+        (lower.as_str(), None)
+    };
+    let mut parts = core.split(':');
+    let mut hour: i64 = parts.next()?.parse().ok()?;
+    let minute: i64 = parts.next()?.parse().ok()?;
+    let second: i64 = match parts.next() {
+        Some(sec) => sec
+            .trim_end_matches(|c: char| !c.is_ascii_digit())
+            .parse()
+            .ok()?,
+        None => 0,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    let ampm = inline_ampm.or_else(|| {
+        let next = next_token?
+            .trim_end_matches(|c: char| !c.is_ascii_alphabetic())
+            .to_ascii_lowercase();
+        match next.as_str() {
+            "am" => Some("am"),
+            "pm" => Some("pm"),
+            _ => None,
+        }
+    });
+    match ampm {
+        Some("am") => {
+            if !(1..=12).contains(&hour) {
+                return None;
+            }
+            if hour == 12 {
+                hour = 0;
+            }
+        }
+        Some("pm") => {
+            if !(1..=12).contains(&hour) {
+                return None;
+            }
+            if hour != 12 {
+                hour += 12;
+            }
+        }
+        _ => {}
+    }
+    if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) || !(0..=59).contains(&second) {
+        return None;
+    }
+    Some((hour, minute, second))
+}
+
+fn civil_datetime_to_epoch(
+    year: i64,
+    month: u32,
+    day: u32,
+    hour: i64,
+    minute: i64,
+    second: i64,
+) -> Option<i64> {
+    if !(1..=12).contains(&month)
+        || !(1..=days_in_month(year, month)).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=59).contains(&second)
+    {
+        return None;
+    }
+    Some(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+            if is_leap { 29 } else { 28 }
+        }
+        _ => 0,
+    }
+}
+
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let m = month as i64;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
 
 /// Returns true when an error or summary indicates a provider quota, usage-limit, or rate-limit failure.
 pub fn is_quota_or_usage_limit_error(message: &str) -> bool {
@@ -8401,6 +8720,70 @@ raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={
                     "gpt-6.1-sol".into()
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn parse_quota_reset_epoch_handles_relative_explicit_and_fallback() {
+        let nov21_1138 = civil_datetime_to_epoch(2026, 11, 21, 11, 38, 0).unwrap();
+        let nov21_2338 = civil_datetime_to_epoch(2026, 11, 21, 23, 38, 0).unwrap();
+        let now = civil_datetime_to_epoch(2026, 11, 21, 10, 0, 0).unwrap();
+
+        // Explicit named month with ordinal + AM/PM
+        assert_eq!(
+            parse_quota_reset_epoch(
+                "You've hit your usage limit. Try again at Nov 21st, 2026 11:38 AM.",
+                now
+            ),
+            nov21_1138 + QUOTA_COOLDOWN_SAFETY_MARGIN_SECS
+        );
+        // Explicit full month 24h
+        assert_eq!(
+            parse_quota_reset_epoch("Usage limit resets November 21, 2026 23:38", now),
+            nov21_2338 + QUOTA_COOLDOWN_SAFETY_MARGIN_SECS
+        );
+        // ISO 8601 UTC and space-separated
+        assert_eq!(
+            parse_quota_reset_epoch("Quota resets at 2026-11-21T11:38:00Z", now),
+            nov21_1138 + QUOTA_COOLDOWN_SAFETY_MARGIN_SECS
+        );
+        assert_eq!(
+            parse_quota_reset_epoch("Retry after 2026-11-21 11:38:00", now),
+            nov21_1138 + QUOTA_COOLDOWN_SAFETY_MARGIN_SECS
+        );
+        // Relative durations (case-insensitive)
+        assert_eq!(
+            parse_quota_reset_epoch("Rate limit exceeded, try again IN 4 HOURS", now),
+            now + 4 * 3600 + QUOTA_COOLDOWN_SAFETY_MARGIN_SECS
+        );
+        assert_eq!(
+            parse_quota_reset_epoch("Quota resets in 45m", now),
+            now + 45 * 60 + QUOTA_COOLDOWN_SAFETY_MARGIN_SECS
+        );
+        assert_eq!(
+            parse_quota_reset_epoch("Try again in 1h30m", now),
+            now + 5400 + QUOTA_COOLDOWN_SAFETY_MARGIN_SECS
+        );
+        assert_eq!(
+            parse_quota_reset_epoch("Resets in 2 days", now),
+            now + 2 * 86_400 + QUOTA_COOLDOWN_SAFETY_MARGIN_SECS
+        );
+        assert_eq!(
+            parse_quota_reset_epoch("Please retry after 30 minutes", now),
+            now + 30 * 60 + QUOTA_COOLDOWN_SAFETY_MARGIN_SECS
+        );
+        assert_eq!(
+            parse_quota_reset_epoch("Try again in 90s", now),
+            now + 90 + QUOTA_COOLDOWN_SAFETY_MARGIN_SECS
+        );
+        // Unparseable or past timestamps fall back to now + DEFAULT_QUOTA_COOLDOWN_SECS
+        assert_eq!(
+            parse_quota_reset_epoch("HTTP 429 Too Many Requests", now),
+            now + DEFAULT_QUOTA_COOLDOWN_SECS
+        );
+        assert_eq!(
+            parse_quota_reset_epoch("Try again at 2026-11-21T09:00:00Z", now),
+            now + DEFAULT_QUOTA_COOLDOWN_SECS
         );
     }
 }
