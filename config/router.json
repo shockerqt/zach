@@ -1,0 +1,126 @@
+{
+  "flash_only": {
+    "model": "gemini-4-hydrogen-high",
+    "effort": "high"
+  },
+  "agy_infra_fallback": {
+    "model": "gpt-6.2-sol",
+    "effort": "high"
+  },
+  "routes": {
+    "XS": {
+      "impl": {
+        "model": "gpt-6.2-sol",
+        "effort": "low",
+        "retry_model": "gpt-6.2-sol",
+        "retry_effort": "medium",
+        "fallback_model": "gemini-4-hydrogen-medium",
+        "fallback_effort": "medium"
+      }
+    },
+    "S": {
+      "impl": {
+        "model": "gpt-6.2-sol",
+        "effort": "medium",
+        "retry_model": "gpt-6.2-sol",
+        "retry_effort": "high",
+        "fallback_model": "gemini-4-hydrogen-medium",
+        "fallback_effort": "medium"
+      },
+      "pr-review": {
+        "model": "gemini-4-hydrogen-high",
+        "effort": "high",
+        "retry_model": "gemini-4-hydrogen-high",
+        "retry_effort": "high",
+        "cross_family_alt": {
+          "model": "gpt-6.2-sol",
+          "effort": "medium",
+          "retry_model": "gpt-6.2-sol",
+          "retry_effort": "high"
+        }
+      }
+    },
+    "M": {
+      "plan": {
+        "model": "gpt-6.2-sol",
+        "effort": "high",
+        "retry_model": "gemini-4-hydrogen-high",
+        "retry_effort": "high",
+        "fallback_model": "gemini-4-hydrogen-high",
+        "fallback_effort": "high",
+        "retry_fallback_model": "gpt-6.2-sol",
+        "retry_fallback_effort": "high"
+      },
+      "plan-review": {
+        "model": "gemini-4-hydrogen-medium",
+        "effort": "medium",
+        "retry_model": "gemini-4-hydrogen-high",
+        "retry_effort": "high",
+        "cross_family_alt": {
+          "model": "gpt-6.2-sol",
+          "effort": "medium",
+          "retry_model": "gpt-6.2-sol",
+          "retry_effort": "high"
+        }
+      },
+      "impl": {
+        "model": "gpt-6.2-sol",
+        "effort": "high",
+        "retry_model": "gpt-6.2-sol",
+        "retry_effort": "high",
+        "fallback_model": "gemini-4-hydrogen-high",
+        "fallback_effort": "high"
+      },
+      "pr-review": {
+        "model": "gemini-4-hydrogen-high",
+        "effort": "high",
+        "retry_model": "gemini-4-hydrogen-high",
+        "retry_effort": "high",
+        "cross_family_alt": {
+          "model": "gpt-6.2-sol",
+          "effort": "medium",
+          "retry_model": "gpt-6.2-sol",
+          "retry_effort": "high"
+        }
+      }
+    },
+    "L": {
+      "plan": {
+        "model": "gpt-6.2-sol",
+        "effort": "high",
+        "retry_model": "gpt-6.2-sol",
+        "retry_effort": "high"
+      },
+      "plan-review": {
+        "model": "gemini-4-hydrogen-high",
+        "effort": "high",
+        "retry_model": "gemini-4-hydrogen-high",
+        "retry_effort": "high",
+        "cross_family_alt": {
+          "model": "gpt-6.2-sol",
+          "effort": "high",
+          "retry_model": "gpt-6.2-sol",
+          "retry_effort": "high"
+        }
+      },
+      "impl": {
+        "model": "gpt-6.2-sol",
+        "effort": "high",
+        "retry_model": "gpt-6.2-sol",
+        "retry_effort": "high"
+      },
+      "pr-review": {
+        "model": "gemini-4-hydrogen-high",
+        "effort": "high",
+        "retry_model": "gemini-4-hydrogen-high",
+        "retry_effort": "high",
+        "cross_family_alt": {
+          "model": "gpt-6.2-sol",
+          "effort": "high",
+          "retry_model": "gpt-6.2-sol",
+          "retry_effort": "high"
+        }
+      }
+    }
+  }
+}

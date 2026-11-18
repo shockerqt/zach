@@ -677,6 +677,23 @@ fn run_v2_sync(args: &[String]) {
 fn run_v2_config(args: &[String]) {
     if let Some(sub) = args.first().map(String::as_str) {
         match sub {
+            "init" => {
+                let explicit = flag_value(&args[1..], "--file");
+                let force = has_flag(&args[1..], "--force");
+                match zach::v2::router::init_router_config(
+                    explicit.as_deref().map(std::path::Path::new),
+                    force,
+                ) {
+                    Ok(written) => {
+                        println!("router_config={}", written.display());
+                        return;
+                    }
+                    Err(err) => {
+                        eprintln!("router config init failed: {err}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             "validate" => {
                 let explicit = flag_value(&args[1..], "--file");
                 let path = explicit
@@ -1498,6 +1515,7 @@ fn print_usage() {
         "       zach sync [--export-file <PATH>] [--ws-task-bin <PATH>] [--db <PATH>] [--reconcile-finished-legacy]"
     );
     println!("       zach config [--max-parallel <1..16>] [--db <PATH>]");
+    println!("       zach config init [--file <PATH>] [--force]");
     println!("       zach config validate [--file <PATH>]");
     println!("       zach config reload [--file <PATH>] [--socket <PATH>]");
     println!("       zach cooldown list [--json] [--db <PATH>] [--socket <PATH>]");
