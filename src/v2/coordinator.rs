@@ -801,6 +801,19 @@ impl Coordinator {
                     }],
                 }
             }
+            ClientCommand::CooldownList => vec![ServerMessage::Cooldowns {
+                cooldowns: self
+                    .store
+                    .list_provider_cooldowns(Some(now_epoch()))
+                    .map_err(|e| e.to_string())?,
+            }],
+            ClientCommand::CooldownClear { family } => {
+                let cleared = self
+                    .store
+                    .clear_provider_cooldown(family.as_deref())
+                    .map_err(|e| e.to_string())?;
+                vec![ServerMessage::CooldownCleared { cleared }]
+            }
         })
     }
 
@@ -909,6 +922,17 @@ impl Coordinator {
         for op in self.store.lifecycle_ops().map_err(|e| e.to_string())? {
             if op.state == "PENDING" && op.retry_epoch > now {
                 let secs = (op.retry_epoch - now) as u64;
+                min_deadline(now_instant + Duration::from_secs(secs));
+            }
+        }
+
+        for cooldown in self
+            .store
+            .list_provider_cooldowns(Some(now))
+            .map_err(|e| e.to_string())?
+        {
+            if cooldown.until_epoch > now {
+                let secs = (cooldown.until_epoch - now) as u64;
                 min_deadline(now_instant + Duration::from_secs(secs));
             }
         }
@@ -2318,44 +2342,115 @@ impl Coordinator {
         attempt.summary = Some(error.into());
         attempt.ended_epoch = Some(now_epoch());
         attempt.phase = "COMPLETE".into();
-        let failures = attempts
+        let is_quota = pipeline::is_quota_or_usage_limit_error(error);
+        let prior_failures = attempts
             .iter()
             .filter(|a| {
                 a.attempt_id != attempt.attempt_id
                     && a.stage == stage
                     && a.retry_generation == task.memory.retry_generation
                     && a.failure_class.as_deref() == Some(class)
+                    && !a
+                        .summary
+                        .as_deref()
+                        .is_some_and(pipeline::is_quota_or_usage_limit_error)
             })
-            .count()
-            + 1;
+            .count();
+        let failures = prior_failures + usize::from(!is_quota);
         let limit = match class {
             "infra" => pipeline::MAX_INFRA_RETRIES,
             "semantic" => pipeline::MAX_SEMANTIC_RETRIES,
             _ => pipeline::MAX_POLICY_RETRIES,
         };
-        let is_quota = pipeline::is_quota_or_usage_limit_error(error);
         if !is_quota {
             task.retry_count += 1;
         }
+        let now = now_epoch();
+        let author_stage = match stage.as_str() {
+            "plan-review" => Some("plan"),
+            "pr-review" => Some("impl"),
+            _ => None,
+        };
+        let author_family = author_stage.and_then(|src_stage| {
+            attempts
+                .iter()
+                .rev()
+                .find(|a| a.stage == src_stage && a.status == "PASSED")
+                .map(|a| infer_model_family(&a.model))
+        });
+        let quota_until_epoch = if is_quota {
+            let exhausted_family = if attempt.model != "unknown" && !attempt.model.trim().is_empty()
+            {
+                infer_model_family(&attempt.model)
+            } else {
+                crate::v2::router::resolve_stage_route(
+                    &task.weight,
+                    &stage,
+                    task.retry_count,
+                    author_family,
+                )
+                .ok()
+                .flatten()
+                .map(|r| pipeline::apply_stage_fallback_route(&task, r).family)
+                .unwrap_or(crate::v2::router::ModelFamily::OpenAiSol)
+            };
+            let until_epoch = pipeline::parse_quota_reset_epoch(error, now);
+            self.store
+                .upsert_provider_cooldown(exhausted_family.as_str(), until_epoch, error)
+                .map_err(|e| e.to_string())?;
+            Some(until_epoch)
+        } else {
+            None
+        };
         task.active_attempt_id = None;
         task.memory.pipeline_checkpoint = None;
         task.lease_owner = None;
         task.lease_expires_epoch = None;
         task.memory.last_check_failure = Some(runner::truncate_utf8_bytes(error, 1024));
-        let has_fallback = !matches!(stage.as_str(), "plan-review" | "pr-review")
+        let route_for_fallback = if !matches!(stage.as_str(), "plan-review" | "pr-review")
             && !task.memory.fallback_stages.iter().any(|s| s == &stage)
-            && crate::v2::router::resolve_stage_route(&task.weight, &stage, task.retry_count, None)
-                .ok()
-                .flatten()
-                .is_some_and(|r| r.fallback_family.is_some() && r.fallback_model.is_some());
-        let decision = if is_quota && has_fallback {
+        {
+            crate::v2::router::resolve_stage_route(
+                &task.weight,
+                &stage,
+                task.retry_count,
+                author_family,
+            )
+            .ok()
+            .flatten()
+            .map(|r| pipeline::apply_stage_fallback_route(&task, r))
+        } else {
+            None
+        };
+        let has_fallback = route_for_fallback
+            .as_ref()
+            .is_some_and(|r| r.fallback_family.is_some() && r.fallback_model.is_some());
+        let has_usable_fallback = match route_for_fallback.and_then(|r| {
+            if r.fallback_model.is_some() {
+                r.fallback_family
+            } else {
+                None
+            }
+        }) {
+            Some(fb_family) => self
+                .store
+                .get_active_provider_cooldown(fb_family.as_str(), now)
+                .map_err(|e| e.to_string())?
+                .is_none(),
+            None => false,
+        };
+        let decision = if is_quota && has_usable_fallback {
             task.memory.fallback_stages.push(stage.clone());
             task.status = "Ready".into();
-            task.next_retry_epoch = now_epoch();
+            task.next_retry_epoch = now;
+            None
+        } else if let Some(until_epoch) = quota_until_epoch {
+            task.status = "Ready".into();
+            task.next_retry_epoch = until_epoch;
             None
         } else if failures <= limit {
             task.status = "Ready".into();
-            task.next_retry_epoch = now_epoch() + pipeline::retry_backoff(failures);
+            task.next_retry_epoch = now + pipeline::retry_backoff(failures);
             None
         } else {
             task.status = "Blocked".into();
@@ -6775,6 +6870,67 @@ mod tests {
         assert_eq!(updated.retry_count, 1);
         assert_eq!(updated.memory.fallback_stages, vec!["impl".to_owned()]);
         assert!(c.store.list_decisions(true, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fail_task_quota_without_fallback_defers_to_cooldown_without_burning_infra_retries() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        let mut t = task("quota-no-fb");
+        t.weight = "S".into();
+        t.current_stage = Some("pr-review".into());
+        c.save(&t).unwrap();
+
+        // Seed a PASSED impl attempt on GeminiAgy so pr-review routes to OpenAiSol (no fallback on review stages).
+        let impl_attempt = StageAttemptRecord {
+            attempt_id: "att-impl".into(),
+            task_id: "quota-no-fb".into(),
+            stage: "impl".into(),
+            model: "gemini-4-hydrogen-medium".into(),
+            effort: "medium".into(),
+            systemd_unit: None,
+            invocation_id: None,
+            started_epoch: 100,
+            ended_epoch: Some(200),
+            status: "PASSED".into(),
+            failure_class: None,
+            summary: Some("ok".into()),
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            sha_before: None,
+            sha_after: None,
+            phase: "COMPLETE".into(),
+            last_liveness_epoch: 200,
+            last_output_bytes: 0,
+            last_cpu_usage_usec: None,
+            control_group: None,
+            exit_code: Some(0),
+            exit_code_kind: None,
+            retry_generation: 0,
+        };
+        c.store.record_stage_attempt(&impl_attempt).unwrap();
+
+        for i in 0..=(pipeline::MAX_INFRA_RETRIES + 2) {
+            let before = now_epoch();
+            c.fail_task(
+                "quota-no-fb",
+                &format!("Quota exceeded #{i}, resets in 2 hours"),
+                None,
+            )
+            .unwrap();
+            let updated = c.task("quota-no-fb").unwrap();
+            assert_eq!(updated.status, "Ready");
+            assert_eq!(updated.retry_count, 0);
+            assert!(updated.next_retry_epoch >= before + 2 * 3600);
+            assert!(c.store.list_decisions(true, None).unwrap().is_empty());
+            let cd = c
+                .store
+                .get_active_provider_cooldown("openai-sol", before)
+                .unwrap()
+                .expect("cooldown persisted");
+            assert_eq!(cd.until_epoch, updated.next_retry_epoch);
+        }
     }
 
     #[test]

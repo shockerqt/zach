@@ -446,6 +446,14 @@ pub struct MergeQueueRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderCooldownRecord {
+    pub family: String,
+    pub until_epoch: i64,
+    pub reason: String,
+    pub updated_epoch: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DecisionResolution {
     Resolved(PendingDecisionRecord),
     AlreadyResolved(PendingDecisionRecord),
@@ -835,7 +843,14 @@ impl V2Store {
                  attempt INTEGER NOT NULL DEFAULT 0,
                  updated_epoch INTEGER NOT NULL
              );
-             CREATE INDEX IF NOT EXISTS idx_deliveries_task ON post_merge_deliveries(task_id);",
+             CREATE INDEX IF NOT EXISTS idx_deliveries_task ON post_merge_deliveries(task_id);
+
+             CREATE TABLE IF NOT EXISTS provider_cooldowns (
+                 family TEXT PRIMARY KEY,
+                 until_epoch INTEGER NOT NULL,
+                 reason TEXT NOT NULL,
+                 updated_epoch INTEGER NOT NULL
+             );",
         )?;
 
         if self
@@ -3509,6 +3524,95 @@ impl V2Store {
             retry_generation: row.get(24)?,
         })
     }
+
+    pub fn upsert_provider_cooldown(
+        &mut self,
+        family: &str,
+        until_epoch: i64,
+        reason: &str,
+    ) -> Result<(), V2StoreError> {
+        let updated_epoch = now_epoch();
+        self.conn.execute(
+            "INSERT INTO provider_cooldowns(family, until_epoch, reason, updated_epoch)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(family) DO UPDATE SET
+                 until_epoch = MAX(provider_cooldowns.until_epoch, excluded.until_epoch),
+                 reason = excluded.reason,
+                 updated_epoch = excluded.updated_epoch",
+            params![family, until_epoch, reason, updated_epoch],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_active_provider_cooldown(
+        &self,
+        family: &str,
+        now: i64,
+    ) -> Result<Option<ProviderCooldownRecord>, V2StoreError> {
+        self.conn
+            .query_row(
+                "SELECT family, until_epoch, reason, updated_epoch
+                 FROM provider_cooldowns
+                 WHERE family = ?1 AND until_epoch > ?2",
+                params![family, now],
+                Self::row_to_provider_cooldown,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_provider_cooldowns(
+        &self,
+        now: Option<i64>,
+    ) -> Result<Vec<ProviderCooldownRecord>, V2StoreError> {
+        match now {
+            Some(ts) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT family, until_epoch, reason, updated_epoch
+                     FROM provider_cooldowns
+                     WHERE until_epoch > ?1
+                     ORDER BY until_epoch ASC, family ASC",
+                )?;
+                let rows = stmt
+                    .query_map(params![ts], Self::row_to_provider_cooldown)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            }
+            None => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT family, until_epoch, reason, updated_epoch
+                     FROM provider_cooldowns
+                     ORDER BY until_epoch ASC, family ASC",
+                )?;
+                let rows = stmt
+                    .query_map([], Self::row_to_provider_cooldown)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            }
+        }
+    }
+
+    pub fn clear_provider_cooldown(&mut self, family: Option<&str>) -> Result<usize, V2StoreError> {
+        let count = match family {
+            Some(fam) => self.conn.execute(
+                "DELETE FROM provider_cooldowns WHERE family = ?1",
+                params![fam],
+            )?,
+            None => self.conn.execute("DELETE FROM provider_cooldowns", [])?,
+        };
+        Ok(count)
+    }
+
+    fn row_to_provider_cooldown(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<ProviderCooldownRecord> {
+        Ok(ProviderCooldownRecord {
+            family: row.get(0)?,
+            until_epoch: row.get(1)?,
+            reason: row.get(2)?,
+            updated_epoch: row.get(3)?,
+        })
+    }
 }
 
 fn is_terminal_task_status(status: &str) -> bool {
@@ -6065,5 +6169,66 @@ mod tests {
         let synced8 = store.sync_task(&incoming8).unwrap();
         assert_eq!(synced8.status, "In Progress");
         assert!(synced8.memory.governance_started);
+    }
+
+    #[test]
+    fn provider_cooldowns_persist_across_store_reopen_and_clear() {
+        let dir = std::env::temp_dir().join(format!(
+            "zach-store-cooldown-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("zach.db");
+        let future = now_epoch() + 3600;
+
+        {
+            let mut store = V2Store::open(&db_path).unwrap();
+            store
+                .upsert_provider_cooldown("openai-sol", future, "usage limit reached")
+                .unwrap();
+            store
+                .upsert_provider_cooldown("gemini-agy", future + 120, "429 resource exhausted")
+                .unwrap();
+        }
+
+        {
+            let mut reopened = V2Store::open(&db_path).unwrap();
+            let now = now_epoch();
+            let active = reopened
+                .get_active_provider_cooldown("openai-sol", now)
+                .unwrap();
+            assert!(active.is_some());
+            let rec = active.unwrap();
+            assert_eq!(rec.family, "openai-sol");
+            assert_eq!(rec.until_epoch, future);
+            assert_eq!(rec.reason, "usage limit reached");
+
+            let listed = reopened.list_provider_cooldowns(Some(now)).unwrap();
+            assert_eq!(listed.len(), 2);
+            assert!(
+                reopened
+                    .get_active_provider_cooldown("openai-sol", future + 1)
+                    .unwrap()
+                    .is_none()
+            );
+
+            assert_eq!(
+                reopened
+                    .clear_provider_cooldown(Some("openai-sol"))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                reopened.list_provider_cooldowns(Some(now)).unwrap().len(),
+                1
+            );
+            assert_eq!(reopened.clear_provider_cooldown(None).unwrap(), 1);
+            assert!(reopened.list_provider_cooldowns(None).unwrap().is_empty());
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

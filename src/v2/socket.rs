@@ -2,9 +2,10 @@ pub const DEFAULT_MAX_BUFFER_LEN: usize = 256;
 pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
+use crate::v2::now_epoch;
 use crate::v2::store::{
-    DaemonStatusSummary, DecisionResolution, PendingDecisionRecord, TaskEventRecord, TaskRecord,
-    V2Store, V2StoreError,
+    DaemonStatusSummary, DecisionResolution, PendingDecisionRecord, ProviderCooldownRecord,
+    TaskEventRecord, TaskRecord, V2Store, V2StoreError,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -57,6 +58,13 @@ pub enum ClientCommand {
         #[serde(default)]
         path: Option<String>,
     },
+    #[serde(alias = "COOLDOWN_LIST", alias = "CooldownList")]
+    CooldownList,
+    #[serde(alias = "COOLDOWN_CLEAR", alias = "CooldownClear")]
+    CooldownClear {
+        #[serde(default)]
+        family: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -96,6 +104,12 @@ pub enum ServerMessage {
         warnings: Vec<String>,
         error: Option<String>,
     },
+    #[serde(rename = "COOLDOWNS")]
+    Cooldowns {
+        cooldowns: Vec<ProviderCooldownRecord>,
+    },
+    #[serde(rename = "COOLDOWN_CLEARED")]
+    CooldownCleared { cleared: usize },
     #[serde(rename = "ERROR")]
     Error { error: String },
 }
@@ -490,6 +504,15 @@ impl DaemonServer {
                         },
                     };
                     let _ = write_ndjson(&mut sub.stream, &msg);
+                }
+                Ok(ClientCommand::CooldownList) => {
+                    let cooldowns = store.list_provider_cooldowns(Some(now_epoch()))?;
+                    let _ = write_ndjson(&mut sub.stream, &ServerMessage::Cooldowns { cooldowns });
+                }
+                Ok(ClientCommand::CooldownClear { family }) => {
+                    let cleared = store.clear_provider_cooldown(family.as_deref())?;
+                    let _ =
+                        write_ndjson(&mut sub.stream, &ServerMessage::CooldownCleared { cleared });
                 }
                 Err(e) => {
                     let msg = ServerMessage::Error {
@@ -1315,6 +1338,63 @@ mod tests {
         reader2.read_line(&mut line).expect("read event line");
         let ev: serde_json::Value = serde_json::from_str(&line).expect("parse ev");
         assert_eq!(ev["type"], "EVENT");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn socket_cooldown_list_and_clear_roundtrip() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "zach-sock-cooldown-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let sock_path = temp_dir.join("zach.sock");
+        let db_path = temp_dir.join("zach.db");
+        let mut store = V2Store::open(&db_path).unwrap();
+        store
+            .upsert_provider_cooldown("openai-sol", now_epoch() + 1800, "usage limit")
+            .unwrap();
+        store
+            .upsert_provider_cooldown("gemini-agy", now_epoch() + 900, "429")
+            .unwrap();
+
+        let mut server = DaemonServer::bind(&sock_path, 0).unwrap();
+        let mut client = UnixStream::connect(&sock_path).unwrap();
+        write_ndjson(&mut client, &ClientCommand::CooldownList).unwrap();
+        server.tick(&mut store).unwrap();
+
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let msg: ServerMessage = serde_json::from_str(&line).unwrap();
+        match msg {
+            ServerMessage::Cooldowns { cooldowns } => assert_eq!(cooldowns.len(), 2),
+            other => panic!("expected COOLDOWNS, got {other:?}"),
+        }
+
+        write_ndjson(
+            &mut client,
+            &ClientCommand::CooldownClear {
+                family: Some("openai-sol".into()),
+            },
+        )
+        .unwrap();
+        server.tick(&mut store).unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        let cleared_msg: ServerMessage = serde_json::from_str(&line).unwrap();
+        assert_eq!(cleared_msg, ServerMessage::CooldownCleared { cleared: 1 });
+
+        write_ndjson(&mut client, &ClientCommand::CooldownClear { family: None }).unwrap();
+        server.tick(&mut store).unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        let cleared_all: ServerMessage = serde_json::from_str(&line).unwrap();
+        assert_eq!(cleared_all, ServerMessage::CooldownCleared { cleared: 1 });
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

@@ -56,6 +56,7 @@ fn main() {
         "decide" => run_v2_decide(&args[2..]),
         "sync" => run_v2_sync(&args[2..]),
         "config" => run_v2_config(&args[2..]),
+        "cooldown" => run_v2_cooldown(&args[2..]),
         "run" => run_v2_run(&args[2..]),
         "daemon" | "zachd" => run_v2_daemon(&args[2..]),
         "attach" => run_v2_attach(&args[2..]),
@@ -780,6 +781,144 @@ fn run_v2_config(args: &[String]) {
     println!("router_config={}", router_path.display());
 }
 
+fn try_cooldown_socket(
+    socket_path: &std::path::Path,
+    cmd: &ClientCommand,
+) -> Option<Result<zach::v2::socket::ServerMessage, String>> {
+    use std::io::BufRead;
+    let mut stream = std::os::unix::net::UnixStream::connect(socket_path).ok()?;
+    if let Err(err) = stream.set_read_timeout(Some(std::time::Duration::from_secs(5))) {
+        return Some(Err(format!("cooldown socket timeout: {err}")));
+    }
+    if let Err(err) = write_ndjson(&mut stream, cmd) {
+        return Some(Err(format!("submit cooldown command: {err}")));
+    }
+    let mut line = String::new();
+    if let Err(err) = std::io::BufReader::new(stream).read_line(&mut line) {
+        return Some(Err(format!("read cooldown reply: {err}")));
+    }
+    Some(
+        serde_json::from_str::<zach::v2::socket::ServerMessage>(&line)
+            .map_err(|err| format!("invalid daemon reply: {err}")),
+    )
+}
+
+fn cooldown_list_with_fallback(
+    args: &[String],
+) -> Result<Vec<zach::v2::store::ProviderCooldownRecord>, String> {
+    let socket_path = flag_value(args, "--socket")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_socket_path);
+    if flag_value(args, "--db").is_none()
+        && let Some(res) = try_cooldown_socket(&socket_path, &ClientCommand::CooldownList)
+    {
+        return match res? {
+            zach::v2::socket::ServerMessage::Cooldowns { cooldowns } => Ok(cooldowns),
+            zach::v2::socket::ServerMessage::Error { error } => Err(error),
+            other => Err(format!("unexpected daemon reply: {other:?}")),
+        };
+    }
+    let store = open_store(args);
+    store
+        .list_provider_cooldowns(Some(zach::v2::now_epoch()))
+        .map_err(|e| e.to_string())
+}
+
+fn cooldown_clear_with_fallback(args: &[String], family: Option<String>) -> Result<usize, String> {
+    let socket_path = flag_value(args, "--socket")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_socket_path);
+    if flag_value(args, "--db").is_none()
+        && let Some(res) = try_cooldown_socket(
+            &socket_path,
+            &ClientCommand::CooldownClear {
+                family: family.clone(),
+            },
+        )
+    {
+        return match res? {
+            zach::v2::socket::ServerMessage::CooldownCleared { cleared } => Ok(cleared),
+            zach::v2::socket::ServerMessage::Error { error } => Err(error),
+            other => Err(format!("unexpected daemon reply: {other:?}")),
+        };
+    }
+    let mut store = open_store(args);
+    store
+        .clear_provider_cooldown(family.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+fn extract_clear_family(args: &[String]) -> Result<Option<String>, String> {
+    let clear_all = has_flag(args, "--all");
+    let mut positional: Option<String> = None;
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = args[idx].as_str();
+        if matches!(arg, "--db" | "--socket") {
+            idx += 2;
+            continue;
+        }
+        if arg == "--all" || arg == "--json" {
+            idx += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            return Err(format!("unknown flag: {arg}"));
+        }
+        if positional.is_some() {
+            return Err("unexpected extra argument".into());
+        }
+        positional = Some(arg.to_owned());
+        idx += 1;
+    }
+    if clear_all && positional.is_some() {
+        return Err("cannot pass both <family> and --all".into());
+    }
+    if !clear_all && positional.is_none() {
+        return Err("specify <family> or --all".into());
+    }
+    Ok(positional)
+}
+
+fn run_v2_cooldown(args: &[String]) {
+    let sub = args.first().map(String::as_str).unwrap_or("list");
+    let rest = if args.is_empty() { &[][..] } else { &args[1..] };
+    match sub {
+        "list" => {
+            let cooldowns = cooldown_list_with_fallback(rest).unwrap_or_else(|err| {
+                eprintln!("cooldown list failed: {err}");
+                std::process::exit(1);
+            });
+            if has_flag(rest, "--json") {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&cooldowns).unwrap_or_default()
+                );
+            } else if cooldowns.is_empty() {
+                println!("no active provider cooldowns");
+            } else {
+                let now = zach::v2::now_epoch();
+                for cd in &cooldowns {
+                    let remaining = (cd.until_epoch - now).max(0);
+                    println!(
+                        "{}\tuntil={}\tremaining={}s\treason={}",
+                        cd.family, cd.until_epoch, remaining, cd.reason
+                    );
+                }
+            }
+        }
+        "clear" => {
+            let family = extract_clear_family(rest).unwrap_or_else(|err| usage_error(&err));
+            let cleared = cooldown_clear_with_fallback(rest, family).unwrap_or_else(|err| {
+                eprintln!("cooldown clear failed: {err}");
+                std::process::exit(1);
+            });
+            println!("cleared={cleared}");
+        }
+        other => usage_error(&format!("unknown cooldown subcommand: {other}")),
+    }
+}
+
 fn run_v2_run(args: &[String]) {
     let dry_run = has_flag(args, "--dry-run");
     if !dry_run {
@@ -1361,6 +1500,8 @@ fn print_usage() {
     println!("       zach config [--max-parallel <1..16>] [--db <PATH>]");
     println!("       zach config validate [--file <PATH>]");
     println!("       zach config reload [--file <PATH>] [--socket <PATH>]");
+    println!("       zach cooldown list [--json] [--db <PATH>] [--socket <PATH>]");
+    println!("       zach cooldown clear [<FAMILY> | --all] [--db <PATH>] [--socket <PATH>]");
     println!(
         "       zach run [--task <TASK_ID>] [--group <GROUP>] [--once] [--dry-run] [--json] [--db <PATH>]"
     );
@@ -2066,5 +2207,60 @@ mod tests {
             "repo_locked:ZACH-10"
         );
         assert_eq!(json["path_locks"][0]["task_id"], "ZACH-10");
+    }
+
+    #[test]
+    fn cli_cooldown_list_and_clear_work_offline_via_store_fallback() {
+        let dir = OfflineTestDir::new();
+        let db_path = dir.0.join("zach.db");
+        let sock_path = dir.0.join("missing.sock");
+        {
+            let mut store = V2Store::open(&db_path).unwrap();
+            let future = zach::v2::now_epoch() + 1800;
+            store
+                .upsert_provider_cooldown("openai-sol", future, "usage limit")
+                .unwrap();
+            store
+                .upsert_provider_cooldown("gemini-agy", future + 60, "429")
+                .unwrap();
+        }
+        let args = vec![
+            "--db".to_owned(),
+            db_path.to_string_lossy().into_owned(),
+            "--socket".to_owned(),
+            sock_path.to_string_lossy().into_owned(),
+        ];
+        let listed = cooldown_list_with_fallback(&args).unwrap();
+        assert_eq!(listed.len(), 2);
+
+        let clear_args = vec![
+            "openai-sol".to_owned(),
+            "--db".to_owned(),
+            db_path.to_string_lossy().into_owned(),
+            "--socket".to_owned(),
+            sock_path.to_string_lossy().into_owned(),
+        ];
+        let family = extract_clear_family(&clear_args).unwrap();
+        assert_eq!(family.as_deref(), Some("openai-sol"));
+        assert_eq!(
+            cooldown_clear_with_fallback(&clear_args, family).unwrap(),
+            1
+        );
+        assert_eq!(cooldown_list_with_fallback(&args).unwrap().len(), 1);
+
+        let clear_all_args = vec![
+            "--all".to_owned(),
+            "--db".to_owned(),
+            db_path.to_string_lossy().into_owned(),
+            "--socket".to_owned(),
+            sock_path.to_string_lossy().into_owned(),
+        ];
+        let all_family = extract_clear_family(&clear_all_args).unwrap();
+        assert_eq!(all_family, None);
+        assert_eq!(
+            cooldown_clear_with_fallback(&clear_all_args, all_family).unwrap(),
+            1
+        );
+        assert!(cooldown_list_with_fallback(&args).unwrap().is_empty());
     }
 }
