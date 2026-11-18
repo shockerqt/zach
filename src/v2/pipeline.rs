@@ -2,7 +2,7 @@ use crate::v2::default_ws_task_bin;
 use crate::v2::intake::default_required_stages;
 use crate::v2::now_epoch;
 use crate::v2::router::{
-    ModelFamily, ReasoningEffort, StageRoute, infer_model_family,
+    ModelFamily, StageRoute, active_router_config, infer_model_family,
     is_no_cross_family_reviewer_error, resolve_stage_route,
 };
 use crate::v2::runner::{
@@ -2998,7 +2998,29 @@ pub fn execute_m_l_pipeline(store: &mut V2Store, task_id: &str) -> Result<TaskRe
 /// - [For L]: `human-merge-approval` gate (opens `DECISION_REQUIRED`, pauses in `Blocked` until resolved)
 /// - Final: Enqueues pull request into per-repo FIFO `merge_queue` (retaining `path_locks`)
 ///
-/// Automatically falls back to `gpt-6.2-sol` after 2 AGY infrastructure failures.
+/// Automatically falls back to the configured `agy_infra_fallback` route after 2 AGY infrastructure failures.
+fn agy_infra_fallback_route(base: &StageRoute, prefer_stage_fallback: bool) -> StageRoute {
+    let cfg = active_router_config();
+    if prefer_stage_fallback && let Some(fb_model) = base.fallback_model.clone() {
+        let mut route = base.clone();
+        route.family = infer_model_family(&fb_model);
+        route.model = fb_model;
+        if let Some(effort) = base.fallback_effort {
+            route.effort = effort;
+        }
+        return route;
+    }
+    let fb = cfg.agy_infra_fallback;
+    StageRoute {
+        family: infer_model_family(&fb.model),
+        model: fb.model,
+        effort: fb.effort,
+        fallback_family: None,
+        fallback_model: None,
+        fallback_effort: None,
+        ..base.clone()
+    }
+}
 pub fn execute_m_l_pipeline_with_executor(
     store: &mut V2Store,
     task_id: &str,
@@ -3076,14 +3098,7 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
 
             let mut plan_route = apply_stage_fallback_route(&task, plan_route_initial);
             if plan_route.family == ModelFamily::GeminiAgy && count_agy_infra_failures(&task) >= 2 {
-                plan_route.family = ModelFamily::OpenAiSol;
-                plan_route.model = plan_route
-                    .fallback_model
-                    .clone()
-                    .unwrap_or_else(|| "gpt-6.2-sol".to_owned());
-                if let Some(effort) = plan_route.fallback_effort {
-                    plan_route.effort = effort;
-                }
+                plan_route = agy_infra_fallback_route(&plan_route, true);
             }
             plan_author_family = Some(plan_route.family);
 
@@ -3149,15 +3164,7 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                     ),
                 );
                 if count_agy_infra_failures(&task) >= 2 {
-                    let fb_route = StageRoute {
-                        family: ModelFamily::OpenAiSol,
-                        model: "gpt-6.2-sol".to_owned(),
-                        effort: ReasoningEffort::High,
-                        fallback_family: None,
-                        fallback_model: None,
-                        fallback_effort: None,
-                        ..plan_route.clone()
-                    };
+                    let fb_route = agy_infra_fallback_route(&plan_route, false);
                     let fb_attempt_id = format!(
                         "{}-plan-fb-{}",
                         task.task_id.to_ascii_lowercase(),
@@ -3638,14 +3645,7 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
 
             let mut impl_route = apply_stage_fallback_route(&task, impl_route_initial);
             if impl_route.family == ModelFamily::GeminiAgy && count_agy_infra_failures(&task) >= 2 {
-                impl_route.family = ModelFamily::OpenAiSol;
-                impl_route.model = impl_route
-                    .fallback_model
-                    .clone()
-                    .unwrap_or_else(|| "gpt-6.2-sol".to_owned());
-                if let Some(effort) = impl_route.fallback_effort {
-                    impl_route.effort = effort;
-                }
+                impl_route = agy_infra_fallback_route(&impl_route, true);
             }
             impl_author_family = Some(impl_route.family);
 
@@ -3712,15 +3712,7 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                     ),
                 );
                 if count_agy_infra_failures(&task) >= 2 {
-                    let fb_route = StageRoute {
-                        family: ModelFamily::OpenAiSol,
-                        model: "gpt-6.2-sol".to_owned(),
-                        effort: ReasoningEffort::High,
-                        fallback_family: None,
-                        fallback_model: None,
-                        fallback_effort: None,
-                        ..impl_route.clone()
-                    };
+                    let fb_route = agy_infra_fallback_route(&impl_route, false);
                     let fb_attempt_id = format!(
                         "{}-impl-fb-{}",
                         task.task_id.to_ascii_lowercase(),
@@ -4363,6 +4355,7 @@ pub fn run_supervised_pipeline_step(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::v2::router::ReasoningEffort;
     use crate::v2::runner::{MockStageExecutor, StageExecutionResult};
     use crate::v2::store::{AcceptanceCriterionSpec, TargetFileSpec, TaskMemory};
 

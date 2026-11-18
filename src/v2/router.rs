@@ -155,6 +155,29 @@ impl RouterEnvOverrides {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteEndpoint {
+    pub model: String,
+    pub effort: ReasoningEffort,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RouteEndpointOverride {
+    pub model: Option<String>,
+    pub effort: Option<ReasoningEffort>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CrossFamilyAltOverride {
+    pub model: Option<String>,
+    pub effort: Option<ReasoningEffort>,
+    pub retry_model: Option<String>,
+    pub retry_effort: Option<ReasoningEffort>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct StageOverride {
@@ -164,13 +187,159 @@ pub struct StageOverride {
     pub retry_effort: Option<ReasoningEffort>,
     pub fallback_model: Option<String>,
     pub fallback_effort: Option<ReasoningEffort>,
+    pub retry_fallback_model: Option<String>,
+    pub retry_fallback_effort: Option<ReasoningEffort>,
+    pub cross_family_alt: Option<CrossFamilyAltOverride>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RouterConfig {
-    #[serde(default)]
     pub routes: BTreeMap<String, BTreeMap<String, StageOverride>>,
+    pub flash_only: RouteEndpoint,
+    pub agy_infra_fallback: RouteEndpoint,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRouterConfig {
+    routes: BTreeMap<String, BTreeMap<String, StageOverride>>,
+    flash_only: RouteEndpoint,
+    agy_infra_fallback: RouteEndpoint,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RouterConfigOverlay {
+    #[serde(default)]
+    routes: Option<BTreeMap<String, BTreeMap<String, StageOverride>>>,
+    #[serde(default)]
+    flash_only: Option<RouteEndpointOverride>,
+    #[serde(default)]
+    agy_infra_fallback: Option<RouteEndpointOverride>,
+}
+
+pub const DEFAULT_ROUTER_CONFIG_JSON: &str = include_str!("../../config/router.json");
+
+pub fn default_router_config_json() -> &'static str {
+    DEFAULT_ROUTER_CONFIG_JSON
+}
+
+static BASE_ROUTER_CONFIG: OnceLock<RouterConfig> = OnceLock::new();
+
+fn base_router_config() -> &'static RouterConfig {
+    BASE_ROUTER_CONFIG.get_or_init(|| {
+        let raw: RawRouterConfig = serde_json::from_str(DEFAULT_ROUTER_CONFIG_JSON)
+            .expect("embedded config/router.json must be valid JSON");
+        RouterConfig {
+            routes: raw.routes,
+            flash_only: raw.flash_only,
+            agy_infra_fallback: raw.agy_infra_fallback,
+        }
+    })
+}
+
+impl Default for RouterConfig {
+    fn default() -> Self {
+        base_router_config().clone()
+    }
+}
+
+fn merge_endpoint(base: &mut RouteEndpoint, ov: RouteEndpointOverride) {
+    if let Some(m) = ov.model {
+        base.model = m;
+    }
+    if let Some(eff) = ov.effort {
+        base.effort = eff;
+    }
+}
+
+fn merge_cross_family_alt(base: &mut CrossFamilyAltOverride, ov: CrossFamilyAltOverride) {
+    if ov.model.is_some() {
+        base.model = ov.model;
+    }
+    if ov.effort.is_some() {
+        base.effort = ov.effort;
+    }
+    if ov.retry_model.is_some() {
+        base.retry_model = ov.retry_model;
+    }
+    if ov.retry_effort.is_some() {
+        base.retry_effort = ov.retry_effort;
+    }
+}
+
+fn merge_stage_override(base: &mut StageOverride, ov: StageOverride) {
+    if ov.model.is_some() {
+        base.model = ov.model;
+    }
+    if ov.effort.is_some() {
+        base.effort = ov.effort;
+    }
+    if ov.retry_model.is_some() {
+        base.retry_model = ov.retry_model;
+    }
+    if ov.retry_effort.is_some() {
+        base.retry_effort = ov.retry_effort;
+    }
+    if ov.fallback_model.is_some() {
+        base.fallback_model = ov.fallback_model;
+    }
+    if ov.fallback_effort.is_some() {
+        base.fallback_effort = ov.fallback_effort;
+    }
+    if ov.retry_fallback_model.is_some() {
+        base.retry_fallback_model = ov.retry_fallback_model;
+    }
+    if ov.retry_fallback_effort.is_some() {
+        base.retry_fallback_effort = ov.retry_fallback_effort;
+    }
+    if let Some(alt) = ov.cross_family_alt {
+        let target = base
+            .cross_family_alt
+            .get_or_insert_with(CrossFamilyAltOverride::default);
+        merge_cross_family_alt(target, alt);
+    }
+}
+
+impl<'de> Deserialize<'de> for RouterConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let overlay = RouterConfigOverlay::deserialize(deserializer)?;
+        let mut cfg = RouterConfig::default();
+        if let Some(flash_ov) = overlay.flash_only {
+            merge_endpoint(&mut cfg.flash_only, flash_ov);
+        }
+        if let Some(agy_ov) = overlay.agy_infra_fallback {
+            merge_endpoint(&mut cfg.agy_infra_fallback, agy_ov);
+        }
+        if let Some(routes_ov) = overlay.routes {
+            for (w_key, stage_map) in routes_ov {
+                let existing_weight_key = cfg
+                    .routes
+                    .keys()
+                    .find(|k| k.trim().eq_ignore_ascii_case(w_key.trim()))
+                    .cloned();
+                let target_weight_key = existing_weight_key.unwrap_or(w_key);
+                let base_stages = cfg.routes.entry(target_weight_key).or_default();
+                for (s_key, stage_ov) in stage_map {
+                    let existing_stage_key = base_stages
+                        .keys()
+                        .find(|k| k.trim().eq_ignore_ascii_case(s_key.trim()))
+                        .cloned();
+                    if let Some(k) = existing_stage_key {
+                        if let Some(base_stage) = base_stages.get_mut(&k) {
+                            merge_stage_override(base_stage, stage_ov);
+                        }
+                    } else {
+                        base_stages.insert(s_key, stage_ov);
+                    }
+                }
+            }
+        }
+        Ok(cfg)
+    }
 }
 
 static ACTIVE_ROUTER_CONFIG: OnceLock<RwLock<RouterConfig>> = OnceLock::new();
@@ -240,6 +409,19 @@ pub fn load_router_config_from_path(path: &Path) -> Result<(RouterConfig, Vec<St
 /// Validates a [`RouterConfig`] and returns non-blocking warnings (e.g. same-family review).
 pub fn validate_router_config(cfg: &RouterConfig) -> Result<Vec<String>, String> {
     let mut warnings = Vec::new();
+    for (field, model) in [
+        ("flash_only.model", cfg.flash_only.model.as_str()),
+        (
+            "agy_infra_fallback.model",
+            cfg.agy_infra_fallback.model.as_str(),
+        ),
+    ] {
+        if model.trim().is_empty() {
+            return Err(format!("empty {field} in router config"));
+        }
+        validate_daemon_model(model)?;
+    }
+
     for (weight, stages) in &cfg.routes {
         let norm_weight = weight.trim().to_ascii_uppercase();
         if !matches!(norm_weight.as_str(), "XS" | "S" | "M" | "L") {
@@ -273,6 +455,7 @@ pub fn validate_router_config(cfg: &RouterConfig) -> Result<Vec<String>, String>
                 ("model", ov.model.as_deref()),
                 ("retry_model", ov.retry_model.as_deref()),
                 ("fallback_model", ov.fallback_model.as_deref()),
+                ("retry_fallback_model", ov.retry_fallback_model.as_deref()),
             ] {
                 if let Some(m) = val {
                     if m.trim().is_empty() {
@@ -282,6 +465,31 @@ pub fn validate_router_config(cfg: &RouterConfig) -> Result<Vec<String>, String>
                     }
                     validate_daemon_model(m)?;
                 }
+            }
+            let is_review_stage = matches!(norm_stage.as_str(), "plan-review" | "pr-review");
+            if let Some(alt) = ov.cross_family_alt.as_ref() {
+                if !is_review_stage {
+                    return Err(format!(
+                        "cross_family_alt is only valid for review stages, not {weight}.{stage}"
+                    ));
+                }
+                for (field, val) in [
+                    ("cross_family_alt.model", alt.model.as_deref()),
+                    ("cross_family_alt.retry_model", alt.retry_model.as_deref()),
+                ] {
+                    if let Some(m) = val {
+                        if m.trim().is_empty() {
+                            return Err(format!(
+                                "empty {field} for {weight}.{stage} in router config"
+                            ));
+                        }
+                        validate_daemon_model(m)?;
+                    }
+                }
+            } else if is_review_stage {
+                return Err(format!(
+                    "missing cross_family_alt for review stage {weight}.{stage} in router config"
+                ));
             }
         }
     }
@@ -315,6 +523,29 @@ pub fn validate_router_config(cfg: &RouterConfig) -> Result<Vec<String>, String>
     }
 
     Ok(warnings)
+}
+
+/// Writes the canonical `config/router.json` to `path` (or `default_router_config_path()`).
+/// Refuses to overwrite an existing file unless `force` is `true`.
+pub fn init_router_config(path: Option<&Path>, force: bool) -> Result<PathBuf, String> {
+    let target = path
+        .map(PathBuf::from)
+        .unwrap_or_else(default_router_config_path);
+    if target.exists() && !force {
+        return Err(format!(
+            "router config already exists at {} (pass --force to overwrite)",
+            target.display()
+        ));
+    }
+    if let Some(parent) = target.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create directory {}: {e}", parent.display()))?;
+    }
+    std::fs::write(&target, DEFAULT_ROUTER_CONFIG_JSON)
+        .map_err(|e| format!("failed to write {}: {e}", target.display()))?;
+    Ok(target)
 }
 
 /// Validates and hot-reloads the active router config from `path` (or default path).
@@ -442,238 +673,135 @@ pub fn resolve_stage_route_with_config(
     ) {
         return Ok(None);
     }
+    if !matches!(
+        norm_stage.as_str(),
+        "plan" | "plan-review" | "impl" | "pr-review"
+    ) {
+        return Err(format!("unsupported stage '{stage}' for weight '{weight}'"));
+    }
+
+    let applicable = match norm_weight.as_str() {
+        "XS" => norm_stage == "impl",
+        "S" => matches!(norm_stage.as_str(), "impl" | "pr-review"),
+        "M" | "L" => true,
+        _ => false,
+    };
+    if !applicable {
+        return Ok(None);
+    }
 
     let is_retry = retry_count >= 1;
     let max_task_tokens = max_task_tokens_for_weight(&norm_weight);
     let timeout_secs = stage_timeout_secs(&norm_weight, &norm_stage);
 
-    let route = match (norm_weight.as_str(), norm_stage.as_str()) {
-        // XS: 1-step pipeline (impl only)
-        ("XS", "impl") => {
-            let effort = if is_retry {
-                ReasoningEffort::Medium
-            } else {
-                ReasoningEffort::Low
-            };
-            StageRoute {
-                weight: norm_weight,
-                stage: norm_stage,
-                family: ModelFamily::OpenAiSol,
-                model: "gpt-6.2-sol".to_owned(),
-                effort,
-                fallback_family: Some(ModelFamily::GeminiAgy),
-                fallback_model: Some("gemini-4-hydrogen-medium".to_owned()),
-                fallback_effort: Some(ReasoningEffort::Medium),
-                max_task_tokens,
-                timeout_secs,
-                stall_timeout_secs: DEFAULT_STALL_TIMEOUT_SECS,
-            }
-        }
-        ("XS", "plan" | "plan-review" | "pr-review") => return Ok(None),
-
-        // S: 2-step pipeline (impl -> cross-model pr-review)
-        ("S", "impl") => {
-            let effort = if is_retry {
-                ReasoningEffort::High
-            } else {
-                ReasoningEffort::Medium
-            };
-            StageRoute {
-                weight: norm_weight,
-                stage: norm_stage,
-                family: ModelFamily::OpenAiSol,
-                model: "gpt-6.2-sol".to_owned(),
-                effort,
-                fallback_family: Some(ModelFamily::GeminiAgy),
-                fallback_model: Some("gemini-4-hydrogen-medium".to_owned()),
-                fallback_effort: Some(ReasoningEffort::Medium),
-                max_task_tokens,
-                timeout_secs,
-                stall_timeout_secs: DEFAULT_STALL_TIMEOUT_SECS,
-            }
-        }
-        ("S", "pr-review") => build_cross_model_review_route(
-            norm_weight,
-            norm_stage,
-            is_retry,
-            author_family.unwrap_or(ModelFamily::OpenAiSol),
-            "gemini-4-hydrogen-high",
-            "gemini-4-hydrogen-high",
-            ReasoningEffort::High,
-            ReasoningEffort::Medium,
-            max_task_tokens,
-            timeout_secs,
-        ),
-        ("S", "plan" | "plan-review") => return Ok(None),
-
-        // M: 4-step pipeline (plan -> plan-review -> impl -> pr-review)
-        ("M", "plan") => {
-            if is_retry {
-                StageRoute {
-                    weight: norm_weight,
-                    stage: norm_stage,
-                    family: ModelFamily::GeminiAgy,
-                    model: "gemini-4-hydrogen-high".to_owned(),
-                    effort: ReasoningEffort::High,
-                    fallback_family: Some(ModelFamily::OpenAiSol),
-                    fallback_model: Some("gpt-6.2-sol".to_owned()),
-                    fallback_effort: Some(ReasoningEffort::High),
-                    max_task_tokens,
-                    timeout_secs,
-                    stall_timeout_secs: DEFAULT_STALL_TIMEOUT_SECS,
-                }
-            } else {
-                StageRoute {
-                    weight: norm_weight,
-                    stage: norm_stage,
-                    family: ModelFamily::OpenAiSol,
-                    model: "gpt-6.2-sol".to_owned(),
-                    effort: ReasoningEffort::High,
-                    fallback_family: Some(ModelFamily::GeminiAgy),
-                    fallback_model: Some("gemini-4-hydrogen-high".to_owned()),
-                    fallback_effort: Some(ReasoningEffort::High),
-                    max_task_tokens,
-                    timeout_secs,
-                    stall_timeout_secs: DEFAULT_STALL_TIMEOUT_SECS,
-                }
-            }
-        }
-        ("M", "plan-review") => build_cross_model_review_route(
-            norm_weight,
-            norm_stage,
-            is_retry,
-            author_family.unwrap_or(ModelFamily::OpenAiSol),
-            "gemini-4-hydrogen-medium",
-            "gemini-4-hydrogen-high",
-            if is_retry {
-                ReasoningEffort::High
-            } else {
-                ReasoningEffort::Medium
-            },
-            ReasoningEffort::Medium,
-            max_task_tokens,
-            timeout_secs,
-        ),
-        ("M", "impl") => StageRoute {
-            weight: norm_weight,
-            stage: norm_stage,
-            family: ModelFamily::OpenAiSol,
-            model: "gpt-6.2-sol".to_owned(),
-            effort: ReasoningEffort::High,
-            fallback_family: Some(ModelFamily::GeminiAgy),
-            fallback_model: Some("gemini-4-hydrogen-high".to_owned()),
-            fallback_effort: Some(ReasoningEffort::High),
-            max_task_tokens,
-            timeout_secs,
-            stall_timeout_secs: DEFAULT_STALL_TIMEOUT_SECS,
-        },
-        ("M", "pr-review") => build_cross_model_review_route(
-            norm_weight,
-            norm_stage,
-            is_retry,
-            author_family.unwrap_or(ModelFamily::OpenAiSol),
-            "gemini-4-hydrogen-high",
-            "gemini-4-hydrogen-high",
-            ReasoningEffort::High,
-            ReasoningEffort::Medium,
-            max_task_tokens,
-            timeout_secs,
-        ),
-
-        // L: 4-step pipeline + human gates
-        ("L", "plan") => StageRoute {
-            weight: norm_weight,
-            stage: norm_stage,
-            family: ModelFamily::OpenAiSol,
-            model: "gpt-6.2-sol".to_owned(),
-            effort: ReasoningEffort::High,
-            fallback_family: None,
-            fallback_model: None,
-            fallback_effort: None,
-            max_task_tokens,
-            timeout_secs,
-            stall_timeout_secs: DEFAULT_STALL_TIMEOUT_SECS,
-        },
-        ("L", "plan-review") => build_cross_model_review_route(
-            norm_weight,
-            norm_stage,
-            is_retry,
-            author_family.unwrap_or(ModelFamily::OpenAiSol),
-            "gemini-4-hydrogen-high",
-            "gemini-4-hydrogen-high",
-            ReasoningEffort::High,
-            ReasoningEffort::High,
-            max_task_tokens,
-            timeout_secs,
-        ),
-        ("L", "impl") => StageRoute {
-            weight: norm_weight,
-            stage: norm_stage,
-            family: ModelFamily::OpenAiSol,
-            model: "gpt-6.2-sol".to_owned(),
-            effort: ReasoningEffort::High,
-            fallback_family: None,
-            fallback_model: None,
-            fallback_effort: None,
-            max_task_tokens,
-            timeout_secs,
-            stall_timeout_secs: DEFAULT_STALL_TIMEOUT_SECS,
-        },
-        ("L", "pr-review") => build_cross_model_review_route(
-            norm_weight,
-            norm_stage,
-            is_retry,
-            author_family.unwrap_or(ModelFamily::OpenAiSol),
-            "gemini-4-hydrogen-high",
-            "gemini-4-hydrogen-high",
-            ReasoningEffort::High,
-            ReasoningEffort::High,
-            max_task_tokens,
-            timeout_secs,
-        ),
-
-        _ => return Err(format!("unsupported stage '{stage}' for weight '{weight}'")),
-    };
-
-    let mut route = route;
-    if let Some(stage_map) = cfg
+    let ov = cfg
         .routes
         .iter()
-        .find(|(k, _)| k.trim().eq_ignore_ascii_case(&route.weight))
-        .map(|(_, v)| v)
-        && let Some(ov) = stage_map
-            .iter()
-            .find(|(k, _)| k.trim().eq_ignore_ascii_case(&route.stage))
-            .map(|(_, v)| v)
-    {
-        if is_retry {
-            if let Some(ref m) = ov.retry_model {
-                route.family = infer_model_family(m);
-                route.model = m.clone();
-            } else if let Some(ref m) = ov.model {
-                route.family = infer_model_family(m);
-                route.model = m.clone();
-            }
-            if let Some(eff) = ov.retry_effort.or(ov.effort) {
-                route.effort = eff;
-            }
+        .find(|(k, _)| k.trim().eq_ignore_ascii_case(&norm_weight))
+        .and_then(|(_, stage_map)| {
+            stage_map
+                .iter()
+                .find(|(k, _)| k.trim().eq_ignore_ascii_case(&norm_stage))
+                .map(|(_, v)| v)
+        })
+        .ok_or_else(|| format!("missing route for {norm_weight}.{norm_stage} in router config"))?;
+
+    let use_cross_family_alt = matches!(norm_stage.as_str(), "plan-review" | "pr-review")
+        && author_family == Some(ModelFamily::GeminiAgy);
+
+    let (model, effort, fallback_model, fallback_effort) = if use_cross_family_alt {
+        let alt = ov.cross_family_alt.as_ref().ok_or_else(|| {
+            format!("missing cross_family_alt for {norm_weight}.{norm_stage} in router config")
+        })?;
+        let model = if is_retry {
+            alt.retry_model
+                .as_deref()
+                .or(alt.model.as_deref())
+                .ok_or_else(|| {
+                    format!(
+                        "missing cross_family_alt.model for {norm_weight}.{norm_stage} in router config"
+                    )
+                })?
+                .to_owned()
         } else {
-            if let Some(ref m) = ov.model {
-                route.family = infer_model_family(m);
-                route.model = m.clone();
-            }
-            if let Some(eff) = ov.effort {
-                route.effort = eff;
-            }
-        }
-        if let Some(ref fb) = ov.fallback_model {
-            route.fallback_family = Some(infer_model_family(fb));
-            route.fallback_model = Some(fb.clone());
-        }
-        if let Some(fb_eff) = ov.fallback_effort {
-            route.fallback_effort = Some(fb_eff);
-        }
-    }
+            alt.model
+                .as_deref()
+                .ok_or_else(|| {
+                    format!(
+                        "missing cross_family_alt.model for {norm_weight}.{norm_stage} in router config"
+                    )
+                })?
+                .to_owned()
+        };
+        let effort = if is_retry {
+            alt.retry_effort.or(alt.effort).ok_or_else(|| {
+                format!(
+                    "missing cross_family_alt.effort for {norm_weight}.{norm_stage} in router config"
+                )
+            })?
+        } else {
+            alt.effort.ok_or_else(|| {
+                format!(
+                    "missing cross_family_alt.effort for {norm_weight}.{norm_stage} in router config"
+                )
+            })?
+        };
+        (model, effort, None, None)
+    } else {
+        let model = if is_retry {
+            ov.retry_model
+                .as_deref()
+                .or(ov.model.as_deref())
+                .ok_or_else(|| {
+                    format!("missing model for {norm_weight}.{norm_stage} in router config")
+                })?
+                .to_owned()
+        } else {
+            ov.model
+                .as_deref()
+                .ok_or_else(|| {
+                    format!("missing model for {norm_weight}.{norm_stage} in router config")
+                })?
+                .to_owned()
+        };
+        let effort = if is_retry {
+            ov.retry_effort.or(ov.effort).ok_or_else(|| {
+                format!("missing effort for {norm_weight}.{norm_stage} in router config")
+            })?
+        } else {
+            ov.effort.ok_or_else(|| {
+                format!("missing effort for {norm_weight}.{norm_stage} in router config")
+            })?
+        };
+        let fallback_model = if is_retry {
+            ov.retry_fallback_model
+                .as_deref()
+                .or(ov.fallback_model.as_deref())
+                .map(str::to_owned)
+        } else {
+            ov.fallback_model.clone()
+        };
+        let fallback_effort = if is_retry {
+            ov.retry_fallback_effort.or(ov.fallback_effort)
+        } else {
+            ov.fallback_effort
+        };
+        (model, effort, fallback_model, fallback_effort)
+    };
+
+    let mut route = StageRoute {
+        weight: norm_weight,
+        stage: norm_stage,
+        family: infer_model_family(&model),
+        model,
+        effort,
+        fallback_family: fallback_model.as_deref().map(infer_model_family),
+        fallback_model,
+        fallback_effort,
+        max_task_tokens,
+        timeout_secs,
+        stall_timeout_secs: DEFAULT_STALL_TIMEOUT_SECS,
+    };
 
     let forced_non_empty = overrides
         .forced_model
@@ -688,9 +816,9 @@ pub fn resolve_stage_route_with_config(
         route.fallback_model = None;
         route.fallback_effort = None;
     } else if overrides.flash_only {
-        route.family = ModelFamily::GeminiAgy;
-        route.model = "gemini-4-hydrogen-high".to_owned();
-        route.effort = ReasoningEffort::High;
+        route.family = infer_model_family(&cfg.flash_only.model);
+        route.model = cfg.flash_only.model.clone();
+        route.effort = cfg.flash_only.effort;
         route.fallback_family = None;
         route.fallback_model = None;
         route.fallback_effort = None;
@@ -715,57 +843,6 @@ pub fn resolve_stage_route_with_config(
     }
 
     Ok(Some(route))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_cross_model_review_route(
-    weight: String,
-    stage: String,
-    is_retry: bool,
-    author: ModelFamily,
-    gemini_primary: &str,
-    gemini_retry: &str,
-    gemini_effort: ReasoningEffort,
-    sol_base_effort: ReasoningEffort,
-    max_task_tokens: u64,
-    timeout_secs: u64,
-) -> StageRoute {
-    match author {
-        ModelFamily::OpenAiSol => StageRoute {
-            weight,
-            stage,
-            family: ModelFamily::GeminiAgy,
-            model: if is_retry {
-                gemini_retry.to_owned()
-            } else {
-                gemini_primary.to_owned()
-            },
-            effort: gemini_effort,
-            fallback_family: None,
-            fallback_model: None,
-            fallback_effort: None,
-            max_task_tokens,
-            timeout_secs,
-            stall_timeout_secs: DEFAULT_STALL_TIMEOUT_SECS,
-        },
-        ModelFamily::GeminiAgy => StageRoute {
-            weight,
-            stage,
-            family: ModelFamily::OpenAiSol,
-            model: "gpt-6.2-sol".to_owned(),
-            effort: if is_retry {
-                sol_base_effort.escalate()
-            } else {
-                sol_base_effort
-            },
-            fallback_family: None,
-            fallback_model: None,
-            fallback_effort: None,
-            max_task_tokens,
-            timeout_secs,
-            stall_timeout_secs: DEFAULT_STALL_TIMEOUT_SECS,
-        },
-    }
 }
 
 #[cfg(test)]
@@ -963,5 +1040,126 @@ mod tests {
         let bad_cfg: RouterConfig =
             serde_json::from_str(r#"{"routes":{"XS":{"plan":{"model":"gpt-6.1-sol"}}}}"#).unwrap();
         assert!(validate_router_config(&bad_cfg).is_err());
+    }
+
+    #[test]
+    fn embedded_router_json_validates_cleanly_and_merges_partial_overlays() {
+        let base = RouterConfig::default();
+        let warnings = validate_router_config(&base).unwrap();
+        assert!(
+            warnings.is_empty(),
+            "canonical config/router.json should have no warnings: {warnings:?}"
+        );
+        assert_eq!(base.flash_only.model, "gemini-4-hydrogen-high");
+        assert_eq!(base.flash_only.effort, ReasoningEffort::High);
+        assert_eq!(base.agy_infra_fallback.model, "gpt-6.2-sol");
+        assert_eq!(base.agy_infra_fallback.effort, ReasoningEffort::High);
+
+        // Partial user overlay preserves omitted effort, retry_model, and fallback_model.
+        let partial_raw = r#"{
+            "flash_only": { "model": "gemini-4-hydrogen-medium" },
+            "agy_infra_fallback": { "model": "gpt-6.2-astra", "effort": "medium" },
+            "routes": {
+                "xs": {
+                    "IMPL": { "model": "gpt-6.2-astra" }
+                },
+                "M": {
+                    "plan": { "model": "gpt-6.2-astra" }
+                }
+            }
+        }"#;
+        let merged: RouterConfig = serde_json::from_str(partial_raw).unwrap();
+        assert!(validate_router_config(&merged).unwrap().is_empty());
+        assert_eq!(merged.flash_only.model, "gemini-4-hydrogen-medium");
+        assert_eq!(merged.flash_only.effort, ReasoningEffort::High);
+        assert_eq!(merged.agy_infra_fallback.model, "gpt-6.2-astra");
+        assert_eq!(merged.agy_infra_fallback.effort, ReasoningEffort::Medium);
+
+        let xs_impl = resolve_stage_route_with_config(
+            "XS",
+            "impl",
+            0,
+            None,
+            &RouterEnvOverrides::default(),
+            &merged,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(xs_impl.model, "gpt-6.2-astra");
+        assert_eq!(xs_impl.effort, ReasoningEffort::Low);
+        assert_eq!(
+            xs_impl.fallback_model.as_deref(),
+            Some("gemini-4-hydrogen-medium")
+        );
+
+        let m_plan_retry = resolve_stage_route_with_config(
+            "M",
+            "plan",
+            1,
+            None,
+            &RouterEnvOverrides::default(),
+            &merged,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(m_plan_retry.model, "gemini-4-hydrogen-high");
+        assert_eq!(m_plan_retry.fallback_model.as_deref(), Some("gpt-6.2-sol"));
+
+        let flash_route = resolve_stage_route_with_config(
+            "S",
+            "impl",
+            0,
+            None,
+            &RouterEnvOverrides {
+                flash_only: true,
+                forced_model: None,
+            },
+            &merged,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(flash_route.model, "gemini-4-hydrogen-medium");
+        assert_eq!(flash_route.effort, ReasoningEffort::High);
+    }
+
+    #[test]
+    fn router_validation_rejects_empty_endpoints_and_invalid_cross_family_alt() {
+        let empty_flash: RouterConfig =
+            serde_json::from_str(r#"{"flash_only":{"model":"  "}}"#).unwrap();
+        assert!(validate_router_config(&empty_flash).is_err());
+
+        let empty_agy_fb: RouterConfig =
+            serde_json::from_str(r#"{"agy_infra_fallback":{"model":""}}"#).unwrap();
+        assert!(validate_router_config(&empty_agy_fb).is_err());
+
+        let bad_alt: RouterConfig = serde_json::from_str(
+            r#"{"routes":{"XS":{"impl":{"cross_family_alt":{"model":"gpt-6.2-sol"}}}}}"#,
+        )
+        .unwrap();
+        assert!(validate_router_config(&bad_alt).is_err());
+    }
+
+    #[test]
+    fn init_router_config_writes_canonical_json_and_respects_force() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "zach_router_init_test_{}_{}",
+            std::process::id(),
+            crate::v2::now_epoch()
+        ));
+        let target = temp_dir.join("nested").join("router.json");
+        let written = init_router_config(Some(&target), false).unwrap();
+        assert_eq!(written, target);
+        let (loaded, warnings) = load_router_config_from_path(&target).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(loaded, RouterConfig::default());
+
+        assert!(init_router_config(Some(&target), false).is_err());
+        std::fs::write(&target, "{}").unwrap();
+        init_router_config(Some(&target), true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            default_router_config_json()
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
