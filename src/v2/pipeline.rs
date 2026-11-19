@@ -1502,22 +1502,21 @@ pub fn parse_agy_cli_response(
         });
     };
 
-    if stderr.contains("timed out")
+    let has_stderr_timeout = stderr.contains("timed out")
         || stderr.contains("TIMEOUT")
-        || stderr.contains("RuntimeMaxSec")
-        || stdout.contains("TIMEOUT")
-    {
-        return Err(AgyCliError {
-            failure_class: "AGY_TIMEOUT".to_owned(),
-            message: format!(
-                "worker execution timed out (code={code}): {}",
-                stderr.trim()
-            ),
-        });
-    }
+        || stderr.contains("RuntimeMaxSec");
 
     let trimmed_out = stdout.trim();
     if trimmed_out.is_empty() {
+        if has_stderr_timeout {
+            return Err(AgyCliError {
+                failure_class: "AGY_TIMEOUT".to_owned(),
+                message: format!(
+                    "worker execution timed out (code={code}): {}",
+                    stderr.trim()
+                ),
+            });
+        }
         return Err(AgyCliError {
             failure_class: "AGY_EXIT".to_owned(),
             message: format!(
@@ -1530,6 +1529,15 @@ pub fn parse_agy_cli_response(
     let json: serde_json::Value = match serde_json::from_str(trimmed_out) {
         Ok(v) => v,
         Err(_) => {
+            if has_stderr_timeout || stdout.contains("TIMEOUT") {
+                return Err(AgyCliError {
+                    failure_class: "AGY_TIMEOUT".to_owned(),
+                    message: format!(
+                        "worker execution timed out (code={code}): {}",
+                        stderr.trim()
+                    ),
+                });
+            }
             return Err(AgyCliError {
                 failure_class: "AGY_EXIT".to_owned(),
                 message: format!(
@@ -1546,17 +1554,40 @@ pub fn parse_agy_cli_response(
         .unwrap_or(true);
 
     if status_str.eq_ignore_ascii_case("error") || !exec_succeeded {
-        let err_code = json
-            .get("error_code")
+        let diagnostic = json.get("diagnostic");
+        let err_code = diagnostic
+            .and_then(|d| d.get("code"))
             .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                json.get("error_code")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+            })
             .unwrap_or("AGY_STATUS_ERROR");
-        let summary = json
-            .get("summary")
-            .or_else(|| json.get("message"))
+        let summary = diagnostic
+            .and_then(|d| d.get("summary"))
             .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                json.get("summary")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .or_else(|| {
+                json.get("message")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+            })
             .unwrap_or(trimmed_out);
+        let is_canonical_timeout = err_code == "AGY_TIMEOUT"
+            || json.get("process_status").and_then(|v| v.as_str()) == Some("timeout");
         return Err(AgyCliError {
-            failure_class: "AGY_STATUS".to_owned(),
+            failure_class: if is_canonical_timeout {
+                "AGY_TIMEOUT".to_owned()
+            } else {
+                "AGY_STATUS".to_owned()
+            },
             message: format!("{err_code}: {summary}"),
         });
     }
@@ -2012,6 +2043,9 @@ pub fn classify_failure_class(stage: &str, status: &str, message: &str) -> &'sta
     if is_quota_or_usage_limit_error(message) {
         return FAILURE_CLASS_INFRA;
     }
+    if lower_msg.trim_start().starts_with("agy_") {
+        return FAILURE_CLASS_INFRA;
+    }
     if matches!(lower_stage.as_str(), "plan-review" | "pr-review")
         && (lower_msg.contains("schema")
             || lower_msg.contains("review verdict")
@@ -2019,14 +2053,15 @@ pub fn classify_failure_class(stage: &str, status: &str, message: &str) -> &'sta
     {
         return FAILURE_CLASS_SEMANTIC;
     }
-    if lower_msg.contains("forbidden")
+    if lower_msg.contains("forbidden path")
+        || lower_msg.contains("plan target is forbidden")
         || lower_msg.contains("out-of-scope")
         || lower_msg.contains("scope_violation")
         || lower_msg.contains("outside target_files")
         || lower_msg.contains("token budget")
         || lower_msg.contains("budget exhausted")
         || lower_msg.contains("size policy")
-        || lower_msg.contains("policy")
+        || lower_msg.contains("policy violation")
         || lower_msg.contains("exceeds xs ceiling")
         || lower_msg.contains("exceeds s ceiling")
         || lower_msg.contains("verdict gate")
@@ -7026,6 +7061,82 @@ print(json.dumps({
         assert_eq!(
             classify_failure_class("impl", "FAILED", "token budget exhausted for task ZACH-015"),
             "policy"
+        );
+    }
+
+    #[test]
+    fn zach062_agy_status_error_and_raw_bodies_are_not_misclassified_as_policy() {
+        let diag_json = r#"{
+            "status": "error",
+            "execution_succeeded": false,
+            "error_code": "FALLBACK_CODE",
+            "summary": "raw body mentioning forbidden_paths and Scope boundary",
+            "diagnostic": {
+                "code": "AGY_DIAG_TIMEOUT",
+                "summary": "worker stalled before completing"
+            }
+        }"#;
+        let diag_err = parse_agy_cli_response(diag_json, "", Some(1)).unwrap_err();
+        assert_eq!(diag_err.failure_class, "AGY_STATUS");
+        assert_eq!(
+            diag_err.message,
+            "AGY_DIAG_TIMEOUT: worker stalled before completing"
+        );
+
+        let fallback_json = r#"{
+            "execution_succeeded": false,
+            "message": "Scope boundary check failed in worker"
+        }"#;
+        let fallback_err = parse_agy_cli_response(fallback_json, "", Some(1)).unwrap_err();
+        assert_eq!(fallback_err.failure_class, "AGY_STATUS");
+        assert_eq!(
+            fallback_err.message,
+            "AGY_STATUS_ERROR: Scope boundary check failed in worker"
+        );
+
+        assert_eq!(
+            classify_failure_class(
+                "impl",
+                "FAILED",
+                "AGY_STATUS_ERROR: worker body echoed forbidden_paths and policy"
+            ),
+            FAILURE_CLASS_INFRA
+        );
+        assert_eq!(
+            classify_failure_class(
+                "pr-review",
+                "FAILED",
+                "AGY_STATUS_ERROR: Scope boundary and review verdict schema mentioned"
+            ),
+            FAILURE_CLASS_INFRA
+        );
+        assert_eq!(
+            classify_failure_class(
+                "impl",
+                "FAILED",
+                "raw worker body referenced forbidden_paths and retry policy"
+            ),
+            FAILURE_CLASS_INFRA
+        );
+        assert_ne!(
+            classify_failure_class(
+                "impl",
+                "FAILED",
+                "AGY_STATUS_ERROR: {\"forbidden_paths\":[\"Cargo.toml\"],\"scope\":\"Scope boundary\"}"
+            ),
+            FAILURE_CLASS_POLICY
+        );
+        assert_eq!(
+            classify_failure_class(
+                "impl",
+                "FAILED",
+                "forbidden path violation on ZACH-062: Cargo.toml matches Cargo.toml"
+            ),
+            FAILURE_CLASS_POLICY
+        );
+        assert_eq!(
+            classify_failure_class("impl", "FAILED", "exceeds size policy for XS"),
+            FAILURE_CLASS_POLICY
         );
     }
 
