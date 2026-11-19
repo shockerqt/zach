@@ -1,0 +1,25 @@
+schema_version: 1
+post_merge_workflows: []
+promotions:
+  - name: zach-runtime
+    when_paths: []
+    build_workflow: ci.yml
+    artifact_name_template: 'zach-release-digest-${sha}'
+    digest_file: release.sha256
+    promote_workflow: promote-zach.yml
+    plan_inputs:
+      build_run_id: '${build_run_id}'
+      source_sha: '${source_sha}'
+      artifact_digest: '${artifact_digest}'
+      approve_production: 'false'
+    approve_inputs:
+      build_run_id: '${build_run_id}'
+      source_sha: '${source_sha}'
+      artifact_digest: '${artifact_digest}'
+      expected_current: '${expected_current}'
+      approve_production: 'true'
+    plan_artifact_prefix: 'zach-delivery-${run_id}-${attempt}'
+    plan_file: zach-plan.json
+    delivery_file: zach-delivery.json
+    current_source_authority: plan
+    health_checks: []
