@@ -399,6 +399,23 @@ fn default_attempt_phase() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttemptAuditRecord {
+    pub attempt_id: String,
+    pub task_id: String,
+    pub stage: String,
+    pub turn_count: u64,
+    pub tool_call_count: u64,
+    pub tool_error_count: u64,
+    pub edit_compile_fail_loops: u64,
+    pub redundant_read_count: u64,
+    pub cached_input_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub check_divergence: bool,
+    pub error_code: Option<String>,
+    pub created_epoch: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskEventRecord {
     pub seq_id: i64,
     pub task_id: String,
@@ -865,6 +882,22 @@ impl V2Store {
                  until_epoch INTEGER NOT NULL,
                  reason TEXT NOT NULL,
                  updated_epoch INTEGER NOT NULL
+             );
+
+             CREATE TABLE IF NOT EXISTS attempt_audits (
+                 attempt_id TEXT PRIMARY KEY,
+                 task_id TEXT NOT NULL,
+                 stage TEXT NOT NULL,
+                 turn_count INTEGER NOT NULL DEFAULT 0,
+                 tool_call_count INTEGER NOT NULL DEFAULT 0,
+                 tool_error_count INTEGER NOT NULL DEFAULT 0,
+                 edit_compile_fail_loops INTEGER NOT NULL DEFAULT 0,
+                 redundant_read_count INTEGER NOT NULL DEFAULT 0,
+                 cached_input_tokens INTEGER,
+                 reasoning_tokens INTEGER,
+                 check_divergence INTEGER NOT NULL DEFAULT 0,
+                 error_code TEXT,
+                 created_epoch INTEGER NOT NULL
              );",
         )?;
 
@@ -879,6 +912,7 @@ impl V2Store {
         }
         self.migrate_supervision()?;
         self.migrate_stage_attempts_nullable_tokens()?;
+        self.migrate_attempt_audits()?;
         // These additive fields also tolerate an interrupted pre-release upgrade.
         let delivery_columns: BTreeSet<String> = {
             let mut stmt = self
@@ -996,6 +1030,42 @@ impl V2Store {
         let fk_res = self.conn.execute_batch("PRAGMA foreign_keys=ON;");
         res?;
         fk_res?;
+        Ok(())
+    }
+
+    fn migrate_attempt_audits(&mut self) -> Result<(), V2StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: BTreeSet<String> = {
+            let mut stmt = tx.prepare("PRAGMA table_info('attempt_audits')")?;
+            stmt.query_map([], |row| row.get(1))?
+                .collect::<Result<_, _>>()?
+        };
+        for (name, definition) in [
+            ("task_id", "TEXT NOT NULL DEFAULT ''"),
+            ("stage", "TEXT NOT NULL DEFAULT ''"),
+            ("turn_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("tool_call_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("tool_error_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("edit_compile_fail_loops", "INTEGER NOT NULL DEFAULT 0"),
+            ("redundant_read_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("cached_input_tokens", "INTEGER"),
+            ("reasoning_tokens", "INTEGER"),
+            ("check_divergence", "INTEGER NOT NULL DEFAULT 0"),
+            ("error_code", "TEXT"),
+            ("created_epoch", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            if !existing.contains(name) {
+                tx.execute_batch(&format!(
+                    "ALTER TABLE attempt_audits ADD COLUMN {name} {definition};"
+                ))?;
+            }
+        }
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_attempt_audits_task ON attempt_audits(task_id);",
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2878,6 +2948,157 @@ impl V2Store {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    pub fn record_attempt_audit(&mut self, audit: &AttemptAuditRecord) -> Result<(), V2StoreError> {
+        let sanitized_error_code = audit
+            .error_code
+            .as_deref()
+            .map(|c| {
+                crate::v2::audit::redact_adr004_text(
+                    c,
+                    crate::v2::audit::MAX_AUDIT_DIGEST_ERROR_SIGNATURE_LEN,
+                )
+            })
+            .filter(|c| !c.is_empty());
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO attempt_audits (
+                attempt_id, task_id, stage, turn_count, tool_call_count, tool_error_count,
+                edit_compile_fail_loops, redundant_read_count, cached_input_tokens,
+                reasoning_tokens, check_divergence, error_code, created_epoch
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT(attempt_id) DO UPDATE SET
+                task_id = excluded.task_id,
+                stage = excluded.stage,
+                turn_count = excluded.turn_count,
+                tool_call_count = excluded.tool_call_count,
+                tool_error_count = excluded.tool_error_count,
+                edit_compile_fail_loops = excluded.edit_compile_fail_loops,
+                redundant_read_count = excluded.redundant_read_count,
+                cached_input_tokens = COALESCE(excluded.cached_input_tokens, attempt_audits.cached_input_tokens),
+                reasoning_tokens = COALESCE(excluded.reasoning_tokens, attempt_audits.reasoning_tokens),
+                check_divergence = MAX(attempt_audits.check_divergence, excluded.check_divergence),
+                error_code = COALESCE(excluded.error_code, attempt_audits.error_code),
+                created_epoch = excluded.created_epoch",
+            params![
+                audit.attempt_id,
+                audit.task_id,
+                audit.stage,
+                audit.turn_count as i64,
+                audit.tool_call_count as i64,
+                audit.tool_error_count as i64,
+                audit.edit_compile_fail_loops as i64,
+                audit.redundant_read_count as i64,
+                audit.cached_input_tokens.map(|v| v as i64),
+                audit.reasoning_tokens.map(|v| v as i64),
+                i64::from(audit.check_divergence),
+                sanitized_error_code,
+                audit.created_epoch,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_attempt_audit(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Option<AttemptAuditRecord>, V2StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT attempt_id, task_id, stage, turn_count, tool_call_count, tool_error_count,
+                    edit_compile_fail_loops, redundant_read_count, cached_input_tokens,
+                    reasoning_tokens, check_divergence, error_code, created_epoch
+             FROM attempt_audits WHERE attempt_id = ?1",
+        )?;
+        stmt.query_row(params![attempt_id], Self::map_attempt_audit_row)
+            .optional()
+            .map_err(V2StoreError::from)
+    }
+
+    pub fn list_attempt_audits(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<AttemptAuditRecord>, V2StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT attempt_id, task_id, stage, turn_count, tool_call_count, tool_error_count,
+                    edit_compile_fail_loops, redundant_read_count, cached_input_tokens,
+                    reasoning_tokens, check_divergence, error_code, created_epoch
+             FROM attempt_audits WHERE task_id = ?1 ORDER BY created_epoch ASC, rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![task_id], Self::map_attempt_audit_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn mark_attempt_check_divergence(
+        &mut self,
+        attempt_id: &str,
+        task_id: &str,
+        stage: &str,
+        error_code: Option<&str>,
+    ) -> Result<(), V2StoreError> {
+        let sanitized_error_code = error_code
+            .map(|c| {
+                crate::v2::audit::redact_adr004_text(
+                    c,
+                    crate::v2::audit::MAX_AUDIT_DIGEST_ERROR_SIGNATURE_LEN,
+                )
+            })
+            .filter(|c| !c.is_empty());
+        let now = now_epoch();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO attempt_audits (
+                attempt_id, task_id, stage, turn_count, tool_call_count, tool_error_count,
+                edit_compile_fail_loops, redundant_read_count, cached_input_tokens,
+                reasoning_tokens, check_divergence, error_code, created_epoch
+             ) VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, NULL, NULL, 1, ?4, ?5)
+             ON CONFLICT(attempt_id) DO UPDATE SET
+                check_divergence = 1,
+                error_code = COALESCE(excluded.error_code, attempt_audits.error_code)",
+            params![attempt_id, task_id, stage, sanitized_error_code, now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_task_events(&self, task_id: &str) -> Result<Vec<TaskEventRecord>, V2StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq_id, task_id, task_group, ts_epoch, event_type, payload_json
+             FROM task_events WHERE task_id = ?1 ORDER BY seq_id ASC",
+        )?;
+        let rows = stmt.query_map(params![task_id], Self::map_event_row)?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
+    }
+
+    fn map_attempt_audit_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptAuditRecord> {
+        Ok(AttemptAuditRecord {
+            attempt_id: row.get(0)?,
+            task_id: row.get(1)?,
+            stage: row.get(2)?,
+            turn_count: row.get::<_, i64>(3)?.max(0) as u64,
+            tool_call_count: row.get::<_, i64>(4)?.max(0) as u64,
+            tool_error_count: row.get::<_, i64>(5)?.max(0) as u64,
+            edit_compile_fail_loops: row.get::<_, i64>(6)?.max(0) as u64,
+            redundant_read_count: row.get::<_, i64>(7)?.max(0) as u64,
+            cached_input_tokens: row.get::<_, Option<i64>>(8)?.map(|v| v.max(0) as u64),
+            reasoning_tokens: row.get::<_, Option<i64>>(9)?.map(|v| v.max(0) as u64),
+            check_divergence: row.get::<_, i64>(10)? != 0,
+            error_code: row.get(11)?,
+            created_epoch: row.get(12)?,
+        })
     }
 
     /// Returns the set of `attempt_id`s that are non-terminal or referenced by
@@ -6496,5 +6717,78 @@ mod tests {
                 .contains("decode task memory_json in active_attempt_ids"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn attempt_audits_migration_and_round_trip_persistence() {
+        let db = LegacyTestDb::new();
+        let db_path = &db.0;
+
+        // Pre-seed a partial attempt_audits table with an existing row to verify
+        // additive migration with SQLite DEFAULT clauses works on non-empty tables.
+        {
+            let conn = Connection::open(db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE attempt_audits (
+                     attempt_id TEXT PRIMARY KEY
+                 );
+                 INSERT INTO attempt_audits(attempt_id) VALUES('att-legacy-1');",
+            )
+            .unwrap();
+        }
+
+        let mut store = V2Store::open(db_path).expect("migrate partial attempt_audits table");
+        let legacy = store
+            .get_attempt_audit("att-legacy-1")
+            .unwrap()
+            .expect("legacy row preserved");
+        assert_eq!(legacy.attempt_id, "att-legacy-1");
+        assert_eq!(legacy.task_id, "");
+        assert_eq!(legacy.stage, "");
+        assert_eq!(legacy.turn_count, 0);
+        assert!(!legacy.check_divergence);
+
+        let rec = AttemptAuditRecord {
+            attempt_id: "att-1".to_owned(),
+            task_id: "ZACH-072".to_owned(),
+            stage: "impl".to_owned(),
+            turn_count: 4,
+            tool_call_count: 11,
+            tool_error_count: 2,
+            edit_compile_fail_loops: 1,
+            redundant_read_count: 3,
+            cached_input_tokens: Some(420),
+            reasoning_tokens: Some(95),
+            check_divergence: false,
+            error_code: Some("api_key=secret123456 failure".to_owned()),
+            created_epoch: 1_700_000_001,
+        };
+        store.record_attempt_audit(&rec).unwrap();
+
+        let loaded = store.get_attempt_audit("att-1").unwrap().unwrap();
+        assert_eq!(loaded.turn_count, 4);
+        assert_eq!(loaded.tool_call_count, 11);
+        assert_eq!(loaded.tool_error_count, 2);
+        assert_eq!(loaded.edit_compile_fail_loops, 1);
+        assert_eq!(loaded.redundant_read_count, 3);
+        assert_eq!(loaded.cached_input_tokens, Some(420));
+        assert_eq!(loaded.reasoning_tokens, Some(95));
+        assert!(!loaded.check_divergence);
+        assert_eq!(
+            loaded.error_code.as_deref(),
+            Some("[REDACTED_CREDENTIAL] failure")
+        );
+
+        // Marking check_divergence persists even if record_attempt_audit is called again with false.
+        store
+            .mark_attempt_check_divergence("att-1", "ZACH-072", "impl", Some("semantic"))
+            .unwrap();
+        store.record_attempt_audit(&rec).unwrap();
+        let after_div = store.get_attempt_audit("att-1").unwrap().unwrap();
+        assert!(after_div.check_divergence);
+
+        let list = store.list_attempt_audits("ZACH-072").unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].attempt_id, "att-1");
     }
 }

@@ -1192,6 +1192,7 @@ impl StageExecutor for SystemdStageExecutor {
                             output.status.code(),
                             &parsed,
                         )?;
+                        let _ = crate::v2::audit::extract_and_write_attempt_audit(&attempt_dir);
                         Ok(parsed)
                     }
                     Err(agy_err) => {
@@ -1215,6 +1216,7 @@ impl StageExecutor for SystemdStageExecutor {
                                 .unwrap_or_default()
                                 .as_bytes(),
                         )?;
+                        let _ = crate::v2::audit::extract_and_write_attempt_audit(&attempt_dir);
                         Err(err_msg)
                     }
                 }
@@ -1244,6 +1246,7 @@ impl StageExecutor for SystemdStageExecutor {
                     output.status.code(),
                     &result,
                 )?;
+                let _ = crate::v2::audit::extract_and_write_attempt_audit(&attempt_dir);
                 Ok(result)
             }
         }
@@ -2740,6 +2743,9 @@ pub fn stop_and_cleanup(
     match controller.inspect(unit)?.state()? {
         UnitState::Dead | UnitState::Missing | UnitState::Failed => {}
         _ => return Err("cleanup refused while execution remains".into()),
+    }
+    if std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
+        let _ = crate::v2::audit::extract_and_write_attempt_audit(dir);
     }
     if let Some(resources) = resources {
         resources.cleanup_after_stop()?;
@@ -4730,5 +4736,105 @@ Binary files /dev/null and b/assets/logo.bin differ
             "expired dir in active_attempt_ids must be preserved"
         );
         assert!(fresh_completed.exists(), "fresh dir must be preserved");
+    }
+
+    #[test]
+    fn stop_and_cleanup_extracts_audit_json_before_deleting_codex_and_gemini_homes() {
+        struct DeadController;
+        impl UnitController for DeadController {
+            fn inspect(&self, _unit: &str) -> Result<UnitObservation, String> {
+                Ok(UnitObservation {
+                    load_state: "not-found".into(),
+                    active_state: "inactive".into(),
+                    sub_state: "dead".into(),
+                    ..Default::default()
+                })
+            }
+            fn launch(&self, _manifest: &AttemptManifest) -> Result<(), String> {
+                Ok(())
+            }
+            fn stop(&self, _unit: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn reset_failed(&self, _unit: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn list_units(&self) -> Result<Vec<String>, String> {
+                Ok(Vec::new())
+            }
+        }
+
+        let dir = TempTestDir::new("zach072-stop-cleanup-audit");
+        let attempt_dir = dir.path();
+        std::fs::write(
+            attempt_dir.join("manifest.json"),
+            r#"{"attempt_id":"att-clean-1","task_id":"ZACH-072","route":{"stage":"impl","family":"OpenAiSol"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            attempt_dir.join("stdout.jsonl"),
+            r#"{"type":"turn.completed","usage":{"input_tokens":500,"cached_input_tokens":100,"output_tokens":120,"reasoning_output_tokens":30}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(attempt_dir.join("codex-home/sessions")).unwrap();
+        std::fs::write(
+            attempt_dir.join("codex-home/auth.json"),
+            r#"{"OPENAI_API_KEY":"sk-supersecretkey1234567890123456"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            attempt_dir.join("codex-home/sessions/rollout-1.jsonl"),
+            [
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500,"cached_input_tokens":100,"output_tokens":120,"reasoning_output_tokens":30,"total_tokens":620}}}}"#,
+                r#"{"type":"response_item","payload":{"type":"function_call","call_id":"call-1","name":"edit_file","arguments":"{\"path\":\"src/lib.rs\"}"}}"#,
+                r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"Exit code: 0"}}"#,
+                r#"{"type":"response_item","payload":{"type":"local_shell_call","call_id":"call-2","action":{"command":["cargo","test"]}}}"#,
+                r#"{"type":"response_item","payload":{"type":"local_shell_call_output","call_id":"call-2","output":"Exit code: 101"}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(attempt_dir.join("gemini-home/logs")).unwrap();
+        std::fs::write(
+            attempt_dir.join("gemini-home/oauth.json"),
+            r#"{"access_token":"ghp_1234567890abcdefghij123456"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            attempt_dir.join("gemini-home/logs/transcript.jsonl"),
+            r#"{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"read_file","arguments":{"Path":"src/lib.rs"}}]}"#,
+        )
+        .unwrap();
+
+        stop_and_cleanup(&DeadController, "zach-test-unit", attempt_dir, None, false)
+            .expect("stop_and_cleanup succeeds");
+
+        assert!(
+            !attempt_dir.join("codex-home").exists(),
+            "codex-home must be removed"
+        );
+        assert!(
+            !attempt_dir.join("gemini-home").exists(),
+            "gemini-home must be removed"
+        );
+        let audit_path = attempt_dir.join("audit.json");
+        assert!(
+            audit_path.is_file(),
+            "audit.json must be extracted before cleanup"
+        );
+        let audit_bytes = std::fs::read(&audit_path).unwrap();
+        assert!(audit_bytes.len() <= crate::v2::audit::MAX_AUDIT_JSON_BYTES);
+        let audit_text = String::from_utf8(audit_bytes).unwrap();
+        assert!(!audit_text.contains("sk-supersecretkey"));
+        assert!(!audit_text.contains("ghp_1234567890"));
+        let report: crate::v2::audit::AttemptAuditReport =
+            serde_json::from_str(&audit_text).unwrap();
+        assert_eq!(report.attempt_id, "att-clean-1");
+        assert_eq!(report.task_id, "ZACH-072");
+        assert_eq!(report.cached_input_tokens, Some(100));
+        assert_eq!(report.reasoning_tokens, Some(30));
+        assert_eq!(report.tool_call_count, 2);
+        assert_eq!(report.tool_error_count, 1);
+        assert_eq!(report.edit_compile_fail_loops, 1);
     }
 }

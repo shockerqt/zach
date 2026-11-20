@@ -62,6 +62,7 @@ fn main() {
         "attach" => run_v2_attach(&args[2..]),
         "events" => run_v2_events(&args[2..]),
         "web" => run_v2_web(&args[2..]),
+        "audit" => run_v2_audit(&args[2..]),
         "--help" | "-h" => print_usage(),
         unknown => {
             eprintln!("unknown option: {unknown}");
@@ -1075,6 +1076,84 @@ fn run_audit(args: &[String]) {
     }
 }
 
+fn parse_v2_audit_args(args: &[String]) -> Result<(String, Option<PathBuf>), String> {
+    let mut task_id: Option<String> = None;
+    let mut db_path: Option<PathBuf> = None;
+    let mut json = false;
+    let mut idx = 0usize;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--json" => {
+                json = true;
+                idx += 1;
+            }
+            "--db" => {
+                let value = args
+                    .get(idx + 1)
+                    .filter(|v| !v.starts_with('-'))
+                    .ok_or_else(|| "missing value for --db".to_owned())?;
+                db_path = Some(PathBuf::from(value));
+                idx += 2;
+            }
+            "--task" | "--task-id" => {
+                let value = args
+                    .get(idx + 1)
+                    .filter(|v| !v.starts_with('-'))
+                    .ok_or_else(|| format!("missing value for {}", args[idx]))?;
+                if task_id.is_some() {
+                    return Err("duplicate task id".to_owned());
+                }
+                task_id = Some(value.clone());
+                idx += 2;
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown option for audit: {other}"));
+            }
+            positional => {
+                if task_id.is_some() {
+                    return Err(format!("unexpected extra argument: {positional}"));
+                }
+                task_id = Some(positional.to_owned());
+                idx += 1;
+            }
+        }
+    }
+    let task_id = task_id
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "missing <TASK_ID>".to_owned())?;
+    if !json {
+        return Err("missing required --json flag".to_owned());
+    }
+    Ok((task_id, db_path))
+}
+
+fn run_v2_audit(args: &[String]) {
+    if has_flag(args, "--help") || has_flag(args, "-h") {
+        print_usage();
+        return;
+    }
+    let (task_id, db_path) = parse_v2_audit_args(args).unwrap_or_else(|err| usage_error(&err));
+    let db_path = db_path.unwrap_or_else(default_db_path);
+    let store = V2Store::open(&db_path).unwrap_or_else(|error| {
+        eprintln!("failed to open v2 store {}: {error}", db_path.display());
+        std::process::exit(1);
+    });
+    match zach::v2::audit::build_task_audit_digest(&store, &task_id) {
+        Ok(digest) => match serde_json::to_string_pretty(&digest) {
+            Ok(rendered) => println!("{rendered}"),
+            Err(error) => {
+                eprintln!("audit serialization failed: {error}");
+                std::process::exit(1);
+            }
+        },
+        Err(error) => {
+            eprintln!("audit failed: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
     args.windows(2)
         .find(|pair| pair[0] == flag)
@@ -1538,6 +1617,7 @@ fn print_usage() {
     println!(
         "       zach events [--group <GROUP>] [--since-seq <N>] [--wait] [--socket <PATH>] [--db <PATH>]"
     );
+    println!("       zach audit <TASK_ID> --json [--db <PATH>]");
 }
 
 #[cfg(test)]
@@ -2280,5 +2360,167 @@ mod tests {
             1
         );
         assert!(cooldown_list_with_fallback(&args).unwrap().is_empty());
+    }
+
+    #[test]
+    fn zach_audit_cli_args_and_json_output_match_governance_validate_audit_digest_contract() {
+        let parsed = parse_v2_audit_args(&[
+            "ZACH-072".to_owned(),
+            "--json".to_owned(),
+            "--db".to_owned(),
+            "/tmp/test.sqlite3".to_owned(),
+        ])
+        .expect("parse valid audit args");
+        assert_eq!(parsed.0, "ZACH-072");
+        assert_eq!(parsed.1, Some(PathBuf::from("/tmp/test.sqlite3")));
+
+        assert!(parse_v2_audit_args(&["ZACH-072".to_owned()]).is_err());
+        assert!(parse_v2_audit_args(&["--json".to_owned()]).is_err());
+        assert!(
+            parse_v2_audit_args(&[
+                "ZACH-072".to_owned(),
+                "--json".to_owned(),
+                "--bogus".to_owned(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_v2_audit_args(&[
+                "ZACH-072".to_owned(),
+                "EXTRA".to_owned(),
+                "--json".to_owned(),
+            ])
+            .is_err()
+        );
+
+        let dir = OfflineTestDir::new();
+        let db_path = dir.0.join("audit-cli.sqlite3");
+        let mut store = V2Store::open(&db_path).expect("open store");
+        let task = zach::v2::store::TaskRecord {
+            task_id: "ZACH-072".to_owned(),
+            task_group: "zach".to_owned(),
+            title: "Extract audit digest".to_owned(),
+            repository: "zach".to_owned(),
+            github_repo: Some("shockerqt/zach".to_owned()),
+            issue_number: Some(146),
+            weight: "M".to_owned(),
+            status: "Done".to_owned(),
+            worktree_path: None,
+            branch: None,
+            context_pack: zach::v2::store::ContextPackSpec::default(),
+            depends_on: vec![],
+            required_stages: vec![
+                "plan".to_owned(),
+                "plan-review".to_owned(),
+                "impl".to_owned(),
+                "pr-review".to_owned(),
+            ],
+            stages_completed: vec![
+                "plan".to_owned(),
+                "plan-review".to_owned(),
+                "impl".to_owned(),
+                "pr-review".to_owned(),
+            ],
+            current_stage: None,
+            active_attempt_id: None,
+            plan_base_sha: None,
+            reviewed_sha: Some("abc1234".to_owned()),
+            pr_number: Some(155),
+            executor: Some("zach".to_owned()),
+            autonomous_consent: true,
+            retry_count: 1,
+            next_retry_epoch: 0,
+            lease_owner: None,
+            lease_expires_epoch: None,
+            memory: zach::v2::store::TaskMemory {
+                review_rework_count: 1,
+                ..Default::default()
+            },
+            version: 1,
+            updated_epoch: 1_700_000_100,
+        };
+        store.upsert_task(&task).unwrap();
+        store
+            .record_stage_attempt(&zach::v2::store::StageAttemptRecord {
+                attempt_id: "att-cli-1".to_owned(),
+                task_id: "ZACH-072".to_owned(),
+                stage: "impl".to_owned(),
+                model: "gpt-6.1-sol".to_owned(),
+                effort: "medium".to_owned(),
+                systemd_unit: None,
+                invocation_id: None,
+                started_epoch: 1_700_000_010,
+                ended_epoch: Some(1_700_000_050),
+                status: "FAILED".to_owned(),
+                failure_class: Some("semantic".to_owned()),
+                summary: Some("prompt: api_key=sk-1234567890abcdefghij123456 test fail".to_owned()),
+                input_tokens: Some(1200),
+                output_tokens: Some(300),
+                total_tokens: Some(1500),
+                sha_before: None,
+                sha_after: None,
+                phase: "COMPLETE".to_owned(),
+                last_liveness_epoch: 1_700_000_050,
+                last_output_bytes: 0,
+                last_cpu_usage_usec: None,
+                control_group: None,
+                exit_code: Some(1),
+                exit_code_kind: Some("exited".to_owned()),
+                retry_generation: 0,
+            })
+            .unwrap();
+        store
+            .record_attempt_audit(&zach::v2::store::AttemptAuditRecord {
+                attempt_id: "att-cli-1".to_owned(),
+                task_id: "ZACH-072".to_owned(),
+                stage: "impl".to_owned(),
+                turn_count: 3,
+                tool_call_count: 7,
+                tool_error_count: 2,
+                edit_compile_fail_loops: 1,
+                redundant_read_count: 1,
+                cached_input_tokens: Some(400),
+                reasoning_tokens: Some(100),
+                check_divergence: true,
+                error_code: Some("check_failed".to_owned()),
+                created_epoch: 1_700_000_050,
+            })
+            .unwrap();
+
+        let digest = zach::v2::audit::build_task_audit_digest(&store, "ZACH-072")
+            .expect("build task audit digest");
+        let val = zach::v2::audit::validate_task_audit_digest(&digest)
+            .expect("validate digest against TASK_AUDIT_DIGEST v1");
+        let obj = val.as_object().unwrap();
+        for key in obj.keys() {
+            assert!(
+                zach::v2::audit::AUDIT_DIGEST_ALLOWED_KEYS.contains(&key.as_str()),
+                "unexpected digest key: {key}"
+            );
+        }
+        assert_eq!(obj["schema_version"], 1);
+        assert_eq!(obj["task_id"], "ZACH-072");
+        assert_eq!(obj["executor"], "zach");
+        assert_eq!(obj["stage_attempts_count"], 1);
+        assert_eq!(obj["rework_count"], 1);
+        assert_eq!(obj["retry_count"], 1);
+        assert_eq!(obj["tool_error_count"], 2);
+        assert_eq!(obj["edit_compile_fail_loops"], 1);
+        assert_eq!(obj["check_divergence"], true);
+
+        let tu = obj["token_usage"].as_object().unwrap();
+        assert_eq!(tu.len(), 3);
+        assert_eq!(tu["input_tokens"], 1200);
+        assert_eq!(tu["output_tokens"], 300);
+        assert_eq!(tu["total_tokens"], 1500);
+
+        let sigs = obj["error_signatures"].as_array().unwrap();
+        assert!(!sigs.is_empty() && sigs.len() <= 10);
+        for sig in sigs {
+            let s = sig.as_str().unwrap();
+            assert!(!s.is_empty() && s.chars().count() <= 160);
+            assert!(!s.contains("sk-1234567890"));
+            assert!(!s.to_ascii_lowercase().starts_with("prompt:"));
+        }
     }
 }
