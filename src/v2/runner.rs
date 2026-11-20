@@ -14,6 +14,7 @@ use std::process::{Command, Stdio};
 pub const MAX_SUMMARY_BYTES: usize = 1024;
 pub const MAX_RECENT_ATTEMPT_BYTES: usize = 256;
 pub const DEFAULT_ATTEMPT_RETENTION_DAYS: u64 = 7;
+pub const SYSTEMD_RUNTIME_MAX_GRACE_SECS: u64 = 60;
 
 pub const ALLOWED_ENV_KEYS: &[&str] = &[
     "HOME",
@@ -48,7 +49,7 @@ pub struct StageCommandSpec {
     pub output_schema_json: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StageExecutionResult {
     pub status: String,
     pub summary: String,
@@ -61,6 +62,8 @@ pub struct StageExecutionResult {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
+    #[serde(default)]
+    pub duration_seconds: Option<f64>,
     pub sha_before: Option<String>,
     pub sha_after: Option<String>,
     pub diff_files: Vec<DiffFileEntry>,
@@ -279,7 +282,12 @@ pub fn build_systemd_stage_command_with_env(
         format!("--unit={unit_name}.service"),
         "--slice=zach-workers.slice".to_owned(),
         "-p".to_owned(),
-        format!("RuntimeMaxSec={}", route.timeout_secs),
+        format!(
+            "RuntimeMaxSec={}",
+            route
+                .timeout_secs
+                .saturating_add(SYSTEMD_RUNTIME_MAX_GRACE_SECS)
+        ),
         "-p".to_owned(),
         "MemoryMax=4G".to_owned(),
         "-p".to_owned(),
@@ -554,20 +562,29 @@ pub fn attempt_retention_from_env() -> std::time::Duration {
     std::time::Duration::from_secs(days.saturating_mul(86_400))
 }
 
-/// Prunes `<state_dir>/attempts/<attempt_id>` directories older than `retention`.
+/// Prunes `<state_dir>/attempts/<attempt_id>` directories older than `retention`
+/// that are not in `active_attempt_ids`.
 pub fn prune_old_attempts(
     state_dir: &std::path::Path,
     retention: std::time::Duration,
+    active_attempt_ids: &BTreeSet<String>,
 ) -> Result<usize, String> {
-    prune_old_attempts_at(state_dir, retention, std::time::SystemTime::now())
+    prune_old_attempts_at(
+        state_dir,
+        retention,
+        std::time::SystemTime::now(),
+        active_attempt_ids,
+    )
 }
 
 /// Prunes `<state_dir>/attempts/<attempt_id>` directories older than `retention`
-/// relative to `now`, skipping symlinks and non-directories without following links.
+/// relative to `now`, skipping any directory in `active_attempt_ids`, symlinks,
+/// and non-directories without following links.
 pub fn prune_old_attempts_at(
     state_dir: &std::path::Path,
     retention: std::time::Duration,
     now: std::time::SystemTime,
+    active_attempt_ids: &BTreeSet<String>,
 ) -> Result<usize, String> {
     let attempts_root = state_dir.join("attempts");
     let root_meta = match std::fs::symlink_metadata(&attempts_root) {
@@ -598,9 +615,10 @@ pub fn prune_old_attempts_at(
             continue;
         }
         let path = entry.path();
-        // Detached artifacts can be referenced by live units, post-processing,
-        // or Governance/close receipts. Only the supervisor can release them.
-        if path.join("manifest.json").exists() {
+        let Some(attempt_id) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if active_attempt_ids.contains(attempt_id) {
             continue;
         }
         let Ok(dir_meta) = std::fs::symlink_metadata(&path) else {
@@ -1186,6 +1204,10 @@ impl StageExecutor for SystemdStageExecutor {
                             "failure_class": agy_err.failure_class,
                             "exit_code": output.status.code(),
                             "summary": err_msg,
+                            "input_tokens": agy_err.input_tokens,
+                            "output_tokens": agy_err.output_tokens,
+                            "total_tokens": agy_err.total_tokens,
+                            "duration_seconds": agy_err.duration_seconds,
                         });
                         write_secure_file(
                             &attempt_dir.join("result.json"),
@@ -1209,6 +1231,7 @@ impl StageExecutor for SystemdStageExecutor {
                     input_tokens: parsed.input_tokens,
                     output_tokens: parsed.output_tokens,
                     total_tokens: parsed.total_tokens,
+                    duration_seconds: None,
                     sha_before,
                     sha_after,
                     diff_files,
@@ -2620,13 +2643,59 @@ pub fn harvest_detached(
     } else {
         Some(observation.exit_code.unwrap_or(1).max(1))
     };
+    let is_systemd_timeout = observation.result.trim().eq_ignore_ascii_case("timeout");
+    let effective_stderr = if is_systemd_timeout
+        && !stderr.contains("timed out")
+        && !stderr.contains("TIMEOUT")
+        && !stderr.contains("RuntimeMaxSec")
+    {
+        if stderr.trim().is_empty() {
+            "systemd unit timed out (Result=timeout RuntimeMaxSec)".to_owned()
+        } else {
+            format!(
+                "{}\nsystemd unit timed out (Result=timeout RuntimeMaxSec)",
+                stderr.trim_end()
+            )
+        }
+    } else {
+        stderr.clone()
+    };
     let mut result = match manifest.route.family {
         ModelFamily::GeminiAgy => {
-            crate::v2::pipeline::parse_agy_cli_response(&stdout, &stderr, code)
-                .map_err(|e| e.to_string())?
+            match crate::v2::pipeline::parse_agy_cli_response(&stdout, &effective_stderr, code) {
+                Ok(res) => res,
+                Err(mut agy_err) => {
+                    if is_systemd_timeout && agy_err.failure_class == "AGY_EXIT" {
+                        agy_err.failure_class = "AGY_TIMEOUT".to_owned();
+                    }
+                    if agy_err.input_tokens.is_some()
+                        || agy_err.output_tokens.is_some()
+                        || agy_err.total_tokens.is_some()
+                        || agy_err.duration_seconds.is_some()
+                    {
+                        StageExecutionResult {
+                            status: "FAILED".to_owned(),
+                            summary: truncate_utf8_bytes(&agy_err.to_string(), MAX_SUMMARY_BYTES),
+                            review_markdown: None,
+                            review_output: None,
+                            stage_output: None,
+                            invocation_id: None,
+                            input_tokens: agy_err.input_tokens,
+                            output_tokens: agy_err.output_tokens,
+                            total_tokens: agy_err.total_tokens,
+                            duration_seconds: agy_err.duration_seconds,
+                            sha_before: None,
+                            sha_after: None,
+                            diff_files: Vec::new(),
+                        }
+                    } else {
+                        return Err(agy_err.to_string());
+                    }
+                }
+            }
         }
         ModelFamily::OpenAiSol => {
-            let p = parse_codex_jsonl_output(&stdout, &stderr, code)?;
+            let p = parse_codex_jsonl_output(&stdout, &effective_stderr, code)?;
             StageExecutionResult {
                 status: p.status,
                 summary: p.summary,
@@ -2637,6 +2706,7 @@ pub fn harvest_detached(
                 input_tokens: p.input_tokens,
                 output_tokens: p.output_tokens,
                 total_tokens: p.total_tokens,
+                duration_seconds: None,
                 sha_before: None,
                 sha_after: None,
                 diff_files: Vec::new(),
@@ -3152,7 +3222,7 @@ other-user-unit.service loaded active running
     }
 
     #[test]
-    fn gemini_worker_timeout_is_clamped_to_1800() {
+    fn gemini_worker_timeout_is_clamped_to_3600_and_systemd_has_grace() {
         let task = sample_task();
         let mut route = resolve_stage_route("M", "impl", 0, None).unwrap().unwrap();
         route.family = ModelFamily::GeminiAgy;
@@ -3180,6 +3250,15 @@ other-user-unit.service loaded active running
         assert!(spec.args.contains(&"RemainAfterExit=yes".to_owned()));
         assert!(spec.args.contains(&"CollectMode=inactive".to_owned()));
         assert!(spec.args.contains(&"--service-type=exec".to_owned()));
+        assert!(
+            spec.args.contains(&format!(
+                "RuntimeMaxSec={}",
+                3600 + SYSTEMD_RUNTIME_MAX_GRACE_SECS
+            )),
+            "expected RuntimeMaxSec=3660, got {:?}",
+            spec.args
+        );
+        assert_eq!(spec.timeout_secs, 3600);
         assert!(
             !spec
                 .args
@@ -3210,10 +3289,23 @@ other-user-unit.service loaded active running
         assert_eq!(payload["action"], "run");
         assert_eq!(payload["model"], "gemini-4-hydrogen-high");
         assert_eq!(payload["task"], secret_prompt);
-        assert_eq!(payload["timeout_seconds"], 1800);
+        assert_eq!(payload["timeout_seconds"], 3600);
         assert_eq!(payload["orchestration_id"], "zach-005");
 
-        // Also verify lower bound clamp (30)
+        // Verify upper bound clamp (3600) while systemd keeps +60s grace above route.timeout_secs
+        route.timeout_secs = 7200;
+        let high_spec =
+            build_systemd_stage_command_with_env(&task, "att-gemini-high", &route, "p", &clean_env)
+                .expect("build high timeout command");
+        let high_payload: serde_json::Value =
+            serde_json::from_str(&high_spec.stdin_payload).expect("valid JSON");
+        assert_eq!(high_payload["timeout_seconds"], 3600);
+        assert!(high_spec.args.contains(&format!(
+            "RuntimeMaxSec={}",
+            7200 + SYSTEMD_RUNTIME_MAX_GRACE_SECS
+        )));
+
+        // Also verify lower bound clamp (30) and +60s grace
         route.timeout_secs = 5;
         let low_spec =
             build_systemd_stage_command_with_env(&task, "att-gemini-low", &route, "p", &clean_env)
@@ -3221,6 +3313,23 @@ other-user-unit.service loaded active running
         let low_payload: serde_json::Value =
             serde_json::from_str(&low_spec.stdin_payload).expect("valid JSON");
         assert_eq!(low_payload["timeout_seconds"], 30);
+        assert!(low_spec.args.contains(&format!(
+            "RuntimeMaxSec={}",
+            5 + SYSTEMD_RUNTIME_MAX_GRACE_SECS
+        )));
+
+        // Verify OpenAiSol route also receives +60s RuntimeMaxSec grace
+        let mut codex_route = resolve_stage_route("M", "impl", 0, None).unwrap().unwrap();
+        codex_route.family = ModelFamily::OpenAiSol;
+        codex_route.timeout_secs = 1800;
+        let codex_spec =
+            build_systemd_stage_command_with_env(&task, "att-codex", &codex_route, "p", &clean_env)
+                .expect("build codex command");
+        assert!(codex_spec.args.contains(&format!(
+            "RuntimeMaxSec={}",
+            1800 + SYSTEMD_RUNTIME_MAX_GRACE_SECS
+        )));
+        assert_eq!(codex_spec.timeout_secs, 1800);
     }
 
     #[test]
@@ -3956,6 +4065,7 @@ print(json.dumps({
             state_dir.path(),
             std::time::Duration::from_secs(7 * 86_400),
             std::time::SystemTime::now(),
+            &BTreeSet::new(),
         )
         .expect("prune succeeds");
 
@@ -4446,5 +4556,179 @@ Binary files /dev/null and b/assets/logo.bin differ
             err.contains(&missing_bin.display().to_string()),
             "err={err}"
         );
+    }
+
+    #[test]
+    fn harvest_detached_maps_systemd_result_timeout_to_agy_timeout() {
+        let root = TempTestDir::new("zach071-harvest-timeout");
+        let attempt_dir = root.path().join("att-timeout");
+        std::fs::create_dir_all(&attempt_dir).unwrap();
+        let mut task = sample_task();
+        task.worktree_path = Some(root.path().display().to_string());
+        let mut route = resolve_stage_route("M", "impl", 0, Some(ModelFamily::GeminiAgy))
+            .unwrap()
+            .unwrap();
+        route.family = ModelFamily::GeminiAgy;
+        let env = BTreeMap::from([("HOME".into(), root.path().display().to_string())]);
+        let spec =
+            build_systemd_stage_command_with_env(&task, "att-timeout", &route, "p", &env).unwrap();
+        let manifest = AttemptManifest {
+            mount_layout_version: 1,
+            attempt_id: "att-timeout".into(),
+            task_id: task.task_id.clone(),
+            route,
+            spec,
+            sha_before: "0000000".into(),
+            attempt_dir: attempt_dir.clone(),
+        };
+        let timeout_obs = UnitObservation::parse(
+            "LoadState=loaded\nActiveState=failed\nSubState=failed\nResult=timeout\nExecMainCode=2\nExecMainStatus=15\nInvocationID=inv-1\nControlGroup=/user.slice/zach\n",
+        );
+
+        // 1. Empty stdout + empty stderr on Result=timeout -> AGY_TIMEOUT (never AGY_EXIT)
+        std::fs::write(attempt_dir.join("stdout.jsonl"), "").unwrap();
+        std::fs::write(attempt_dir.join("stderr.log"), "").unwrap();
+        let err = harvest_detached(&manifest, &timeout_obs).unwrap_err();
+        assert!(
+            err.starts_with("AGY_TIMEOUT:"),
+            "expected AGY_TIMEOUT for empty stdout, got: {err}"
+        );
+
+        // 2. Truncated non-JSON stdout + empty stderr on Result=timeout -> AGY_TIMEOUT
+        std::fs::write(attempt_dir.join("stdout.jsonl"), "{\"status\": \"running\"").unwrap();
+        let err = harvest_detached(&manifest, &timeout_obs).unwrap_err();
+        assert!(
+            err.starts_with("AGY_TIMEOUT:"),
+            "expected AGY_TIMEOUT for truncated non-JSON stdout, got: {err}"
+        );
+
+        // 3. Valid completed JSON envelope flushed before timeout is preserved
+        std::fs::write(
+            attempt_dir.join("stdout.jsonl"),
+            serde_json::json!({
+                "status": "ok",
+                "execution_succeeded": true,
+                "summary": "completed right before limit",
+                "duration_seconds": 1799.2,
+                "usage": { "input_tokens": 100, "output_tokens": 50, "total_tokens": 150 }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let ok = harvest_detached(&manifest, &timeout_obs).unwrap();
+        assert_eq!(ok.status, "PASSED");
+        assert_eq!(ok.total_tokens, Some(150));
+        assert_eq!(ok.duration_seconds, Some(1799.2));
+    }
+
+    #[test]
+    fn harvest_detached_preserves_usage_and_duration_on_failed_agy_envelope() {
+        let root = TempTestDir::new("zach071-harvest-failed-usage");
+        let attempt_dir = root.path().join("att-failed-usage");
+        std::fs::create_dir_all(&attempt_dir).unwrap();
+        let mut task = sample_task();
+        task.worktree_path = Some(root.path().display().to_string());
+        let mut route = resolve_stage_route("M", "impl", 0, Some(ModelFamily::GeminiAgy))
+            .unwrap()
+            .unwrap();
+        route.family = ModelFamily::GeminiAgy;
+        let env = BTreeMap::from([("HOME".into(), root.path().display().to_string())]);
+        let spec =
+            build_systemd_stage_command_with_env(&task, "att-failed-usage", &route, "p", &env)
+                .unwrap();
+        let manifest = AttemptManifest {
+            mount_layout_version: 1,
+            attempt_id: "att-failed-usage".into(),
+            task_id: task.task_id.clone(),
+            route,
+            spec,
+            sha_before: "abc1234".into(),
+            attempt_dir: attempt_dir.clone(),
+        };
+        let obs = UnitObservation::parse(
+            "LoadState=loaded\nActiveState=failed\nSubState=failed\nResult=exit-code\nExecMainCode=1\nExecMainStatus=1\nInvocationID=inv-fail-1\nControlGroup=/user.slice/zach\n",
+        );
+        std::fs::write(
+            attempt_dir.join("stdout.jsonl"),
+            serde_json::json!({
+                "status": "error",
+                "execution_succeeded": false,
+                "process_status": "timeout",
+                "error_code": "AGY_TIMEOUT",
+                "summary": "worker timed out after 1800s",
+                "duration_seconds": 1800.4,
+                "usage": {
+                    "input_tokens": 55000,
+                    "output_tokens": 2500,
+                    "total_tokens": 57500
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(attempt_dir.join("stderr.log"), "").unwrap();
+
+        let result =
+            harvest_detached(&manifest, &obs).expect("failed envelope with usage returns Ok");
+        assert_eq!(result.status, "FAILED");
+        assert!(
+            result.summary.starts_with("AGY_TIMEOUT:"),
+            "summary={}",
+            result.summary
+        );
+        assert_eq!(result.input_tokens, Some(55_000));
+        assert_eq!(result.output_tokens, Some(2_500));
+        assert_eq!(result.total_tokens, Some(57_500));
+        assert_eq!(result.duration_seconds, Some(1800.4));
+        assert_eq!(result.invocation_id.as_deref(), Some("inv-fail-1"));
+
+        let harvest_json: StageExecutionResult =
+            serde_json::from_slice(&std::fs::read(attempt_dir.join("harvest.json")).unwrap())
+                .expect("valid harvest.json");
+        assert_eq!(harvest_json.status, "FAILED");
+        assert_eq!(harvest_json.total_tokens, Some(57_500));
+        assert_eq!(harvest_json.duration_seconds, Some(1800.4));
+    }
+
+    #[test]
+    fn prune_old_attempts_at_prunes_manifest_dirs_unless_in_active_attempt_ids() {
+        let state_dir = TempTestDir::new("zach071-prune-active-set");
+        let attempts_dir = state_dir.path().join("attempts");
+        let old_completed = attempts_dir.join("att-old-completed");
+        let old_active = attempts_dir.join("att-old-active");
+        let fresh_completed = attempts_dir.join("att-fresh-completed");
+        for dir in [&old_completed, &old_active, &fresh_completed] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("manifest.json"), "{}").unwrap();
+        }
+
+        for dir in [&old_completed, &old_active] {
+            let status = Command::new("touch")
+                .args(["-d", "10 days ago"])
+                .arg(dir)
+                .status()
+                .expect("run touch");
+            assert!(status.success());
+        }
+
+        let active = BTreeSet::from(["att-old-active".to_owned()]);
+        let pruned = prune_old_attempts_at(
+            state_dir.path(),
+            std::time::Duration::from_secs(7 * 86_400),
+            std::time::SystemTime::now(),
+            &active,
+        )
+        .expect("prune succeeds");
+
+        assert_eq!(pruned, 1);
+        assert!(
+            !old_completed.exists(),
+            "expired completed dir with manifest.json must be pruned"
+        );
+        assert!(
+            old_active.exists(),
+            "expired dir in active_attempt_ids must be preserved"
+        );
+        assert!(fresh_completed.exists(), "fresh dir must be preserved");
     }
 }

@@ -565,6 +565,21 @@ pub fn normalize_repo_path(raw: &str) -> String {
     }
 }
 
+fn extract_attempt_id_from_path(raw: &str) -> Option<String> {
+    let components: Vec<_> = Path::new(raw).components().collect();
+    let mut found = None;
+    for window in components.windows(2) {
+        if window[0].as_os_str() == "attempts"
+            && let std::path::Component::Normal(id) = window[1]
+            && let Some(id_str) = id.to_str()
+            && !id_str.trim().is_empty()
+        {
+            found = Some(id_str.to_owned());
+        }
+    }
+    found
+}
+
 pub fn paths_overlap(a: &str, b: &str) -> bool {
     let a = normalize_repo_path(a);
     let b = normalize_repo_path(b);
@@ -2863,6 +2878,96 @@ impl V2Store {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    /// Returns the set of `attempt_id`s that are non-terminal or referenced by
+    /// active tasks, in-flight lifecycle operations, or non-terminal task checkpoints.
+    pub fn active_attempt_ids(&self) -> Result<BTreeSet<String>, V2StoreError> {
+        let mut active = BTreeSet::new();
+
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT attempt_id FROM stage_attempts
+                 WHERE phase != 'COMPLETE' OR ended_epoch IS NULL OR status = 'RUNNING'",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                let id = row?;
+                if !id.trim().is_empty() {
+                    active.insert(id);
+                }
+            }
+        }
+
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT active_attempt_id, status, memory_json FROM tasks")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (active_attempt_id, status, memory_json) = row?;
+                if let Some(id) = active_attempt_id
+                    && !id.trim().is_empty()
+                {
+                    active.insert(id);
+                }
+                if !matches!(status.trim(), "Done" | "Cancelled") {
+                    let memory: TaskMemory = serde_json::from_str(&memory_json).map_err(|e| {
+                        V2StoreError(format!(
+                            "decode task memory_json in active_attempt_ids: {e}"
+                        ))
+                    })?;
+                    if let Some(cp) = memory.pipeline_checkpoint.as_ref()
+                        && !cp.attempt_id.trim().is_empty()
+                    {
+                        active.insert(cp.attempt_id.clone());
+                    }
+                    if let Some(id) = memory.suspended_impl_attempt_id.as_deref()
+                        && !id.trim().is_empty()
+                    {
+                        active.insert(id.to_owned());
+                    }
+                    if let Some(path) = memory.last_pr_review_evidence_path.as_deref()
+                        && let Some(id) = extract_attempt_id_from_path(path)
+                    {
+                        active.insert(id);
+                    }
+                }
+            }
+        }
+
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT attempt_id, body_path FROM lifecycle_ops WHERE state != 'ACKNOWLEDGED'",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })?;
+            for row in rows {
+                let (attempt_id, body_path) = row?;
+                if let Some(id) = attempt_id
+                    && !id.trim().is_empty()
+                {
+                    active.insert(id);
+                }
+                if let Some(path) = body_path
+                    && let Some(id) = extract_attempt_id_from_path(&path)
+                {
+                    active.insert(id);
+                }
+            }
+        }
+
+        Ok(active)
     }
 
     pub fn acquire_path_locks(
@@ -6230,5 +6335,166 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn active_attempt_ids_tracks_in_flight_references_excludes_terminal_and_fails_closed() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        let now = now_epoch();
+
+        // 1. Active/non-terminal task referencing active_attempt_id, pipeline_checkpoint,
+        //    suspended_impl_attempt_id, and last_pr_review_evidence_path.
+        let mut active_task = sample_task("ZACH-071-ACTIVE", "In Progress", vec![]);
+        active_task.active_attempt_id = Some("att-task-active".into());
+        active_task.memory.pipeline_checkpoint = Some(PipelineCheckpoint {
+            attempt_id: "att-checkpoint".into(),
+            operation: "VALIDATE".into(),
+        });
+        active_task.memory.suspended_impl_attempt_id = Some("att-suspended".into());
+        active_task.memory.last_pr_review_evidence_path =
+            Some("/var/lib/zach/attempts/att-evidence/stage-evidence.md".into());
+        store.upsert_task(&active_task).unwrap();
+
+        // 2. Terminal ("Done") task whose memory still holds old checkpoint/evidence paths:
+        //    its historical memory references must NOT protect expired attempt dirs.
+        let mut done_task = sample_task("ZACH-071-DONE", "Done", vec![]);
+        done_task.memory.pipeline_checkpoint = Some(PipelineCheckpoint {
+            attempt_id: "att-done-checkpoint".into(),
+            operation: "VALIDATE".into(),
+        });
+        done_task.memory.last_pr_review_evidence_path =
+            Some("/var/lib/zach/attempts/att-done-evidence/stage-evidence.md".into());
+        store.upsert_task(&done_task).unwrap();
+
+        // 3. Stage attempts: one non-COMPLETE, one ended_epoch=None, one RUNNING, one COMPLETE.
+        let make_attempt =
+            |id: &str, task_id: &str, phase: &str, status: &str, ended: Option<i64>| {
+                StageAttemptRecord {
+                    attempt_id: id.into(),
+                    task_id: task_id.into(),
+                    stage: "impl".into(),
+                    model: "gemini-4-hydrogen-high".into(),
+                    effort: "high".into(),
+                    systemd_unit: None,
+                    invocation_id: None,
+                    started_epoch: now - 100,
+                    ended_epoch: ended,
+                    status: status.into(),
+                    failure_class: None,
+                    summary: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    total_tokens: None,
+                    sha_before: None,
+                    sha_after: None,
+                    phase: phase.into(),
+                    last_liveness_epoch: now,
+                    last_output_bytes: 0,
+                    last_cpu_usage_usec: None,
+                    control_group: None,
+                    exit_code: None,
+                    exit_code_kind: None,
+                    retry_generation: 0,
+                }
+            };
+        store
+            .record_stage_attempt(&make_attempt(
+                "att-harvested",
+                "ZACH-071-ACTIVE",
+                "HARVESTED",
+                "PASSED",
+                Some(now),
+            ))
+            .unwrap();
+        store
+            .record_stage_attempt(&make_attempt(
+                "att-no-end",
+                "ZACH-071-ACTIVE",
+                "COMPLETE",
+                "PASSED",
+                None,
+            ))
+            .unwrap();
+        store
+            .record_stage_attempt(&make_attempt(
+                "att-running",
+                "ZACH-071-ACTIVE",
+                "COMPLETE",
+                "RUNNING",
+                Some(now),
+            ))
+            .unwrap();
+        store
+            .record_stage_attempt(&make_attempt(
+                "att-finished",
+                "ZACH-071-DONE",
+                "COMPLETE",
+                "PASSED",
+                Some(now - 50),
+            ))
+            .unwrap();
+
+        // 4. Lifecycle ops: one PENDING (with attempt_id and body_path), one ACKNOWLEDGED.
+        store
+            .conn
+            .execute(
+                "INSERT INTO lifecycle_ops(operation_id,task_id,kind,args_json,body_path,state,created_epoch,updated_epoch,attempt_id)
+                 VALUES('op-pending','ZACH-071-ACTIVE','stage','[]','/state/attempts/att-op-body/body.md','PENDING',1,1,'att-op-id')",
+                [],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO lifecycle_ops(operation_id,task_id,kind,args_json,body_path,state,created_epoch,updated_epoch,attempt_id)
+                 VALUES('op-acked','ZACH-071-DONE','stage','[]','/state/attempts/att-acked-body/body.md','ACKNOWLEDGED',1,1,'att-acked-id')",
+                [],
+            )
+            .unwrap();
+
+        let ids = store.active_attempt_ids().unwrap();
+        for expected in [
+            "att-task-active",
+            "att-checkpoint",
+            "att-suspended",
+            "att-evidence",
+            "att-harvested",
+            "att-no-end",
+            "att-running",
+            "att-op-id",
+            "att-op-body",
+        ] {
+            assert!(
+                ids.contains(expected),
+                "missing expected active id {expected} in {ids:?}"
+            );
+        }
+        for excluded in [
+            "att-finished",
+            "att-done-checkpoint",
+            "att-done-evidence",
+            "att-acked-id",
+            "att-acked-body",
+        ] {
+            assert!(
+                !ids.contains(excluded),
+                "unexpected terminal id {excluded} in {ids:?}"
+            );
+        }
+
+        // 5. Fail closed when a non-terminal task has corrupt memory_json.
+        store
+            .conn
+            .execute(
+                "UPDATE tasks SET memory_json = '{not-valid-json' WHERE task_id = 'ZACH-071-ACTIVE'",
+                [],
+            )
+            .unwrap();
+        let err = store.active_attempt_ids().unwrap_err();
+        assert!(
+            err.0
+                .contains("decode task memory_json in active_attempt_ids"),
+            "unexpected error: {err}"
+        );
     }
 }
