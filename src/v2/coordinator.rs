@@ -694,6 +694,7 @@ impl Coordinator {
                                                 .and_then(|cp| cp.merge_sha.as_deref()),
                                         )
                                         .map_err(|e| e.to_string())?;
+                                    self.emit_task_audit_digest(&task.task_id)?;
                                 }
                             } else if key.starts_with("merge:") {
                                 self.merge_failed(&task_id, &error)?;
@@ -1664,6 +1665,7 @@ impl Coordinator {
             WorkerResult::StartupReconciled { adopted, retired } => {
                 self.startup_ownership()?;
                 for attempt in retired {
+                    self.persist_attempt_audit(&attempt);
                     self.store
                         .record_stage_attempt(&attempt)
                         .map_err(|e| e.to_string())?;
@@ -2035,6 +2037,7 @@ impl Coordinator {
                 else {
                     return Ok(());
                 };
+                self.persist_attempt_audit(&attempt);
                 self.attached.remove(&id);
                 self.manifests.remove(&id);
                 let mut task = self.task(&attempt.task_id)?;
@@ -2052,6 +2055,9 @@ impl Coordinator {
                         .transition_attempt(&task, &attempt, true, None)
                         .map_err(|e| e.to_string())?;
                     self.invalidate_tasks_cache();
+                    if task.status == "Blocked" {
+                        self.emit_task_audit_digest(&task.task_id)?;
+                    }
                 } else if attempt.status != "PASSED" {
                     self.fail_task(
                         &attempt.task_id,
@@ -2345,12 +2351,64 @@ impl Coordinator {
                 .remove_merge_queue_entry(&task.repository, id)
                 .map_err(|e| e.to_string())?;
         }
+        self.emit_task_audit_digest(id)?;
         Ok(())
+    }
+
+    fn persist_attempt_audit(&mut self, attempt: &StageAttemptRecord) {
+        let attempt_dir = self.state_dir.join("attempts").join(&attempt.attempt_id);
+        let mut record =
+            crate::v2::audit::read_or_extract_attempt_audit_record(&attempt_dir, attempt);
+        if record.error_code.is_none() && attempt.status != "PASSED" {
+            record.error_code = attempt
+                .failure_class
+                .as_deref()
+                .or(attempt.summary.as_deref())
+                .map(|s| {
+                    crate::v2::audit::redact_adr004_text(
+                        s,
+                        crate::v2::audit::MAX_AUDIT_DIGEST_ERROR_SIGNATURE_LEN,
+                    )
+                })
+                .filter(|s| !s.is_empty());
+        }
+        let _ = self.store.record_attempt_audit(&record);
+    }
+
+    fn emit_task_audit_digest(&mut self, task_id: &str) -> Result<(), String> {
+        let task = self.task(task_id)?;
+        match crate::v2::audit::build_task_audit_digest(&self.store, task_id) {
+            Ok(digest) => match crate::v2::audit::validate_task_audit_digest(&digest) {
+                Ok(payload) => {
+                    self.store
+                        .append_event(
+                            &task.task_id,
+                            &task.task_group,
+                            "TASK_AUDIT_DIGEST",
+                            &payload,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    Ok(())
+                }
+                Err(probs) => {
+                    let err = format!("TASK_AUDIT_DIGEST validation failed: {}", probs.join("; "));
+                    self.error_event(Some(task_id), Some("audit-digest"), &err)
+                }
+            },
+            Err(err) => self.error_event(Some(task_id), Some("audit-digest"), &err),
+        }
     }
 
     fn fail_task(&mut self, task_id: &str, error: &str, class: Option<&str>) -> Result<(), String> {
         let mut task = self.task(task_id)?;
         let stage = task.current_stage.clone().unwrap_or_else(|| "impl".into());
+        let is_check_divergence = task
+            .memory
+            .pipeline_checkpoint
+            .as_ref()
+            .is_some_and(|cp| cp.operation == "CHECKS")
+            || error.starts_with("check '")
+            || error.starts_with("failed to run check '");
         let class =
             class.unwrap_or_else(|| pipeline::classify_failure_class(&stage, "FAILED", error));
         let attempts = self
@@ -2402,6 +2460,15 @@ impl Coordinator {
         let now = now_epoch();
         attempt.ended_epoch = Some(attempt.ended_epoch.unwrap_or(now).max(now));
         attempt.phase = "COMPLETE".into();
+        self.persist_attempt_audit(&attempt);
+        if is_check_divergence {
+            let _ = self.store.mark_attempt_check_divergence(
+                &attempt.attempt_id,
+                &task.task_id,
+                &stage,
+                Some(class),
+            );
+        }
         let is_quota = pipeline::is_quota_or_usage_limit_error(error);
         let prior_failures = attempts
             .iter()
@@ -2539,6 +2606,9 @@ impl Coordinator {
             .transition_attempt(&task, &attempt, true, decision.as_ref())
             .map_err(|e| e.to_string())?;
         self.invalidate_tasks_cache();
+        if task.status == "Blocked" {
+            self.emit_task_audit_digest(&task.task_id)?;
+        }
         Ok(())
     }
 
@@ -2715,6 +2785,7 @@ impl Coordinator {
                     task.reviewed_sha.as_deref(),
                 )
                 .map_err(|e| e.to_string())?;
+            self.emit_task_audit_digest(&op.task_id)?;
         }
         Ok(())
     }
@@ -2923,6 +2994,9 @@ impl Coordinator {
         self.store
             .acknowledge_lifecycle(&task, &op, completed_attempt.as_deref())
             .map_err(|e| e.to_string())?;
+        if op.kind == "close" || task.status == "Blocked" {
+            self.emit_task_audit_digest(&task.task_id)?;
+        }
         Ok(())
     }
 
@@ -3408,7 +3482,11 @@ impl Coordinator {
         task.memory
             .applied_decisions
             .push(decision.decision_id.clone());
-        self.save(&task)
+        self.save(&task)?;
+        if task.status == "Blocked" {
+            self.emit_task_audit_digest(&task.task_id)?;
+        }
+        Ok(())
     }
 
     fn delivery_verified(&self, task: &TaskRecord) -> Result<bool, String> {
@@ -3745,6 +3823,7 @@ impl Coordinator {
                 self.store
                     .update_merge_queue_state(&task.repository, id, "MERGE_QUEUE_BLOCKED")
                     .map_err(|e| e.to_string())?;
+                self.emit_task_audit_digest(id)?;
             }
         }
         Ok(())
@@ -3821,7 +3900,9 @@ impl Coordinator {
         };
         self.store
             .transition_task(&task, None, !uncertain && !close, Some(&decision))
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        self.emit_task_audit_digest(id)?;
+        Ok(())
     }
 }
 
@@ -11024,5 +11105,187 @@ mod tests {
             }),
             "expected SUPERVISOR_ERROR event for prune-attempts, got {events:?}"
         );
+    }
+
+    #[test]
+    fn coordinator_persists_attempt_audits_and_emits_fail_closed_task_audit_digest_on_done_and_blocked()
+     {
+        let dir = TestDirectory::new();
+        let db_path = dir.0.join("zach.db");
+        let (mut c, _handle) = Coordinator::create(V2Store::open(&db_path).unwrap(), dir.0.clone());
+
+        // 1. WorkerResult::Stopped persists attempt_audits from <attempt_dir>/audit.json.
+        let mut t = task("ZACH-072-T1");
+        t.status = "In Progress".into();
+        t.current_stage = Some("impl".into());
+        t.active_attempt_id = Some("att-stopped-1".into());
+        t.memory.pipeline_checkpoint = Some(PipelineCheckpoint {
+            attempt_id: "att-stopped-1".into(),
+            operation: "CLEANUP_PENDING".into(),
+        });
+        c.save(&t).unwrap();
+
+        let att_dir = dir.0.join("attempts/att-stopped-1");
+        std::fs::create_dir_all(&att_dir).unwrap();
+        std::fs::write(
+            att_dir.join("manifest.json"),
+            r#"{"attempt_id":"att-stopped-1","task_id":"ZACH-072-T1","route":{"stage":"impl","family":"OpenAiSol"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            att_dir.join("stdout.jsonl"),
+            [
+                r#"{"type":"item.completed","item":{"id":"1","type":"file_change","changes":[{"path":"src/lib.rs"}]}}"#,
+                r#"{"type":"item.completed","item":{"id":"2","type":"command_execution","command":"cargo test","exit_code":101,"status":"failed"}}"#,
+                r#"{"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":300,"output_tokens":200,"reasoning_output_tokens":50}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        crate::v2::audit::extract_and_write_attempt_audit(&att_dir).unwrap();
+
+        let stopped_attempt = StageAttemptRecord {
+            attempt_id: "att-stopped-1".into(),
+            task_id: "ZACH-072-T1".into(),
+            stage: "impl".into(),
+            model: "gpt-6.1-sol".into(),
+            effort: "medium".into(),
+            systemd_unit: Some("zach-test.service".into()),
+            invocation_id: None,
+            started_epoch: now_epoch() - 5,
+            ended_epoch: Some(now_epoch()),
+            status: "PASSED".into(),
+            failure_class: None,
+            summary: Some("ok".into()),
+            input_tokens: Some(1000),
+            output_tokens: Some(200),
+            total_tokens: Some(1200),
+            sha_before: None,
+            sha_after: None,
+            phase: "HARVESTED".into(),
+            last_liveness_epoch: now_epoch(),
+            last_output_bytes: 0,
+            last_cpu_usage_usec: None,
+            control_group: None,
+            exit_code: Some(0),
+            exit_code_kind: Some("exited".into()),
+            retry_generation: 0,
+        };
+        c.store.record_stage_attempt(&stopped_attempt).unwrap();
+
+        c.worker_result(WorkerResult::Stopped("att-stopped-1".into()))
+            .unwrap();
+        let persisted = c
+            .store
+            .get_attempt_audit("att-stopped-1")
+            .unwrap()
+            .expect("attempt_audits row persisted on Stopped");
+        assert_eq!(persisted.turn_count, 1);
+        assert_eq!(persisted.tool_call_count, 2);
+        assert_eq!(persisted.tool_error_count, 1);
+        assert_eq!(persisted.edit_compile_fail_loops, 1);
+        assert_eq!(persisted.cached_input_tokens, Some(300));
+        assert_eq!(persisted.reasoning_tokens, Some(50));
+        assert!(!persisted.check_divergence);
+
+        // 2. Post-harvest VALIDATE failure (policy) must NOT falsely flag check_divergence,
+        //    and terminal Blocked emits TASK_AUDIT_DIGEST.
+        let mut t_val = task("ZACH-072-VAL");
+        t_val.status = "In Progress".into();
+        t_val.current_stage = Some("impl".into());
+        t_val.active_attempt_id = Some("att-val-1".into());
+        t_val.memory.pipeline_checkpoint = Some(PipelineCheckpoint {
+            attempt_id: "att-val-1".into(),
+            operation: "VALIDATE".into(),
+        });
+        c.save(&t_val).unwrap();
+        let mut val_attempt = stopped_attempt.clone();
+        val_attempt.attempt_id = "att-val-1".into();
+        val_attempt.task_id = "ZACH-072-VAL".into();
+        c.store.record_stage_attempt(&val_attempt).unwrap();
+        // Policy limit is 0 so first failure transitions directly to Blocked.
+        c.fail_task(
+            "ZACH-072-VAL",
+            "scope violation: modified forbidden path .github/ci.yml",
+            Some("policy"),
+        )
+        .unwrap();
+        let val_audit = c.store.get_attempt_audit("att-val-1").unwrap().unwrap();
+        assert!(
+            !val_audit.check_divergence,
+            "VALIDATE scope_violation failure must not flag check_divergence"
+        );
+        let val_events = c.store.list_task_events("ZACH-072-VAL").unwrap();
+        let blocked_digest_ev = val_events
+            .iter()
+            .find(|e| e.event_type == "TASK_AUDIT_DIGEST")
+            .expect("Blocked transition must emit TASK_AUDIT_DIGEST");
+        let blocked_digest: crate::v2::audit::TaskAuditDigest =
+            serde_json::from_value(blocked_digest_ev.payload.clone()).unwrap();
+        assert!(crate::v2::audit::validate_task_audit_digest(&blocked_digest).is_ok());
+        assert!(!blocked_digest.check_divergence);
+        assert!(blocked_digest.blocked_events >= 1);
+
+        // 3. Post-harvest CHECKS failure marks check_divergence = true.
+        let mut t_chk = c.task("ZACH-072-T1").unwrap();
+        t_chk.memory.pipeline_checkpoint = Some(PipelineCheckpoint {
+            attempt_id: "att-stopped-1".into(),
+            operation: "CHECKS".into(),
+        });
+        c.save(&t_chk).unwrap();
+        c.fail_task(
+            "ZACH-072-T1",
+            "check 'cargo test' failed with exit code 101",
+            Some("semantic"),
+        )
+        .unwrap();
+        let after_chk = c.store.get_attempt_audit("att-stopped-1").unwrap().unwrap();
+        assert!(
+            after_chk.check_divergence,
+            "CHECKS failure must mark check_divergence = true"
+        );
+
+        // 4. TASK_DONE via lifecycle_ack("close") emits validated TASK_AUDIT_DIGEST.
+        let mut t_done = c.task("ZACH-072-T1").unwrap();
+        t_done.status = "Queued for Merge".into();
+        t_done.memory.merge_checkpoint = Some(MergeCheckpoint {
+            phase: "CLOSE_PENDING".into(),
+            target_sha: "abc1234".into(),
+            pr_number: 146,
+            merge_sha: Some("def5678".into()),
+            post_merge_verified: true,
+            phase_started_epoch: now_epoch(),
+        });
+        c.save(&t_done).unwrap();
+        c.store
+            .enqueue_lifecycle(&crate::v2::store::LifecycleOperation {
+                attempt_id: None,
+                decision_id: None,
+                operation_id: "close-ZACH-072-T1".into(),
+                task_id: "ZACH-072-T1".into(),
+                kind: "close".into(),
+                args: vec!["close".into(), "ZACH-072-T1".into()],
+                body_path: None,
+                depends_on: None,
+                state: "PENDING".into(),
+                retry_epoch: 0,
+                attempts: 1,
+                last_error: None,
+            })
+            .unwrap();
+        c.lifecycle_ack("close-ZACH-072-T1", "closed").unwrap();
+        let done_events = c.store.list_task_events("ZACH-072-T1").unwrap();
+        let done_digest_ev = done_events
+            .iter()
+            .rfind(|e| e.event_type == "TASK_AUDIT_DIGEST")
+            .expect("TASK_DONE must emit TASK_AUDIT_DIGEST");
+        let done_digest: crate::v2::audit::TaskAuditDigest =
+            serde_json::from_value(done_digest_ev.payload.clone()).unwrap();
+        assert!(crate::v2::audit::validate_task_audit_digest(&done_digest).is_ok());
+        assert_eq!(done_digest.task_id, "ZACH-072-T1");
+        assert_eq!(done_digest.executor, "zach");
+        assert!(done_digest.check_divergence);
+        assert_eq!(done_digest.tool_error_count, 1);
+        assert_eq!(done_digest.edit_compile_fail_loops, 1);
     }
 }

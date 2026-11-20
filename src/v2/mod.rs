@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod coordinator;
 pub mod delivery;
 pub mod intake;
