@@ -25,6 +25,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
+pub const ATTEMPT_PRUNE_INTERVAL_SECS: u64 = 3600;
+
 /// Acquire before socket unlink/bind; CLOEXEC prevents subprocesses retaining it.
 pub struct DaemonLock {
     _file: File,
@@ -142,6 +144,7 @@ pub enum WorkerResult {
     },
     Reconciled,
     DeliveryPolled,
+    AttemptsPruned(usize),
 }
 
 type DeliveryStoreOperation = Box<dyn FnOnce(&mut V2Store) + Send>;
@@ -234,6 +237,7 @@ pub struct Coordinator {
     synced: bool,
     last_export: Instant,
     last_delivery_poll: Instant,
+    last_prune: Option<Instant>,
     last_heartbeat: Instant,
     next_tick_deadline: Option<Instant>,
     in_tick: bool,
@@ -298,6 +302,7 @@ impl Coordinator {
             synced: false,
             last_export: Instant::now() - Duration::from_secs(3600),
             last_delivery_poll: Instant::now() - Duration::from_secs(10),
+            last_prune: None,
             last_heartbeat: Instant::now() - Duration::from_secs(10),
             next_tick_deadline: None,
             in_tick: false,
@@ -338,7 +343,7 @@ impl Coordinator {
                 "post-merge-deliveries" => "delivery-poll",
                 "identity" | "observe" => "inspection",
                 "stop" | "cleanup" => "unit-mutation",
-                "reconcile" | "preflight" | "export" => "control",
+                "reconcile" | "preflight" | "export" | "prune-attempts" => "control",
                 _ => "other",
             };
             *probe.entry(class).or_default() += 1;
@@ -466,7 +471,8 @@ impl Coordinator {
 
     fn handle_event_dirty(&mut self, event: CoordinatorEvent) -> Result<bool, String> {
         let dirty = match &event {
-            CoordinatorEvent::Completed { .. } | CoordinatorEvent::DeliveryStore(_) => true,
+            CoordinatorEvent::Completed { key, .. } => key != "prune-attempts",
+            CoordinatorEvent::DeliveryStore(_) => true,
             CoordinatorEvent::Socket { command, .. } => matches!(
                 command,
                 ClientCommand::Decide { .. } | ClientCommand::Run { .. }
@@ -1049,8 +1055,44 @@ impl Coordinator {
             self.dispatch()?;
             self.drive_merges()?;
             self.poll_deliveries()?;
+            if let Err(err) = self.maybe_submit_attempt_prune() {
+                self.error_event(None, Some("prune-attempts"), &err)?;
+            }
         }
         self.deliver_events()
+    }
+
+    fn maybe_submit_attempt_prune(&mut self) -> Result<bool, String> {
+        if self.jobs.contains("prune-attempts")
+            || self
+                .last_prune
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(ATTEMPT_PRUNE_INTERVAL_SECS))
+        {
+            return Ok(false);
+        }
+        let now = Instant::now();
+        if !self.state_dir.join("attempts").is_dir() {
+            self.last_prune = Some(now);
+            return Ok(false);
+        }
+        // Advance `last_prune` before querying/submitting so errors cannot cause a per-tick retry storm.
+        self.last_prune = Some(now);
+        let mut active_ids = self.store.active_attempt_ids().map_err(|e| e.to_string())?;
+        active_ids.extend(self.manifests.keys().cloned());
+        active_ids.extend(self.attached.iter().cloned());
+        active_ids.extend(self.resources.keys().cloned());
+        let state_dir = self.state_dir.clone();
+        let retention = runner::attempt_retention_from_env();
+        let submitted = self.submit(
+            "prune-attempts".into(),
+            None,
+            0,
+            Box::new(move || {
+                let pruned = runner::prune_old_attempts(&state_dir, retention, &active_ids)?;
+                Ok(WorkerResult::AttemptsPruned(pruned))
+            }),
+        );
+        Ok(submitted)
     }
 
     fn reconcile_terminal_tasks(&mut self) -> Result<(), String> {
@@ -1684,6 +1726,7 @@ impl Coordinator {
                 self.worker_result(WorkerResult::Reconciled)?;
             }
             WorkerResult::DeliveryPolled => {}
+            WorkerResult::AttemptsPruned(_) => {}
             WorkerResult::Reconciled => {
                 // Prove every exclusion before the first cleanup/lock/failure write.
                 let native = self.startup_ownership()?;
@@ -1881,14 +1924,29 @@ impl Coordinator {
                     return Ok(());
                 };
                 let mut task = self.task(&attempt.task_id)?;
+                let mut duration_ended_epoch: Option<i64> = None;
                 match result {
                     Ok(result) => {
                         attempt.status = result.status.clone();
+                        if result.status != "PASSED" && attempt.failure_class.is_none() {
+                            attempt.failure_class = Some(
+                                pipeline::classify_failure_class(
+                                    &attempt.stage,
+                                    &result.status,
+                                    &result.summary,
+                                )
+                                .into(),
+                            );
+                        }
                         attempt.summary = Some(result.summary.clone());
                         attempt.input_tokens = result.input_tokens;
                         attempt.output_tokens = result.output_tokens;
                         attempt.total_tokens = result.total_tokens;
                         attempt.sha_after = result.sha_after;
+                        if let Some(dur) = result.duration_seconds {
+                            duration_ended_epoch =
+                                Some(attempt.started_epoch.saturating_add(dur.round() as i64));
+                        }
                         if let Some(tokens) = result.total_tokens {
                             let previous = self
                                 .store
@@ -1918,7 +1976,8 @@ impl Coordinator {
                     }
                 }
                 attempt.phase = "HARVESTED".into();
-                attempt.ended_epoch = Some(now_epoch());
+                let now = now_epoch();
+                attempt.ended_epoch = Some(duration_ended_epoch.map_or(now, |d| d.max(now)));
                 self.store
                     .record_stage_attempt(&attempt)
                     .map_err(|e| e.to_string())?;
@@ -2340,7 +2399,8 @@ impl Coordinator {
         }
         attempt.failure_class = Some(class.into());
         attempt.summary = Some(error.into());
-        attempt.ended_epoch = Some(now_epoch());
+        let now = now_epoch();
+        attempt.ended_epoch = Some(attempt.ended_epoch.unwrap_or(now).max(now));
         attempt.phase = "COMPLETE".into();
         let is_quota = pipeline::is_quota_or_usage_limit_error(error);
         let prior_failures = attempts
@@ -2365,7 +2425,6 @@ impl Coordinator {
         if !is_quota {
             task.retry_count += 1;
         }
-        let now = now_epoch();
         let author_stage = match stage.as_str() {
             "plan-review" => Some("plan"),
             "pr-review" => Some("impl"),
@@ -10752,6 +10811,218 @@ mod tests {
                 .list_stage_attempts("ZACH-061-BACKLOG")
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn failed_agy_harvest_persists_tokens_failure_class_and_preserves_duration_ended_epoch() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        let now = now_epoch();
+
+        let mut t = task("ZACH-071-USAGE");
+        t.status = "In Progress".into();
+        t.current_stage = Some("impl".into());
+        t.active_attempt_id = Some("att-fail-2".into());
+        c.save(&t).unwrap();
+
+        // Seed a prior attempt on the same stage to verify token_usage_by_stage accumulates.
+        let prior = StageAttemptRecord {
+            attempt_id: "att-fail-1".into(),
+            task_id: t.task_id.clone(),
+            stage: "impl".into(),
+            model: "gemini-4-hydrogen-high".into(),
+            effort: "high".into(),
+            systemd_unit: None,
+            invocation_id: None,
+            started_epoch: now - 300,
+            ended_epoch: Some(now - 200),
+            status: "FAILED".into(),
+            failure_class: Some("infra".into()),
+            summary: Some("AGY_TIMEOUT: prior".into()),
+            input_tokens: Some(1_000),
+            output_tokens: Some(500),
+            total_tokens: Some(1_500),
+            sha_before: None,
+            sha_after: None,
+            phase: "COMPLETE".into(),
+            last_liveness_epoch: now - 200,
+            last_output_bytes: 0,
+            last_cpu_usage_usec: None,
+            control_group: None,
+            exit_code: Some(124),
+            exit_code_kind: Some("exited".into()),
+            retry_generation: 0,
+        };
+        c.store.record_stage_attempt(&prior).unwrap();
+
+        let active_started = now;
+        let current = StageAttemptRecord {
+            attempt_id: "att-fail-2".into(),
+            task_id: t.task_id.clone(),
+            stage: "impl".into(),
+            model: "gemini-4-hydrogen-high".into(),
+            effort: "high".into(),
+            systemd_unit: Some("zach-stage-zach-071-usage-impl-att-fail-2".into()),
+            invocation_id: Some("inv-2".into()),
+            started_epoch: active_started,
+            ended_epoch: None,
+            status: "RUNNING".into(),
+            failure_class: None,
+            summary: None,
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            sha_before: Some("abc".into()),
+            sha_after: None,
+            phase: "RUNNING".into(),
+            last_liveness_epoch: active_started,
+            last_output_bytes: 0,
+            last_cpu_usage_usec: None,
+            control_group: None,
+            exit_code: Some(124),
+            exit_code_kind: Some("exited".into()),
+            retry_generation: 0,
+        };
+        c.store.record_stage_attempt(&current).unwrap();
+
+        let expected_ended = active_started + 1800;
+        c.worker_result(WorkerResult::Harvested {
+            attempt_id: "att-fail-2".into(),
+            result: Ok(StageExecutionResult {
+                status: "FAILED".into(),
+                summary: "AGY_TIMEOUT: AGY_TIMEOUT: worker timed out".into(),
+                review_markdown: None,
+                review_output: None,
+                stage_output: None,
+                invocation_id: Some("inv-2".into()),
+                input_tokens: Some(40_000),
+                output_tokens: Some(2_000),
+                total_tokens: Some(42_000),
+                duration_seconds: Some(1800.2),
+                sha_before: Some("abc".into()),
+                sha_after: Some("abc".into()),
+                diff_files: Vec::new(),
+            }),
+        })
+        .unwrap();
+
+        let harvested = c.store.get_stage_attempt("att-fail-2").unwrap().unwrap();
+        assert_eq!(harvested.phase, "HARVESTED");
+        assert_eq!(harvested.status, "FAILED");
+        assert_eq!(harvested.failure_class.as_deref(), Some("infra"));
+        assert_eq!(harvested.input_tokens, Some(40_000));
+        assert_eq!(harvested.output_tokens, Some(2_000));
+        assert_eq!(harvested.total_tokens, Some(42_000));
+        assert_eq!(harvested.ended_epoch, Some(expected_ended));
+
+        // Follow up with WorkerResult::Stopped -> fail_task and verify ended_epoch & tokens survive.
+        c.worker_result(WorkerResult::Stopped("att-fail-2".into()))
+            .unwrap();
+
+        let completed = c.store.get_stage_attempt("att-fail-2").unwrap().unwrap();
+        assert_eq!(completed.phase, "COMPLETE");
+        assert_eq!(completed.status, "FAILED");
+        assert_eq!(completed.failure_class.as_deref(), Some("infra"));
+        assert_eq!(completed.input_tokens, Some(40_000));
+        assert_eq!(completed.output_tokens, Some(2_000));
+        assert_eq!(completed.total_tokens, Some(42_000));
+        assert_eq!(completed.ended_epoch, Some(expected_ended));
+
+        let updated_task = c.task("ZACH-071-USAGE").unwrap();
+        assert_eq!(
+            updated_task
+                .memory
+                .token_usage_by_stage
+                .get("impl")
+                .copied(),
+            Some(43_500)
+        );
+    }
+
+    #[test]
+    fn periodic_attempt_prune_offloads_to_worker_pool_unions_active_ids_and_is_non_dirty() {
+        let dir = TestDirectory::new();
+        let db_path = dir.0.join("zach.db");
+        let (mut c, _handle) = Coordinator::create(V2Store::open(&db_path).unwrap(), dir.0.clone());
+        c.preflight = true;
+        c.reconciled = true;
+        c.synced = true;
+        c.ready = true;
+
+        // 1. When <state_dir>/attempts does not exist, skip without submitting.
+        assert!(!c.maybe_submit_attempt_prune().unwrap());
+        assert!(c.last_prune.is_some());
+        assert!(!c.jobs.contains("prune-attempts"));
+
+        // Reset timer and create attempts/ with expired dirs containing manifest.json.
+        c.last_prune = None;
+        let attempts_dir = dir.0.join("attempts");
+        let expired_completed = attempts_dir.join("att-expired-completed");
+        let expired_sqlite_active = attempts_dir.join("att-expired-sqlite");
+        let expired_mem_attached = attempts_dir.join("att-expired-attached");
+        for p in [
+            &expired_completed,
+            &expired_sqlite_active,
+            &expired_mem_attached,
+        ] {
+            std::fs::create_dir_all(p).unwrap();
+            std::fs::write(p.join("manifest.json"), "{}").unwrap();
+            let status = std::process::Command::new("touch")
+                .args(["-d", "10 days ago"])
+                .arg(p)
+                .status()
+                .expect("touch old mtime");
+            assert!(status.success());
+        }
+
+        // Seed SQLite active attempt and in-memory attached attempt.
+        let mut t = task("ZACH-071-PRUNE");
+        t.status = "In Progress".into();
+        t.active_attempt_id = Some("att-expired-sqlite".into());
+        c.save(&t).unwrap();
+        c.attached.insert("att-expired-attached".into());
+
+        // 2. Submit prune job to WorkerPool.
+        assert!(c.maybe_submit_attempt_prune().unwrap());
+        assert!(c.jobs.contains("prune-attempts"));
+        // Respects cooldown while in flight / recently run.
+        assert!(!c.maybe_submit_attempt_prune().unwrap());
+
+        // 3. Wait for WorkerPool completion and verify handle_event_dirty returns false.
+        let event =
+            c.rx.recv_timeout(Duration::from_secs(5))
+                .expect("prune-attempts worker result");
+        let dirty = c.handle_event_dirty(event).unwrap();
+        assert!(
+            !dirty,
+            "prune-attempts completion must not mark coordinator dirty"
+        );
+        assert!(!c.jobs.contains("prune-attempts"));
+        assert!(!expired_completed.exists());
+        assert!(expired_sqlite_active.exists());
+        assert!(expired_mem_attached.exists());
+
+        // 4. Corrupt memory_json causes active_attempt_ids() to fail closed and tick_inner emits SUPERVISOR_ERROR.
+        c.last_prune = None;
+        c.last_export = Instant::now();
+        c.last_delivery_poll = Instant::now();
+        let raw_conn = rusqlite::Connection::open(&db_path).unwrap();
+        raw_conn
+            .execute(
+                "UPDATE tasks SET memory_json = '{corrupt' WHERE task_id = 'ZACH-071-PRUNE'",
+                [],
+            )
+            .unwrap();
+        drop(raw_conn);
+        c.tick().unwrap();
+        let events = c.store.list_events_since(None, 0, 100).unwrap();
+        assert!(
+            events.iter().any(|e| {
+                e.event_type == "SUPERVISOR_ERROR"
+                    && e.payload.get("job_key").and_then(|v| v.as_str()) == Some("prune-attempts")
+            }),
+            "expected SUPERVISOR_ERROR event for prune-attempts, got {events:?}"
         );
     }
 }

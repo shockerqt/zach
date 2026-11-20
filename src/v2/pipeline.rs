@@ -590,10 +590,14 @@ pub fn plan_task_execution(task: &TaskRecord) -> Result<DryRunTaskPlan, String> 
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AgyCliError {
     pub failure_class: String,
     pub message: String,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub duration_seconds: Option<f64>,
 }
 
 impl std::fmt::Display for AgyCliError {
@@ -813,6 +817,8 @@ fn maybe_fallback_openaisol_to_geminiagy(
     Ok(executor.execute_stage(task, &fb_attempt_id, &fb_route, &fb_spec))
 }
 
+pub const MAX_AGY_CLI_TIMEOUT_SECS: u64 = 3600;
+
 /// Builds a structured JSON payload for `agent-tooling/plugins/gemini-worker/scripts/worker.mjs --cli`.
 pub fn build_agy_cli_payload(
     task: &TaskRecord,
@@ -826,7 +832,7 @@ pub fn build_agy_cli_payload(
     };
     let worktree = task.worktree_path.clone().unwrap_or_default();
     let allowed_files = filter_existing_allowed_files(&worktree, &task.context_pack.target_files);
-    let timeout_seconds = route.timeout_secs.clamp(30, 1800);
+    let timeout_seconds = route.timeout_secs.clamp(30, MAX_AGY_CLI_TIMEOUT_SECS);
     let orchestration_id = task.task_id.to_ascii_lowercase();
 
     serde_json::json!({
@@ -1499,6 +1505,10 @@ pub fn parse_agy_cli_response(
             } else {
                 stderr.trim().to_owned()
             },
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            duration_seconds: None,
         });
     };
 
@@ -1515,6 +1525,10 @@ pub fn parse_agy_cli_response(
                     "worker execution timed out (code={code}): {}",
                     stderr.trim()
                 ),
+                input_tokens: None,
+                output_tokens: None,
+                total_tokens: None,
+                duration_seconds: None,
             });
         }
         return Err(AgyCliError {
@@ -1523,6 +1537,10 @@ pub fn parse_agy_cli_response(
                 "worker exited with code {code} and empty stdout: {}",
                 stderr.trim()
             ),
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            duration_seconds: None,
         });
     }
 
@@ -1536,6 +1554,10 @@ pub fn parse_agy_cli_response(
                         "worker execution timed out (code={code}): {}",
                         stderr.trim()
                     ),
+                    input_tokens: None,
+                    output_tokens: None,
+                    total_tokens: None,
+                    duration_seconds: None,
                 });
             }
             return Err(AgyCliError {
@@ -1543,9 +1565,16 @@ pub fn parse_agy_cli_response(
                 message: format!(
                     "worker exited with code {code} with non-JSON output: {trimmed_out}"
                 ),
+                input_tokens: None,
+                output_tokens: None,
+                total_tokens: None,
+                duration_seconds: None,
             });
         }
     };
+
+    let (input_tokens, output_tokens, total_tokens) = parse_agy_usage(&json);
+    let duration_seconds = parse_agy_duration_seconds(&json);
 
     let status_str = json.get("status").and_then(|v| v.as_str()).unwrap_or("");
     let exec_succeeded = json
@@ -1589,6 +1618,10 @@ pub fn parse_agy_cli_response(
                 "AGY_STATUS".to_owned()
             },
             message: format!("{err_code}: {summary}"),
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            duration_seconds,
         });
     }
 
@@ -1631,8 +1664,6 @@ pub fn parse_agy_cli_response(
         .and_then(|v| v.as_str())
         .map(str::to_owned);
 
-    let (input_tokens, output_tokens, total_tokens) = parse_agy_usage(&json);
-
     Ok(StageExecutionResult {
         status: "PASSED".to_owned(),
         summary,
@@ -1643,10 +1674,17 @@ pub fn parse_agy_cli_response(
         input_tokens,
         output_tokens,
         total_tokens,
+        duration_seconds,
         sha_before: None,
         sha_after: None,
         diff_files: Vec::new(),
     })
+}
+
+fn parse_agy_duration_seconds(json: &serde_json::Value) -> Option<f64> {
+    json.get("duration_seconds")
+        .and_then(|v| v.as_f64())
+        .filter(|d| d.is_finite() && *d >= 0.0)
 }
 
 fn parse_agy_usage(json: &serde_json::Value) -> (Option<u64>, Option<u64>, Option<u64>) {
@@ -4405,6 +4443,7 @@ mod tests {
             input_tokens: None,
             output_tokens: None,
             total_tokens: None,
+            duration_seconds: None,
             sha_before: None,
             sha_after: None,
             diff_files: Vec::new(),
@@ -5338,6 +5377,7 @@ print(json.dumps({
                     input_tokens: Some(12_000),
                     output_tokens: Some(3_000),
                     total_tokens: Some(15_000),
+                    duration_seconds: None,
                     sha_before: Some("abc1234".to_owned()),
                     sha_after: Some("abc1234".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -5357,6 +5397,7 @@ print(json.dumps({
                     input_tokens: Some(8_000),
                     output_tokens: Some(1_500),
                     total_tokens: Some(9_500),
+                    duration_seconds: None,
                     sha_before: Some("def5678".to_owned()),
                     sha_after: Some("def5678".to_owned()),
                     diff_files: Vec::new(),
@@ -5458,6 +5499,7 @@ print(json.dumps({
                 input_tokens: Some(4_000),
                 output_tokens: Some(800),
                 total_tokens: Some(4_800),
+                duration_seconds: None,
                 sha_before: Some("abc1234".to_owned()),
                 sha_after: Some("xs-sha-1".to_owned()),
                 diff_files: vec![DiffFileEntry {
@@ -5551,6 +5593,7 @@ print(json.dumps({
                     input_tokens: Some(10_000),
                     output_tokens: Some(2_000),
                     total_tokens: Some(12_000),
+                    duration_seconds: None,
                     sha_before: None,
                     sha_after: None,
                     diff_files: Vec::new(),
@@ -5566,6 +5609,7 @@ print(json.dumps({
                     input_tokens: Some(8_000),
                     output_tokens: Some(1_000),
                     total_tokens: Some(9_000),
+                    duration_seconds: None,
                     sha_before: None,
                     sha_after: None,
                     diff_files: Vec::new(),
@@ -5581,6 +5625,7 @@ print(json.dumps({
                     input_tokens: Some(15_000),
                     output_tokens: Some(3_000),
                     total_tokens: Some(18_000),
+                    duration_seconds: None,
                     sha_before: Some("base123".to_owned()),
                     sha_after: Some("base123".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -5601,6 +5646,7 @@ print(json.dumps({
                     input_tokens: Some(12_000),
                     output_tokens: Some(2_000),
                     total_tokens: Some(14_000),
+                    duration_seconds: None,
                     sha_before: Some("sha-m-impl".to_owned()),
                     sha_after: Some("sha-m-impl".to_owned()),
                     diff_files: Vec::new(),
@@ -5698,6 +5744,7 @@ print(json.dumps({
                     input_tokens: Some(1_000),
                     output_tokens: Some(500),
                     total_tokens: Some(1_500),
+                    duration_seconds: None,
                     sha_before: None,
                     sha_after: None,
                     diff_files: Vec::new(),
@@ -5713,6 +5760,7 @@ print(json.dumps({
                     input_tokens: Some(1_000),
                     output_tokens: Some(500),
                     total_tokens: Some(1_500),
+                    duration_seconds: None,
                     sha_before: None,
                     sha_after: None,
                     diff_files: Vec::new(),
@@ -5760,6 +5808,7 @@ print(json.dumps({
             input_tokens: Some(5_000),
             output_tokens: Some(1_000),
             total_tokens: Some(6_000),
+            duration_seconds: None,
             sha_before: Some("base-l".to_owned()),
             sha_after: Some("sha-l-impl".to_owned()),
             diff_files: vec![DiffFileEntry {
@@ -5779,6 +5828,7 @@ print(json.dumps({
             input_tokens: Some(5_000),
             output_tokens: Some(1_000),
             total_tokens: Some(6_000),
+            duration_seconds: None,
             sha_before: Some("sha-l-impl".to_owned()),
             sha_after: Some("sha-l-impl".to_owned()),
             diff_files: Vec::new(),
@@ -5946,6 +5996,7 @@ print(json.dumps({
                 input_tokens: Some(1_000),
                 output_tokens: Some(500),
                 total_tokens: Some(1_500),
+                duration_seconds: None,
                 sha_before: None,
                 sha_after: None,
                 diff_files: Vec::new(),
@@ -6237,6 +6288,7 @@ print(json.dumps({
                     input_tokens: Some(1_000),
                     output_tokens: Some(200),
                     total_tokens: Some(1_200),
+                    duration_seconds: None,
                     sha_before: Some("abc1234".to_owned()),
                     sha_after: Some("sha-impl-1".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -6256,6 +6308,7 @@ print(json.dumps({
                     input_tokens: Some(500),
                     output_tokens: Some(100),
                     total_tokens: Some(600),
+                    duration_seconds: None,
                     sha_before: Some("mock-committed-sha".to_owned()),
                     sha_after: Some("mock-committed-sha".to_owned()),
                     diff_files: Vec::new(),
@@ -6270,6 +6323,7 @@ print(json.dumps({
                     input_tokens: Some(1_000),
                     output_tokens: Some(200),
                     total_tokens: Some(1_200),
+                    duration_seconds: None,
                     sha_before: Some("mock-committed-sha".to_owned()),
                     sha_after: Some("sha-impl-2".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -6289,6 +6343,7 @@ print(json.dumps({
                     input_tokens: Some(500),
                     output_tokens: Some(100),
                     total_tokens: Some(600),
+                    duration_seconds: None,
                     sha_before: Some("mock-committed-sha".to_owned()),
                     sha_after: Some("mock-committed-sha".to_owned()),
                     diff_files: Vec::new(),
@@ -6343,6 +6398,7 @@ print(json.dumps({
                     input_tokens: Some(500),
                     output_tokens: Some(100),
                     total_tokens: Some(600),
+                    duration_seconds: None,
                     sha_before: None,
                     sha_after: None,
                     diff_files: Vec::new(),
@@ -6357,6 +6413,7 @@ print(json.dumps({
                     input_tokens: Some(500),
                     output_tokens: Some(100),
                     total_tokens: Some(600),
+                    duration_seconds: None,
                     sha_before: None,
                     sha_after: None,
                     diff_files: Vec::new(),
@@ -6371,6 +6428,7 @@ print(json.dumps({
                     input_tokens: Some(500),
                     output_tokens: Some(100),
                     total_tokens: Some(600),
+                    duration_seconds: None,
                     sha_before: Some("abc".to_owned()),
                     sha_after: Some("sha-1".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -6390,6 +6448,7 @@ print(json.dumps({
                     input_tokens: Some(500),
                     output_tokens: Some(100),
                     total_tokens: Some(600),
+                    duration_seconds: None,
                     sha_before: Some("sha-m-1".to_owned()),
                     sha_after: Some("sha-m-1".to_owned()),
                     diff_files: Vec::new(),
@@ -6404,6 +6463,7 @@ print(json.dumps({
                     input_tokens: Some(500),
                     output_tokens: Some(100),
                     total_tokens: Some(600),
+                    duration_seconds: None,
                     sha_before: Some("sha-m-1".to_owned()),
                     sha_after: Some("sha-2".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -6423,6 +6483,7 @@ print(json.dumps({
                     input_tokens: Some(500),
                     output_tokens: Some(100),
                     total_tokens: Some(600),
+                    duration_seconds: None,
                     sha_before: Some("sha-m-2".to_owned()),
                     sha_after: Some("sha-m-2".to_owned()),
                     diff_files: Vec::new(),
@@ -6472,6 +6533,7 @@ print(json.dumps({
                     input_tokens: Some(500),
                     output_tokens: Some(100),
                     total_tokens: Some(600),
+                    duration_seconds: None,
                     sha_before: Some("abc".to_owned()),
                     sha_after: Some("sha-limit".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -6491,6 +6553,7 @@ print(json.dumps({
                     input_tokens: Some(500),
                     output_tokens: Some(100),
                     total_tokens: Some(600),
+                    duration_seconds: None,
                     sha_before: Some("sha-limit".to_owned()),
                     sha_after: Some("sha-limit".to_owned()),
                     diff_files: Vec::new(),
@@ -6555,6 +6618,7 @@ print(json.dumps({
                     input_tokens: Some(1_000),
                     output_tokens: Some(200),
                     total_tokens: Some(1_200),
+                    duration_seconds: None,
                     sha_before: Some("abc".to_owned()),
                     sha_after: Some("sha-ac5".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -6574,6 +6638,7 @@ print(json.dumps({
                     input_tokens: None,
                     output_tokens: None,
                     total_tokens: None,
+                    duration_seconds: None,
                     sha_before: None,
                     sha_after: None,
                     diff_files: Vec::new(),
@@ -6685,6 +6750,7 @@ print(json.dumps({
                 input_tokens: Some(100),
                 output_tokens: Some(50),
                 total_tokens: Some(150),
+                duration_seconds: None,
                 sha_before: None,
                 sha_after: None,
                 diff_files: Vec::new(),
@@ -6768,6 +6834,7 @@ print(json.dumps({
                     input_tokens: Some(1_000),
                     output_tokens: Some(200),
                     total_tokens: Some(1_200),
+                    duration_seconds: None,
                     sha_before: None,
                     sha_after: None,
                     diff_files: Vec::new(),
@@ -6782,6 +6849,7 @@ print(json.dumps({
                     input_tokens: Some(800),
                     output_tokens: Some(100),
                     total_tokens: Some(900),
+                    duration_seconds: None,
                     sha_before: None,
                     sha_after: None,
                     diff_files: Vec::new(),
@@ -6796,6 +6864,7 @@ print(json.dumps({
                     input_tokens: Some(1_500),
                     output_tokens: Some(300),
                     total_tokens: Some(1_800),
+                    duration_seconds: None,
                     sha_before: Some("base123".to_owned()),
                     sha_after: Some("sha-m-impl".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -6815,6 +6884,7 @@ print(json.dumps({
                     input_tokens: Some(900),
                     output_tokens: Some(150),
                     total_tokens: Some(1_050),
+                    duration_seconds: None,
                     sha_before: Some("sha-m-impl".to_owned()),
                     sha_after: Some("sha-m-impl".to_owned()),
                     diff_files: Vec::new(),
@@ -6905,6 +6975,7 @@ print(json.dumps({
                 input_tokens: Some(500),
                 output_tokens: Some(100),
                 total_tokens: Some(600),
+                duration_seconds: None,
                 sha_before: Some("stale-reviewed-sha".to_owned()),
                 sha_after: Some("new-merged-reviewed-sha".to_owned()),
                 diff_files: Vec::new(),
@@ -7190,6 +7261,7 @@ print(json.dumps({
                         input_tokens: Some(1_000),
                         output_tokens: Some(200),
                         total_tokens: Some(1_200),
+                        duration_seconds: None,
                         sha_before: Some("abc1234".to_owned()),
                         sha_after: Some("def5678".to_owned()),
                         diff_files: vec![DiffFileEntry {
@@ -7209,6 +7281,7 @@ print(json.dumps({
                         input_tokens: Some(500),
                         output_tokens: Some(100),
                         total_tokens: Some(600),
+                        duration_seconds: None,
                         sha_before: Some("def5678".to_owned()),
                         sha_after: Some("def5678".to_owned()),
                         diff_files: Vec::new(),
@@ -7260,6 +7333,7 @@ print(json.dumps({
                         input_tokens: Some(100),
                         output_tokens: Some(50),
                         total_tokens: Some(150),
+                        duration_seconds: None,
                         sha_before: Some("abc".to_owned()),
                         sha_after: Some("def".to_owned()),
                         diff_files: vec![DiffFileEntry {
@@ -7312,6 +7386,7 @@ print(json.dumps({
                     input_tokens: Some(100),
                     output_tokens: Some(50),
                     total_tokens: Some(150),
+                    duration_seconds: None,
                     sha_before: Some("abc".to_owned()),
                     sha_after: Some("def".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -7373,6 +7448,7 @@ print(json.dumps({
                         input_tokens: Some(100),
                         output_tokens: Some(50),
                         total_tokens: Some(150),
+                        duration_seconds: None,
                         sha_before: None,
                         sha_after: None,
                         diff_files: Vec::new(),
@@ -7387,6 +7463,7 @@ print(json.dumps({
                         input_tokens: Some(100),
                         output_tokens: Some(50),
                         total_tokens: Some(150),
+                        duration_seconds: None,
                         sha_before: None,
                         sha_after: None,
                         diff_files: Vec::new(),
@@ -7436,6 +7513,7 @@ print(json.dumps({
             input_tokens: Some(1_000),
             output_tokens: Some(200),
             total_tokens: Some(1_200),
+            duration_seconds: None,
             sha_before: Some("abc1234".to_owned()),
             sha_after: Some("abc1234".to_owned()),
             diff_files: vec![DiffFileEntry {
@@ -7455,6 +7533,7 @@ print(json.dumps({
             input_tokens: Some(500),
             output_tokens: Some(100),
             total_tokens: Some(600),
+            duration_seconds: None,
             sha_before: Some("real-sha".to_owned()),
             sha_after: Some("real-sha".to_owned()),
             diff_files: Vec::new(),
@@ -7602,6 +7681,7 @@ print(json.dumps({
                         input_tokens: Some(1_000),
                         output_tokens: Some(200),
                         total_tokens: Some(1_200),
+                        duration_seconds: None,
                         sha_before: Some(sha_before),
                         sha_after: Some(sha_after),
                         diff_files,
@@ -7625,6 +7705,7 @@ print(json.dumps({
                     input_tokens: Some(600),
                     output_tokens: Some(100),
                     total_tokens: Some(700),
+                    duration_seconds: None,
                     sha_before: Some(head_sha.clone()),
                     sha_after: Some(head_sha),
                     diff_files: Vec::new(),
@@ -7839,7 +7920,7 @@ print(json.dumps({
 
         let payload = build_agy_cli_payload(&task, &route, "Plan work");
         assert_eq!(payload["orchestration_id"], "zach-019-agy");
-        assert_eq!(payload["timeout_seconds"], 1800);
+        assert_eq!(payload["timeout_seconds"], 3600);
         let allowed = payload["allowed_files"].as_array().expect("array");
         assert_eq!(allowed.len(), 50);
         assert!(allowed.iter().all(|v| {
@@ -7876,6 +7957,7 @@ print(json.dumps({
                 input_tokens: Some(100),
                 output_tokens: Some(50),
                 total_tokens: Some(150),
+                duration_seconds: None,
                 sha_before: None,
                 sha_after: None,
                 diff_files: Vec::new(),
@@ -7921,6 +8003,7 @@ print(json.dumps({
                 input_tokens: Some(10),
                 output_tokens: Some(5),
                 total_tokens: Some(15),
+                duration_seconds: None,
                 sha_before: None,
                 sha_after: None,
                 diff_files: vec![DiffFileEntry {
@@ -7962,6 +8045,7 @@ print(json.dumps({
                     input_tokens: Some(10),
                     output_tokens: Some(5),
                     total_tokens: Some(15),
+                    duration_seconds: None,
                     sha_before: Some("abc".to_owned()),
                     sha_after: Some("def".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -8106,6 +8190,7 @@ print(json.dumps({
                 input_tokens: Some(200_000),
                 output_tokens: Some(50_000),
                 total_tokens: Some(250_000),
+                duration_seconds: None,
                 sha_before: None,
                 sha_after: None,
                 diff_files: Vec::new(),
@@ -8141,6 +8226,7 @@ print(json.dumps({
                     input_tokens: Some(80_000),
                     output_tokens: Some(20_000),
                     total_tokens: Some(100_000),
+                    duration_seconds: None,
                     sha_before: Some("abc".to_owned()),
                     sha_after: Some("def".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -8160,6 +8246,7 @@ print(json.dumps({
                     input_tokens: Some(50_000),
                     output_tokens: Some(10_000),
                     total_tokens: Some(60_000),
+                    duration_seconds: None,
                     sha_before: Some("def".to_owned()),
                     sha_after: Some("def".to_owned()),
                     diff_files: Vec::new(),
@@ -8214,6 +8301,7 @@ print(json.dumps({
                 input_tokens: failed_codex.input_tokens,
                 output_tokens: failed_codex.output_tokens,
                 total_tokens: failed_codex.total_tokens,
+                duration_seconds: None,
                 sha_before: None,
                 sha_after: None,
                 diff_files: Vec::new(),
@@ -8463,6 +8551,7 @@ raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={
                 input_tokens: Some(100),
                 output_tokens: Some(50),
                 total_tokens: Some(150),
+                duration_seconds: None,
                 sha_before: Some("abc".to_owned()),
                 sha_after: Some("def".to_owned()),
                 diff_files: diff.clone(),
@@ -8501,6 +8590,7 @@ raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={
                 input_tokens: Some(100),
                 output_tokens: Some(50),
                 total_tokens: Some(150),
+                duration_seconds: None,
                 sha_before: Some("abc".to_owned()),
                 sha_after: Some("def".to_owned()),
                 diff_files: diff,
@@ -8554,6 +8644,7 @@ raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={
                     input_tokens: Some(1_000),
                     output_tokens: Some(200),
                     total_tokens: Some(1_200),
+                    duration_seconds: None,
                     sha_before: Some("abc1234".to_owned()),
                     sha_after: Some("abc1234".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -8573,6 +8664,7 @@ raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={
                     input_tokens: Some(500),
                     output_tokens: Some(100),
                     total_tokens: Some(600),
+                    duration_seconds: None,
                     sha_before: Some("mock-committed-sha".to_owned()),
                     sha_after: Some("mock-committed-sha".to_owned()),
                     diff_files: Vec::new(),
@@ -8768,6 +8860,7 @@ raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={
                     input_tokens: Some(1_000),
                     output_tokens: Some(200),
                     total_tokens: Some(1_200),
+                    duration_seconds: None,
                     sha_before: Some("abc1234".into()),
                     sha_after: Some("abc1234".into()),
                     diff_files: vec![DiffFileEntry {
@@ -8787,6 +8880,7 @@ raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={
                     input_tokens: Some(1_000),
                     output_tokens: Some(200),
                     total_tokens: Some(1_200),
+                    duration_seconds: None,
                     sha_before: Some("def5678".into()),
                     sha_after: Some("def5678".into()),
                     diff_files: Vec::new(),
@@ -8889,5 +8983,108 @@ raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={
             parse_quota_reset_epoch("Try again at 2026-11-21T09:00:00Z", now),
             now + DEFAULT_QUOTA_COOLDOWN_SECS
         );
+    }
+
+    #[test]
+    fn build_agy_cli_payload_clamps_timeout_to_30_3600() {
+        let task = sample_s_task("ZACH-071-TIMEOUT");
+        let mut route = StageRoute {
+            weight: "M".to_owned(),
+            stage: "impl".to_owned(),
+            family: ModelFamily::GeminiAgy,
+            model: "gemini-4-hydrogen-high".to_owned(),
+            effort: ReasoningEffort::High,
+            fallback_family: None,
+            fallback_model: None,
+            fallback_effort: None,
+            max_task_tokens: 1_200_000,
+            timeout_secs: 3600,
+            stall_timeout_secs: 600,
+        };
+        assert_eq!(
+            build_agy_cli_payload(&task, &route, "p")["timeout_seconds"],
+            3600
+        );
+        route.timeout_secs = 5000;
+        assert_eq!(
+            build_agy_cli_payload(&task, &route, "p")["timeout_seconds"],
+            3600
+        );
+        route.timeout_secs = 5;
+        assert_eq!(
+            build_agy_cli_payload(&task, &route, "p")["timeout_seconds"],
+            30
+        );
+    }
+
+    #[test]
+    fn parse_agy_cli_response_preserves_usage_and_duration_on_failed_and_passed_runs() {
+        let err_status_json = serde_json::json!({
+            "status": "ERROR",
+            "execution_succeeded": false,
+            "error_code": "AGY_STATUS_ERROR",
+            "summary": "tool call failed",
+            "duration_seconds": 412.75,
+            "usage": {
+                "input_tokens": 12000,
+                "output_tokens": 345,
+                "total_tokens": 12345
+            }
+        })
+        .to_string();
+        let err = parse_agy_cli_response(&err_status_json, "", Some(1)).unwrap_err();
+        assert_eq!(err.failure_class, "AGY_STATUS");
+        assert!(err.message.contains("AGY_STATUS_ERROR"));
+        assert_eq!(err.input_tokens, Some(12_000));
+        assert_eq!(err.output_tokens, Some(345));
+        assert_eq!(err.total_tokens, Some(12_345));
+        assert_eq!(err.duration_seconds, Some(412.75));
+
+        let timeout_json = serde_json::json!({
+            "status": "ok",
+            "execution_succeeded": false,
+            "process_status": "timeout",
+            "diagnostic": {
+                "code": "AGY_TIMEOUT",
+                "summary": "worker hit deadline"
+            },
+            "duration_seconds": 1800.5,
+            "usage": {
+                "input_tokens": 90000,
+                "output_tokens": 1500
+            }
+        })
+        .to_string();
+        let err = parse_agy_cli_response(&timeout_json, "", Some(124)).unwrap_err();
+        assert_eq!(err.failure_class, "AGY_TIMEOUT");
+        assert_eq!(err.input_tokens, Some(90_000));
+        assert_eq!(err.output_tokens, Some(1_500));
+        assert_eq!(err.total_tokens, Some(91_500));
+        assert_eq!(err.duration_seconds, Some(1800.5));
+
+        let ok_json = serde_json::json!({
+            "status": "ok",
+            "execution_succeeded": true,
+            "summary": "done",
+            "duration_seconds": 87.25,
+            "usage": {
+                "input_tokens": 500,
+                "output_tokens": 100,
+                "total_tokens": 600
+            }
+        })
+        .to_string();
+        let ok = parse_agy_cli_response(&ok_json, "", Some(0)).unwrap();
+        assert_eq!(ok.duration_seconds, Some(87.25));
+        assert_eq!(ok.total_tokens, Some(600));
+
+        // Negative duration_seconds is ignored.
+        let neg_json = serde_json::json!({
+            "status": "error",
+            "duration_seconds": -5.0
+        })
+        .to_string();
+        let neg_err = parse_agy_cli_response(&neg_json, "", Some(1)).unwrap_err();
+        assert_eq!(neg_err.duration_seconds, None);
     }
 }
