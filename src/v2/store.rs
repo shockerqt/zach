@@ -1231,9 +1231,109 @@ impl V2Store {
 
     pub(crate) fn lifecycle_in_flight(&self, id: &str) -> Result<bool, V2StoreError> {
         Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM lifecycle_ops WHERE operation_id=?1 AND state='IN_FLIGHT')",
+            "SELECT EXISTS(SELECT 1 FROM lifecycle_ops WHERE operation_id=?1 AND state IN ('IN_FLIGHT','QUEUED'))",
             [id],
             |row| row.get(0),
+        )?)
+    }
+
+    pub(crate) fn grant_decision_publication(&mut self, id: &str) -> Result<bool, V2StoreError> {
+        Ok(self.conn.execute(
+            "UPDATE lifecycle_ops SET state='DISPATCHED', updated_epoch=?2
+             WHERE operation_id=?1 AND state='QUEUED'
+             AND EXISTS (SELECT 1 FROM tasks t WHERE t.task_id=lifecycle_ops.task_id
+                 AND lower(t.status) NOT IN ('done','cancelled') AND t.autonomous_consent)
+             AND EXISTS (SELECT 1 FROM pending_decisions d WHERE d.decision_id=lifecycle_ops.decision_id
+                 AND d.task_id=lifecycle_ops.task_id AND d.status='RESOLVED')
+             AND NOT EXISTS (SELECT 1 FROM task_events e WHERE e.task_id=lifecycle_ops.task_id
+                 AND e.event_type='DECISION_RETIRED'
+                 AND json_extract(e.payload_json,'$.decision_id')=lifecycle_ops.decision_id)
+             AND NOT EXISTS (SELECT 1 FROM lifecycle_ops other
+                 WHERE other.task_id=lifecycle_ops.task_id AND other.state='DISPATCHED')",
+            params![id, now_epoch()],
+        )? == 1)
+    }
+
+    pub(crate) fn deferred_terminal(
+        &self,
+        operation_id: &str,
+        task: &TaskRecord,
+    ) -> Result<Option<(String, bool)>, V2StoreError> {
+        Self::effective_deferred_terminal_on(&self.conn, operation_id, task)
+    }
+
+    fn effective_deferred_terminal_on(
+        conn: &Connection,
+        operation_id: &str,
+        task: &TaskRecord,
+    ) -> Result<Option<(String, bool)>, V2StoreError> {
+        let deferred = Self::deferred_terminal_on(conn, operation_id)?;
+        if deferred.as_ref().is_some_and(|(_, board)| *board)
+            && Self::delivery_holds_terminal(conn, task)?
+        {
+            return Ok(None);
+        }
+        Ok(deferred)
+    }
+
+    fn deferred_terminal_on(
+        conn: &Connection,
+        operation_id: &str,
+    ) -> Result<Option<(String, bool)>, V2StoreError> {
+        Ok(conn
+            .query_row(
+                "SELECT json_extract(payload_json,'$.status'),json_extract(payload_json,'$.board')
+             FROM task_events WHERE event_type='TASK_TERMINAL_DEFERRED'
+             AND json_extract(payload_json,'$.operation_id')=?1 ORDER BY seq_id DESC LIMIT 1",
+                [operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    fn defer_terminal_tx(
+        tx: &rusqlite::Transaction<'_>,
+        task: &TaskRecord,
+        status: &str,
+        board: bool,
+        now: i64,
+    ) -> Result<bool, V2StoreError> {
+        if !is_terminal_task_status(status) || is_terminal_task_status(&task.status) {
+            return Ok(false);
+        }
+        let Some(id) = tx
+            .query_row(
+                "SELECT operation_id FROM lifecycle_ops WHERE task_id=?1 AND state='DISPATCHED'",
+                [&task.task_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        else {
+            return Ok(false);
+        };
+        if Self::deferred_terminal_on(tx, &id)?
+            .as_ref()
+            .is_none_or(|(previous, from_board)| previous != status || *from_board != board)
+        {
+            Self::insert_event_tx(
+                tx,
+                &task.task_id,
+                &task.task_group,
+                now,
+                "TASK_TERMINAL_DEFERRED",
+                &serde_json::json!({"operation_id":id,"status":status,"board":board}),
+            )?;
+        }
+        Ok(true)
+    }
+
+    fn delivery_holds_terminal(conn: &Connection, task: &TaskRecord) -> Result<bool, V2StoreError> {
+        Ok(!is_terminal_task_status(&task.status) && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM post_merge_deliveries p
+             WHERE p.task_id=?1 AND p.decision_id IS NOT NULL AND p.state NOT IN ('verified','aborted')
+             AND NOT EXISTS(SELECT 1 FROM task_events e WHERE e.task_id=p.task_id
+               AND e.event_type='DECISION_RETIRED' AND json_extract(e.payload_json,'$.decision_id')=p.decision_id))",
+            [&task.task_id], |row| row.get(0),
         )?)
     }
 
@@ -1245,7 +1345,7 @@ impl V2Store {
         retry_epoch: i64,
     ) -> Result<(), V2StoreError> {
         let error = error.map(|s| crate::v2::runner::truncate_utf8_bytes(s, 1024));
-        self.conn.execute("UPDATE lifecycle_ops SET state=?2,last_error=?3,retry_epoch=?4,updated_epoch=?5,attempts=attempts+CASE WHEN ?2='IN_FLIGHT' THEN 1 ELSE 0 END WHERE operation_id=?1",params![id,state,error,retry_epoch,now_epoch()])?;
+        self.conn.execute("UPDATE lifecycle_ops SET state=?2,last_error=?3,retry_epoch=?4,updated_epoch=?5,attempts=attempts+CASE WHEN ?2 IN ('IN_FLIGHT','QUEUED') THEN 1 ELSE 0 END WHERE operation_id=?1",params![id,state,error,retry_epoch,now_epoch()])?;
         Ok(())
     }
 
@@ -1267,7 +1367,22 @@ impl V2Store {
         {
             return Ok(());
         }
-        Self::update_task_tx(&tx, &old, task, now_epoch())?;
+        let mut next = task.clone();
+        if op.state == "DISPATCHED"
+            && let Some((status, board)) =
+                Self::effective_deferred_terminal_on(&tx, &op.operation_id, &old)?
+        {
+            next = old.clone();
+            next.status = status;
+            next.memory.governance_terminal_observed |= board;
+            // Clear the fence only inside the acknowledgment transaction. Keep the
+            // publication pending for retirement until the terminal transition is recorded.
+            tx.execute(
+                "UPDATE lifecycle_ops SET state='SETTLING' WHERE operation_id=?1",
+                [&op.operation_id],
+            )?;
+        }
+        Self::update_task_tx(&tx, &old, &next, now_epoch())?;
         if let Some(id) = attempt_id {
             tx.execute(
                 "UPDATE stage_attempts SET phase='COMPLETE' WHERE attempt_id=?1",
@@ -1568,6 +1683,9 @@ impl V2Store {
         next: &TaskRecord,
         now: i64,
     ) -> Result<TaskRecord, V2StoreError> {
+        if Self::defer_terminal_tx(tx, old, &next.status, false, now)? {
+            return Ok(old.clone());
+        }
         let context_pack_json = serde_json::to_string(&next.context_pack)?;
         let depends_on_json = serde_json::to_string(&next.depends_on)?;
         let required_stages_json = serde_json::to_string(&next.required_stages)?;
@@ -1723,6 +1841,29 @@ impl V2Store {
         }
         let result = match existing {
             Some(mut old) => {
+                let delivery_hold = is_terminal_task_status(&incoming.status)
+                    && Self::delivery_holds_terminal(&tx, &old)?;
+                if !delivery_hold
+                    && Self::defer_terminal_tx(&tx, &old, &incoming.status, true, now)?
+                {
+                    tx.commit()?;
+                    return Ok(old);
+                }
+                if !is_terminal_task_status(&incoming.status) && tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM lifecycle_ops WHERE task_id=?1 AND state='DISPATCHED')",
+                    [&old.task_id], |row| row.get::<_, bool>(0),
+                )? {
+                    let mut next = old.clone();
+                    next.autonomous_consent &= incoming.autonomous_consent
+                        && !incoming.executor.as_deref().is_some_and(|executor| {
+                            !executor.trim().is_empty() && !executor.eq_ignore_ascii_case("zach")
+                        });
+                    if next.autonomous_consent != old.autonomous_consent {
+                        old = Self::update_task_tx(&tx, &old, &next, now)?;
+                    }
+                    tx.commit()?;
+                    return Ok(old);
+                }
                 if mode == SyncMode::ReconcileFinishedLegacy
                     && matches!(incoming.status.as_str(), "Done" | "Cancelled")
                 {
@@ -1731,15 +1872,6 @@ impl V2Store {
                     tx.commit()?;
                     return Ok(saved);
                 }
-                let delivery_hold: bool = is_terminal_task_status(&incoming.status)
-                    && !is_terminal_task_status(&old.status)
-                    && tx.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM post_merge_deliveries p
-                         WHERE p.task_id=?1 AND p.decision_id IS NOT NULL AND p.state NOT IN ('verified','aborted')
-                         AND NOT EXISTS(SELECT 1 FROM task_events e WHERE e.task_id=p.task_id
-                           AND e.event_type='DECISION_RETIRED' AND json_extract(e.payload_json,'$.decision_id')=p.decision_id))",
-                        [&old.task_id], |row| row.get(0),
-                    )?;
                 let mut next = incoming.clone();
                 let verified_delivery: bool = old.status == "Done" && tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM post_merge_deliveries WHERE task_id=?1)
