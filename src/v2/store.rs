@@ -442,6 +442,10 @@ pub struct PendingDecisionRecord {
     pub resolved_epoch: Option<i64>,
     pub choice: Option<String>,
     pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retirement_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub linked_unverified_delivery: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -512,6 +516,10 @@ pub struct ActiveTaskDetail {
     pub repository: String,
     pub weight: String,
     pub status: String,
+    #[serde(default)]
+    pub board_status: Option<String>,
+    #[serde(default)]
+    pub open_decision_id: Option<String>,
     pub title: String,
     pub executor: Option<String>,
     pub current_stage: Option<String>,
@@ -530,6 +538,10 @@ pub struct WaitingTaskDetail {
     pub repository: String,
     pub weight: String,
     pub status: String,
+    #[serde(default)]
+    pub board_status: Option<String>,
+    #[serde(default)]
+    pub open_decision_id: Option<String>,
     pub title: String,
     pub wait_reason: String,
     pub target_files: Vec<String>,
@@ -1183,17 +1195,147 @@ impl V2Store {
     }
 
     pub fn lifecycle_ops(&self) -> Result<Vec<LifecycleOperation>, V2StoreError> {
-        Ok(self.conn.prepare("SELECT operation_id,task_id,kind,args_json,body_path,depends_on,state,retry_epoch,attempts,last_error,attempt_id,decision_id FROM lifecycle_ops ORDER BY rowid")?.query_map([], |r| {
+        self.read_lifecycle_ops(false)
+    }
+
+    pub(crate) fn replayable_lifecycle_ops(&self) -> Result<Vec<LifecycleOperation>, V2StoreError> {
+        self.read_lifecycle_ops(true)
+    }
+
+    fn read_lifecycle_ops(
+        &self,
+        replay_only: bool,
+    ) -> Result<Vec<LifecycleOperation>, V2StoreError> {
+        Ok(self.conn.prepare("SELECT operation_id,task_id,kind,args_json,body_path,depends_on,state,retry_epoch,attempts,last_error,attempt_id,decision_id FROM lifecycle_ops l
+            WHERE NOT ?1 OR l.state='ACKNOWLEDGED' OR l.decision_id IS NULL OR NOT EXISTS(
+                SELECT 1 FROM task_events e WHERE e.task_id=l.task_id AND e.event_type='DECISION_RETIRED'
+                AND json_extract(e.payload_json,'$.decision_id')=l.decision_id)
+            ORDER BY rowid")?.query_map([replay_only], |r| {
             let args: String = r.get(3)?;
             Ok(LifecycleOperation { attempt_id:r.get(10)?,decision_id:r.get(11)?,operation_id:r.get(0)?,task_id:r.get(1)?,kind:r.get(2)?,args:serde_json::from_str(&args).unwrap_or_default(),body_path:r.get(4)?,depends_on:r.get(5)?,state:r.get(6)?,retry_epoch:r.get(7)?,attempts:r.get(8)?,last_error:r.get(9)? })
         })?.collect::<Result<_,_>>()?)
     }
 
     pub fn has_pending_lifecycle(&self, task_id: &str) -> Result<bool, V2StoreError> {
-        Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM lifecycle_ops WHERE task_id=?1 AND state!='ACKNOWLEDGED')",
+        Self::has_pending_lifecycle_on(&self.conn, task_id)
+    }
+
+    fn has_pending_lifecycle_on(conn: &Connection, task_id: &str) -> Result<bool, V2StoreError> {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM lifecycle_ops l WHERE task_id=?1 AND state!='ACKNOWLEDGED'
+                AND (l.decision_id IS NULL OR NOT EXISTS(SELECT 1 FROM task_events e
+                     WHERE e.task_id=l.task_id AND e.event_type='DECISION_RETIRED'
+                     AND json_extract(e.payload_json,'$.decision_id')=l.decision_id)))",
             [task_id],
             |r| r.get(0),
+        )?)
+    }
+
+    pub(crate) fn lifecycle_in_flight(&self, id: &str) -> Result<bool, V2StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM lifecycle_ops WHERE operation_id=?1 AND state IN ('IN_FLIGHT','QUEUED'))",
+            [id],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub(crate) fn grant_decision_publication(&mut self, id: &str) -> Result<bool, V2StoreError> {
+        Ok(self.conn.execute(
+            "UPDATE lifecycle_ops SET state='DISPATCHED', updated_epoch=?2
+             WHERE operation_id=?1 AND state='QUEUED'
+             AND EXISTS (SELECT 1 FROM tasks t WHERE t.task_id=lifecycle_ops.task_id
+                 AND lower(t.status) NOT IN ('done','cancelled') AND t.autonomous_consent)
+             AND EXISTS (SELECT 1 FROM pending_decisions d WHERE d.decision_id=lifecycle_ops.decision_id
+                 AND d.task_id=lifecycle_ops.task_id AND d.status='RESOLVED')
+             AND NOT EXISTS (SELECT 1 FROM task_events e WHERE e.task_id=lifecycle_ops.task_id
+                 AND e.event_type='DECISION_RETIRED'
+                 AND json_extract(e.payload_json,'$.decision_id')=lifecycle_ops.decision_id)
+             AND NOT EXISTS (SELECT 1 FROM lifecycle_ops other
+                 WHERE other.task_id=lifecycle_ops.task_id AND other.state='DISPATCHED')",
+            params![id, now_epoch()],
+        )? == 1)
+    }
+
+    pub(crate) fn deferred_terminal(
+        &self,
+        operation_id: &str,
+        task: &TaskRecord,
+    ) -> Result<Option<(String, bool)>, V2StoreError> {
+        Self::effective_deferred_terminal_on(&self.conn, operation_id, task)
+    }
+
+    fn effective_deferred_terminal_on(
+        conn: &Connection,
+        operation_id: &str,
+        task: &TaskRecord,
+    ) -> Result<Option<(String, bool)>, V2StoreError> {
+        let deferred = Self::deferred_terminal_on(conn, operation_id)?;
+        if deferred.as_ref().is_some_and(|(_, board)| *board)
+            && Self::delivery_holds_terminal(conn, task)?
+        {
+            return Ok(None);
+        }
+        Ok(deferred)
+    }
+
+    fn deferred_terminal_on(
+        conn: &Connection,
+        operation_id: &str,
+    ) -> Result<Option<(String, bool)>, V2StoreError> {
+        Ok(conn
+            .query_row(
+                "SELECT json_extract(payload_json,'$.status'),json_extract(payload_json,'$.board')
+             FROM task_events WHERE event_type='TASK_TERMINAL_DEFERRED'
+             AND json_extract(payload_json,'$.operation_id')=?1 ORDER BY seq_id DESC LIMIT 1",
+                [operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    fn defer_terminal_tx(
+        tx: &rusqlite::Transaction<'_>,
+        task: &TaskRecord,
+        status: &str,
+        board: bool,
+        now: i64,
+    ) -> Result<bool, V2StoreError> {
+        if !is_terminal_task_status(status) || is_terminal_task_status(&task.status) {
+            return Ok(false);
+        }
+        let Some(id) = tx
+            .query_row(
+                "SELECT operation_id FROM lifecycle_ops WHERE task_id=?1 AND state='DISPATCHED'",
+                [&task.task_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        else {
+            return Ok(false);
+        };
+        if Self::deferred_terminal_on(tx, &id)?
+            .as_ref()
+            .is_none_or(|(previous, from_board)| previous != status || *from_board != board)
+        {
+            Self::insert_event_tx(
+                tx,
+                &task.task_id,
+                &task.task_group,
+                now,
+                "TASK_TERMINAL_DEFERRED",
+                &serde_json::json!({"operation_id":id,"status":status,"board":board}),
+            )?;
+        }
+        Ok(true)
+    }
+
+    fn delivery_holds_terminal(conn: &Connection, task: &TaskRecord) -> Result<bool, V2StoreError> {
+        Ok(!is_terminal_task_status(&task.status) && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM post_merge_deliveries p
+             WHERE p.task_id=?1 AND p.decision_id IS NOT NULL AND p.state NOT IN ('verified','aborted')
+             AND NOT EXISTS(SELECT 1 FROM task_events e WHERE e.task_id=p.task_id
+               AND e.event_type='DECISION_RETIRED' AND json_extract(e.payload_json,'$.decision_id')=p.decision_id))",
+            [&task.task_id], |row| row.get(0),
         )?)
     }
 
@@ -1205,7 +1347,7 @@ impl V2Store {
         retry_epoch: i64,
     ) -> Result<(), V2StoreError> {
         let error = error.map(|s| crate::v2::runner::truncate_utf8_bytes(s, 1024));
-        self.conn.execute("UPDATE lifecycle_ops SET state=?2,last_error=?3,retry_epoch=?4,updated_epoch=?5,attempts=attempts+CASE WHEN ?2='IN_FLIGHT' THEN 1 ELSE 0 END WHERE operation_id=?1",params![id,state,error,retry_epoch,now_epoch()])?;
+        self.conn.execute("UPDATE lifecycle_ops SET state=?2,last_error=?3,retry_epoch=?4,updated_epoch=?5,attempts=attempts+CASE WHEN ?2 IN ('IN_FLIGHT','QUEUED') THEN 1 ELSE 0 END WHERE operation_id=?1",params![id,state,error,retry_epoch,now_epoch()])?;
         Ok(())
     }
 
@@ -1215,12 +1357,92 @@ impl V2Store {
         op: &LifecycleOperation,
         attempt_id: Option<&str>,
     ) -> Result<(), V2StoreError> {
+        self.finish_lifecycle(task, op, attempt_id, None)
+    }
+
+    pub(crate) fn settle_decision_publication(
+        &mut self,
+        task: &TaskRecord,
+        op: &LifecycleOperation,
+        settlement_id: &str,
+    ) -> Result<(), V2StoreError> {
+        self.finish_lifecycle(task, op, None, Some(settlement_id))
+    }
+
+    fn finish_lifecycle(
+        &mut self,
+        task: &TaskRecord,
+        op: &LifecycleOperation,
+        attempt_id: Option<&str>,
+        settlement_id: Option<&str>,
+    ) -> Result<(), V2StoreError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let old = Self::get_task_tx(&tx, &task.task_id)?
             .ok_or_else(|| V2StoreError("missing lifecycle task".into()))?;
-        Self::update_task_tx(&tx, &old, task, now_epoch())?;
+        if let Some(id) = &op.decision_id
+            && (is_terminal_task_status(&old.status)
+                || Self::get_decision_on(&tx, id)?
+                    .is_some_and(|decision| decision.status == "RETIRED"))
+        {
+            return Ok(());
+        }
+        let mut next = task.clone();
+        if op.state == "DISPATCHED"
+            && let Some((status, board)) =
+                Self::effective_deferred_terminal_on(&tx, &op.operation_id, &old)?
+        {
+            next = old.clone();
+            next.status = status;
+            next.memory.governance_terminal_observed |= board;
+            // Clear the fence only inside the acknowledgment transaction. Keep the
+            // publication pending for retirement until the terminal transition is recorded.
+            tx.execute(
+                "UPDATE lifecycle_ops SET state='SETTLING' WHERE operation_id=?1",
+                [&op.operation_id],
+            )?;
+        }
+        let now = now_epoch();
+        let retirement = if let Some(settlement_id) = settlement_id {
+            if op.state != "DISPATCHED" {
+                return Err(V2StoreError("publication is no longer dispatched".into()));
+            }
+            let id = op
+                .decision_id
+                .clone()
+                .ok_or_else(|| V2StoreError("publication has no decision".into()))?;
+            next.memory.applied_decisions.push(settlement_id.into());
+            if !is_terminal_task_status(&next.status) && !is_post_merge_status(&next.status) {
+                next.memory.halt_requested = true;
+            }
+            Some((id, "publication_settled"))
+        } else if op.state == "DISPATCHED" {
+            let id = format!("settle-{}", op.operation_id);
+            Self::get_decision_on(&tx, &id)?
+                .filter(|decision| decision.status != "RETIRED")
+                .map(|_| (id, "publication_confirmed"))
+        } else {
+            None
+        };
+        let saved = Self::update_task_tx(&tx, &old, &next, now)?;
+        if let Some((id, reason)) = retirement
+            && Self::get_decision_on(&tx, &id)?.is_some_and(|decision| decision.status != "RETIRED")
+        {
+            let reason = if is_terminal_task_status(&saved.status) {
+                saved.status.as_str()
+            } else {
+                reason
+            };
+            Self::insert_event_tx(
+                &tx,
+                &task.task_id,
+                &task.task_group,
+                now,
+                "DECISION_RETIRED",
+                &serde_json::json!({"task_id":task.task_id,"decision_id":id,"reason":reason,"settlement_id":settlement_id}),
+            )?;
+        }
         if let Some(id) = attempt_id {
             tx.execute(
                 "UPDATE stage_attempts SET phase='COMPLETE' WHERE attempt_id=?1",
@@ -1245,7 +1467,11 @@ impl V2Store {
                 &serde_json::json!({"receipt":task.memory.merge_checkpoint}),
             )?;
         }
-        tx.execute("UPDATE lifecycle_ops SET state='ACKNOWLEDGED',last_error=NULL,updated_epoch=?2 WHERE operation_id=?1",params![op.operation_id,now_epoch()])?;
+        tx.execute(
+            "UPDATE lifecycle_ops SET state=?2,last_error=CASE WHEN ?2='ACKNOWLEDGED' THEN NULL ELSE last_error END,
+             updated_epoch=?3 WHERE operation_id=?1",
+            params![op.operation_id, if settlement_id.is_some() { "SETTLED" } else { "ACKNOWLEDGED" }, now],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -1404,10 +1630,115 @@ impl V2Store {
                 task.lease_expires_epoch,
             ],
         )?;
+        if is_terminal_task_status(&task.status) {
+            Self::retire_decisions_tx(tx, task, now)?;
+        }
         let mut inserted = task.clone();
         inserted.version = 1;
         inserted.updated_epoch = now;
         Ok(inserted)
+    }
+
+    fn board_status_on(conn: &Connection, task_id: &str) -> Result<Option<String>, V2StoreError> {
+        Ok(conn
+            .query_row(
+                "SELECT json_extract(payload_json,'$.board_status') FROM task_events
+             WHERE task_id=?1 AND event_type='BOARD_STATUS_OBSERVED' ORDER BY seq_id DESC LIMIT 1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn board_statuses(
+        &self,
+        group: Option<&str>,
+    ) -> Result<BTreeMap<String, String>, V2StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.task_id,json_extract(e.payload_json,'$.board_status')
+             FROM (
+                SELECT task_id,MAX(seq_id) AS seq_id FROM task_events
+                WHERE event_type='BOARD_STATUS_OBSERVED' GROUP BY task_id
+             ) latest JOIN task_events e ON e.seq_id=latest.seq_id
+             JOIN tasks t ON t.task_id=latest.task_id
+             WHERE ?1 IS NULL OR t.task_group=?1 COLLATE NOCASE",
+        )?;
+        Ok(stmt
+            .query_map([group], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?)
+    }
+
+    fn retire_decisions_tx(
+        tx: &rusqlite::Transaction<'_>,
+        task: &TaskRecord,
+        now: i64,
+    ) -> Result<(), V2StoreError> {
+        let decisions = tx.prepare(
+            "SELECT decision_id,status,EXISTS(
+                 SELECT 1 FROM lifecycle_ops l WHERE l.task_id=d.task_id
+                   AND l.decision_id=d.decision_id AND l.state!='ACKNOWLEDGED'
+             ) FROM pending_decisions d WHERE task_id=?1
+             AND NOT EXISTS(SELECT 1 FROM task_events e WHERE e.task_id=d.task_id
+               AND e.event_type='DECISION_RETIRED' AND json_extract(e.payload_json,'$.decision_id')=d.decision_id)
+             ORDER BY created_seq",
+        )?.query_map([&task.task_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (id, status, pending_publication) in decisions {
+            if status == "OPEN"
+                || (status == "RESOLVED"
+                    && (pending_publication || !task.memory.applied_decisions.contains(&id)))
+            {
+                Self::insert_event_tx(
+                    tx,
+                    &task.task_id,
+                    &task.task_group,
+                    now,
+                    "DECISION_RETIRED",
+                    &serde_json::json!({"task_id":task.task_id,"decision_id":id,"reason":task.status}),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retire_terminal_decisions(&mut self) -> Result<(), V2StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ids = tx.prepare(
+            "SELECT DISTINCT t.task_id FROM tasks t JOIN pending_decisions d ON t.task_id=d.task_id
+             WHERE lower(t.status) IN ('done','cancelled')",
+        )?.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+        for id in ids {
+            if let Some(task) = Self::get_task_tx(&tx, &id)? {
+                Self::retire_decisions_tx(&tx, &task, now_epoch())?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn publish_status_tx(
+        tx: &rusqlite::Transaction<'_>,
+        task: &TaskRecord,
+        now: i64,
+        metadata_only: bool,
+    ) -> Result<(), V2StoreError> {
+        let event = if task.status.eq_ignore_ascii_case("Done") {
+            "TASK_DONE"
+        } else {
+            "TASK_STATUS_CHANGED"
+        };
+        Self::insert_event_tx(
+            tx,
+            &task.task_id,
+            &task.task_group,
+            now,
+            event,
+            &serde_json::json!({"task_id":task.task_id,"status":task.status,
+                "board_status":Self::board_status_on(tx, &task.task_id)?, "metadata_only":metadata_only}),
+        )?;
+        Ok(())
     }
 
     fn update_task_tx(
@@ -1416,6 +1747,9 @@ impl V2Store {
         next: &TaskRecord,
         now: i64,
     ) -> Result<TaskRecord, V2StoreError> {
+        if Self::defer_terminal_tx(tx, old, &next.status, false, now)? {
+            return Ok(old.clone());
+        }
         let context_pack_json = serde_json::to_string(&next.context_pack)?;
         let depends_on_json = serde_json::to_string(&next.depends_on)?;
         let required_stages_json = serde_json::to_string(&next.required_stages)?;
@@ -1493,15 +1827,13 @@ impl V2Store {
                 }),
             )?;
         }
-        if old.status != next.status && next.status.eq_ignore_ascii_case("Done") {
-            Self::insert_event_tx(
-                tx,
-                &next.task_id,
-                &next.task_group,
-                now,
-                "TASK_DONE",
-                &serde_json::json!({ "status": next.status }),
-            )?;
+        if old.status != next.status {
+            Self::publish_status_tx(tx, next, now, false)?;
+        }
+        if is_terminal_task_status(&next.status) {
+            Self::retire_decisions_tx(tx, next, now)?;
+        } else if is_terminal_task_status(&old.status) {
+            Self::retire_decisions_tx(tx, old, now)?;
         }
 
         let mut updated = next.clone();
@@ -1551,15 +1883,68 @@ impl V2Store {
         } else {
             now_epoch()
         };
-        let result = match Self::get_task_tx(&tx, &incoming.task_id)? {
+        let existing = Self::get_task_tx(&tx, &incoming.task_id)?;
+        if mode == SyncMode::ReconcileFinishedLegacy
+            && let Some(old) = existing.as_ref()
+            && Self::offline_identity_conflicts(old, incoming)
+        {
+            return Ok(old.clone());
+        }
+        let group = match (&existing, mode) {
+            (Some(old), SyncMode::ReconcileFinishedLegacy)
+                if is_terminal_task_status(&incoming.status) =>
+            {
+                &old.task_group
+            }
+            _ => &incoming.task_group,
+        };
+        let observed = crate::v2::runner::truncate_utf8_bytes(&incoming.status, 128);
+        if Self::board_status_on(&tx, &incoming.task_id)?.as_deref() != Some(observed.as_str()) {
+            Self::insert_event_tx(
+                &tx,
+                &incoming.task_id,
+                group,
+                now,
+                "BOARD_STATUS_OBSERVED",
+                &serde_json::json!({"task_id":incoming.task_id,"board_status":observed}),
+            )?;
+        }
+        let result = match existing {
             Some(mut old) => {
                 if mode == SyncMode::ReconcileFinishedLegacy
-                    && matches!(incoming.status.as_str(), "Done" | "Cancelled")
+                    && is_terminal_task_status(&incoming.status)
                 {
+                    if !matches!(incoming.status.as_str(), "Done" | "Cancelled") {
+                        tx.commit()?;
+                        return Ok(old);
+                    }
                     let raw = strict_task_json(&tx, &mut old)?;
                     let saved = Self::reconcile_offline_tx(&tx, &old, incoming, raw, now)?;
                     tx.commit()?;
                     return Ok(saved);
+                }
+                let delivery_hold = is_terminal_task_status(&incoming.status)
+                    && Self::delivery_holds_terminal(&tx, &old)?;
+                if !delivery_hold
+                    && Self::defer_terminal_tx(&tx, &old, &incoming.status, true, now)?
+                {
+                    tx.commit()?;
+                    return Ok(old);
+                }
+                if !is_terminal_task_status(&incoming.status) && tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM lifecycle_ops WHERE task_id=?1 AND state='DISPATCHED')",
+                    [&old.task_id], |row| row.get::<_, bool>(0),
+                )? {
+                    let mut next = old.clone();
+                    next.autonomous_consent &= incoming.autonomous_consent
+                        && !incoming.executor.as_deref().is_some_and(|executor| {
+                            !executor.trim().is_empty() && !executor.eq_ignore_ascii_case("zach")
+                        });
+                    if next.autonomous_consent != old.autonomous_consent {
+                        old = Self::update_task_tx(&tx, &old, &next, now)?;
+                    }
+                    tx.commit()?;
+                    return Ok(old);
                 }
                 let mut next = incoming.clone();
                 let verified_delivery: bool = old.status == "Done" && tx.query_row(
@@ -1568,13 +1953,11 @@ impl V2Store {
                     [&old.task_id], |row| row.get(0),
                 )?;
                 let is_blocked_to_ready = old.status == "Blocked" && incoming.status == "Ready";
-                let has_pending_lifecycle_ops: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM lifecycle_ops WHERE task_id=?1 AND state!='ACKNOWLEDGED')",
-                    [&old.task_id],
-                    |row| row.get(0),
-                )?;
-                let has_open_decision: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM pending_decisions WHERE task_id=?1 AND status='OPEN')",
+                let has_pending_lifecycle_ops = Self::has_pending_lifecycle_on(&tx, &old.task_id)?;
+                let has_open_decision: bool = !is_terminal_task_status(&old.status) && tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pending_decisions WHERE task_id=?1 AND status='OPEN'
+                     AND NOT EXISTS(SELECT 1 FROM task_events e WHERE e.task_id=pending_decisions.task_id
+                       AND e.event_type='DECISION_RETIRED' AND json_extract(e.payload_json,'$.decision_id')=pending_decisions.decision_id))",
                     [&old.task_id],
                     |row| row.get(0),
                 )?;
@@ -1590,7 +1973,11 @@ impl V2Store {
                 let idle_reset = idle_reset_eligible
                     && (old.status != incoming.status || incoming.status == "Backlog");
                 if !idle_reset
-                    && (should_preserve_zach_state(&old, incoming)
+                    && (delivery_hold
+                        || (has_open_decision
+                            && old.status == "Blocked"
+                            && incoming.status == "Backlog")
+                        || should_preserve_zach_state(&old, incoming)
                         || (verified_delivery && !is_terminal_task_status(&incoming.status)))
                 {
                     next.status = old.status.clone();
@@ -1644,6 +2031,13 @@ impl V2Store {
                     }
                 } else {
                     coalesce_runtime_fields(&old, &mut next);
+                    if is_terminal_task_status(&next.status) {
+                        next.lease_owner = old.lease_owner.clone();
+                        next.lease_expires_epoch = old.lease_expires_epoch;
+                        next.next_retry_epoch = old.next_retry_epoch;
+                        next.memory = old.memory.clone();
+                        next.memory.governance_started |= incoming.memory.governance_started;
+                    }
                     if idle_reset {
                         next.status = incoming.status.clone();
                         next.current_stage = None;
@@ -1674,13 +2068,14 @@ impl V2Store {
                     }
                 }
                 next.memory.governance_terminal_observed |= old.memory.governance_terminal_observed
-                    || is_terminal_task_status(&incoming.status);
+                    || (!delivery_hold && is_terminal_task_status(&incoming.status));
                 Self::update_task_tx(&tx, &old, &next, now)?
             }
             None => {
                 let mut next = incoming.clone();
                 next.memory.governance_terminal_observed |=
                     is_terminal_task_status(&incoming.status);
+                Self::publish_status_tx(&tx, &next, now, true)?;
                 Self::insert_task_tx(&tx, &next, now)?
             }
         };
@@ -1688,14 +2083,8 @@ impl V2Store {
         Ok(result)
     }
 
-    fn reconcile_offline_tx(
-        tx: &rusqlite::Transaction<'_>,
-        old: &TaskRecord,
-        incoming: &TaskRecord,
-        mut raw: RawTask,
-        now: i64,
-    ) -> Result<TaskRecord, V2StoreError> {
-        let conflicting = old.repository != incoming.repository
+    fn offline_identity_conflicts(old: &TaskRecord, incoming: &TaskRecord) -> bool {
+        old.repository != incoming.repository
             || old
                 .github_repo
                 .as_ref()
@@ -1705,6 +2094,16 @@ impl V2Store {
                 .issue_number
                 .zip(incoming.issue_number)
                 .is_some_and(|(a, b)| a != b)
+    }
+
+    fn reconcile_offline_tx(
+        tx: &rusqlite::Transaction<'_>,
+        old: &TaskRecord,
+        incoming: &TaskRecord,
+        mut raw: RawTask,
+        now: i64,
+    ) -> Result<TaskRecord, V2StoreError> {
+        let conflicting = Self::offline_identity_conflicts(old, incoming)
             || incoming.current_stage.is_some()
             || incoming.lease_owner.is_some()
             || incoming.lease_expires_epoch.is_some()
@@ -1789,8 +2188,13 @@ impl V2Store {
         if raw_task(tx, &old.task_id)? != raw {
             return Err(V2StoreError("offline task changed during cleanup".into()));
         }
-        Self::get_task_tx(tx, &old.task_id)?
-            .ok_or_else(|| V2StoreError("offline task disappeared".into()))
+        let saved = Self::get_task_tx(tx, &old.task_id)?
+            .ok_or_else(|| V2StoreError("offline task disappeared".into()))?;
+        if old.status != saved.status {
+            Self::publish_status_tx(tx, &saved, now, empty)?;
+        }
+        Self::retire_decisions_tx(tx, &saved, now)?;
+        Ok(saved)
     }
 
     fn can_classify_empty_tx(
@@ -1824,7 +2228,6 @@ impl V2Store {
             "pending_decisions",
             "merge_queue",
             "path_locks",
-            "task_events",
         ] {
             let exists: bool = tx.query_row(
                 &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE task_id=?1)"),
@@ -1835,7 +2238,15 @@ impl V2Store {
                 return Ok(false);
             }
         }
-        Ok(true)
+        let native_events: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM task_events WHERE task_id=?1
+             AND event_type!='BOARD_STATUS_OBSERVED'
+             AND NOT(event_type IN ('TASK_DONE','TASK_STATUS_CHANGED') AND
+                     coalesce(json_extract(payload_json,'$.metadata_only'),0)=1))",
+            [&old.task_id],
+            |row| row.get(0),
+        )?;
+        Ok(!native_events)
     }
 
     /// Status/consent alone never proves that Zach owns startup recovery. Validate
@@ -1866,16 +2277,14 @@ impl V2Store {
         {
             return Ok(true);
         }
-        for table in [
-            "lifecycle_ops",
-            "post_merge_deliveries",
-            "merge_queue",
-            "path_locks",
-        ] {
-            let filter = match table {
-                "lifecycle_ops" => " AND state!='ACKNOWLEDGED'",
-                "post_merge_deliveries" => " AND state NOT IN ('verified','aborted')",
-                _ => "",
+        if self.has_pending_lifecycle(&task.task_id)? {
+            return Ok(true);
+        }
+        for table in ["post_merge_deliveries", "merge_queue", "path_locks"] {
+            let filter = if table == "post_merge_deliveries" {
+                " AND state NOT IN ('verified','aborted')"
+            } else {
+                ""
             };
             let exists: bool = self.conn.query_row(
                 &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE task_id=?1{filter})"),
@@ -1901,12 +2310,21 @@ impl V2Store {
         }) {
             return Err(V2StoreError("ambiguous native startup history".into()));
         }
-        if self.list_decisions(false, None)?.iter().any(|d| {
-            d.task_id == task.task_id
-                && (d.status != "RESOLVED"
-                    || !task.memory.applied_decisions.contains(&d.decision_id))
-        }) {
-            return Ok(true);
+        let mut decisions = self.conn.prepare(&format!(
+            "{} WHERE d.task_id=?1",
+            Self::DECISION_HISTORY_SELECT,
+        ))?;
+        for row in decisions.query_map([&task.task_id], Self::map_decision_row)? {
+            let decision = row?;
+            if decision.status != "RETIRED"
+                && (decision.status != "RESOLVED"
+                    || !task
+                        .memory
+                        .applied_decisions
+                        .contains(&decision.decision_id))
+            {
+                return Ok(true);
+            }
         }
         // A terminal observation can outlive a later human reopen. With every
         // current native reference/effect excluded above, completed worker stages
@@ -1950,12 +2368,19 @@ impl V2Store {
         {
             return Ok(false);
         }
-        let effects: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_ops WHERE task_id=?1 AND state!='ACKNOWLEDGED') OR EXISTS(SELECT 1 FROM post_merge_deliveries WHERE task_id=?1 AND state!='verified') OR EXISTS(SELECT 1 FROM merge_queue WHERE task_id=?1 AND (state!='FAILED' OR repo!=?2))", params![old.task_id,old.repository], |r| r.get(0))?;
+        let effects: bool = Self::has_pending_lifecycle_on(tx, &old.task_id)?
+            || tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM post_merge_deliveries WHERE task_id=?1 AND state!='verified')
+                 OR EXISTS(SELECT 1 FROM merge_queue WHERE task_id=?1 AND (state!='FAILED' OR repo!=?2))",
+                params![old.task_id, old.repository], |r| r.get(0),
+            )?;
         if effects {
             return Ok(false);
         }
         let decisions = tx
-            .prepare("SELECT decision_id,status FROM pending_decisions WHERE task_id=?1")?
+            .prepare("SELECT decision_id,status FROM pending_decisions d WHERE task_id=?1
+                AND NOT EXISTS(SELECT 1 FROM task_events e WHERE e.task_id=d.task_id
+                    AND e.event_type='DECISION_RETIRED' AND json_extract(e.payload_json,'$.decision_id')=d.decision_id)")?
             .query_map([&old.task_id], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             })?
@@ -2187,6 +2612,7 @@ impl V2Store {
         if !matches_receipt {
             return Ok(None);
         }
+        Self::retire_decisions_tx(&tx, &old, now_epoch())?;
         let mut next = old.clone();
         next.status = "Delivery Pending".into();
         next.memory.merge_lane_released = true;
@@ -2453,9 +2879,6 @@ impl V2Store {
         context_summary: &str,
         sha: Option<&str>,
     ) -> Result<PendingDecisionRecord, V2StoreError> {
-        if let Some(existing) = self.get_decision(decision_id)? {
-            return Ok(existing);
-        }
         let now = now_epoch();
         let bounded_context = crate::v2::runner::truncate_utf8_bytes(
             context_summary,
@@ -2464,6 +2887,24 @@ impl V2Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = Self::get_decision_on(&tx, decision_id)? {
+            return Ok(existing);
+        }
+        let old = Self::get_task_tx(&tx, task_id)?;
+        if old
+            .as_ref()
+            .is_some_and(|task| is_terminal_task_status(&task.status))
+        {
+            return Err(V2StoreError(
+                "cannot open a decision for a terminal task".into(),
+            ));
+        }
+        let linked_unverified_delivery: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM post_merge_deliveries
+                           WHERE task_id=?1 AND decision_id=?2 AND state NOT IN ('verified','aborted'))",
+            params![task_id, decision_id],
+            |row| row.get(0),
+        )?;
         let seq_id = Self::insert_event_tx(
             &tx,
             task_id,
@@ -2476,6 +2917,7 @@ impl V2Store {
                 "question": question,
                 "options": options,
                 "recommended_option": recommended_option,
+                "linked_unverified_delivery": linked_unverified_delivery,
                 "sha": sha,
             }),
         )?;
@@ -2507,6 +2949,11 @@ impl V2Store {
                  version = version + 1, updated_epoch = ?2 WHERE task_id = ?1",
             params![task_id, now, kind],
         )?;
+        if let (Some(old), Some(next)) = (old, Self::get_task_tx(&tx, task_id)?)
+            && old.status != next.status
+        {
+            Self::publish_status_tx(&tx, &next, now, false)?;
+        }
         tx.commit()?;
         self.get_decision(decision_id)?
             .ok_or_else(|| V2StoreError("Failed to read created decision".into()))
@@ -2519,17 +2966,29 @@ impl V2Store {
         resolved_by: &str,
         note: Option<&str>,
     ) -> Result<DecisionResolution, V2StoreError> {
-        let choice = if let Some(existing) = self.get_decision(decision_id)? {
+        let now = now_epoch();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let choice = if let Some(existing) = Self::get_decision_on(&tx, decision_id)? {
+            if existing.status == "RETIRED" {
+                return Ok(DecisionResolution::NotFound);
+            }
             if existing.status == "RESOLVED" {
                 return Ok(DecisionResolution::AlreadyResolved(existing));
             }
-            let task = self
-                .get_task(&existing.task_id)?
+            let task = Self::get_task_tx(&tx, &existing.task_id)?
                 .ok_or_else(|| V2StoreError("decision task missing".into()))?;
-            let delivery = existing.kind != "governance_close_failed"
-                && (is_post_merge_decision(&existing.kind)
-                    || is_post_merge_status(&task.status)
-                    || !self.list_deliveries(Some(&existing.task_id))?.is_empty());
+            let delivery = !matches!(
+                existing.kind.as_str(),
+                "governance_close_failed" | "governance_publication_uncertain"
+            ) && (is_post_merge_decision(&existing.kind)
+                || is_post_merge_status(&task.status)
+                || tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM post_merge_deliveries WHERE task_id=?1)",
+                    [&existing.task_id],
+                    |row| row.get(0),
+                )?);
             let selected = if delivery {
                 choice
                     .parse::<usize>()
@@ -2555,14 +3014,14 @@ impl V2Store {
             return Ok(DecisionResolution::NotFound);
         };
         let choice = choice.as_str();
-        let now = now_epoch();
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = tx.execute(
             "UPDATE pending_decisions
              SET status = 'RESOLVED', choice = ?2, resolved_by = ?3, resolved_epoch = ?4, note = ?5
-             WHERE decision_id = ?1 AND status = 'OPEN'",
+             WHERE decision_id = ?1 AND status = 'OPEN'
+               AND EXISTS(SELECT 1 FROM tasks t WHERE t.task_id=pending_decisions.task_id
+                          AND lower(t.status) NOT IN ('done','cancelled'))
+               AND NOT EXISTS(SELECT 1 FROM task_events e WHERE e.task_id=pending_decisions.task_id
+                   AND e.event_type='DECISION_RETIRED' AND json_extract(e.payload_json,'$.decision_id')=?1)",
             params![decision_id, choice, resolved_by, now, note],
         )?;
         if changed == 0 {
@@ -2588,8 +3047,11 @@ impl V2Store {
             params![task_id],
             |row| row.get(0),
         )?;
-        let post_merge = kind != "governance_close_failed"
-            && (is_post_merge_decision(&kind) || is_post_merge_status(&task_status) || linked);
+        let post_merge =
+            !matches!(
+                kind.as_str(),
+                "governance_close_failed" | "governance_publication_uncertain"
+            ) && (is_post_merge_decision(&kind) || is_post_merge_status(&task_status) || linked);
         let mut next_status = task_status.as_str();
         if post_merge {
             let options_raw: String = tx.query_row(
@@ -2690,6 +3152,11 @@ impl V2Store {
                 "note": note,
             }),
         )?;
+        if next_status != task_status
+            && let Some(task) = Self::get_task_tx(&tx, &task_id)?
+        {
+            Self::publish_status_tx(&tx, &task, now, false)?;
+        }
         tx.commit()?;
         let rec = self
             .get_decision(decision_id)?
@@ -2701,15 +3168,37 @@ impl V2Store {
         &self,
         decision_id: &str,
     ) -> Result<Option<PendingDecisionRecord>, V2StoreError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT decision_id, task_id, task_group, kind, question, options_json,
-                    recommended_option, context_summary, sha, status, created_seq,
-                    resolved_by, resolved_epoch, choice, note
-             FROM pending_decisions WHERE decision_id = ?1",
-        )?;
-        stmt.query_row(params![decision_id], Self::map_decision_row)
-            .optional()
-            .map_err(V2StoreError::from)
+        Self::get_decision_on(&self.conn, decision_id)
+    }
+
+    const DECISION_HISTORY_SELECT: &str = "
+        SELECT d.decision_id,d.task_id,d.task_group,d.kind,d.question,d.options_json,
+               d.recommended_option,d.context_summary,d.sha,d.status,d.created_seq,
+               d.resolved_by,d.resolved_epoch,d.choice,d.note,
+               coalesce(
+                   (SELECT json_extract(e.payload_json,'$.reason') FROM task_events e
+                    WHERE e.task_id=d.task_id AND e.event_type='DECISION_RETIRED'
+                    AND json_extract(e.payload_json,'$.decision_id')=d.decision_id
+                    ORDER BY seq_id DESC LIMIT 1),
+                   (SELECT t.status FROM tasks t WHERE t.task_id=d.task_id
+                    AND d.status='OPEN' AND lower(t.status) IN ('done','cancelled'))
+               ) AS retirement_reason,
+               EXISTS(SELECT 1 FROM post_merge_deliveries p
+                      WHERE p.task_id=d.task_id AND p.decision_id=d.decision_id
+                      AND p.state NOT IN ('verified','aborted'))
+        FROM pending_decisions d";
+
+    fn get_decision_on(
+        conn: &Connection,
+        decision_id: &str,
+    ) -> Result<Option<PendingDecisionRecord>, V2StoreError> {
+        Ok(conn
+            .prepare(&format!(
+                "{} WHERE d.decision_id=?1",
+                Self::DECISION_HISTORY_SELECT
+            ))?
+            .query_row([decision_id], Self::map_decision_row)
+            .optional()?)
     }
 
     pub fn list_decisions(
@@ -2717,27 +3206,19 @@ impl V2Store {
         open_only: bool,
         group_filter: Option<&str>,
     ) -> Result<Vec<PendingDecisionRecord>, V2StoreError> {
-        let mut all = Vec::new();
-        let mut stmt = self.conn.prepare(
-            "SELECT decision_id, task_id, task_group, kind, question, options_json,
-                    recommended_option, context_summary, sha, status, created_seq,
-                    resolved_by, resolved_epoch, choice, note
-             FROM pending_decisions ORDER BY created_seq ASC",
-        )?;
-        let rows = stmt.query_map([], Self::map_decision_row)?;
-        for r in rows {
-            let item = r?;
-            if open_only && item.status != "OPEN" {
-                continue;
+        let mut stmt = self.conn.prepare(&format!(
+            "{} WHERE (?1 IS NULL OR d.task_group=?1 COLLATE NOCASE) ORDER BY d.created_seq",
+            Self::DECISION_HISTORY_SELECT,
+        ))?;
+        let rows = stmt.query_map([group_filter], Self::map_decision_row)?;
+        let mut decisions = Vec::new();
+        for row in rows {
+            let decision = row?;
+            if !open_only || decision.status == "OPEN" {
+                decisions.push(decision);
             }
-            if let Some(group) = group_filter
-                && !item.task_group.eq_ignore_ascii_case(group)
-            {
-                continue;
-            }
-            all.push(item);
         }
-        Ok(all)
+        Ok(decisions)
     }
 
     pub fn record_stage_attempt(
@@ -2885,6 +3366,14 @@ impl V2Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let old = Self::get_task_tx(&tx, &task.task_id)?
             .ok_or_else(|| V2StoreError("transition task missing".into()))?;
+        if decision.is_some()
+            && is_terminal_task_status(&old.status)
+            && !is_terminal_task_status(&task.status)
+        {
+            return Err(V2StoreError(
+                "decision cannot reopen a terminal task".into(),
+            ));
+        }
         Self::update_task_tx(&tx, &old, task, now_epoch())?;
         if let Some(attempt) = attempt {
             Self::record_stage_attempt_tx(&tx, attempt)?;
@@ -2893,7 +3382,10 @@ impl V2Store {
             tx.execute("DELETE FROM path_locks WHERE task_id=?1", [&task.task_id])?;
             tx.execute("DELETE FROM merge_queue WHERE task_id=?1", [&task.task_id])?;
         }
-        if let Some(decision) = decision {
+        if let Some(decision) = decision
+            && !is_terminal_task_status(&task.status)
+            && !is_terminal_task_status(&old.status)
+        {
             let exists: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pending_decisions WHERE decision_id=?1)",
                 [&decision.decision_id],
@@ -3165,7 +3657,7 @@ impl V2Store {
 
         {
             let mut stmt = self.conn.prepare(
-                "SELECT attempt_id, body_path FROM lifecycle_ops WHERE state != 'ACKNOWLEDGED'",
+                "SELECT attempt_id, body_path FROM lifecycle_ops WHERE state NOT IN ('ACKNOWLEDGED','SETTLED')",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((
@@ -3513,7 +4005,7 @@ impl V2Store {
             pending_write_backs: self
                 .lifecycle_ops()?
                 .iter()
-                .filter(|o| o.state != "ACKNOWLEDGED")
+                .filter(|o| !matches!(o.state.as_str(), "ACKNOWLEDGED" | "SETTLED"))
                 .count(),
             reconciliation_errors: self
                 .meta("reconciliation_errors")?
@@ -3620,6 +4112,8 @@ impl V2Store {
         let available_slots = max_parallel.saturating_sub(active_slot_count);
         let now = now_epoch();
 
+        let board_statuses = self.board_statuses(group_filter)?;
+        let open_decisions = self.list_decisions(true, group_filter)?;
         let mut active_tasks = Vec::new();
         let mut waiting_tasks = Vec::new();
         let mut group_task_ids = BTreeSet::new();
@@ -3631,6 +4125,12 @@ impl V2Store {
                 continue;
             }
             group_task_ids.insert(task.task_id.clone());
+            let board_status = board_statuses.get(&task.task_id).cloned();
+            let open_decision_id = open_decisions
+                .iter()
+                .filter(|decision| decision.task_id == task.task_id)
+                .max_by_key(|decision| (decision.linked_unverified_delivery, decision.created_seq))
+                .map(|decision| decision.decision_id.clone());
 
             let target_files: Vec<String> = task
                 .context_pack
@@ -3664,6 +4164,8 @@ impl V2Store {
                     repository: task.repository.clone(),
                     weight: task.weight.clone(),
                     status: task.status.clone(),
+                    board_status,
+                    open_decision_id,
                     title: task.title.clone(),
                     executor: task.executor.clone(),
                     current_stage: task.current_stage.clone(),
@@ -3674,7 +4176,10 @@ impl V2Store {
                     target_files,
                     reservation,
                 });
-            } else if matches!(task.status.as_str(), "Ready" | "Blocked") {
+            } else if matches!(task.status.as_str(), "Ready" | "Blocked")
+                || is_post_merge_status(&task.status)
+                || open_decision_id.is_some()
+            {
                 let wait_reason = if !task.autonomous_consent {
                     "awaiting_consent".to_owned()
                 } else if blocked_by_decision.contains(&task.task_id) {
@@ -3702,6 +4207,8 @@ impl V2Store {
                             format!("path_conflict:{owner}:{path}")
                         }
                     }
+                } else if is_post_merge_status(&task.status) {
+                    "post_merge_delivery".to_owned()
                 } else if available_slots == 0 {
                     "no_free_slots".to_owned()
                 } else {
@@ -3714,6 +4221,8 @@ impl V2Store {
                     repository: task.repository.clone(),
                     weight: task.weight.clone(),
                     status: task.status.clone(),
+                    board_status,
+                    open_decision_id,
                     title: task.title.clone(),
                     wait_reason,
                     target_files,
@@ -3732,8 +4241,6 @@ impl V2Store {
             .into_iter()
             .filter(|entry| group_filter.is_none() || group_task_ids.contains(&entry.task_id))
             .collect();
-        let open_decisions = self.list_decisions(true, group_filter)?;
-
         Ok(DetailedStatusReport {
             summary,
             active_tasks,
@@ -3799,6 +4306,7 @@ impl V2Store {
     fn map_decision_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingDecisionRecord> {
         let options_str: String = row.get(5)?;
         let rec_opt: Option<i64> = row.get(6)?;
+        let retirement_reason = row.get::<_, Option<String>>(15)?;
         Ok(PendingDecisionRecord {
             decision_id: row.get(0)?,
             task_id: row.get(1)?,
@@ -3809,12 +4317,18 @@ impl V2Store {
             recommended_option: rec_opt.and_then(|v| usize::try_from(v).ok()),
             context_summary: row.get(7)?,
             sha: row.get(8)?,
-            status: row.get(9)?,
+            status: if retirement_reason.is_some() {
+                "RETIRED".into()
+            } else {
+                row.get(9)?
+            },
             created_seq: row.get(10)?,
             resolved_by: row.get(11)?,
             resolved_epoch: row.get(12)?,
             choice: row.get(13)?,
             note: row.get(14)?,
+            retirement_reason,
+            linked_unverified_delivery: row.get(16)?,
         })
     }
 
@@ -4054,6 +4568,162 @@ mod tests {
     }
 
     #[test]
+    fn terminalization_preserves_decision_history_and_runtime_across_replay_and_restart() {
+        for terminal in ["Done", "Cancelled"] {
+            for from_board in [true, false] {
+                let db = LegacyTestDb::new();
+                let mut store = V2Store::open(&db.0).unwrap();
+                let mut task = sample_task("SYNTHETIC-1", "Backlog", vec![]);
+                task.autonomous_consent = false;
+                store.sync_task(&task).unwrap();
+                store
+                    .open_decision(
+                        "stale",
+                        &task.task_id,
+                        &task.task_group,
+                        "failure",
+                        "Retry?",
+                        &["Retry stage".into()],
+                        Some(0),
+                        "original failure",
+                        None,
+                    )
+                    .unwrap();
+                let mut saved = store.get_task(&task.task_id).unwrap().unwrap();
+                saved.active_attempt_id = Some("running".into());
+                saved.lease_owner = Some("owner".into());
+                saved.lease_expires_epoch = Some(55);
+                saved.memory.pipeline_checkpoint = Some(PipelineCheckpoint {
+                    attempt_id: "running".into(),
+                    operation: "VALIDATE".into(),
+                });
+                store.upsert_task(&saved).unwrap();
+                store.conn.execute_batch("INSERT INTO stage_attempts(attempt_id,task_id,stage,model,effort,started_epoch,status,phase,last_liveness_epoch) VALUES('running','SYNTHETIC-1','impl','synthetic','low',1,'RUNNING','RUNNING',1)").unwrap();
+                assert!(
+                    store
+                        .acquire_path_locks(&task.repository, &["*".into()], &task.task_id)
+                        .unwrap()
+                );
+                let raw_decisions = table_rows(&store, "pending_decisions");
+                let raw_attempts = table_rows(&store, "stage_attempts");
+                let raw_locks = table_rows(&store, "path_locks");
+                assert_eq!(store.sync_task(&task).unwrap().status, "Blocked");
+                assert_eq!(store.status_summary().unwrap().open_decisions_count, 1);
+                let cursor = store.max_seq_id().unwrap();
+                task.status = terminal.into();
+                if from_board {
+                    store.sync_task(&task).unwrap();
+                } else {
+                    saved.status = terminal.into();
+                    store.transition_task(&saved, None, false, None).unwrap();
+                }
+                let events = store.list_events_since(None, cursor, 10).unwrap();
+                let mut expected = vec![];
+                if from_board {
+                    expected.push("BOARD_STATUS_OBSERVED");
+                }
+                expected.extend([
+                    if terminal == "Done" {
+                        "TASK_DONE"
+                    } else {
+                        "TASK_STATUS_CHANGED"
+                    },
+                    "DECISION_RETIRED",
+                ]);
+                assert_eq!(
+                    events
+                        .iter()
+                        .map(|event| event.event_type.as_str())
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+                assert_eq!(
+                    events[events.len() - 2].payload["board_status"],
+                    if from_board { terminal } else { "Backlog" }
+                );
+                assert_eq!(store.status_summary().unwrap().open_decisions_count, 0);
+                assert!(store.list_decisions(true, None).unwrap().is_empty());
+                let history = store.list_decisions(false, None).unwrap().remove(0);
+                assert_eq!(history.status, "RETIRED");
+                assert_eq!(history.retirement_reason.as_deref(), Some(terminal));
+                assert_eq!(history.context_summary, "original failure");
+                assert_eq!(history.choice, None);
+                assert!(
+                    store
+                        .open_decision(
+                            "late",
+                            &task.task_id,
+                            &task.task_group,
+                            "failure",
+                            "Late?",
+                            &["Retry stage".into()],
+                            None,
+                            "",
+                            None
+                        )
+                        .is_err()
+                );
+                if from_board {
+                    store.sync_task(&task).unwrap();
+                }
+                drop(store);
+                let mut store = V2Store::open(&db.0).unwrap();
+                store.retire_terminal_decisions().unwrap();
+                assert_eq!(store.list_events_since(None, cursor, 10).unwrap(), events);
+                let mut reopened = store.get_task(&task.task_id).unwrap().unwrap();
+                assert_eq!(reopened.active_attempt_id, saved.active_attempt_id);
+                assert_eq!(reopened.lease_owner, saved.lease_owner);
+                assert_eq!(reopened.lease_expires_epoch, saved.lease_expires_epoch);
+                assert_eq!(
+                    reopened.memory.pipeline_checkpoint,
+                    saved.memory.pipeline_checkpoint
+                );
+                reopened.status = "Ready".into();
+                store.upsert_task(&reopened).unwrap();
+                assert!(matches!(
+                    store
+                        .resolve_decision("stale", "Retry stage", "actor", None)
+                        .unwrap(),
+                    DecisionResolution::NotFound
+                ));
+                assert!(store.list_decisions(true, None).unwrap().is_empty());
+                assert_eq!(table_rows(&store, "pending_decisions"), raw_decisions);
+                assert_eq!(table_rows(&store, "stage_attempts"), raw_attempts);
+                assert_eq!(table_rows(&store, "path_locks"), raw_locks);
+                assert_eq!(store.get_decision("stale").unwrap().unwrap(), history);
+            }
+        }
+    }
+
+    #[test]
+    fn declined_offline_observation_is_idempotent_and_leaves_empty_row_eligible() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        let mut input = terminal_input();
+        let original = sample_task(&input.task_id, "Backlog", vec![]);
+        store.upsert_task(&original).unwrap();
+        let raw = raw_task(&store.conn, &input.task_id).unwrap();
+        input.current_stage = Some("conflicting".into());
+        for _ in 0..2 {
+            store
+                .sync_task_with_mode(&input, SyncMode::ReconcileFinishedLegacy)
+                .unwrap();
+            assert_eq!(raw_task(&store.conn, &input.task_id).unwrap(), raw);
+            assert_eq!(store.max_seq_id().unwrap(), 1);
+        }
+        input.current_stage = None;
+        let accepted = store
+            .sync_task_with_mode(&input, SyncMode::ReconcileFinishedLegacy)
+            .unwrap();
+        assert_eq!(accepted.status, "Done");
+        assert_eq!(store.max_seq_id().unwrap(), 2);
+        let mut expected = raw;
+        expected.insert("status".into(), "Done".to_owned().into());
+        expected.insert("version".into(), accepted.version.into());
+        expected.insert("updated_epoch".into(), accepted.updated_epoch.into());
+        assert_eq!(raw_task(&store.conn, &input.task_id).unwrap(), expected);
+    }
+
+    #[test]
     fn offline_empty_metadata_preserves_raw_rows_events_and_repeats_after_reopen() {
         for terminal in ["Done", "Cancelled"] {
             for status in ["Backlog", "Ready", "In Progress", terminal] {
@@ -4069,7 +4739,6 @@ mod tests {
                     // Native upsert emits Done only on UPDATE, not this initial INSERT.
                     store.conn.execute("UPDATE tasks SET memory_json=?1, context_pack_json=' { } ', stages_completed_json=' [ ] ', depends_on_json=' [ ] '",[memory]).unwrap();
                     let before = raw_task(&store.conn, &t.task_id).unwrap();
-                    let events = table_rows(&store, "task_events");
                     let export = serde_json::json!({"schema_version":2,"tasks":[{"id":t.task_id,"repository":t.repository,"status":terminal,"executor":"external","reviewed_sha":"canonical-review","context_pack":{"base_sha":"canonical-base"},"stages_completed":["manual-complete"],"branch":"task/planned","worktree":"/predeclared","autonomous_consent":!t.autonomous_consent}]});
                     let incoming = crate::v2::intake::decode_export_records(&export.to_string())
                         .unwrap()
@@ -4084,7 +4753,22 @@ mod tests {
                         expected.insert("updated_epoch".into(), out.updated_epoch.into());
                     }
                     assert_eq!(raw_task(&store.conn, &t.task_id).unwrap(), expected);
-                    assert_eq!(table_rows(&store, "task_events"), events);
+                    let events = store.list_task_events(&t.task_id).unwrap();
+                    let mut expected_types = vec!["BOARD_STATUS_OBSERVED"];
+                    if status != terminal {
+                        expected_types.push(if terminal == "Done" {
+                            "TASK_DONE"
+                        } else {
+                            "TASK_STATUS_CHANGED"
+                        });
+                    }
+                    assert_eq!(
+                        events
+                            .iter()
+                            .map(|e| e.event_type.as_str())
+                            .collect::<Vec<_>>(),
+                        expected_types
+                    );
                     for table in [
                         "stage_attempts",
                         "lifecycle_ops",
@@ -4101,6 +4785,7 @@ mod tests {
                         .sync_task_with_mode(&incoming, SyncMode::ReconcileFinishedLegacy)
                         .unwrap();
                     assert_eq!(raw_task(&reopened.conn, &t.task_id).unwrap(), expected);
+                    assert_eq!(reopened.list_task_events(&t.task_id).unwrap(), events);
                 }
             }
         }
@@ -4246,7 +4931,22 @@ mod tests {
         expected.insert("memory_json".into(), after_memory.clone().into());
         assert_eq!(after, expected);
         for (table, rows) in history {
-            assert_eq!(table_rows(&store, table), rows, "{table}");
+            let after = table_rows(&store, table);
+            if table == "task_events" {
+                assert_eq!(after[..rows.len()], rows);
+                assert_eq!(
+                    after[rows.len()..]
+                        .iter()
+                        .map(|row| row[4].clone())
+                        .collect::<Vec<_>>(),
+                    vec![
+                        "BOARD_STATUS_OBSERVED".to_owned().into(),
+                        "TASK_DONE".to_owned().into()
+                    ]
+                );
+            } else {
+                assert_eq!(after, rows, "{table}");
+            }
         }
         store
             .sync_task_with_mode(&terminal_input(), SyncMode::ReconcileFinishedLegacy)
@@ -4287,7 +4987,17 @@ mod tests {
                 .unwrap();
             assert_eq!(raw_task(&store.conn, "SYNTHETIC-1").unwrap(), before);
             for (t, rows) in tables {
-                assert_eq!(table_rows(&store, t), rows);
+                let after = table_rows(&store, t);
+                if t == "task_events" {
+                    assert_eq!(after.len(), rows.len() + 1);
+                    assert_eq!(after[..rows.len()], rows);
+                    assert_eq!(
+                        after[rows.len()][4],
+                        "BOARD_STATUS_OBSERVED".to_owned().into()
+                    );
+                } else {
+                    assert_eq!(after, rows);
+                }
             }
         }
         for finished in [false, true] {
@@ -5627,6 +6337,89 @@ mod tests {
     }
 
     #[test]
+    fn terminal_exports_do_not_retire_an_unverified_linked_delivery_gate() {
+        for terminal in ["Done", "Cancelled"] {
+            let db = LegacyTestDb::new();
+            let mut store = V2Store::open(&db.0).unwrap();
+            let task = delivery_task("Pending Prod Promotion");
+            let mut row = sample_delivery(&task);
+            let id = row.decision_id.clone().unwrap();
+            store
+                .save_deliveries_and_task(&task, std::slice::from_ref(&row))
+                .unwrap();
+            let mut incoming = task.clone();
+            incoming.status = terminal.into();
+            // The persisted link protects the checkpoint before the gate is published.
+            assert_eq!(store.sync_task(&incoming).unwrap().status, task.status);
+            let original = store
+                .open_decision(
+                    &id,
+                    &task.task_id,
+                    &task.task_group,
+                    "prod_promotion_approval",
+                    "Promote?",
+                    &["Approve".into(), "Reject".into()],
+                    None,
+                    "hold",
+                    None,
+                )
+                .unwrap();
+            let unrelated = store
+                .open_decision(
+                    "newer",
+                    &task.task_id,
+                    &task.task_group,
+                    "failure",
+                    "Retry?",
+                    &["Retry stage".into()],
+                    None,
+                    "unrelated",
+                    None,
+                )
+                .unwrap();
+            assert!(original.linked_unverified_delivery);
+            assert!(!unrelated.linked_unverified_delivery);
+            assert!(unrelated.created_seq > original.created_seq);
+            let cursor = store.max_seq_id().unwrap();
+            drop(store);
+            let mut store = V2Store::open(&db.0).unwrap();
+            store.retire_terminal_decisions().unwrap();
+            for mode in [
+                SyncMode::Standard,
+                SyncMode::ReconcileFinishedLegacy,
+                SyncMode::Standard,
+            ] {
+                let saved = store.sync_task_with_mode(&incoming, mode).unwrap();
+                assert_eq!(saved.status, task.status);
+                assert!(!saved.memory.governance_terminal_observed);
+                assert_eq!(store.list_deliveries(None).unwrap(), vec![row.clone()]);
+                assert_eq!(
+                    store.list_decisions(true, None).unwrap(),
+                    vec![original.clone(), unrelated.clone()]
+                );
+                assert_eq!(store.board_statuses(None).unwrap()[&task.task_id], terminal);
+                let detail = store.detailed_status(None).unwrap();
+                assert_eq!(
+                    detail.waiting_tasks[0].open_decision_id.as_deref(),
+                    Some(id.as_str())
+                );
+                assert_eq!(store.max_seq_id().unwrap(), cursor);
+            }
+            row.state = "verified".into();
+            store.upsert_delivery(&row).unwrap();
+            assert_eq!(store.sync_task(&incoming).unwrap().status, terminal);
+            assert_eq!(store.get_decision(&id).unwrap().unwrap().status, "RETIRED");
+            assert!(matches!(
+                store
+                    .resolve_decision(&id, "Approve", "actor", None)
+                    .unwrap(),
+                DecisionResolution::NotFound
+            ));
+            assert_eq!(store.list_deliveries(None).unwrap(), vec![row]);
+        }
+    }
+
+    #[test]
     fn delivery_decision_resolution_is_atomic_and_retries_do_not_reopen_implementation() {
         let mut store = V2Store::open_in_memory().unwrap();
         let task = delivery_task("Pending Prod Promotion");
@@ -5926,19 +6719,21 @@ mod tests {
                     .save_deliveries_and_task(&stale_task, std::slice::from_ref(&stale_row))
                     .is_err()
             );
-            terminal_store
-                .open_decision(
-                    "late-delivery-gate",
-                    &stale_task.task_id,
-                    &stale_task.task_group,
-                    "delivery_contract_error",
-                    "Retry delivery?",
-                    &["Retry".into(), "Abort".into()],
-                    None,
-                    "late observation",
-                    Some(&stale_row.merge_sha),
-                )
-                .unwrap();
+            assert!(
+                terminal_store
+                    .open_decision(
+                        "late-delivery-gate",
+                        &stale_task.task_id,
+                        &stale_task.task_group,
+                        "delivery_contract_error",
+                        "Retry delivery?",
+                        &["Retry".into(), "Abort".into()],
+                        None,
+                        "late observation",
+                        Some(&stale_row.merge_sha),
+                    )
+                    .is_err()
+            );
             assert_eq!(
                 terminal_store
                     .get_task(&stale_task.task_id)

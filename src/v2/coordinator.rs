@@ -53,6 +53,184 @@ impl DaemonLock {
     }
 }
 
+trait LifecycleWsTaskClient: WsTaskClient {
+    fn execute_fenced(&self, args: &[String], _fence: &File) -> Result<String, String> {
+        self.execute(args)
+    }
+
+    fn issue_comments(&self, _repo: &str, _issue: i64) -> Result<String, String> {
+        Err("Governance marker readback unavailable".into())
+    }
+}
+
+impl LifecycleWsTaskClient for intake::SystemWsTaskClient {
+    fn execute_fenced(&self, args: &[String], fence: &File) -> Result<String, String> {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new(&self.bin);
+        command.args(args);
+        let fd = fence.as_raw_fd();
+        // Keep the lock in the publishing subprocess even if the daemon exits.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = command
+            .output()
+            .map_err(|_| "Governance publication launch failed")?;
+        if !output.status.success() {
+            return Err("Governance publication outcome requires readback".into());
+        }
+        String::from_utf8(output.stdout)
+            .map_err(|_| "invalid Governance publication receipt".into())
+    }
+
+    fn issue_comments(&self, repo: &str, issue: i64) -> Result<String, String> {
+        let Some((owner, name)) = repo.split_once('/') else {
+            return Err("invalid Governance issue repository".into());
+        };
+        if issue <= 0
+            || ![owner, name].iter().all(|part| {
+                !part.is_empty()
+                    && !matches!(*part, "." | "..")
+                    && part
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+            })
+        {
+            return Err("invalid Governance issue identity".into());
+        }
+        let output = std::process::Command::new("gh")
+            .args([
+                "api",
+                &format!("repos/{repo}/issues/{issue}/comments?per_page=100"),
+                "--paginate",
+                "--jq",
+                ".[] | [.user.login, .body] | @json",
+            ])
+            .output()
+            .map_err(|_| "Governance marker readback failed")?;
+        if !output.status.success() {
+            return Err("Governance marker readback failed".into());
+        }
+        String::from_utf8(output.stdout).map_err(|_| "invalid Governance marker response".into())
+    }
+}
+
+fn publication_fence(state_dir: &Path, task_id: &str) -> Result<File, String> {
+    runner::validate_attempt_id(task_id)?;
+    let dir = runner::ensure_secure_dir(&state_dir.join("publication-fences"))?;
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join(task_id))
+        .map_err(|_| "cannot open Governance publication fence")?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err("Governance publication fence unavailable".into());
+    }
+    Ok(file)
+}
+
+fn operation_arg<'a>(op: &'a LifecycleOperation, flag: &str) -> Option<&'a str> {
+    op.args
+        .windows(2)
+        .find(|pair| pair[0] == flag)
+        .map(|pair| pair[1].as_str())
+}
+
+fn recover_decision_publication(
+    ws: &dyn LifecycleWsTaskClient,
+    task: &TaskRecord,
+    op: &LifecycleOperation,
+) -> Result<(String, Box<TaskRecord>), String> {
+    let repo = task
+        .github_repo
+        .as_deref()
+        .ok_or("missing Governance issue repository")?;
+    let issue = task.issue_number.ok_or("missing Governance issue number")?;
+    let key = operation_arg(op, "--idempotency-key").ok_or("missing Governance publication key")?;
+    let sha = operation_arg(op, "--sha").ok_or("missing Governance publication SHA")?;
+    let verdict = operation_arg(op, "--verdict").ok_or("missing Governance publication verdict")?;
+    let actor = operation_arg(op, "--actor").ok_or("missing Governance publication actor")?;
+    let mut weight = None;
+    for line in ws.issue_comments(repo, issue)?.lines() {
+        let (author, body): (String, String) =
+            serde_json::from_str(line).map_err(|_| "invalid Governance marker response")?;
+        // Match the Governance trusted authors and the generated comment header.
+        if !matches!(author.as_str(), "shockerqt" | "github-actions[bot]") {
+            continue;
+        }
+        let Some(header) = body.lines().next().and_then(|line| {
+            line.strip_prefix("<!-- governance-v2: ")?
+                .strip_suffix(" -->")
+        }) else {
+            continue;
+        };
+        if !header
+            .split_whitespace()
+            .any(|field| field.split_once('=') == Some(("idempotency_key", key)))
+        {
+            continue;
+        }
+        let mut fields = BTreeMap::new();
+        for field in header.split_whitespace() {
+            let (name, value) = field
+                .split_once('=')
+                .ok_or("invalid Governance marker field")?;
+            if fields.insert(name, value).is_some() {
+                return Err("ambiguous Governance publication marker".into());
+            }
+        }
+        if fields.get("task_id") != Some(&op.task_id.as_str())
+            || fields.get("stage") != Some(&op.kind.as_str())
+            || fields.get("sha") != Some(&sha)
+            || fields.get("verdict") != Some(&verdict)
+            || fields.get("actor") != Some(&actor)
+            || weight.is_some()
+        {
+            return Err("conflicting Governance publication marker".into());
+        }
+        weight = Some(match fields.get("weight").copied() {
+            Some(value @ ("XS" | "S" | "M" | "L")) => value.to_owned(),
+            _ => return Err("invalid Governance marker weight".into()),
+        });
+    }
+    let weight = weight.ok_or("Governance publication marker has not been confirmed")?;
+    // ws-task posts the marker before updating labels and board status. Require
+    // the board postcondition, or an authoritative terminal observation, as well.
+    let expected_status = match (op.kind.as_str(), verdict) {
+        ("human-plan-approval", "APPROVED") | ("human-merge-approval", "CHANGES_REQUESTED") => {
+            "In Progress"
+        }
+        ("human-plan-approval", "CHANGES_REQUESTED") => "Planning",
+        ("human-merge-approval", "APPROVED") => "PR Review",
+        _ => return Err("unsupported Governance decision publication".into()),
+    };
+    let export = ws.execute(&["export".into(), "--sync".into(), "--json".into()])?;
+    let observed = intake::decode_export_records(&export)
+        .map_err(|_| "invalid Governance readback export")?
+        .into_iter()
+        .find(|item| {
+            item.task_id == op.task_id
+                && item.github_repo.as_deref() == Some(repo)
+                && item.issue_number == Some(issue)
+        })
+        .ok_or("missing Governance issue in readback export")?;
+    if observed.status != expected_status
+        && !matches!(observed.status.as_str(), "Done" | "Cancelled")
+    {
+        return Err("Governance publication board status is unconfirmed".into());
+    }
+    Ok((serde_json::json!({"task_id":op.task_id,"stage":op.kind,"sha":sha,"verdict":verdict,"weight":weight}).to_string(),
+        Box::new(observed)))
+}
+
 type Job = Box<dyn FnOnce() -> Result<WorkerResult, String> + Send>;
 struct WorkerJob {
     key: String,
@@ -130,6 +308,11 @@ pub enum WorkerResult {
         attempt_id: String,
         step: PipelineStepResult,
     },
+    LifecycleRecovered {
+        operation_id: String,
+        output: String,
+        observation: Box<TaskRecord>,
+    },
     Lifecycle {
         operation_id: String,
         output: String,
@@ -144,6 +327,7 @@ pub enum WorkerResult {
     },
     Reconciled,
     DeliveryPolled,
+    LifecycleSkipped,
     AttemptsPruned(usize),
 }
 
@@ -172,6 +356,10 @@ impl DeliveryStore for CoordinatorDeliveryStore {
 
 pub enum CoordinatorEvent {
     DeliveryStore(DeliveryStoreOperation),
+    AuthorizeLifecycle {
+        operation: Box<LifecycleOperation>,
+        reply: mpsc::SyncSender<Result<bool, String>>,
+    },
     Socket {
         client_id: usize,
         command: ClientCommand,
@@ -222,7 +410,7 @@ pub struct Coordinator {
     monitors: WorkerPool,
     governance: WorkerPool,
     controller: Arc<dyn UnitController>,
-    ws: Arc<dyn WsTaskClient>,
+    ws: Arc<dyn LifecycleWsTaskClient>,
     semaphore: HeavyCheckSemaphore,
     jobs: BTreeSet<String>,
     manifests: BTreeMap<String, AttemptManifest>,
@@ -371,36 +559,7 @@ impl Coordinator {
         self.store
             .set_meta("daemon_instance_id", &self.instance)
             .map_err(|e| e.to_string())?;
-        for op in self.store.lifecycle_ops().map_err(|e| e.to_string())? {
-            if op.kind == "start" && op.state == "ACKNOWLEDGED" {
-                let mut task = self.task(&op.task_id)?;
-                if !task.memory.governance_started
-                    && !matches!(task.status.as_str(), "Backlog" | "Ready")
-                {
-                    task.memory.governance_started = true;
-                    self.save(&task)?;
-                }
-            }
-            if op.state == "FAILED" {
-                let task = self.task(&op.task_id)?;
-                if task.autonomous_consent
-                    && !task.memory.halt_requested
-                    && !matches!(task.status.as_str(), "Done" | "Cancelled")
-                {
-                    self.lifecycle_failed(
-                        &op.operation_id,
-                        op.last_error
-                            .as_deref()
-                            .unwrap_or("interrupted publication failure"),
-                    )?;
-                }
-            }
-            if op.state == "IN_FLIGHT" {
-                self.store
-                    .update_lifecycle(&op.operation_id, "PENDING", None, 0)
-                    .map_err(|e| e.to_string())?;
-            }
-        }
+        self.recover_lifecycle_journal()?;
         let mut dirty = true;
         loop {
             self.flush_deliveries()?;
@@ -460,6 +619,57 @@ impl Coordinator {
         }
     }
 
+    fn recover_lifecycle_journal(&mut self) -> Result<(), String> {
+        for op in self.store.lifecycle_ops().map_err(|e| e.to_string())? {
+            if op.kind == "start" && op.state == "ACKNOWLEDGED" {
+                let mut task = self.task(&op.task_id)?;
+                if !task.memory.governance_started
+                    && !matches!(task.status.as_str(), "Backlog" | "Ready")
+                {
+                    task.memory.governance_started = true;
+                    self.save(&task)?;
+                }
+            }
+            if op.state == "FAILED" {
+                let task = self.task(&op.task_id)?;
+                if task.autonomous_consent
+                    && !task.memory.halt_requested
+                    && !matches!(task.status.as_str(), "Done" | "Cancelled")
+                {
+                    self.lifecycle_failed(
+                        &op.operation_id,
+                        op.last_error
+                            .as_deref()
+                            .unwrap_or("interrupted publication failure"),
+                    )?;
+                }
+            }
+            if matches!(op.state.as_str(), "QUEUED" | "IN_FLIGHT") {
+                let state = if op.state == "IN_FLIGHT"
+                    && let Some(id) = &op.decision_id
+                    && self
+                        .store
+                        .get_decision(id)
+                        .map_err(|e| e.to_string())?
+                        .is_some_and(|decision| decision.status == "RESOLVED")
+                    && !matches!(
+                        self.task(&op.task_id)?.status.as_str(),
+                        "Done" | "Cancelled"
+                    ) {
+                    // An older daemon could have granted a decision publication
+                    // without recording that grant separately from queueing.
+                    "DISPATCHED"
+                } else {
+                    "PENDING"
+                };
+                self.store
+                    .update_lifecycle(&op.operation_id, state, None, 0)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
     fn shutdown(&mut self) -> Result<(), String> {
         self.ready = false;
         self.store
@@ -479,7 +689,9 @@ impl Coordinator {
                     | ClientCommand::Run { .. }
                     | ClientCommand::StageRun { .. }
             ),
-            CoordinatorEvent::Replay { .. } | CoordinatorEvent::Shutdown => false,
+            CoordinatorEvent::Replay { .. }
+            | CoordinatorEvent::AuthorizeLifecycle { .. }
+            | CoordinatorEvent::Shutdown => false,
         };
         self.handle_event(event)?;
         Ok(dirty)
@@ -676,6 +888,7 @@ impl Coordinator {
                                 if self.delivery_verified(&task)?
                                     && task.autonomous_consent
                                     && !task.memory.halt_requested
+                                    && !matches!(task.status.as_str(), "Done" | "Cancelled")
                                 {
                                     self.store
                                         .open_decision(
@@ -707,6 +920,9 @@ impl Coordinator {
                     }
                 }
             }
+            CoordinatorEvent::AuthorizeLifecycle { operation, reply } => {
+                let _ = reply.send(self.authorize_lifecycle(&operation));
+            }
             CoordinatorEvent::DeliveryStore(operation) => {
                 operation(&mut self.store);
                 self.invalidate_tasks_cache();
@@ -728,6 +944,10 @@ impl Coordinator {
                     tasks: self
                         .store
                         .list_tasks(group.as_deref())
+                        .map_err(|e| e.to_string())?,
+                    board_statuses: self
+                        .store
+                        .board_statuses(group.as_deref())
                         .map_err(|e| e.to_string())?,
                     open_decisions: self
                         .store
@@ -999,7 +1219,7 @@ impl Coordinator {
         }
 
         for op in self.store.lifecycle_ops().map_err(|e| e.to_string())? {
-            if op.state == "PENDING" && op.retry_epoch > now {
+            if matches!(op.state.as_str(), "PENDING" | "DISPATCHED") && op.retry_epoch > now {
                 let secs = (op.retry_epoch - now) as u64;
                 min_deadline(now_instant + Duration::from_secs(secs));
             }
@@ -1099,9 +1319,9 @@ impl Coordinator {
             return self.deliver_events();
         }
         self.reconcile_terminal_tasks()?;
+        self.resume_decisions()?;
         self.replay_lifecycle()?;
         self.resume_pipeline_steps()?;
-        self.resume_decisions()?;
         self.reconcile_terminal_tasks()?;
         let mut recovery_ready = true;
         for task in self.list_all_tasks_cached()? {
@@ -1298,6 +1518,9 @@ impl Coordinator {
         }
         // Enumerate as well as inspect exact persisted identities. Dispatch stays disabled.
         self.startup_ownership()?;
+        self.store
+            .retire_terminal_decisions()
+            .map_err(|e| e.to_string())?;
         let controller = self.controller.clone();
         let snapshots = self
             .list_all_tasks_cached()?
@@ -1808,7 +2031,7 @@ impl Coordinator {
                 }
                 self.worker_result(WorkerResult::Reconciled)?;
             }
-            WorkerResult::DeliveryPolled => {}
+            WorkerResult::DeliveryPolled | WorkerResult::LifecycleSkipped => {}
             WorkerResult::AttemptsPruned(_) => {}
             WorkerResult::Reconciled => {
                 // Prove every exclusion before the first cleanup/lock/failure write.
@@ -2197,6 +2420,17 @@ impl Coordinator {
                 } else {
                     self.save(&task)?;
                 }
+            }
+            WorkerResult::LifecycleRecovered {
+                operation_id,
+                output,
+                observation,
+            } => {
+                self.store
+                    .sync_task(&observation)
+                    .map_err(|e| e.to_string())?;
+                self.invalidate_tasks_cache();
+                self.lifecycle_ack(&operation_id, &output)?;
             }
             WorkerResult::Lifecycle {
                 operation_id,
@@ -2693,9 +2927,111 @@ impl Coordinator {
         Ok(())
     }
 
+    fn lifecycle_delivery_allowed(
+        &self,
+        op: &LifecycleOperation,
+        task: &TaskRecord,
+    ) -> Result<bool, String> {
+        Ok(op.kind != "close"
+            || self
+                .store
+                .list_deliveries(Some(&task.task_id))
+                .map_err(|e| e.to_string())?
+                .is_empty()
+            || self.delivery_verified(task)?)
+    }
+
+    fn lifecycle_task_allowed(
+        &self,
+        op: &LifecycleOperation,
+        task: &TaskRecord,
+    ) -> Result<bool, String> {
+        let negative_human = op.kind.starts_with("human-")
+            && op
+                .args
+                .windows(2)
+                .any(|args| args[0] == "--verdict" && args[1] == "CHANGES_REQUESTED");
+        Ok(task.autonomous_consent
+            && (!task.memory.halt_requested || negative_human)
+            && task.status != "Cancelled"
+            && (task.status != "Done" || (op.kind == "close" && self.delivery_verified(task)?)))
+    }
+
+    fn authorize_lifecycle(&mut self, op: &LifecycleOperation) -> Result<bool, String> {
+        if !self
+            .store
+            .lifecycle_in_flight(&op.operation_id)
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(false);
+        }
+        let task = self.task(&op.task_id)?;
+        if let Some(id) = &op.decision_id
+            && (matches!(task.status.as_str(), "Done" | "Cancelled")
+                || self
+                    .store
+                    .get_decision(id)
+                    .map_err(|e| e.to_string())?
+                    .is_none_or(|d| d.status != "RESOLVED"))
+        {
+            return Ok(false);
+        }
+        if !self.lifecycle_task_allowed(op, &task)? {
+            self.store
+                .update_lifecycle(
+                    &op.operation_id,
+                    "FAILED",
+                    Some("publication intent superseded by task stop/terminal state"),
+                    0,
+                )
+                .map_err(|e| e.to_string())?;
+            return Ok(false);
+        }
+        if !self.lifecycle_delivery_allowed(op, &task)? {
+            self.store
+                .update_lifecycle(&op.operation_id, "PENDING", None, 0)
+                .map_err(|e| e.to_string())?;
+            return Ok(false);
+        }
+        if op.decision_id.is_some() {
+            return self
+                .store
+                .grant_decision_publication(&op.operation_id)
+                .map_err(|e| e.to_string());
+        }
+        Ok(true)
+    }
+
     fn replay_lifecycle(&mut self) -> Result<(), String> {
-        let ops = self.store.lifecycle_ops().map_err(|e| e.to_string())?;
+        let ops = self
+            .store
+            .replayable_lifecycle_ops()
+            .map_err(|e| e.to_string())?;
         for op in &ops {
+            if op.state == "DISPATCHED" {
+                if op.retry_epoch <= now_epoch() {
+                    let task = self.task(&op.task_id)?;
+                    let operation = op.clone();
+                    let state = self.state_dir.clone();
+                    let ws = self.ws.clone();
+                    self.submit(
+                        format!("ws:{}", op.operation_id),
+                        Some(op.task_id.clone()),
+                        2,
+                        Box::new(move || {
+                            let _fence = publication_fence(&state, &operation.task_id)?;
+                            let (output, observation) =
+                                recover_decision_publication(ws.as_ref(), &task, &operation)?;
+                            Ok(WorkerResult::LifecycleRecovered {
+                                operation_id: operation.operation_id,
+                                output,
+                                observation,
+                            })
+                        }),
+                    );
+                }
+                continue;
+            }
             if op.state != "PENDING" || op.retry_epoch > now_epoch() {
                 continue;
             }
@@ -2713,28 +3049,13 @@ impl Coordinator {
                 continue;
             }
             let task = self.task(&op.task_id)?;
-            if op.kind == "close"
-                && !self
-                    .store
-                    .list_deliveries(Some(&task.task_id))
-                    .map_err(|e| e.to_string())?
-                    .is_empty()
-                && !self.delivery_verified(&task)?
-            {
+            if op.decision_id.is_some() && matches!(task.status.as_str(), "Done" | "Cancelled") {
                 continue;
             }
-
-            let negative_human = op.kind.starts_with("human-")
-                && op
-                    .args
-                    .windows(2)
-                    .any(|args| args[0] == "--verdict" && args[1] == "CHANGES_REQUESTED");
-            if !task.autonomous_consent
-                || (task.memory.halt_requested && !negative_human)
-                || task.status == "Cancelled"
-                || (task.status == "Done"
-                    && !(op.kind == "close" && self.delivery_verified(&task)?))
-            {
+            if !self.lifecycle_delivery_allowed(op, &task)? {
+                continue;
+            }
+            if !self.lifecycle_task_allowed(op, &task)? {
                 self.store
                     .update_lifecycle(
                         &op.operation_id,
@@ -2752,9 +3073,14 @@ impl Coordinator {
                 .transpose()
                 .map_err(|e| e.to_string())?
                 .flatten();
+            if op.decision_id.is_some() && decision.as_ref().is_none_or(|d| d.status != "RESOLVED")
+            {
+                continue;
+            }
             let state = self.state_dir.clone();
             let ws = self.ws.clone();
             let operation = op.clone();
+            let commands = self.commands.clone();
             let key = format!("ws:{}", op.operation_id);
             if self.submit(
                 key,
@@ -2767,9 +3093,30 @@ impl Coordinator {
                             return Err("human evidence path does not match durable intent".into());
                         }
                     }
-                    let mut args = operation.args;
+                    let fence = decision
+                        .as_ref()
+                        .map(|_| publication_fence(&state, &operation.task_id))
+                        .transpose()?;
+                    // The coordinator commits the per-task fence before replying.
+                    // A terminal update after this grant must await the receipt.
+                    let authorize = || -> Result<bool, String> {
+                        let (reply, verdict) = mpsc::sync_channel(1);
+                        commands
+                            .send(CoordinatorEvent::AuthorizeLifecycle {
+                                operation: Box::new(operation.clone()),
+                                reply,
+                            })
+                            .map_err(|_| "lifecycle coordinator stopped".to_string())?;
+                        verdict
+                            .recv()
+                            .map_err(|_| "lifecycle coordinator stopped".to_string())?
+                    };
+                    let mut args = operation.args.clone();
                     // Recover a successful remote start whose local receipt was lost.
                     if operation.kind == "start" && operation.attempts > 0 {
+                        if !authorize()? {
+                            return Ok(WorkerResult::LifecycleSkipped);
+                        }
                         let export =
                             ws.execute(&["export".into(), "--sync".into(), "--json".into()])?;
                         let export: intake::ExportContract =
@@ -2788,15 +3135,34 @@ impl Coordinator {
                             args.push("--resume".into());
                         }
                     }
-                    let output = ws.execute(&args)?;
+                    if !authorize()? {
+                        return Ok(WorkerResult::LifecycleSkipped);
+                    }
+                    let output = if let Some(fence) = &fence {
+                        ws.execute_fenced(&args, fence)?
+                    } else {
+                        ws.execute(&args)?
+                    };
                     let output = if operation.kind == "close" {
                         String::new()
                     } else {
-                        serde_json::to_string(&intake::parse_start_receipt(
-                            &output,
-                            &operation.task_id,
-                        )?)
-                        .map_err(|e| e.to_string())?
+                        let receipt = intake::parse_start_receipt(&output, &operation.task_id)?;
+                        if operation.decision_id.is_some()
+                            && (receipt["stage"].as_str() != Some(operation.kind.as_str())
+                                || receipt["verdict"].as_str()
+                                    != operation_arg(&operation, "--verdict")
+                                || operation_arg(&operation, "--sha")
+                                    .is_some_and(|sha| receipt["sha"].as_str() != Some(sha))
+                                || !matches!(
+                                    receipt["weight"].as_str(),
+                                    Some("XS" | "S" | "M" | "L")
+                                ))
+                        {
+                            return Err(
+                                "Governance decision publication receipt identity mismatch".into(),
+                            );
+                        }
+                        serde_json::to_string(&receipt).map_err(|e| e.to_string())?
                     };
                     Ok(WorkerResult::Lifecycle {
                         operation_id: operation.operation_id,
@@ -2805,7 +3171,16 @@ impl Coordinator {
                 }),
             ) {
                 self.store
-                    .update_lifecycle(&op.operation_id, "IN_FLIGHT", None, 0)
+                    .update_lifecycle(
+                        &op.operation_id,
+                        if op.decision_id.is_some() {
+                            "QUEUED"
+                        } else {
+                            "IN_FLIGHT"
+                        },
+                        None,
+                        0,
+                    )
                     .map_err(|e| e.to_string())?;
             }
         }
@@ -2822,16 +3197,47 @@ impl Coordinator {
         else {
             return Ok(());
         };
-        if op.state == "ACKNOWLEDGED" {
+        if matches!(op.state.as_str(), "ACKNOWLEDGED" | "SETTLED") {
+            return Ok(());
+        }
+        if op.state == "DISPATCHED" {
+            self.store
+                .update_lifecycle(id, "DISPATCHED", Some(error), now_epoch() + 30)
+                .map_err(|e| e.to_string())?;
+            let task = self.task(&op.task_id)?;
+            if op.decision_id.is_some()
+                && !matches!(task.status.as_str(), "Done" | "Cancelled")
+                && let Ok(_fence) = publication_fence(&self.state_dir, &op.task_id)
+            {
+                self.store
+                    .open_decision(
+                        &format!("settle-{}", op.operation_id),
+                        &task.task_id,
+                        &task.task_group,
+                        "governance_publication_uncertain",
+                        "Close this publication after manually checking Governance?",
+                        &["Close without replay".into()],
+                        None,
+                        "The write may have landed. Verify and reconcile the issue and board before closing. Closing permanently retires this publication and applies any deferred terminal transition.",
+                        operation_arg(&op, "--sha"),
+                    )
+                    .map_err(|e| e.to_string())?;
+                self.invalidate_tasks_cache();
+            }
             return Ok(());
         }
         let current = self.task(&op.task_id)?;
-        if !current.autonomous_consent
-            || current.memory.halt_requested
-            || current.status == "Cancelled"
-            || (current.status == "Done"
-                && !(op.kind == "close" && self.delivery_verified(&current)?))
+        if let Some(id) = &op.decision_id
+            && (matches!(current.status.as_str(), "Done" | "Cancelled")
+                || self
+                    .store
+                    .get_decision(id)
+                    .map_err(|e| e.to_string())?
+                    .is_some_and(|decision| decision.status == "RETIRED"))
         {
+            return Ok(());
+        }
+        if !self.lifecycle_task_allowed(&op, &current)? {
             self.store
                 .update_lifecycle(id, "FAILED", Some(error), 0)
                 .map_err(|e| e.to_string())?;
@@ -2846,7 +3252,7 @@ impl Coordinator {
                 now_epoch() + pipeline::retry_backoff(op.attempts as usize),
             )
             .map_err(|e| e.to_string())?;
-        if failed {
+        if failed && !matches!(current.status.as_str(), "Done" | "Cancelled") {
             let task = self.task(&op.task_id)?;
             let (kind, option) = if op.kind == "close" {
                 ("governance_close_failed", "Retry close")
@@ -2879,11 +3285,34 @@ impl Coordinator {
             .into_iter()
             .find(|o| o.operation_id == id)
             .ok_or("unknown lifecycle operation")?;
-        if op.state == "ACKNOWLEDGED" {
+        if matches!(op.state.as_str(), "ACKNOWLEDGED" | "SETTLED") {
             return Ok(());
         }
         // Receipt and local transition commit atomically after external acknowledgment.
         let mut task = self.task(&op.task_id)?;
+        if let Some(decision_id) = &op.decision_id
+            && (matches!(task.status.as_str(), "Done" | "Cancelled")
+                || self
+                    .store
+                    .get_decision(decision_id)
+                    .map_err(|e| e.to_string())?
+                    .is_none_or(|decision| decision.status != "RESOLVED"))
+        {
+            return Ok(());
+        }
+        if op.state == "DISPATCHED"
+            && self
+                .store
+                .deferred_terminal(id, &task)
+                .map_err(|e| e.to_string())?
+                .is_some()
+        {
+            self.store
+                .acknowledge_lifecycle(&task, &op, None)
+                .map_err(|e| e.to_string())?;
+            self.invalidate_tasks_cache();
+            return Ok(());
+        }
         if op.kind != "close"
             && (!task.autonomous_consent
                 || task.memory.halt_requested
@@ -3300,11 +3729,46 @@ impl Coordinator {
         decision: &crate::v2::store::PendingDecisionRecord,
     ) -> Result<(), String> {
         let mut task = self.task(&decision.task_id)?;
+        if decision.status != "RESOLVED" || matches!(task.status.as_str(), "Done" | "Cancelled") {
+            return Ok(());
+        }
+
         if task
             .memory
             .applied_decisions
             .contains(&decision.decision_id)
         {
+            return Ok(());
+        }
+        if decision.kind == "governance_publication_uncertain" {
+            let id = decision
+                .decision_id
+                .strip_prefix("settle-")
+                .ok_or("invalid publication settlement identity")?;
+            let op = self
+                .store
+                .lifecycle_ops()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .find(|op| {
+                    op.operation_id == id
+                        && op.task_id == task.task_id
+                        && op.state == "DISPATCHED"
+                        && op.decision_id.is_some()
+                })
+                .ok_or("missing dispatched publication for settlement")?;
+            // A confirmed readback already in progress gets to finish first.
+            // The durable decision can be applied on a later tick or after restart.
+            if self.jobs.contains(&format!("ws:{id}")) {
+                return Ok(());
+            }
+            let Ok(_fence) = publication_fence(&self.state_dir, &task.task_id) else {
+                return Ok(());
+            };
+            self.store
+                .settle_decision_publication(&task, &op, &decision.decision_id)
+                .map_err(|e| e.to_string())?;
+            self.invalidate_tasks_cache();
             return Ok(());
         }
         if matches!(
@@ -4358,6 +4822,7 @@ mod tests {
         reads: AtomicUsize,
         mutations: AtomicUsize,
     }
+    impl LifecycleWsTaskClient for RehearsalWs {}
     impl WsTaskClient for RehearsalWs {
         fn execute(&self, args: &[String]) -> Result<String, String> {
             if args == ["export", "--sync", "--json"] {
@@ -4555,6 +5020,9 @@ mod tests {
 
     fn rehearsal_startup(c: &mut Coordinator) -> Result<(), String> {
         c.startup_ownership()?;
+        c.store
+            .retire_terminal_decisions()
+            .map_err(|e| e.to_string())?;
         let snapshots = c
             .store
             .list_tasks(None)
@@ -5762,6 +6230,25 @@ mod tests {
             {
                 return Err("STANDARD_OWNER_BINDING".into());
             }
+            let latest_observation = expected.iter().rev().find(|row| {
+                row[1] == V::Text(t.task_id.clone())
+                    && row[4] == V::Text("BOARD_STATUS_OBSERVED".into())
+            });
+            let observed_payload = serde_json::json!({
+                "task_id": t.task_id, "board_status": incoming.status
+            })
+            .to_string();
+            if latest_observation.is_none_or(|row| row[5] != V::Text(observed_payload.clone())) {
+                next = next.checked_add(1).ok_or("STANDARD_EVENT_OVERFLOW")?;
+                expected.push(vec![
+                    V::Integer(next),
+                    V::Text(t.task_id.clone()),
+                    V::Text(t.task_group.clone()),
+                    V::Integer(t.updated_epoch),
+                    V::Text("BOARD_STATUS_OBSERVED".into()),
+                    V::Text(observed_payload),
+                ]);
+            }
             if old.weight == t.weight {
                 continue;
             }
@@ -5793,7 +6280,7 @@ mod tests {
             return Err("STANDARD_EVENTS".into());
         }
         let mut expected_alloc = old_alloc;
-        if count > 0 {
+        if next > high {
             if let Some(row) = expected_alloc.iter_mut().find(|r| r[1] == name) {
                 row[2] = V::Integer(next);
             } else {
@@ -5987,7 +6474,7 @@ mod tests {
         assert_eq!(validate_standard(&o, &w, &raw).unwrap(), 2);
         let events = event_rows(o.after.get("task_events").unwrap()).unwrap();
         assert_eq!(events[14][1], V::Text("z-first".into()));
-        assert_eq!(events[15][1], V::Text("a-second".into()));
+        assert_eq!(events[16][1], V::Text("a-second".into()));
         // Simulate canonical JSON transport sorting, which orders 10 before2.
         for image in [&mut o.before, &mut o.after] {
             image
@@ -6048,7 +6535,7 @@ mod tests {
             c.store.get_task(&returned.task_id).unwrap().unwrap()
         );
         assert_eq!(
-            c.store.list_events_since(None, 0, 100).unwrap()[0].event_type,
+            c.store.list_events_since(None, 0, 100).unwrap()[1].event_type,
             "TASK_DONE"
         );
     }
@@ -6209,8 +6696,8 @@ mod tests {
         assert_eq!(validate_standard(&bad, &w, &raw).unwrap(), 2);
         let rows = bad.after.get_mut("task_events").unwrap();
         let first = rows[0][1].clone();
-        rows[0][1] = rows[1][1].clone();
-        rows[1][1] = first;
+        rows[0][1] = rows[2][1].clone();
+        rows[2][1] = first;
         assert!(validate_standard(&bad, &w, &raw).is_err());
     }
 
@@ -6221,13 +6708,13 @@ mod tests {
         let o = observe_standard(&mut c, &w, &raw).unwrap();
         let mut supported = o.clone();
         supported.allocator_before[0][2] = V::Integer(50);
-        supported.allocator_after[0][2] = V::Integer(51);
-        supported
-            .after
-            .get_mut("task_events")
-            .unwrap()
-            .last_mut()
-            .unwrap()[0] = V::Integer(51);
+        supported.allocator_after[0][2] = V::Integer(52);
+        for (row, seq) in supported.after.get_mut("task_events").unwrap()[2..]
+            .iter_mut()
+            .zip(51..=52)
+        {
+            row[0] = V::Integer(seq);
+        }
         for rows in [
             &mut supported.allocator_before,
             &mut supported.allocator_after,
@@ -6269,13 +6756,13 @@ mod tests {
                 "high-text" => bad.allocator_before[0][2] = V::Text("50".into()),
                 "high-negative" => bad.allocator_before[0][2] = V::Integer(-1),
                 "high-behind" => bad.allocator_before[0][2] = V::Integer(0),
-                "advance" => bad.allocator_after[0][2] = V::Integer(52),
+                "advance" => bad.allocator_after[0][2] = V::Integer(53),
                 "gap" => {
                     bad.after
                         .get_mut("task_events")
                         .unwrap()
                         .last_mut()
-                        .unwrap()[0] = V::Integer(52)
+                        .unwrap()[0] = V::Integer(53)
                 }
                 "overflow" => bad.allocator_before[0][2] = V::Integer(i64::MAX),
                 "unrelated" => bad.allocator_after[1][2] = V::Integer(10),
@@ -6297,11 +6784,7 @@ mod tests {
         let (_dir, mut c, raw, w) = weight_fixture(&[("no-event", "M", "M", "Done")], 0);
         let mut no_event = observe_standard(&mut c, &w, &raw).unwrap();
         assert_eq!(validate_standard(&no_event, &w, &raw).unwrap(), 0);
-        no_event.allocator_after.push(vec![
-            V::Integer(1),
-            V::Text("task_events".into()),
-            V::Integer(1),
-        ]);
+        no_event.allocator_after[0][2] = V::Integer(2);
         refresh_allocator_image(&mut no_event);
         assert!(validate_standard(&no_event, &w, &raw).is_err());
     }
@@ -6317,7 +6800,7 @@ mod tests {
             let (_dir, mut c, raw, w) = weight_fixture(&[("unreviewed", from, to, status)], 0);
             let o = observe_standard(&mut c, &w, &raw).unwrap();
             assert_eq!(
-                c.store.list_events_since(None, 0, 100).unwrap()[0].event_type,
+                c.store.list_events_since(None, 0, 100).unwrap()[1].event_type,
                 "WEIGHT_ESCALATED"
             );
             assert!(validate_standard(&o, &w, &raw).is_err());
@@ -6431,9 +6914,8 @@ mod tests {
             .unwrap();
         let raw=serde_json::json!({"schema_version":2,"tasks":[{"id":old.task_id,"repository":old.repository,"status":"Done","weight":"L","executor":"external","autonomous_consent":false}]}).to_string();
         let w = actual_decode(&raw).unwrap();
-        let events = c.store.list_events_since(None, 0, 100).unwrap();
-        let allocator = standard_allocator(&mut c.store).unwrap();
-        for _ in 0..2 {
+        let mut events = c.store.list_events_since(None, 0, 100).unwrap();
+        for pass in 0..2 {
             c.store
                 .sync_task_with_mode(
                     &w.records[0],
@@ -6441,8 +6923,20 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(c.task(&old.task_id).unwrap().weight, "M");
-            assert_eq!(c.store.list_events_since(None, 0, 100).unwrap(), events);
-            assert_eq!(standard_allocator(&mut c.store).unwrap(), allocator);
+            let after = c.store.list_events_since(None, 0, 100).unwrap();
+            if pass == 0 {
+                assert_eq!(after[..events.len()], events);
+                assert_eq!(
+                    after[events.len()..]
+                        .iter()
+                        .map(|e| e.event_type.as_str())
+                        .collect::<Vec<_>>(),
+                    ["BOARD_STATUS_OBSERVED", "TASK_DONE"]
+                );
+                events = after;
+            } else {
+                assert_eq!(after, events);
+            }
             assert_eq!(
                 c.store.list_stage_attempts(&old.task_id).unwrap(),
                 vec![a.clone()]
@@ -6466,7 +6960,7 @@ mod tests {
         let mut incoming = old.clone();
         incoming.status = "Done".into();
         incoming.weight = "L".into();
-        for _ in 0..2 {
+        for pass in 0..2 {
             let history = c.store.list_events_since(None, 0, 100).unwrap();
             let allocator = standard_allocator(&mut c.store).unwrap();
             c.store
@@ -6476,8 +6970,18 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(c.task(&old.task_id).unwrap().weight, "M");
-            assert_eq!(c.store.list_events_since(None, 0, 100).unwrap(), history);
-            assert_eq!(standard_allocator(&mut c.store).unwrap(), allocator);
+            let after = c.store.list_events_since(None, 0, 100).unwrap();
+            assert_eq!(
+                after
+                    .iter()
+                    .map(|e| e.event_type.as_str())
+                    .collect::<Vec<_>>(),
+                ["BOARD_STATUS_OBSERVED", "TASK_DONE"]
+            );
+            if pass > 0 {
+                assert_eq!(after, history);
+                assert_eq!(standard_allocator(&mut c.store).unwrap(), allocator);
+            }
         }
     }
 
@@ -6909,7 +7413,7 @@ mod tests {
     }
 
     #[test]
-    fn offline_empty_terminal_is_visible_in_actual_snapshot_without_event() {
+    fn offline_empty_terminal_is_visible_in_actual_snapshot_and_event_history() {
         let dir = TestDirectory::new();
         let mut c = coordinator(&dir.0);
         let payload = serde_json::json!({"schema_version":2,"tasks":[{"id":"empty-snapshot","repository":"synthetic","status":"In Progress","autonomous_consent":false}]});
@@ -6925,7 +7429,14 @@ mod tests {
                 crate::v2::store::SyncMode::ReconcileFinishedLegacy,
             )
             .unwrap();
-        assert!(c.store.list_events_since(None, 0, 100).unwrap().is_empty());
+        let events = c.store.list_events_since(None, 0, 100).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|e| e.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["BOARD_STATUS_OBSERVED", "TASK_DONE"]
+        );
         let messages = c
             .socket_command(ClientCommand::Subscribe {
                 group: None,
@@ -6934,7 +7445,10 @@ mod tests {
             })
             .unwrap();
         assert!(
-            matches!(&messages[0],ServerMessage::Snapshot{tasks,..} if tasks.len()==1 && tasks[0].status=="Done")
+            matches!(&messages[0],ServerMessage::Snapshot{tasks,board_statuses,as_of_seq,..}
+                if tasks.len()==1 && tasks[0].status=="Done"
+                && board_statuses.get(&tasks[0].task_id).is_some_and(|s| s == "Done")
+                && *as_of_seq == events[1].seq_id)
         );
     }
 
@@ -7968,10 +8482,110 @@ mod tests {
         socket_thread.join().unwrap().unwrap();
         coordinator_thread.join().unwrap().unwrap();
     }
+    #[test]
+    fn coordinated_socket_delivers_live_terminal_events_and_replays_against_snapshot() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixStream;
+
+        let dir = TestDirectory::new();
+        let (mut c, handle) =
+            Coordinator::create(V2Store::open_in_memory().unwrap(), dir.0.clone());
+        let mut t = task("replay-decision");
+        t.status = "Backlog".into();
+        t.autonomous_consent = false;
+        c.store.sync_task(&t).unwrap();
+        c.store
+            .open_decision(
+                "old",
+                &t.task_id,
+                &t.task_group,
+                "failure",
+                "Retry?",
+                &["Retry stage".into()],
+                None,
+                "context",
+                None,
+            )
+            .unwrap();
+        c.preflight = true;
+        c.reconciled = true;
+        c.synced = true;
+        c.last_export = Instant::now();
+        let commands = handle.commands.clone();
+        let coordinator = std::thread::spawn(move || c.run());
+        let path = PathBuf::from(format!("target/z78-live-{}.sock", std::process::id()));
+        let mut server = crate::v2::socket::DaemonServer::bind(&path, 0).unwrap();
+        let shutdown = server.shutdown.clone();
+        let socket = std::thread::spawn(move || server.run_coordinated(handle, false));
+        let subscribe = |since_seq, once| {
+            let mut client = UnixStream::connect(&path).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            crate::v2::socket::write_ndjson(
+                &mut client,
+                &ClientCommand::Subscribe {
+                    group: Some("test".into()),
+                    since_seq: Some(since_seq),
+                    once: Some(once),
+                },
+            )
+            .unwrap();
+            BufReader::new(client)
+        };
+        let read = |reader: &mut BufReader<UnixStream>| {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()
+        };
+        let mut client = subscribe(0, false);
+        let snapshot = read(&mut client);
+        assert_eq!(snapshot["tasks"][0]["status"], "Blocked");
+        assert_eq!(snapshot["board_statuses"]["replay-decision"], "Backlog");
+        assert_eq!(snapshot["open_decisions"][0]["decision_id"], "old");
+        let cursor = snapshot["as_of_seq"].as_i64().unwrap();
+        for expected in 1..=cursor {
+            assert_eq!(read(&mut client)["event"]["seq_id"], expected);
+        }
+        t.status = "Cancelled".into();
+        commands
+            .send(CoordinatorEvent::DeliveryStore(Box::new(move |store| {
+                store.sync_task(&t).unwrap();
+            })))
+            .unwrap();
+        let live = (0..3).map(|_| read(&mut client)).collect::<Vec<_>>();
+        assert_eq!(
+            live.iter()
+                .map(|e| e["event"]["event_type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "BOARD_STATUS_OBSERVED",
+                "TASK_STATUS_CHANGED",
+                "DECISION_RETIRED"
+            ]
+        );
+        assert_eq!(live[2]["event"]["payload"]["decision_id"], "old");
+        let mut reconnect = subscribe(cursor, true);
+        let snapshot = read(&mut reconnect);
+        assert_eq!(snapshot["as_of_seq"], cursor + 3);
+        assert_eq!(snapshot["tasks"][0]["status"], "Cancelled");
+        assert_eq!(snapshot["board_statuses"]["replay-decision"], "Cancelled");
+        assert_eq!(snapshot["open_decisions"], serde_json::json!([]));
+        for event in live {
+            assert_eq!(read(&mut reconnect), event);
+        }
+        let mut trailing = String::new();
+        assert_eq!(reconnect.read_line(&mut trailing).unwrap(), 0);
+        shutdown.store(true, Ordering::Relaxed);
+        socket.join().unwrap().unwrap();
+        coordinator.join().unwrap().unwrap();
+    }
+
     #[derive(Default)]
     struct RecordingWsTaskClient {
         calls: Mutex<Vec<Vec<String>>>,
     }
+    impl LifecycleWsTaskClient for RecordingWsTaskClient {}
     impl WsTaskClient for RecordingWsTaskClient {
         fn execute(&self, args: &[String]) -> Result<String, String> {
             self.calls.lock().unwrap().push(args.to_vec());
@@ -7981,9 +8595,727 @@ mod tests {
                 .find(|pair| pair[0] == "--sha")
                 .map(|pair| pair[1].as_str())
                 .unwrap_or("base");
-            Ok(serde_json::json!({"task_id":id,"stage":args.get(2),"sha":sha,"weight":"M","branch":"task/ordered","worktree":"/governed/ordered"}).to_string())
+            let verdict = args
+                .windows(2)
+                .find(|pair| pair[0] == "--verdict")
+                .map(|pair| &pair[1]);
+            Ok(serde_json::json!({"task_id":id,"stage":args.get(2),"sha":sha,"verdict":verdict,"weight":"M","branch":"task/ordered","worktree":"/governed/ordered"}).to_string())
         }
     }
+    #[test]
+    fn startup_retires_legacy_decisions_and_never_replays_unapplied_publication() {
+        for terminal in ["Done", "Cancelled"] {
+            let dir = TestDirectory::new();
+            let db = dir.0.join("legacy.sqlite3");
+            let mut store = V2Store::open(&db).unwrap();
+            let t = task("legacy-terminal");
+            store.upsert_task(&t).unwrap();
+            for id in ["open", "unapplied"] {
+                store
+                    .open_decision(
+                        id,
+                        &t.task_id,
+                        &t.task_group,
+                        "human-plan-approval",
+                        "Approve?",
+                        &["Approve".into()],
+                        None,
+                        "original context",
+                        None,
+                    )
+                    .unwrap();
+            }
+            store
+                .resolve_decision("unapplied", "Approve", "alice", Some("human note"))
+                .unwrap();
+            let op = LifecycleOperation {
+                operation_id: "approval-intent".into(),
+                task_id: t.task_id.clone(),
+                kind: "human-plan-approval".into(),
+                args: vec![],
+                body_path: None,
+                depends_on: None,
+                state: "PENDING".into(),
+                retry_epoch: 0,
+                attempts: 0,
+                last_error: None,
+                decision_id: Some("unapplied".into()),
+                attempt_id: None,
+            };
+            store.enqueue_lifecycle(&op).unwrap();
+            store
+                .connection_mut()
+                .execute("UPDATE tasks SET status=?1", [terminal])
+                .unwrap();
+            assert!(store.list_decisions(true, None).unwrap().is_empty());
+            drop(store);
+            let (mut c, _handle) = Coordinator::create(V2Store::open(&db).unwrap(), dir.0.clone());
+            c.controller = Arc::new(RehearsalUnits::default());
+            c.submission_probe = Some(BTreeMap::new());
+            rehearsal_startup(&mut c).unwrap();
+            c.replay_lifecycle().unwrap();
+            c.resume_decisions().unwrap();
+            c.lifecycle_ack("approval-intent", "late result").unwrap();
+            c.lifecycle_failed("approval-intent", "late failure")
+                .unwrap();
+            assert_eq!(c.store.lifecycle_ops().unwrap(), vec![op.clone()]);
+            assert_eq!(c.task(&t.task_id).unwrap().status, terminal);
+            assert!(
+                c.task(&t.task_id)
+                    .unwrap()
+                    .memory
+                    .applied_decisions
+                    .is_empty()
+            );
+            let retired = c.store.get_decision("unapplied").unwrap().unwrap();
+            assert_eq!(retired.status, "RETIRED");
+            assert_eq!(retired.choice.as_deref(), Some("Approve"));
+            assert_eq!(retired.note.as_deref(), Some("human note"));
+            let max = c.store.max_seq_id().unwrap();
+            let mut reopened = c.task(&t.task_id).unwrap();
+            reopened.status = "Ready".into();
+            c.save(&reopened).unwrap();
+            c.replay_lifecycle().unwrap();
+            c.resume_decisions().unwrap();
+            c.lifecycle_ack("approval-intent", "replayed result")
+                .unwrap();
+            assert_eq!(c.store.lifecycle_ops().unwrap(), vec![op]);
+            assert_eq!(c.task(&t.task_id).unwrap().status, "Ready");
+            assert_eq!(c.store.max_seq_id().unwrap(), max + 1);
+            let events = c.store.list_task_events(&t.task_id).unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| e.event_type == "DECISION_RETIRED")
+                    .count(),
+                2
+            );
+        }
+    }
+
+    fn apply_human_rejection(c: &mut Coordinator) -> (TaskRecord, LifecycleOperation) {
+        let mut t = task("rejected");
+        t.status = "Blocked".into();
+        let stage = "human-plan-approval";
+        t.current_stage = Some(stage.into());
+        c.save(&t).unwrap();
+        let id = "human-rejected-human-plan-approval-base-0-0-p0-r0";
+        c.store
+            .open_decision(
+                id,
+                &t.task_id,
+                &t.task_group,
+                stage,
+                "Approve?",
+                &["Reject".into()],
+                None,
+                "plan review",
+                t.plan_base_sha.as_deref(),
+            )
+            .unwrap();
+        let DecisionResolution::Resolved(rejection) = c
+            .store
+            .resolve_decision(id, "Reject", "alice", Some("keep this note"))
+            .unwrap()
+        else {
+            panic!("expected resolved rejection");
+        };
+        c.apply_decision(&rejection).unwrap();
+        let t = c.task(&t.task_id).unwrap();
+        assert!(t.memory.halt_requested);
+        assert_eq!(t.memory.applied_decisions, [id]);
+        let op = c.store.lifecycle_ops().unwrap().remove(0);
+        assert_eq!(op.decision_id.as_deref(), Some(id));
+        assert_eq!(op.state, "PENDING");
+        (t, op)
+    }
+
+    #[test]
+    fn terminal_and_reopen_retire_locally_applied_rejection_with_pending_publication() {
+        for terminal in ["Done", "Cancelled"] {
+            let dir = TestDirectory::new();
+            let mut c = coordinator(&dir.0);
+            c.ws = Arc::new(RecordingWsTaskClient::default());
+            let (mut t, op) = apply_human_rejection(&mut c);
+            let id = op.decision_id.as_deref().unwrap();
+            t.status = terminal.into();
+            c.worker_result(WorkerResult::Export(vec![t.clone()]))
+                .unwrap();
+            assert_eq!(c.task(&t.task_id).unwrap().status, terminal);
+            let decision = c.store.get_decision(id).unwrap().unwrap();
+            assert_eq!(decision.status, "RETIRED");
+            assert_eq!(decision.choice.as_deref(), Some("Reject"));
+            assert_eq!(decision.note.as_deref(), Some("keep this note"));
+            t.status = "Ready".into();
+            t.memory.halt_requested = false;
+            c.worker_result(WorkerResult::Export(vec![t.clone()]))
+                .unwrap();
+            assert_eq!(c.task(&t.task_id).unwrap().status, "Ready");
+            assert!(!c.store.has_pending_lifecycle(&t.task_id).unwrap());
+            c.replay_lifecycle().unwrap();
+            assert!(c.jobs.is_empty());
+            c.lifecycle_ack(&op.operation_id, "late receipt").unwrap();
+            c.lifecycle_failed(&op.operation_id, "late error").unwrap();
+            assert_eq!(c.store.get_decision(id).unwrap().unwrap().status, "RETIRED");
+            assert_eq!(c.store.lifecycle_ops().unwrap(), [op]);
+        }
+    }
+
+    #[test]
+    fn queued_rejection_rechecks_eligibility_before_remote_publication() {
+        for (terminal, reopen) in [
+            (None, false),
+            (Some("Done"), false),
+            (Some("Cancelled"), true),
+        ] {
+            let dir = TestDirectory::new();
+            let mut c = coordinator(&dir.0);
+            let ws = Arc::new(RecordingWsTaskClient::default());
+            c.ws = ws.clone();
+            let (mut t, op) = apply_human_rejection(&mut c);
+
+            let (held, holding) = mpsc::sync_channel(0);
+            let (release, released) = mpsc::sync_channel(0);
+            assert!(c.governance.submit(
+                "held".into(),
+                None,
+                Box::new(move || {
+                    held.send(()).unwrap();
+                    released.recv().unwrap();
+                    Ok(WorkerResult::LifecycleSkipped)
+                })
+            ));
+            holding.recv_timeout(Duration::from_secs(2)).unwrap();
+            c.replay_lifecycle().unwrap();
+            assert!(c.store.lifecycle_in_flight(&op.operation_id).unwrap());
+
+            if let Some(terminal) = terminal {
+                t.status = terminal.into();
+                c.worker_result(WorkerResult::Export(vec![t.clone()]))
+                    .unwrap();
+                assert_eq!(c.task(&t.task_id).unwrap().status, terminal);
+                if reopen {
+                    t.status = "Ready".into();
+                    t.memory.halt_requested = false;
+                    c.worker_result(WorkerResult::Export(vec![t.clone()]))
+                        .unwrap();
+                    assert_eq!(c.task(&t.task_id).unwrap().status, "Ready");
+                }
+            }
+            release.send(()).unwrap();
+            for _ in 0..3 {
+                let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                c.handle_event(event).unwrap();
+            }
+            assert!(c.jobs.is_empty());
+            assert_eq!(
+                ws.calls.lock().unwrap().len(),
+                usize::from(terminal.is_none())
+            );
+            assert_eq!(
+                c.store.lifecycle_ops().unwrap()[0].state,
+                if terminal.is_none() {
+                    "ACKNOWLEDGED"
+                } else {
+                    "QUEUED"
+                }
+            );
+        }
+    }
+
+    struct FencedPublicationWs {
+        recording: RecordingWsTaskClient,
+        active: mpsc::SyncSender<()>,
+        finish: Mutex<mpsc::Receiver<bool>>,
+        comments: Mutex<String>,
+        board_status: Mutex<String>,
+    }
+
+    impl WsTaskClient for FencedPublicationWs {
+        fn execute(&self, args: &[String]) -> Result<String, String> {
+            assert_eq!(args, ["export", "--sync", "--json"]);
+            Ok(serde_json::json!({"schema_version":2,"tasks":[{
+                "id":"rejected","repository":"rejected","github_repo":"example/rejected","issue_number":1,
+                "status":*self.board_status.lock().unwrap(),"autonomous_consent":true
+            }]}).to_string())
+        }
+    }
+
+    impl LifecycleWsTaskClient for FencedPublicationWs {
+        fn execute_fenced(&self, args: &[String], _fence: &File) -> Result<String, String> {
+            self.active.send(()).unwrap();
+            let output = self.recording.execute(args)?;
+            if self.finish.lock().unwrap().recv().unwrap() {
+                Ok(output)
+            } else {
+                Err("publication response lost".into())
+            }
+        }
+
+        fn issue_comments(&self, repo: &str, issue: i64) -> Result<String, String> {
+            assert_eq!((repo, issue), ("example/rejected", 1));
+            Ok(self.comments.lock().unwrap().clone())
+        }
+    }
+
+    #[test]
+    fn decision_publication_defers_terminal_after_grant_and_while_call_is_active() {
+        for (terminal, delivery_hold) in [
+            ("Done", false),
+            ("Cancelled", false),
+            ("Done", true),
+            ("Cancelled", true),
+        ] {
+            let dir = TestDirectory::new();
+            let mut c = coordinator(&dir.0);
+            let (active, entered) = mpsc::sync_channel(0);
+            let (finish, outcome) = mpsc::channel();
+            let ws = Arc::new(FencedPublicationWs {
+                recording: RecordingWsTaskClient::default(),
+                active,
+                finish: Mutex::new(outcome),
+                comments: Mutex::new(String::new()),
+                board_status: Mutex::new(terminal.into()),
+            });
+            c.ws = ws.clone();
+            let (mut task, op) = apply_human_rejection(&mut c);
+            c.replay_lifecycle().unwrap();
+            let CoordinatorEvent::AuthorizeLifecycle { operation, reply } =
+                c.rx.recv_timeout(Duration::from_secs(2)).unwrap()
+            else {
+                panic!("expected grant request")
+            };
+            assert!(c.authorize_lifecycle(&operation).unwrap());
+            assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "DISPATCHED");
+
+            let delivery = if delivery_hold {
+                let decision = c
+                    .store
+                    .open_decision(
+                        "delivery-hold",
+                        &task.task_id,
+                        &task.task_group,
+                        "prod_promotion_approval",
+                        "Approve delivery?",
+                        &["Approve".into()],
+                        None,
+                        "receipt pending",
+                        None,
+                    )
+                    .unwrap();
+                let mut row = delivery_rows(&task).remove(0);
+                row.state = "approval_pending".into();
+                row.decision_id = Some(decision.decision_id);
+                c.store.upsert_delivery(&row).unwrap();
+                c.store.list_deliveries(Some(&task.task_id)).unwrap()
+            } else {
+                vec![]
+            };
+            task.status = terminal.into();
+            c.worker_result(WorkerResult::Export(vec![task.clone()]))
+                .unwrap();
+            assert!(ws.recording.calls.lock().unwrap().is_empty());
+            assert_eq!(
+                c.task(&task.task_id).unwrap().status,
+                if delivery_hold {
+                    "Delivery Pending"
+                } else {
+                    "Blocked"
+                }
+            );
+            assert_eq!(
+                c.store.board_statuses(None).unwrap()[&task.task_id],
+                terminal
+            );
+
+            reply.send(Ok(true)).unwrap();
+            entered.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(publication_fence(&dir.0, &task.task_id).is_err());
+            assert!(publication_fence(&dir.0, "another-task").is_ok());
+            assert!(!matches!(
+                c.task(&task.task_id).unwrap().status.as_str(),
+                "Done" | "Cancelled"
+            ));
+
+            if !delivery_hold {
+                // A new board observation can arrive while the call is in progress.
+                task.status = "Ready".into();
+                task.memory.halt_requested = false;
+                c.worker_result(WorkerResult::Export(vec![task.clone()]))
+                    .unwrap();
+                assert_eq!(
+                    c.store.board_statuses(None).unwrap()[&task.task_id],
+                    "Ready"
+                );
+                assert_eq!(c.task(&task.task_id).unwrap().status, "Blocked");
+            }
+            finish.send(true).unwrap();
+            let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            c.handle_event(event).unwrap();
+            assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "ACKNOWLEDGED");
+            assert_eq!(ws.recording.calls.lock().unwrap().len(), 1);
+            if delivery_hold {
+                assert_eq!(c.task(&task.task_id).unwrap().status, "Delivery Pending");
+                assert_eq!(
+                    c.store.list_deliveries(Some(&task.task_id)).unwrap(),
+                    delivery
+                );
+                assert_eq!(
+                    c.store
+                        .get_decision("delivery-hold")
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    "OPEN"
+                );
+            } else {
+                assert_eq!(c.task(&task.task_id).unwrap().status, terminal);
+                c.worker_result(WorkerResult::Export(vec![task])).unwrap();
+                assert_eq!(c.task(&op.task_id).unwrap().status, "Ready");
+                assert_eq!(
+                    c.store
+                        .get_decision(op.decision_id.as_deref().unwrap())
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    "RETIRED"
+                );
+                c.replay_lifecycle().unwrap();
+                assert!(c.jobs.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn queued_decision_publication_retries_after_restart_and_fences_local_terminal_save() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        let (mut task, op) = apply_human_rejection(&mut c);
+        c.store
+            .update_lifecycle(&op.operation_id, "QUEUED", None, 0)
+            .unwrap();
+        c.recover_lifecycle_journal().unwrap();
+        assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "PENDING");
+
+        c.store
+            .update_lifecycle(&op.operation_id, "QUEUED", None, 0)
+            .unwrap();
+        assert!(c.authorize_lifecycle(&op).unwrap());
+        task.status = "Done".into();
+        c.save(&task).unwrap();
+        assert_eq!(c.task(&task.task_id).unwrap().status, "Blocked");
+        c.lifecycle_ack(&op.operation_id, "").unwrap();
+        let saved = c.task(&task.task_id).unwrap();
+        assert_eq!(saved.status, "Done");
+        assert!(!saved.memory.governance_terminal_observed);
+        assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "ACKNOWLEDGED");
+    }
+
+    fn assert_publication_terminal_event_order(
+        store: &V2Store,
+        task_id: &str,
+        terminal: &str,
+        board_status: &str,
+        retired_ids: &[&str],
+    ) {
+        let events = store.list_task_events(task_id).unwrap();
+        let effective = events
+            .iter()
+            .find(|event| {
+                matches!(
+                    event.event_type.as_str(),
+                    "TASK_DONE" | "TASK_STATUS_CHANGED"
+                ) && event.payload["status"] == terminal
+            })
+            .unwrap();
+        assert_eq!(effective.payload["task_id"], task_id);
+        assert_eq!(effective.payload["board_status"], board_status);
+        let observation = events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.seq_id < effective.seq_id && event.event_type == "BOARD_STATUS_OBSERVED"
+            })
+            .unwrap();
+        assert_eq!(observation.payload["board_status"], board_status);
+        let retirements: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == "DECISION_RETIRED")
+            .collect();
+        assert_eq!(retirements.len(), retired_ids.len());
+        for id in retired_ids {
+            let retired = retirements
+                .iter()
+                .find(|event| event.payload["decision_id"] == *id)
+                .unwrap();
+            assert!(effective.seq_id < retired.seq_id);
+            assert_eq!(retired.payload["task_id"], task_id);
+            assert_eq!(retired.payload["reason"], terminal);
+        }
+    }
+
+    #[test]
+    fn grant_before_launch_can_be_settled_after_restart_without_replay() {
+        for terminal in ["Done", "Cancelled"] {
+            let dir = TestDirectory::new();
+            let db = dir.0.join("journal.sqlite");
+            let (mut c, _) = Coordinator::create(V2Store::open(&db).unwrap(), dir.0.clone());
+            let (mut task, op) = apply_human_rejection(&mut c);
+            task.github_repo = Some("example/rejected".into());
+            c.save(&task).unwrap();
+            c.store
+                .update_lifecycle(&op.operation_id, "QUEUED", None, 0)
+                .unwrap();
+            assert!(c.authorize_lifecycle(&op).unwrap());
+            // The grant commits, but no publisher ever launches.
+            drop(c);
+
+            let (active, _entered) = mpsc::sync_channel(0);
+            let (_finish, outcome) = mpsc::channel();
+            let ws = Arc::new(FencedPublicationWs {
+                recording: RecordingWsTaskClient::default(),
+                active,
+                finish: Mutex::new(outcome),
+                comments: Mutex::new(String::new()),
+                board_status: Mutex::new(terminal.into()),
+            });
+            let (mut c, _) = Coordinator::create(V2Store::open(&db).unwrap(), dir.0.clone());
+            c.ws = ws.clone();
+            c.recover_lifecycle_journal().unwrap();
+            task.status = terminal.into();
+            let before = c.task(&task.task_id).unwrap();
+            let cursor = c.store.max_seq_id().unwrap();
+            let export = ws
+                .execute(&["export".into(), "--sync".into(), "--json".into()])
+                .unwrap();
+            let incoming = intake::decode_export_records(&export).unwrap().remove(0);
+            let mut conflicting = incoming.clone();
+            conflicting.repository = "unrelated".into();
+            for (index, incoming) in [&conflicting, &incoming].into_iter().enumerate() {
+                let declined = c
+                    .store
+                    .sync_task_with_mode(
+                        incoming,
+                        crate::v2::store::SyncMode::ReconcileFinishedLegacy,
+                    )
+                    .unwrap();
+                assert_eq!(declined, before);
+                assert!(
+                    c.store
+                        .deferred_terminal(&op.operation_id, &before)
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "DISPATCHED");
+                if index == 0 {
+                    assert!(
+                        c.store
+                            .list_task_events(&task.task_id)
+                            .unwrap()
+                            .iter()
+                            .all(|event| event.seq_id <= cursor),
+                        "a conflicting offline identity must not report board status"
+                    );
+                }
+            }
+            let events = c.store.list_task_events(&task.task_id).unwrap();
+            let observed: Vec<_> = events
+                .iter()
+                .filter(|event| event.seq_id > cursor)
+                .collect();
+            assert_eq!(observed.len(), 1);
+            assert_eq!(observed[0].event_type, "BOARD_STATUS_OBSERVED");
+            assert_eq!(observed[0].payload["board_status"], terminal);
+            c.worker_result(WorkerResult::Export(vec![task.clone()]))
+                .unwrap();
+            let id = format!("settle-{}", op.operation_id);
+
+            // An inherited fence blocks settlement while a publisher could still run.
+            let fence = publication_fence(&dir.0, &task.task_id).unwrap();
+            c.replay_lifecycle().unwrap();
+            let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            c.handle_event(event).unwrap();
+            assert!(c.store.get_decision(&id).unwrap().is_none());
+            drop(fence);
+
+            c.store
+                .update_lifecycle(&op.operation_id, "DISPATCHED", None, 0)
+                .unwrap();
+            c.replay_lifecycle().unwrap();
+            let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            c.handle_event(event).unwrap();
+            assert_eq!(c.task(&task.task_id).unwrap().status, "Blocked");
+            assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "DISPATCHED");
+            assert!(
+                c.store
+                    .resolve_decision(&id, "Retry publication", "alice", None)
+                    .is_err()
+            );
+            assert!(matches!(
+                c.store
+                    .resolve_decision(
+                        &id,
+                        "Close without replay",
+                        "alice",
+                        Some("Checked issue and board")
+                    )
+                    .unwrap(),
+                DecisionResolution::Resolved(_)
+            ));
+            // Resolution and application can also straddle a crash.
+            drop(c);
+            let (mut c, _) = Coordinator::create(V2Store::open(&db).unwrap(), dir.0.clone());
+            c.ws = ws.clone();
+            c.recover_lifecycle_journal().unwrap();
+            let fence = publication_fence(&dir.0, &task.task_id).unwrap();
+            c.resume_decisions().unwrap();
+            assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "DISPATCHED");
+            drop(fence);
+            c.resume_decisions().unwrap();
+            let settled = c.task(&task.task_id).unwrap();
+            assert_eq!(settled.status, terminal);
+            assert!(settled.memory.governance_terminal_observed);
+            assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "SETTLED");
+            assert!(!c.store.has_pending_lifecycle(&task.task_id).unwrap());
+            assert_eq!(
+                c.store
+                    .get_decision(op.decision_id.as_deref().unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "RETIRED"
+            );
+            assert_eq!(
+                c.store.get_decision(&id).unwrap().unwrap().status,
+                "RESOLVED"
+            );
+
+            assert_publication_terminal_event_order(
+                &c.store,
+                &op.task_id,
+                terminal,
+                terminal,
+                &[op.decision_id.as_deref().unwrap()],
+            );
+
+            task.status = "Ready".into();
+            task.memory.halt_requested = false;
+            c.worker_result(WorkerResult::Export(vec![task])).unwrap();
+            c.resume_decisions().unwrap();
+            c.replay_lifecycle().unwrap();
+            assert_eq!(c.task(&op.task_id).unwrap().status, "Ready");
+            assert!(c.jobs.is_empty());
+            assert!(ws.recording.calls.lock().unwrap().is_empty());
+            assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "SETTLED");
+        }
+    }
+
+    #[test]
+    fn lost_decision_publication_result_holds_across_restart_until_exact_readback() {
+        let dir = TestDirectory::new();
+        let db = dir.0.join("journal.sqlite");
+        let (mut c, _) = Coordinator::create(V2Store::open(&db).unwrap(), dir.0.clone());
+        let (active, entered) = mpsc::sync_channel(0);
+        let (finish, outcome) = mpsc::channel();
+        let ws = Arc::new(FencedPublicationWs {
+            recording: RecordingWsTaskClient::default(),
+            active,
+            finish: Mutex::new(outcome),
+            comments: Mutex::new(String::new()),
+            board_status: Mutex::new("Pending".into()),
+        });
+        c.ws = ws.clone();
+        let (mut task, op) = apply_human_rejection(&mut c);
+        task.github_repo = Some("example/rejected".into());
+        c.save(&task).unwrap();
+        c.replay_lifecycle().unwrap();
+        let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        c.handle_event(event).unwrap();
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        task.status = "Cancelled".into();
+        c.worker_result(WorkerResult::Export(vec![task])).unwrap();
+        finish.send(false).unwrap();
+        // Simulate a daemon that loses the worker result before journaling it.
+        assert!(matches!(c.rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            CoordinatorEvent::Completed { result, .. } if result.is_err()));
+        drop(c);
+
+        let (mut c, _) = Coordinator::create(V2Store::open(&db).unwrap(), dir.0.clone());
+        c.ws = ws.clone();
+        c.recover_lifecycle_journal().unwrap();
+        assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "DISPATCHED");
+        let marker = format!(
+            "<!-- governance-v2: task_id={} stage={} verdict=CHANGES_REQUESTED weight=S actor=alice sha=base idempotency_key={} -->",
+            op.task_id, op.kind, op.operation_id
+        );
+        for (author, body) in [
+            ("shockerqt", String::new()),
+            ("external", marker.clone()),
+            ("shockerqt", marker.replace("sha=base", "sha=wrong")),
+            ("shockerqt", marker.clone()), // exact marker but board postcondition still absent
+        ] {
+            *ws.comments.lock().unwrap() = serde_json::json!([author, body]).to_string();
+            c.store
+                .update_lifecycle(&op.operation_id, "DISPATCHED", None, 0)
+                .unwrap();
+            c.replay_lifecycle().unwrap();
+            let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            c.handle_event(event).unwrap();
+            assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "DISPATCHED");
+            assert_eq!(c.task(&op.task_id).unwrap().status, "Blocked");
+            assert_eq!(
+                c.store.board_statuses(None).unwrap()[&op.task_id],
+                "Cancelled"
+            );
+            assert_eq!(ws.recording.calls.lock().unwrap().len(), 1);
+        }
+        let settlement_id = format!("settle-{}", op.operation_id);
+        assert_eq!(
+            c.store
+                .get_decision(&settlement_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "OPEN"
+        );
+        // A previous publisher can still own the per-task process lock after restart.
+        let outstanding = publication_fence(&dir.0, &op.task_id).unwrap();
+        *ws.board_status.lock().unwrap() = "Planning".into();
+        c.store
+            .update_lifecycle(&op.operation_id, "DISPATCHED", None, 0)
+            .unwrap();
+        c.replay_lifecycle().unwrap();
+        let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        c.handle_event(event).unwrap();
+        assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "DISPATCHED");
+        assert_eq!(c.task(&op.task_id).unwrap().status, "Blocked");
+        drop(outstanding);
+        c.store
+            .update_lifecycle(&op.operation_id, "DISPATCHED", None, 0)
+            .unwrap();
+        c.replay_lifecycle().unwrap();
+        let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        c.handle_event(event).unwrap();
+        assert_eq!(c.task(&op.task_id).unwrap().status, "Cancelled");
+        assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "ACKNOWLEDGED");
+        assert_eq!(
+            c.store
+                .get_decision(&settlement_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "RETIRED"
+        );
+        assert_publication_terminal_event_order(
+            &c.store,
+            &op.task_id,
+            "Cancelled",
+            "Planning",
+            &[op.decision_id.as_deref().unwrap(), &settlement_id],
+        );
+        assert_eq!(ws.recording.calls.lock().unwrap().len(), 1);
+    }
+
     #[test]
     fn ws_task_adapter_replays_start_before_plan_and_acknowledges_each_once() {
         let dir = TestDirectory::new();
@@ -8018,6 +9350,8 @@ mod tests {
         c.store.enqueue_lifecycle(&plan).unwrap();
         for _ in 0..2 {
             c.replay_lifecycle().unwrap();
+            let authorization = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            c.handle_event(authorization).unwrap();
             let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
             c.handle_event(event).unwrap();
         }
@@ -8339,6 +9673,8 @@ mod tests {
         c.apply_decision(&decision).unwrap();
         assert_eq!(c.task(&t.task_id).unwrap().status, "Delivery Pending");
         c.replay_lifecycle().unwrap();
+        let authorization = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        c.handle_event(authorization).unwrap();
         let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
         c.handle_event(event).unwrap();
         c.lifecycle_ack(&close.operation_id, "").unwrap(); // duplicate receipt
@@ -9077,7 +10413,18 @@ mod tests {
             hash(
                 &HISTORY
                     .iter()
-                    .map(|name| Ok((*name, selected(i, name, id)?)))
+                    .map(|name| {
+                        let mut table = selected(i, name, id)?;
+                        // Standard separately validates the full event stream and allocator.
+                        // The retained runtime receipt excludes board-only observations.
+                        if *name == "task_events" {
+                            let kind = column(&table, "event_type")?;
+                            table.rows.retain(|row| {
+                                text(&row.values[kind]).ok() != Some("BOARD_STATUS_OBSERVED")
+                            });
+                        }
+                        Ok((*name, table))
+                    })
                     .collect::<Result<BTreeMap<_, _>, String>>()?,
             )
         }
@@ -9580,25 +10927,33 @@ mod tests {
             }
             need(saw_last_sync, "PROFILE_META_LAST_SYNC")?;
 
-            // sqlite_sequence rowid & no-event preservation.
-            let b_ev = before_img
-                .tables
-                .get("task_events")
-                .ok_or("PROFILE_TABLE")?;
-            let a_ev = after_img.tables.get("task_events").ok_or("PROFILE_TABLE")?;
-            let b_seq = before_img
-                .tables
-                .get("sqlite_sequence")
-                .ok_or("PROFILE_TABLE")?;
-            let a_seq = after_img
-                .tables
-                .get("sqlite_sequence")
-                .ok_or("PROFILE_TABLE")?;
-            if b_ev.rows == a_ev.rows {
-                need(b_seq == a_seq, "PROFILE_ALLOCATOR")?;
-            }
-            for (br, ar) in b_seq.rows.iter().zip(&a_seq.rows) {
-                need(br.rowid == ar.rowid, "PROFILE_ALLOCATOR_ROWID")?;
+            // Bind the raw receipt to the exact events and allocator validated above.
+            for (image, observed, allocator) in [
+                (before_img, &obs.before, &obs.allocator_before),
+                (after_img, &obs.after, &obs.allocator_after),
+            ] {
+                for (name, expected) in [
+                    (
+                        "task_events",
+                        event_rows(observed.get("task_events").ok_or("PROFILE_TABLE")?)?,
+                    ),
+                    ("sqlite_sequence", allocator_rows(allocator)?),
+                ] {
+                    let actual = &image.tables.get(name).ok_or("PROFILE_TABLE")?.rows;
+                    need(actual.len() == expected.len(), "PROFILE_EVENT_INVENTORY")?;
+                    for (actual, expected) in actual.iter().zip(expected) {
+                        let cells = expected.into_iter().map(cell).collect::<Vec<_>>();
+                        let values = if name == "sqlite_sequence" {
+                            &cells[1..]
+                        } else {
+                            &cells[..]
+                        };
+                        need(
+                            actual.rowid == number(&cells[0])? && actual.values == values,
+                            "PROFILE_EVENT_BINDING",
+                        )?;
+                    }
+                }
             }
 
             // tasks rowid preservation + exact retained allowlist & receipt generation.

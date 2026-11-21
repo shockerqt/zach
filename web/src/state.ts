@@ -57,12 +57,27 @@ export function acceptSnapshot(s: State, v: Snapshot): State {
   };
 }
 export function applyEvent(s: State, e: Event): State {
-  if (e.seq_id <= s.cursor) return s;
+  const historical = e.seq_id <= s.watermark;
+  if (historical ? s.feed.some((entry) => entry.seq_id === e.seq_id) : e.seq_id <= s.cursor)
+    return s;
+  const p = e.payload;
+  const entry = {
+    ...e,
+    payload: {},
+    ...(e.event_type === "DECISION_RESOLVED"
+      ? { detail: `Opción ganadora: ${string(p.choice)}` }
+      : {}),
+  };
+  if (historical) {
+    return {
+      ...s,
+      feed: [...s.feed, entry].sort((a, b) => b.seq_id - a.seq_id).slice(0, 200),
+    };
+  }
   let tasks = s.tasks.map((t) => ({ ...t })),
     decisions = [...s.decisions],
     stages = { ...s.stages },
     mergedUntil = s.mergedUntil;
-  const p = e.payload;
   let t = tasks.find((t) => t.task_id === e.task_id);
   if (!t) {
     t = {
@@ -92,6 +107,14 @@ export function applyEvent(s: State, e: Event): State {
       decisions = decisions.filter((d) => d.decision_id !== id);
       break;
     }
+    case "DECISION_RETIRED": {
+      const id = string(p.decision_id);
+      decisions = decisions.filter((d) => d.decision_id !== id);
+      break;
+    }
+    case "BOARD_STATUS_OBSERVED":
+      t.board_status = string(p.board_status);
+      break;
     case "STAGE_STARTED":
     case "STAGE_COMPLETED": {
       const stage = string(p.stage),
@@ -137,7 +160,11 @@ export function applyEvent(s: State, e: Event): State {
       t.weight = string(p.to_weight);
       break;
     case "TASK_DONE":
+    case "TASK_STATUS_CHANGED":
       t.status = string(p.status);
+      if (p.board_status != null) t.board_status = string(p.board_status);
+      if (["done", "cancelled"].includes(t.status.toLowerCase()))
+        decisions = decisions.filter((d) => d.task_id !== e.task_id);
       break;
     case "MERGE_ENQUEUED":
       t.pr_number = integer(p.pr_number);
@@ -160,16 +187,7 @@ export function applyEvent(s: State, e: Event): State {
     decisions,
     stages,
     cursor: e.seq_id,
-    feed: [
-      {
-        ...e,
-        payload: {},
-        ...(e.event_type === "DECISION_RESOLVED"
-          ? { detail: `Opción ganadora: ${string(p.choice)}` }
-          : {}),
-      },
-      ...s.feed,
-    ].slice(0, 200),
+    feed: [entry, ...s.feed].slice(0, 200),
     mergedUntil,
   };
 }
@@ -179,10 +197,14 @@ export function observedStage(s: State, t: Task): Stage | undefined {
     ? s.stages[t.task_id + ":" + t.current_stage]
     : undefined;
 }
+export function taskDecision(s: State, t: Task): Decision | undefined {
+  const open = s.decisions.filter((d) => d.task_id === t.task_id);
+  return open.findLast((d) => d.linked_unverified_delivery) ?? open.at(-1);
+}
 export function taskLane(s: State, t: Task): "active" | "queued" | "terminal" {
-  if (observedStage(s, t)?.status === "RUNNING") return "active";
   const status = t.status.toLowerCase();
   if (["done", "completed", "cancelled"].includes(status)) return "terminal";
+  if (observedStage(s, t)?.status === "RUNNING") return "active";
   return ["ready", "backlog"].includes(status) ? "queued" : "active";
 }
 function stageIsActive(s: State, t: Task): boolean {

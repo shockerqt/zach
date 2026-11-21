@@ -32,6 +32,7 @@ export interface Task {
   pr_number?: number;
   weight: string;
   status: string;
+  board_status?: string;
   required_stages: string[];
   stages_completed: string[];
   current_stage?: string;
@@ -47,6 +48,7 @@ export interface Decision {
   context_summary: string;
   status: string;
   choice?: string;
+  linked_unverified_delivery?: boolean;
 }
 export interface Snapshot {
   tasks: Task[];
@@ -97,14 +99,22 @@ export function decision(v: unknown, eventTask?: string): Decision {
         : string(o.context_summary),
     status: o.status == null ? "OPEN" : string(o.status),
     choice: optional(o.choice),
+    linked_unverified_delivery: o.linked_unverified_delivery === true,
   };
 }
 export function snapshot(v: unknown, requireStatus = false): Snapshot {
   const o = object(v);
   if (!Array.isArray(o.tasks) || !Array.isArray(o.open_decisions))
     throw Error("Snapshot no válido");
+  const boardStatuses = o.board_statuses == null ? {} : object(o.board_statuses);
   const result: Snapshot = {
-    tasks: o.tasks.map(task),
+    tasks: o.tasks.map((value) => {
+      const parsed = task(value);
+      parsed.board_status = Object.hasOwn(boardStatuses, parsed.task_id)
+        ? string(boardStatuses[parsed.task_id])
+        : undefined;
+      return parsed;
+    }),
     open_decisions: o.open_decisions.map((v) => decision(v)),
     as_of_seq: integer(o.as_of_seq),
   };
@@ -120,12 +130,27 @@ export function snapshot(v: unknown, requireStatus = false): Snapshot {
 }
 export function event(v: unknown): Event {
   const o = object(v);
+  const eventType = string(o.event_type);
+  const payload = object(o.payload);
+  switch (eventType) {
+    case "BOARD_STATUS_OBSERVED":
+      string(payload.board_status);
+      break;
+    case "TASK_STATUS_CHANGED":
+      string(payload.status);
+      optional(payload.board_status);
+      break;
+    case "DECISION_RETIRED":
+      identity(payload.decision_id);
+      string(payload.reason);
+      break;
+  }
   return {
     seq_id: integer(o.seq_id),
     task_id: identity(o.task_id),
     ts_epoch: integer(o.ts_epoch),
-    event_type: string(o.event_type),
-    payload: object(o.payload),
+    event_type: eventType,
+    payload,
   };
 }
 export function github(task: Task, kind: "issue" | "pull"): string | undefined {

@@ -82,6 +82,8 @@ pub enum ServerMessage {
     Snapshot {
         tasks: Vec<TaskRecord>,
         open_decisions: Vec<PendingDecisionRecord>,
+        #[serde(default)]
+        board_statuses: std::collections::BTreeMap<String, String>,
         as_of_seq: i64,
     },
     #[serde(rename = "EVENT")]
@@ -308,6 +310,7 @@ pub fn handle_subscribe(
     let snapshot = ServerMessage::Snapshot {
         tasks,
         open_decisions,
+        board_statuses: store.board_statuses(session.task_group.as_deref())?,
         as_of_seq,
     };
     if let Err(e) = session.send_message(&snapshot) {
@@ -1078,6 +1081,13 @@ mod tests {
         assert_eq!(snap["type"], "SNAPSHOT");
         assert_eq!(snap["as_of_seq"], 4);
         assert_eq!(snap["tasks"][0]["task_id"], "TASK-REPLAY-1");
+        assert_eq!(snap["board_statuses"], json!({}));
+        let mut legacy = snap;
+        legacy.as_object_mut().unwrap().remove("board_statuses");
+        assert!(
+            matches!(serde_json::from_value::<ServerMessage>(legacy).unwrap(),
+            ServerMessage::Snapshot { board_statuses, .. } if board_statuses.is_empty())
+        );
         line.clear();
 
         // 2. Historical events since_seq > 1: EV2, EV3, EV4
