@@ -1229,6 +1229,14 @@ impl V2Store {
         )?)
     }
 
+    pub(crate) fn lifecycle_in_flight(&self, id: &str) -> Result<bool, V2StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM lifecycle_ops WHERE operation_id=?1 AND state='IN_FLIGHT')",
+            [id],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn update_lifecycle(
         &mut self,
         id: &str,
@@ -1487,15 +1495,19 @@ impl V2Store {
         now: i64,
     ) -> Result<(), V2StoreError> {
         let decisions = tx.prepare(
-            "SELECT decision_id,status FROM pending_decisions d WHERE task_id=?1
+            "SELECT decision_id,status,EXISTS(
+                 SELECT 1 FROM lifecycle_ops l WHERE l.task_id=d.task_id
+                   AND l.decision_id=d.decision_id AND l.state!='ACKNOWLEDGED'
+             ) FROM pending_decisions d WHERE task_id=?1
              AND NOT EXISTS(SELECT 1 FROM task_events e WHERE e.task_id=d.task_id
                AND e.event_type='DECISION_RETIRED' AND json_extract(e.payload_json,'$.decision_id')=d.decision_id)
              ORDER BY created_seq",
-        )?.query_map([&task.task_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        )?.query_map([&task.task_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?)))?
             .collect::<Result<Vec<_>, _>>()?;
-        for (id, status) in decisions {
+        for (id, status, pending_publication) in decisions {
             if status == "OPEN"
-                || (status == "RESOLVED" && !task.memory.applied_decisions.contains(&id))
+                || (status == "RESOLVED"
+                    && (pending_publication || !task.memory.applied_decisions.contains(&id)))
             {
                 Self::insert_event_tx(
                     tx,

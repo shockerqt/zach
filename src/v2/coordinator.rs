@@ -144,6 +144,7 @@ pub enum WorkerResult {
     },
     Reconciled,
     DeliveryPolled,
+    LifecycleSkipped,
     AttemptsPruned(usize),
 }
 
@@ -172,6 +173,10 @@ impl DeliveryStore for CoordinatorDeliveryStore {
 
 pub enum CoordinatorEvent {
     DeliveryStore(DeliveryStoreOperation),
+    AuthorizeLifecycle {
+        operation: Box<LifecycleOperation>,
+        reply: mpsc::SyncSender<Result<bool, String>>,
+    },
     Socket {
         client_id: usize,
         command: ClientCommand,
@@ -477,7 +482,9 @@ impl Coordinator {
                 command,
                 ClientCommand::Decide { .. } | ClientCommand::Run { .. }
             ),
-            CoordinatorEvent::Replay { .. } | CoordinatorEvent::Shutdown => false,
+            CoordinatorEvent::Replay { .. }
+            | CoordinatorEvent::AuthorizeLifecycle { .. }
+            | CoordinatorEvent::Shutdown => false,
         };
         self.handle_event(event)?;
         Ok(dirty)
@@ -705,6 +712,9 @@ impl Coordinator {
                         }
                     }
                 }
+            }
+            CoordinatorEvent::AuthorizeLifecycle { operation, reply } => {
+                let _ = reply.send(self.authorize_lifecycle(&operation));
             }
             CoordinatorEvent::DeliveryStore(operation) => {
                 operation(&mut self.store);
@@ -1735,7 +1745,7 @@ impl Coordinator {
                 }
                 self.worker_result(WorkerResult::Reconciled)?;
             }
-            WorkerResult::DeliveryPolled => {}
+            WorkerResult::DeliveryPolled | WorkerResult::LifecycleSkipped => {}
             WorkerResult::AttemptsPruned(_) => {}
             WorkerResult::Reconciled => {
                 // Prove every exclusion before the first cleanup/lock/failure write.
@@ -2620,6 +2630,75 @@ impl Coordinator {
         Ok(())
     }
 
+    fn lifecycle_delivery_allowed(
+        &self,
+        op: &LifecycleOperation,
+        task: &TaskRecord,
+    ) -> Result<bool, String> {
+        Ok(op.kind != "close"
+            || self
+                .store
+                .list_deliveries(Some(&task.task_id))
+                .map_err(|e| e.to_string())?
+                .is_empty()
+            || self.delivery_verified(task)?)
+    }
+
+    fn lifecycle_task_allowed(
+        &self,
+        op: &LifecycleOperation,
+        task: &TaskRecord,
+    ) -> Result<bool, String> {
+        let negative_human = op.kind.starts_with("human-")
+            && op
+                .args
+                .windows(2)
+                .any(|args| args[0] == "--verdict" && args[1] == "CHANGES_REQUESTED");
+        Ok(task.autonomous_consent
+            && (!task.memory.halt_requested || negative_human)
+            && task.status != "Cancelled"
+            && (task.status != "Done" || (op.kind == "close" && self.delivery_verified(task)?)))
+    }
+
+    fn authorize_lifecycle(&mut self, op: &LifecycleOperation) -> Result<bool, String> {
+        if !self
+            .store
+            .lifecycle_in_flight(&op.operation_id)
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(false);
+        }
+        let task = self.task(&op.task_id)?;
+        if let Some(id) = &op.decision_id
+            && (matches!(task.status.as_str(), "Done" | "Cancelled")
+                || self
+                    .store
+                    .get_decision(id)
+                    .map_err(|e| e.to_string())?
+                    .is_none_or(|d| d.status != "RESOLVED"))
+        {
+            return Ok(false);
+        }
+        if !self.lifecycle_task_allowed(op, &task)? {
+            self.store
+                .update_lifecycle(
+                    &op.operation_id,
+                    "FAILED",
+                    Some("publication intent superseded by task stop/terminal state"),
+                    0,
+                )
+                .map_err(|e| e.to_string())?;
+            return Ok(false);
+        }
+        if !self.lifecycle_delivery_allowed(op, &task)? {
+            self.store
+                .update_lifecycle(&op.operation_id, "PENDING", None, 0)
+                .map_err(|e| e.to_string())?;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     fn replay_lifecycle(&mut self) -> Result<(), String> {
         let ops = self
             .store
@@ -2646,28 +2725,10 @@ impl Coordinator {
             if op.decision_id.is_some() && matches!(task.status.as_str(), "Done" | "Cancelled") {
                 continue;
             }
-            if op.kind == "close"
-                && !self
-                    .store
-                    .list_deliveries(Some(&task.task_id))
-                    .map_err(|e| e.to_string())?
-                    .is_empty()
-                && !self.delivery_verified(&task)?
-            {
+            if !self.lifecycle_delivery_allowed(op, &task)? {
                 continue;
             }
-
-            let negative_human = op.kind.starts_with("human-")
-                && op
-                    .args
-                    .windows(2)
-                    .any(|args| args[0] == "--verdict" && args[1] == "CHANGES_REQUESTED");
-            if !task.autonomous_consent
-                || (task.memory.halt_requested && !negative_human)
-                || task.status == "Cancelled"
-                || (task.status == "Done"
-                    && !(op.kind == "close" && self.delivery_verified(&task)?))
-            {
+            if !self.lifecycle_task_allowed(op, &task)? {
                 self.store
                     .update_lifecycle(
                         &op.operation_id,
@@ -2692,6 +2753,7 @@ impl Coordinator {
             let state = self.state_dir.clone();
             let ws = self.ws.clone();
             let operation = op.clone();
+            let commands = self.commands.clone();
             let key = format!("ws:{}", op.operation_id);
             if self.submit(
                 key,
@@ -2704,9 +2766,26 @@ impl Coordinator {
                             return Err("human evidence path does not match durable intent".into());
                         }
                     }
-                    let mut args = operation.args;
+                    // The coordinator orders authorization against terminal updates.
+                    // Ask at the call boundary, after the job leaves the worker queue.
+                    let authorize = || -> Result<bool, String> {
+                        let (reply, verdict) = mpsc::sync_channel(1);
+                        commands
+                            .send(CoordinatorEvent::AuthorizeLifecycle {
+                                operation: Box::new(operation.clone()),
+                                reply,
+                            })
+                            .map_err(|_| "lifecycle coordinator stopped".to_string())?;
+                        verdict
+                            .recv()
+                            .map_err(|_| "lifecycle coordinator stopped".to_string())?
+                    };
+                    let mut args = operation.args.clone();
                     // Recover a successful remote start whose local receipt was lost.
                     if operation.kind == "start" && operation.attempts > 0 {
+                        if !authorize()? {
+                            return Ok(WorkerResult::LifecycleSkipped);
+                        }
                         let export =
                             ws.execute(&["export".into(), "--sync".into(), "--json".into()])?;
                         let export: intake::ExportContract =
@@ -2724,6 +2803,9 @@ impl Coordinator {
                         {
                             args.push("--resume".into());
                         }
+                    }
+                    if !authorize()? {
+                        return Ok(WorkerResult::LifecycleSkipped);
                     }
                     let output = ws.execute(&args)?;
                     let output = if operation.kind == "close" {
@@ -8184,6 +8266,136 @@ mod tests {
         }
     }
 
+    fn apply_human_rejection(c: &mut Coordinator) -> (TaskRecord, LifecycleOperation) {
+        let mut t = task("rejected");
+        t.status = "Blocked".into();
+        let stage = "human-plan-approval";
+        t.current_stage = Some(stage.into());
+        c.save(&t).unwrap();
+        let id = "human-rejected-human-plan-approval-base-0-0-p0-r0";
+        c.store
+            .open_decision(
+                id,
+                &t.task_id,
+                &t.task_group,
+                stage,
+                "Approve?",
+                &["Reject".into()],
+                None,
+                "plan review",
+                t.plan_base_sha.as_deref(),
+            )
+            .unwrap();
+        let DecisionResolution::Resolved(rejection) = c
+            .store
+            .resolve_decision(id, "Reject", "alice", Some("keep this note"))
+            .unwrap()
+        else {
+            panic!("expected resolved rejection");
+        };
+        c.apply_decision(&rejection).unwrap();
+        let t = c.task(&t.task_id).unwrap();
+        assert!(t.memory.halt_requested);
+        assert_eq!(t.memory.applied_decisions, [id]);
+        let op = c.store.lifecycle_ops().unwrap().remove(0);
+        assert_eq!(op.decision_id.as_deref(), Some(id));
+        assert_eq!(op.state, "PENDING");
+        (t, op)
+    }
+
+    #[test]
+    fn terminal_and_reopen_retire_locally_applied_rejection_with_pending_publication() {
+        for terminal in ["Done", "Cancelled"] {
+            let dir = TestDirectory::new();
+            let mut c = coordinator(&dir.0);
+            c.ws = Arc::new(RecordingWsTaskClient::default());
+            let (mut t, op) = apply_human_rejection(&mut c);
+            let id = op.decision_id.as_deref().unwrap();
+            t.status = terminal.into();
+            c.worker_result(WorkerResult::Export(vec![t.clone()]))
+                .unwrap();
+            assert_eq!(c.task(&t.task_id).unwrap().status, terminal);
+            let decision = c.store.get_decision(id).unwrap().unwrap();
+            assert_eq!(decision.status, "RETIRED");
+            assert_eq!(decision.choice.as_deref(), Some("Reject"));
+            assert_eq!(decision.note.as_deref(), Some("keep this note"));
+            t.status = "Ready".into();
+            t.memory.halt_requested = false;
+            c.worker_result(WorkerResult::Export(vec![t.clone()]))
+                .unwrap();
+            assert_eq!(c.task(&t.task_id).unwrap().status, "Ready");
+            assert!(!c.store.has_pending_lifecycle(&t.task_id).unwrap());
+            c.replay_lifecycle().unwrap();
+            assert!(c.jobs.is_empty());
+            c.lifecycle_ack(&op.operation_id, "late receipt").unwrap();
+            c.lifecycle_failed(&op.operation_id, "late error").unwrap();
+            assert_eq!(c.store.get_decision(id).unwrap().unwrap().status, "RETIRED");
+            assert_eq!(c.store.lifecycle_ops().unwrap(), [op]);
+        }
+    }
+
+    #[test]
+    fn queued_rejection_rechecks_eligibility_before_remote_publication() {
+        for (terminal, reopen) in [
+            (None, false),
+            (Some("Done"), false),
+            (Some("Cancelled"), true),
+        ] {
+            let dir = TestDirectory::new();
+            let mut c = coordinator(&dir.0);
+            let ws = Arc::new(RecordingWsTaskClient::default());
+            c.ws = ws.clone();
+            let (mut t, op) = apply_human_rejection(&mut c);
+
+            let (held, holding) = mpsc::sync_channel(0);
+            let (release, released) = mpsc::sync_channel(0);
+            assert!(c.governance.submit(
+                "held".into(),
+                None,
+                Box::new(move || {
+                    held.send(()).unwrap();
+                    released.recv().unwrap();
+                    Ok(WorkerResult::LifecycleSkipped)
+                })
+            ));
+            holding.recv_timeout(Duration::from_secs(2)).unwrap();
+            c.replay_lifecycle().unwrap();
+            assert!(c.store.lifecycle_in_flight(&op.operation_id).unwrap());
+
+            if let Some(terminal) = terminal {
+                t.status = terminal.into();
+                c.worker_result(WorkerResult::Export(vec![t.clone()]))
+                    .unwrap();
+                assert_eq!(c.task(&t.task_id).unwrap().status, terminal);
+                if reopen {
+                    t.status = "Ready".into();
+                    t.memory.halt_requested = false;
+                    c.worker_result(WorkerResult::Export(vec![t.clone()]))
+                        .unwrap();
+                    assert_eq!(c.task(&t.task_id).unwrap().status, "Ready");
+                }
+            }
+            release.send(()).unwrap();
+            for _ in 0..3 {
+                let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                c.handle_event(event).unwrap();
+            }
+            assert!(c.jobs.is_empty());
+            assert_eq!(
+                ws.calls.lock().unwrap().len(),
+                usize::from(terminal.is_none())
+            );
+            assert_eq!(
+                c.store.lifecycle_ops().unwrap()[0].state,
+                if terminal.is_none() {
+                    "ACKNOWLEDGED"
+                } else {
+                    "IN_FLIGHT"
+                }
+            );
+        }
+    }
+
     #[test]
     fn ws_task_adapter_replays_start_before_plan_and_acknowledges_each_once() {
         let dir = TestDirectory::new();
@@ -8218,6 +8430,8 @@ mod tests {
         c.store.enqueue_lifecycle(&plan).unwrap();
         for _ in 0..2 {
             c.replay_lifecycle().unwrap();
+            let authorization = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            c.handle_event(authorization).unwrap();
             let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
             c.handle_event(event).unwrap();
         }
@@ -8539,6 +8753,8 @@ mod tests {
         c.apply_decision(&decision).unwrap();
         assert_eq!(c.task(&t.task_id).unwrap().status, "Delivery Pending");
         c.replay_lifecycle().unwrap();
+        let authorization = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        c.handle_event(authorization).unwrap();
         let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
         c.handle_event(event).unwrap();
         c.lifecycle_ack(&close.operation_id, "").unwrap(); // duplicate receipt
