@@ -35,6 +35,7 @@ const DEFAULT_DECISION_KINDS: &[&str] = &[
     "review_rework_limit",
     "governance_close_failed",
     "governance_publication_failed",
+    "governance_publication_uncertain",
     "checkpoint_unverifiable",
     "repository_ownership_conflict",
     "cross_family_reviewer_unavailable",

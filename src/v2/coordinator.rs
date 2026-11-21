@@ -1247,9 +1247,9 @@ impl Coordinator {
             return self.deliver_events();
         }
         self.reconcile_terminal_tasks()?;
+        self.resume_decisions()?;
         self.replay_lifecycle()?;
         self.resume_pipeline_steps()?;
-        self.resume_decisions()?;
         self.reconcile_terminal_tasks()?;
         let mut recovery_ready = true;
         for task in self.list_all_tasks_cached()? {
@@ -3116,13 +3116,33 @@ impl Coordinator {
         else {
             return Ok(());
         };
-        if op.state == "ACKNOWLEDGED" {
+        if matches!(op.state.as_str(), "ACKNOWLEDGED" | "SETTLED") {
             return Ok(());
         }
         if op.state == "DISPATCHED" {
             self.store
                 .update_lifecycle(id, "DISPATCHED", Some(error), now_epoch() + 30)
                 .map_err(|e| e.to_string())?;
+            let task = self.task(&op.task_id)?;
+            if op.decision_id.is_some()
+                && !matches!(task.status.as_str(), "Done" | "Cancelled")
+                && let Ok(_fence) = publication_fence(&self.state_dir, &op.task_id)
+            {
+                self.store
+                    .open_decision(
+                        &format!("settle-{}", op.operation_id),
+                        &task.task_id,
+                        &task.task_group,
+                        "governance_publication_uncertain",
+                        "Close this publication after manually checking Governance?",
+                        &["Close without replay".into()],
+                        None,
+                        "The write may have landed. Verify and reconcile the issue and board before closing. Closing permanently retires this publication and applies any deferred terminal transition.",
+                        operation_arg(&op, "--sha"),
+                    )
+                    .map_err(|e| e.to_string())?;
+                self.invalidate_tasks_cache();
+            }
             return Ok(());
         }
         let current = self.task(&op.task_id)?;
@@ -3184,7 +3204,7 @@ impl Coordinator {
             .into_iter()
             .find(|o| o.operation_id == id)
             .ok_or("unknown lifecycle operation")?;
-        if op.state == "ACKNOWLEDGED" {
+        if matches!(op.state.as_str(), "ACKNOWLEDGED" | "SETTLED") {
             return Ok(());
         }
         // Receipt and local transition commit atomically after external acknowledgment.
@@ -3637,6 +3657,37 @@ impl Coordinator {
             .applied_decisions
             .contains(&decision.decision_id)
         {
+            return Ok(());
+        }
+        if decision.kind == "governance_publication_uncertain" {
+            let id = decision
+                .decision_id
+                .strip_prefix("settle-")
+                .ok_or("invalid publication settlement identity")?;
+            let op = self
+                .store
+                .lifecycle_ops()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .find(|op| {
+                    op.operation_id == id
+                        && op.task_id == task.task_id
+                        && op.state == "DISPATCHED"
+                        && op.decision_id.is_some()
+                })
+                .ok_or("missing dispatched publication for settlement")?;
+            // A confirmed readback already in progress gets to finish first.
+            // The durable decision can be applied on a later tick or after restart.
+            if self.jobs.contains(&format!("ws:{id}")) {
+                return Ok(());
+            }
+            let Ok(_fence) = publication_fence(&self.state_dir, &task.task_id) else {
+                return Ok(());
+            };
+            self.store
+                .settle_decision_publication(&task, &op, &decision.decision_id)
+                .map_err(|e| e.to_string())?;
+            self.invalidate_tasks_cache();
             return Ok(());
         }
         if matches!(
@@ -8880,6 +8931,111 @@ mod tests {
     }
 
     #[test]
+    fn grant_before_launch_can_be_settled_after_restart_without_replay() {
+        for terminal in ["Done", "Cancelled"] {
+            let dir = TestDirectory::new();
+            let db = dir.0.join("journal.sqlite");
+            let (mut c, _) = Coordinator::create(V2Store::open(&db).unwrap(), dir.0.clone());
+            let (mut task, op) = apply_human_rejection(&mut c);
+            task.github_repo = Some("example/rejected".into());
+            c.save(&task).unwrap();
+            c.store
+                .update_lifecycle(&op.operation_id, "QUEUED", None, 0)
+                .unwrap();
+            assert!(c.authorize_lifecycle(&op).unwrap());
+            // The grant commits, but no publisher ever launches.
+            drop(c);
+
+            let (active, _entered) = mpsc::sync_channel(0);
+            let (_finish, outcome) = mpsc::channel();
+            let ws = Arc::new(FencedPublicationWs {
+                recording: RecordingWsTaskClient::default(),
+                active,
+                finish: Mutex::new(outcome),
+                comments: Mutex::new(String::new()),
+                board_status: Mutex::new(terminal.into()),
+            });
+            let (mut c, _) = Coordinator::create(V2Store::open(&db).unwrap(), dir.0.clone());
+            c.ws = ws.clone();
+            c.recover_lifecycle_journal().unwrap();
+            task.status = terminal.into();
+            c.worker_result(WorkerResult::Export(vec![task.clone()]))
+                .unwrap();
+            let id = format!("settle-{}", op.operation_id);
+
+            // An inherited fence blocks settlement while a publisher could still run.
+            let fence = publication_fence(&dir.0, &task.task_id).unwrap();
+            c.replay_lifecycle().unwrap();
+            let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            c.handle_event(event).unwrap();
+            assert!(c.store.get_decision(&id).unwrap().is_none());
+            drop(fence);
+
+            c.store
+                .update_lifecycle(&op.operation_id, "DISPATCHED", None, 0)
+                .unwrap();
+            c.replay_lifecycle().unwrap();
+            let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            c.handle_event(event).unwrap();
+            assert_eq!(c.task(&task.task_id).unwrap().status, "Blocked");
+            assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "DISPATCHED");
+            assert!(
+                c.store
+                    .resolve_decision(&id, "Retry publication", "alice", None)
+                    .is_err()
+            );
+            assert!(matches!(
+                c.store
+                    .resolve_decision(
+                        &id,
+                        "Close without replay",
+                        "alice",
+                        Some("Checked issue and board")
+                    )
+                    .unwrap(),
+                DecisionResolution::Resolved(_)
+            ));
+            // Resolution and application can also straddle a crash.
+            drop(c);
+            let (mut c, _) = Coordinator::create(V2Store::open(&db).unwrap(), dir.0.clone());
+            c.ws = ws.clone();
+            c.recover_lifecycle_journal().unwrap();
+            let fence = publication_fence(&dir.0, &task.task_id).unwrap();
+            c.resume_decisions().unwrap();
+            assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "DISPATCHED");
+            drop(fence);
+            c.resume_decisions().unwrap();
+            let settled = c.task(&task.task_id).unwrap();
+            assert_eq!(settled.status, terminal);
+            assert!(settled.memory.governance_terminal_observed);
+            assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "SETTLED");
+            assert!(!c.store.has_pending_lifecycle(&task.task_id).unwrap());
+            assert_eq!(
+                c.store
+                    .get_decision(op.decision_id.as_deref().unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "RETIRED"
+            );
+            assert_eq!(
+                c.store.get_decision(&id).unwrap().unwrap().status,
+                "RESOLVED"
+            );
+
+            task.status = "Ready".into();
+            task.memory.halt_requested = false;
+            c.worker_result(WorkerResult::Export(vec![task])).unwrap();
+            c.resume_decisions().unwrap();
+            c.replay_lifecycle().unwrap();
+            assert_eq!(c.task(&op.task_id).unwrap().status, "Ready");
+            assert!(c.jobs.is_empty());
+            assert!(ws.recording.calls.lock().unwrap().is_empty());
+            assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "SETTLED");
+        }
+    }
+
+    #[test]
     fn lost_decision_publication_result_holds_across_restart_until_exact_readback() {
         let dir = TestDirectory::new();
         let db = dir.0.join("journal.sqlite");
@@ -8938,6 +9094,15 @@ mod tests {
             );
             assert_eq!(ws.recording.calls.lock().unwrap().len(), 1);
         }
+        let settlement_id = format!("settle-{}", op.operation_id);
+        assert_eq!(
+            c.store
+                .get_decision(&settlement_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "OPEN"
+        );
         // A previous publisher can still own the per-task process lock after restart.
         let outstanding = publication_fence(&dir.0, &op.task_id).unwrap();
         *ws.board_status.lock().unwrap() = "Planning".into();
@@ -8958,6 +9123,14 @@ mod tests {
         c.handle_event(event).unwrap();
         assert_eq!(c.task(&op.task_id).unwrap().status, "Cancelled");
         assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "ACKNOWLEDGED");
+        assert_eq!(
+            c.store
+                .get_decision(&settlement_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "RETIRED"
+        );
         assert_eq!(ws.recording.calls.lock().unwrap().len(), 1);
     }
 

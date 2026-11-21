@@ -1355,6 +1355,25 @@ impl V2Store {
         op: &LifecycleOperation,
         attempt_id: Option<&str>,
     ) -> Result<(), V2StoreError> {
+        self.finish_lifecycle(task, op, attempt_id, None)
+    }
+
+    pub(crate) fn settle_decision_publication(
+        &mut self,
+        task: &TaskRecord,
+        op: &LifecycleOperation,
+        settlement_id: &str,
+    ) -> Result<(), V2StoreError> {
+        self.finish_lifecycle(task, op, None, Some(settlement_id))
+    }
+
+    fn finish_lifecycle(
+        &mut self,
+        task: &TaskRecord,
+        op: &LifecycleOperation,
+        attempt_id: Option<&str>,
+        settlement_id: Option<&str>,
+    ) -> Result<(), V2StoreError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1382,6 +1401,42 @@ impl V2Store {
                 [&op.operation_id],
             )?;
         }
+        let now = now_epoch();
+        if let Some(settlement_id) = settlement_id {
+            if op.state != "DISPATCHED" {
+                return Err(V2StoreError("publication is no longer dispatched".into()));
+            }
+            let id = op
+                .decision_id
+                .as_deref()
+                .ok_or_else(|| V2StoreError("publication has no decision".into()))?;
+            Self::insert_event_tx(
+                &tx,
+                &task.task_id,
+                &task.task_group,
+                now,
+                "DECISION_RETIRED",
+                &serde_json::json!({"decision_id":id,"reason":"publication_settled","settlement_id":settlement_id}),
+            )?;
+            next.memory.applied_decisions.push(settlement_id.into());
+            if !is_terminal_task_status(&next.status) && !is_post_merge_status(&next.status) {
+                next.memory.halt_requested = true;
+            }
+        } else if op.state == "DISPATCHED" {
+            let settlement_id = format!("settle-{}", op.operation_id);
+            if Self::get_decision_on(&tx, &settlement_id)?
+                .is_some_and(|decision| decision.status != "RETIRED")
+            {
+                Self::insert_event_tx(
+                    &tx,
+                    &task.task_id,
+                    &task.task_group,
+                    now,
+                    "DECISION_RETIRED",
+                    &serde_json::json!({"decision_id":settlement_id,"reason":"publication_confirmed"}),
+                )?;
+            }
+        }
         Self::update_task_tx(&tx, &old, &next, now_epoch())?;
         if let Some(id) = attempt_id {
             tx.execute(
@@ -1407,7 +1462,11 @@ impl V2Store {
                 &serde_json::json!({"receipt":task.memory.merge_checkpoint}),
             )?;
         }
-        tx.execute("UPDATE lifecycle_ops SET state='ACKNOWLEDGED',last_error=NULL,updated_epoch=?2 WHERE operation_id=?1",params![op.operation_id,now_epoch()])?;
+        tx.execute(
+            "UPDATE lifecycle_ops SET state=?2,last_error=CASE WHEN ?2='ACKNOWLEDGED' THEN NULL ELSE last_error END,
+             updated_epoch=?3 WHERE operation_id=?1",
+            params![op.operation_id, if settlement_id.is_some() { "SETTLED" } else { "ACKNOWLEDGED" }, now],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -2894,14 +2953,16 @@ impl V2Store {
             }
             let task = Self::get_task_tx(&tx, &existing.task_id)?
                 .ok_or_else(|| V2StoreError("decision task missing".into()))?;
-            let delivery = existing.kind != "governance_close_failed"
-                && (is_post_merge_decision(&existing.kind)
-                    || is_post_merge_status(&task.status)
-                    || tx.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM post_merge_deliveries WHERE task_id=?1)",
-                        [&existing.task_id],
-                        |row| row.get(0),
-                    )?);
+            let delivery = !matches!(
+                existing.kind.as_str(),
+                "governance_close_failed" | "governance_publication_uncertain"
+            ) && (is_post_merge_decision(&existing.kind)
+                || is_post_merge_status(&task.status)
+                || tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM post_merge_deliveries WHERE task_id=?1)",
+                    [&existing.task_id],
+                    |row| row.get(0),
+                )?);
             let selected = if delivery {
                 choice
                     .parse::<usize>()
@@ -2960,8 +3021,11 @@ impl V2Store {
             params![task_id],
             |row| row.get(0),
         )?;
-        let post_merge = kind != "governance_close_failed"
-            && (is_post_merge_decision(&kind) || is_post_merge_status(&task_status) || linked);
+        let post_merge =
+            !matches!(
+                kind.as_str(),
+                "governance_close_failed" | "governance_publication_uncertain"
+            ) && (is_post_merge_decision(&kind) || is_post_merge_status(&task_status) || linked);
         let mut next_status = task_status.as_str();
         if post_merge {
             let options_raw: String = tx.query_row(
@@ -3564,7 +3628,7 @@ impl V2Store {
 
         {
             let mut stmt = self.conn.prepare(
-                "SELECT attempt_id, body_path FROM lifecycle_ops WHERE state != 'ACKNOWLEDGED'",
+                "SELECT attempt_id, body_path FROM lifecycle_ops WHERE state NOT IN ('ACKNOWLEDGED','SETTLED')",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((
@@ -3912,7 +3976,7 @@ impl V2Store {
             pending_write_backs: self
                 .lifecycle_ops()?
                 .iter()
-                .filter(|o| o.state != "ACKNOWLEDGED")
+                .filter(|o| !matches!(o.state.as_str(), "ACKNOWLEDGED" | "SETTLED"))
                 .count(),
             reconciliation_errors: self
                 .meta("reconciliation_errors")?
