@@ -819,7 +819,9 @@ fn maybe_fallback_openaisol_to_geminiagy(
 
 pub const MAX_AGY_CLI_TIMEOUT_SECS: u64 = 3600;
 
-/// Builds a structured JSON payload for `agent-tooling/plugins/gemini-worker/scripts/worker.mjs --cli`.
+/// Builds a structured JSON payload for `agent-tooling/plugins/gemini-worker/scripts/worker.mjs --cli`
+/// using ADR-014 clean stage mode (`stage_mode: true`, `stream_json: true`) and canonical
+/// `ReviewVerdict` `--json-schema` for review stages (`plan-review` and `pr-review`).
 pub fn build_agy_cli_payload(
     task: &TaskRecord,
     route: &StageRoute,
@@ -835,8 +837,15 @@ pub fn build_agy_cli_payload(
     let timeout_seconds = route.timeout_secs.clamp(30, MAX_AGY_CLI_TIMEOUT_SECS);
     let orchestration_id = task.task_id.to_ascii_lowercase();
 
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "action": "run",
+        "harness": "agy",
+        "stage_mode": true,
+        "stream_json": true,
+        "task_id": task.task_id,
+        "stage": route.stage,
+        "executor": "zach",
+        "effort": route.effort.as_str(),
         "kind": kind,
         "task": prompt,
         "model": route.model,
@@ -845,7 +854,15 @@ pub fn build_agy_cli_payload(
         "confirmed": true,
         "timeout_seconds": timeout_seconds,
         "orchestration_id": orchestration_id,
-    })
+    });
+    if matches!(route.stage.as_str(), "plan-review" | "pr-review")
+        && let Ok(schema_val) =
+            serde_json::from_str::<serde_json::Value>(&review_verdict_json_schema_string())
+        && let Some(obj) = payload.as_object_mut()
+    {
+        obj.insert("json_schema".to_owned(), schema_val);
+    }
+    payload
 }
 
 /// Locate the same Context Pack-shaped YAML block Governance consumes, skipping
@@ -1277,7 +1294,7 @@ fn truncate_prompt_section(text: &str, max_chars: usize) -> String {
     out
 }
 
-fn bounded_prompt(header: String, sections: Vec<(&str, String)>) -> String {
+fn bounded_prompt(header: String, sections: Vec<(String, String)>) -> String {
     let mut out = truncate_prompt_section(&header, 1000);
     let headings: usize = sections
         .iter()
@@ -1287,7 +1304,7 @@ fn bounded_prompt(header: String, sections: Vec<(&str, String)>) -> String {
     // Share spare capacity among sections; short schemas/findings remain complete.
     let mut caps = vec![0; sections.len()];
     for (i, (name, body)) in sections.iter().enumerate() {
-        if *name == "Required Output Format (Strict JSON Only)" {
+        if name == "Required Output Format (Strict JSON Only)" {
             caps[i] = body.encode_utf16().count();
             budget = budget.saturating_sub(caps[i]);
         }
@@ -1320,22 +1337,188 @@ fn bounded_prompt(header: String, sections: Vec<(&str, String)>) -> String {
     out
 }
 
-fn governance_skill(name: &str) -> String {
-    let root = std::env::var_os("ZACH_GOVERNANCE_ROOT")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| "/home/ubuntu/workspace/governance".into());
-    format!(
-        "{}\nDaemon mode: return output to zachd. Do not publish stages or call ws-task/gh; zachd owns publication.",
-        governance_skill_from_root(&root, name)
-    )
+pub const LEARNINGS_MAX_CHARS: usize = 1500;
+const REPO_INSTRUCTIONS_MAX_CHARS: usize = 3000;
+
+/// Bounded ADR-004 content-safe bootstrap provenance metadata recorded per stage attempt.
+/// Never stores raw prompt text, transcripts, or credentials.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BootstrapMetadata {
+    pub role: String,
+    pub cwd: String,
+    pub repository: String,
+    pub branch: String,
+    pub writable: bool,
+    pub repo_instructions_loaded: bool,
+    pub repo_instruction_paths: Vec<String>,
+    pub role_skill_loaded: bool,
+    pub role_skill_path: Option<String>,
+    pub learnings_loaded: bool,
+    pub learnings_chars: usize,
+    pub missing_required_instructions: Vec<String>,
 }
 
+pub fn role_skill_name(stage: &str) -> &'static str {
+    match stage {
+        "plan" => "governance-planner",
+        "plan-review" => "governance-plan-reviewer",
+        "impl" => "governance-implementer",
+        "pr-review" => "governance-pr-reviewer",
+        _ => "governance-planner",
+    }
+}
+
+fn governance_root_path() -> std::path::PathBuf {
+    std::env::var_os("ZACH_GOVERNANCE_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| "/home/ubuntu/workspace/governance".into())
+}
+
+fn governance_skill_fallback(name: &str) -> String {
+    match name {
+        "governance-planner" => "governance-planner: Explore canonical owners read-only; propose architecture, risks, tests and a ## [PLAN] with a fenced yaml Context Pack containing weight, target_files, forbidden_paths, verification_commands and acceptance_criteria. Escalate weight for critical scope; preserve existing boundaries and criteria.".to_owned(),
+        "governance-plan-reviewer" => "governance-plan-reviewer: Independently audit ownership and path existence, weight accuracy, testability of every acceptance criterion, safety and forbidden paths. Return APPROVED or CHANGES_REQUESTED using the required ReviewVerdict schema.".to_owned(),
+        "governance-implementer" => "governance-implementer: Inspect exact struct/field/symbol definitions before editing inside the governed worktree; never touch forbidden_paths; verify every AC-i and run all worker_checks before finishing.".to_owned(),
+        _ => "governance-pr-reviewer: Independently audit the real git diff against merge-base and verify every AC-i with exact file:line citations inside diff hunks. Return APPROVED or CHANGES_REQUESTED using the required ReviewVerdict JSON schema.".to_owned(),
+    }
+}
+
+fn governance_skill_from_root_with_meta(root: &Path, name: &str) -> (String, bool, Option<String>) {
+    let path = root.join(".agents/skills").join(name).join("SKILL.md");
+    match std::fs::read_to_string(&path) {
+        Ok(text) if !text.trim().is_empty() => (text, true, Some(path.display().to_string())),
+        _ => (governance_skill_fallback(name), false, None),
+    }
+}
+
+#[cfg(test)]
 fn governance_skill_from_root(root: &Path, name: &str) -> String {
-    std::fs::read_to_string(root.join(".agents/skills").join(name).join("SKILL.md"))
-        .unwrap_or_else(|_| match name {
-            "governance-planner" => "governance-planner: Explore canonical owners read-only; propose architecture, risks, tests and a ## [PLAN] with a fenced yaml Context Pack containing weight, target_files, forbidden_paths, verification_commands and acceptance_criteria. Escalate weight for critical scope; preserve existing boundaries and criteria.".to_owned(),
-            _ => "governance-plan-reviewer: Independently audit ownership and path existence, weight accuracy, testability of every acceptance criterion, safety and forbidden paths. Return APPROVED or CHANGES_REQUESTED using the required ReviewVerdict schema.".to_owned(),
-        })
+    governance_skill_from_root_with_meta(root, name).0
+}
+
+fn load_repo_instructions(worktree_path: &Path) -> (String, Vec<String>) {
+    let mut parts = Vec::new();
+    let mut loaded_paths = Vec::new();
+    for filename in ["AGENTS.md", "INSTRUCTIONS.md"] {
+        let candidate = worktree_path.join(filename);
+        if let Ok(content) = std::fs::read_to_string(&candidate)
+            && !content.trim().is_empty()
+        {
+            loaded_paths.push(filename.to_owned());
+            parts.push(format!(
+                "### {filename}\n{}",
+                truncate_prompt_section(content.trim(), REPO_INSTRUCTIONS_MAX_CHARS)
+            ));
+        }
+    }
+    (parts.join("\n\n"), loaded_paths)
+}
+
+fn load_bounded_learnings(governance_root: &Path, repo: &str) -> (String, bool) {
+    if std::env::var("ZACH_DISABLE_PREFLIGHT_LEARNINGS")
+        .ok()
+        .as_deref()
+        == Some("1")
+        || repo.trim().is_empty()
+    {
+        return (String::new(), false);
+    }
+    let preflight = governance_root.join("bin/ws-preflight");
+    if !preflight.is_file() {
+        return (String::new(), false);
+    }
+    let Ok(output) = std::process::Command::new(&preflight)
+        .args([
+            "--learnings",
+            "--repo",
+            repo,
+            "--max-chars",
+            &LEARNINGS_MAX_CHARS.to_string(),
+        ])
+        .output()
+    else {
+        return (String::new(), false);
+    };
+    if !output.status.success() {
+        return (String::new(), false);
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if text.is_empty() {
+        return (String::new(), false);
+    }
+    (truncate_prompt_section(&text, LEARNINGS_MAX_CHARS), true)
+}
+
+/// Resolves role skill, applicable repo instructions (`AGENTS.md`/`INSTRUCTIONS.md`),
+/// and bounded operational learnings for any of the 4 Governance v2 stages, returning
+/// both the prompt sections and ADR-004 content-safe `BootstrapMetadata`.
+pub fn resolve_stage_bootstrap_from_roots(
+    task: &TaskRecord,
+    stage: &str,
+    worktree_path: &str,
+    governance_root: &Path,
+    learnings_override: Option<String>,
+) -> (Vec<(String, String)>, BootstrapMetadata) {
+    let skill_name = role_skill_name(stage);
+    let (skill_body, role_skill_loaded, role_skill_path) =
+        governance_skill_from_root_with_meta(governance_root, skill_name);
+    let skill_text = format!(
+        "{skill_body}\nDaemon mode: return output to zachd. Do not publish stages or call ws-task/gh; zachd owns publication."
+    );
+    let (repo_body, repo_instruction_paths) = load_repo_instructions(Path::new(worktree_path));
+    let repo_instructions_loaded = !repo_instruction_paths.is_empty();
+    let (learnings_body, learnings_loaded) = match learnings_override {
+        Some(text) => {
+            let trimmed = text.trim().to_owned();
+            if trimmed.is_empty() {
+                (String::new(), false)
+            } else {
+                (truncate_prompt_section(&trimmed, LEARNINGS_MAX_CHARS), true)
+            }
+        }
+        None => load_bounded_learnings(governance_root, &task.repository),
+    };
+
+    let mut missing_required_instructions = Vec::new();
+    if !role_skill_loaded {
+        missing_required_instructions.push(format!("role_skill:{skill_name}"));
+    }
+    if !repo_instructions_loaded {
+        missing_required_instructions
+            .push("repo_instructions:AGENTS.md|INSTRUCTIONS.md".to_owned());
+    }
+
+    let mut sections = vec![(skill_name.to_owned(), skill_text)];
+    if repo_instructions_loaded {
+        sections.push(("Repository Instructions".to_owned(), repo_body));
+    }
+    if learnings_loaded {
+        sections.push(("Operational Learnings".to_owned(), learnings_body.clone()));
+    }
+
+    let meta = BootstrapMetadata {
+        role: stage.to_owned(),
+        cwd: worktree_path.to_owned(),
+        repository: task.repository.clone(),
+        branch: task.branch.clone().unwrap_or_default(),
+        writable: stage == "impl",
+        repo_instructions_loaded,
+        repo_instruction_paths,
+        role_skill_loaded,
+        role_skill_path,
+        learnings_loaded,
+        learnings_chars: learnings_body.chars().count(),
+        missing_required_instructions,
+    };
+    (sections, meta)
+}
+
+pub fn resolve_stage_bootstrap(
+    task: &TaskRecord,
+    stage: &str,
+    worktree_path: &str,
+) -> (Vec<(String, String)>, BootstrapMetadata) {
+    resolve_stage_bootstrap_from_roots(task, stage, worktree_path, &governance_root_path(), None)
 }
 
 fn prompt_context(task: &TaskRecord) -> String {
@@ -1356,46 +1539,45 @@ fn prompt_diagnostic(text: &Option<String>) -> String {
 }
 
 pub fn build_plan_prompt(task: &TaskRecord, worktree_path: &str) -> String {
+    let (mut sections, _) = resolve_stage_bootstrap(task, "plan", worktree_path);
+    sections.extend([
+        ("Context Pack".to_owned(), prompt_context(task)),
+        ("Acceptance Criteria".to_owned(), prompt_acs(task)),
+        (
+            "Prior Plan Review Findings".to_owned(),
+            prompt_diagnostic(&task.memory.last_plan_review_findings),
+        ),
+    ]);
     bounded_prompt(
         format!(
             "Plan task {} ({}) inside governed worktree {}.\nDaemon mode: read-only. Return the full plan; do not publish stages or call ws-task, git, or gh. Use only the supported YAML subset: scalars, block lists/maps, and inline []. Preserve forbidden_paths and acceptance criteria.\n",
             task.task_id, task.title, worktree_path
         ),
-        vec![
-            ("governance-planner", governance_skill("governance-planner")),
-            ("Context Pack", prompt_context(task)),
-            ("Acceptance Criteria", prompt_acs(task)),
-            (
-                "Prior Plan Review Findings",
-                prompt_diagnostic(&task.memory.last_plan_review_findings),
-            ),
-        ],
+        sections,
     )
 }
 
 pub fn build_plan_review_prompt(task: &TaskRecord, worktree_path: &str, plan: &str) -> String {
+    let (mut sections, _) = resolve_stage_bootstrap(task, "plan-review", worktree_path);
+    sections.extend([
+        (
+            "Required Output Format (Strict JSON Only)".to_owned(),
+            review_verdict_json_schema_string(),
+        ),
+        ("Context Pack".to_owned(), prompt_context(task)),
+        ("Acceptance Criteria".to_owned(), prompt_acs(task)),
+        ("Candidate Plan".to_owned(), plan.to_owned()),
+        (
+            "Prior Plan Review Findings".to_owned(),
+            prompt_diagnostic(&task.memory.last_plan_review_findings),
+        ),
+    ]);
     bounded_prompt(
         format!(
             "Review architectural plan for {} ({}) inside {}.\nDaemon mode: read-only; return JSON only; do not publish or call ws-task, git, or gh. Citations must use line >= 1 in plan, the candidate artifact, or existing/proposed repository files. APPROVED requires every AC PASS and no blocking findings.\n",
             task.task_id, task.title, worktree_path
         ),
-        vec![
-            (
-                "governance-plan-reviewer",
-                governance_skill("governance-plan-reviewer"),
-            ),
-            (
-                "Required Output Format (Strict JSON Only)",
-                review_verdict_json_schema_string(),
-            ),
-            ("Context Pack", prompt_context(task)),
-            ("Acceptance Criteria", prompt_acs(task)),
-            ("Candidate Plan", plan.to_owned()),
-            (
-                "Prior Plan Review Findings",
-                prompt_diagnostic(&task.memory.last_plan_review_findings),
-            ),
-        ],
+        sections,
     )
 }
 
@@ -1411,27 +1593,29 @@ pub(crate) fn task_with_full_approved_plan(
 }
 
 pub fn build_impl_prompt(task: &TaskRecord, worktree_path: &str) -> String {
+    let (mut sections, _) = resolve_stage_bootstrap(task, "impl", worktree_path);
+    sections.extend([
+        ("Context Pack".to_owned(), prompt_context(task)),
+        ("Acceptance Criteria".to_owned(), prompt_acs(task)),
+        (
+            "Approved Plan".to_owned(),
+            task.memory.approved_plan.clone().unwrap_or_default(),
+        ),
+        (
+            "Prior Review Findings (Address All Blocking Items)".to_owned(),
+            prompt_diagnostic(&task.memory.last_review_findings),
+        ),
+        (
+            "Prior Check Failure".to_owned(),
+            prompt_diagnostic(&task.memory.last_check_failure),
+        ),
+    ]);
     bounded_prompt(
         format!(
             "Implement task {} ({}) inside governed worktree {}.\n",
             task.task_id, task.title, worktree_path
         ),
-        vec![
-            ("Context Pack", prompt_context(task)),
-            ("Acceptance Criteria", prompt_acs(task)),
-            (
-                "Approved Plan",
-                task.memory.approved_plan.clone().unwrap_or_default(),
-            ),
-            (
-                "Prior Review Findings (Address All Blocking Items)",
-                prompt_diagnostic(&task.memory.last_review_findings),
-            ),
-            (
-                "Prior Check Failure",
-                prompt_diagnostic(&task.memory.last_check_failure),
-            ),
-        ],
+        sections,
     )
 }
 
@@ -1440,6 +1624,46 @@ pub fn build_pr_review_prompt(
     worktree_path: &str,
     diff_ctx: &ReviewedDiffContext,
 ) -> String {
+    let (mut sections, _) = resolve_stage_bootstrap(task, "pr-review", worktree_path);
+    sections.extend([
+        (
+            "Required Output Format (Strict JSON Only)".to_owned(),
+            review_verdict_json_schema_string(),
+        ),
+        ("Context Pack".to_owned(), prompt_context(task)),
+        ("Acceptance Criteria".to_owned(), prompt_acs(task)),
+        (
+            "Approved Plan".to_owned(),
+            task.memory.approved_plan.clone().unwrap_or_else(|| {
+                "No approved plan recorded (XS/S task or pre-plan resume).".to_owned()
+            }),
+        ),
+        (
+            "Prior Review Findings".to_owned(),
+            prompt_diagnostic(&task.memory.last_review_findings),
+        ),
+        (
+            "Changed Files & Valid Line Ranges".to_owned(),
+            diff_ctx
+                .files
+                .iter()
+                .map(|(p, r)| {
+                    format!(
+                        "{p}: lines [{}]",
+                        r.iter()
+                            .map(|r| format!("{}-{}", r.start, r.end))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        (
+            "Diff Excerpt (--unified=0)".to_owned(),
+            diff_ctx.diff_excerpt.clone(),
+        ),
+    ]);
     bounded_prompt(
         format!(
             "Review implementation of task {} ({}) inside governed worktree {}.\nYou MUST inspect the real git diff and verify every acceptance criterion.\nReviewed Commit Range: {}\nMerge Base SHA: {}\nReviewed SHA: {}\nInspect with: git diff {}\nEvery cited file and line MUST exist in the reviewed commit range.\n",
@@ -1451,42 +1675,7 @@ pub fn build_pr_review_prompt(
             diff_ctx.reviewed_sha,
             diff_ctx.commit_range
         ),
-        vec![
-            (
-                "Required Output Format (Strict JSON Only)",
-                review_verdict_json_schema_string(),
-            ),
-            ("Context Pack", prompt_context(task)),
-            ("Acceptance Criteria", prompt_acs(task)),
-            (
-                "Approved Plan",
-                task.memory.approved_plan.clone().unwrap_or_else(|| {
-                    "No approved plan recorded (XS/S task or pre-plan resume).".to_owned()
-                }),
-            ),
-            (
-                "Prior Review Findings",
-                prompt_diagnostic(&task.memory.last_review_findings),
-            ),
-            (
-                "Changed Files & Valid Line Ranges",
-                diff_ctx
-                    .files
-                    .iter()
-                    .map(|(p, r)| {
-                        format!(
-                            "{p}: lines [{}]",
-                            r.iter()
-                                .map(|r| format!("{}-{}", r.start, r.end))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ),
-            ("Diff Excerpt (--unified=0)", diff_ctx.diff_excerpt.clone()),
-        ],
+        sections,
     )
 }
 
@@ -1547,29 +1736,41 @@ pub fn parse_agy_cli_response(
     let json: serde_json::Value = match serde_json::from_str(trimmed_out) {
         Ok(v) => v,
         Err(_) => {
-            if has_stderr_timeout || stdout.contains("TIMEOUT") {
-                return Err(AgyCliError {
-                    failure_class: "AGY_TIMEOUT".to_owned(),
-                    message: format!(
-                        "worker execution timed out (code={code}): {}",
-                        stderr.trim()
-                    ),
-                    input_tokens: None,
-                    output_tokens: None,
-                    total_tokens: None,
-                    duration_seconds: None,
-                });
+            // ADR-014 stream-json emits sanitized JSONL liveness events followed by one terminal JSON envelope.
+            let terminal_line = trimmed_out
+                .lines()
+                .rev()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok());
+            match terminal_line {
+                Some(v) => v,
+                None => {
+                    if has_stderr_timeout || stdout.contains("TIMEOUT") {
+                        return Err(AgyCliError {
+                            failure_class: "AGY_TIMEOUT".to_owned(),
+                            message: format!(
+                                "worker execution timed out (code={code}): {}",
+                                stderr.trim()
+                            ),
+                            input_tokens: None,
+                            output_tokens: None,
+                            total_tokens: None,
+                            duration_seconds: None,
+                        });
+                    }
+                    return Err(AgyCliError {
+                        failure_class: "AGY_EXIT".to_owned(),
+                        message: format!(
+                            "worker exited with code {code} with non-JSON output: {trimmed_out}"
+                        ),
+                        input_tokens: None,
+                        output_tokens: None,
+                        total_tokens: None,
+                        duration_seconds: None,
+                    });
+                }
             }
-            return Err(AgyCliError {
-                failure_class: "AGY_EXIT".to_owned(),
-                message: format!(
-                    "worker exited with code {code} with non-JSON output: {trimmed_out}"
-                ),
-                input_tokens: None,
-                output_tokens: None,
-                total_tokens: None,
-                duration_seconds: None,
-            });
         }
     };
 

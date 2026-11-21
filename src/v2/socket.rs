@@ -65,6 +65,13 @@ pub enum ClientCommand {
         #[serde(default)]
         family: Option<String>,
     },
+    #[serde(alias = "STAGE_RUN", alias = "StageRun")]
+    StageRun {
+        task: String,
+        stage: String,
+        #[serde(default)]
+        wait: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -110,6 +117,21 @@ pub enum ServerMessage {
     },
     #[serde(rename = "COOLDOWN_CLEARED")]
     CooldownCleared { cleared: usize },
+    #[serde(rename = "STAGE_RUN_RESULT")]
+    StageRunResult {
+        ok: bool,
+        task_id: String,
+        stage: String,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        attempt_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stage_receipt: Option<crate::v2::runner::StageReceiptV1>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     #[serde(rename = "ERROR")]
     Error { error: String },
 }
@@ -479,6 +501,14 @@ impl DaemonServer {
                         &mut sub.stream,
                         &ServerMessage::Error {
                             error: "run requires coordinator".into(),
+                        },
+                    );
+                }
+                Ok(ClientCommand::StageRun { .. }) => {
+                    let _result = write_ndjson(
+                        &mut sub.stream,
+                        &ServerMessage::Error {
+                            error: "stage run requires coordinator".into(),
                         },
                     );
                 }
