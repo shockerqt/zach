@@ -112,6 +112,7 @@ function DecisionCard({
 }
 function TaskCard({ t, s }: { t: Task; s: State }) {
   const pr = github(t, "pull");
+  const openDecision = s.decisions.filter((d) => d.task_id === t.task_id).at(-1);
   return (
     <article className="card task">
       <div className="taskhead">
@@ -150,7 +151,10 @@ function TaskCard({ t, s }: { t: Task; s: State }) {
       <div className="taskfoot">
         <p className={t.memory.last_check_failure ? "failure" : ""}>
           {t.memory.last_check_failure ? "⚠ Fallo registrado · " : ""}
-          {t.status}
+          Estado efectivo: {t.status} · GitHub: {t.board_status ?? "Desconocido"}
+          {openDecision && (
+            <span> · Decisión abierta: {openDecision.question} ({openDecision.decision_id})</span>
+          )}
           {observedStage(s, t) && (
             <span> · Etapa observada: {observedStage(s, t)!.status}</span>
           )}

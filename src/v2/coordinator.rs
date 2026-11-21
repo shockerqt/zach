@@ -674,6 +674,7 @@ impl Coordinator {
                                 if self.delivery_verified(&task)?
                                     && task.autonomous_consent
                                     && !task.memory.halt_requested
+                                    && !matches!(task.status.as_str(), "Done" | "Cancelled")
                                 {
                                     self.store
                                         .open_decision(
@@ -726,6 +727,10 @@ impl Coordinator {
                     tasks: self
                         .store
                         .list_tasks(group.as_deref())
+                        .map_err(|e| e.to_string())?,
+                    board_statuses: self
+                        .store
+                        .board_statuses(group.as_deref())
                         .map_err(|e| e.to_string())?,
                     open_decisions: self
                         .store
@@ -1226,6 +1231,9 @@ impl Coordinator {
         }
         // Enumerate as well as inspect exact persisted identities. Dispatch stays disabled.
         self.startup_ownership()?;
+        self.store
+            .retire_terminal_decisions()
+            .map_err(|e| e.to_string())?;
         let controller = self.controller.clone();
         let snapshots = self
             .list_all_tasks_cached()?
@@ -2613,7 +2621,10 @@ impl Coordinator {
     }
 
     fn replay_lifecycle(&mut self) -> Result<(), String> {
-        let ops = self.store.lifecycle_ops().map_err(|e| e.to_string())?;
+        let ops = self
+            .store
+            .replayable_lifecycle_ops()
+            .map_err(|e| e.to_string())?;
         for op in &ops {
             if op.state != "PENDING" || op.retry_epoch > now_epoch() {
                 continue;
@@ -2632,6 +2643,9 @@ impl Coordinator {
                 continue;
             }
             let task = self.task(&op.task_id)?;
+            if op.decision_id.is_some() && matches!(task.status.as_str(), "Done" | "Cancelled") {
+                continue;
+            }
             if op.kind == "close"
                 && !self
                     .store
@@ -2671,6 +2685,10 @@ impl Coordinator {
                 .transpose()
                 .map_err(|e| e.to_string())?
                 .flatten();
+            if op.decision_id.is_some() && decision.as_ref().is_none_or(|d| d.status != "RESOLVED")
+            {
+                continue;
+            }
             let state = self.state_dir.clone();
             let ws = self.ws.clone();
             let operation = op.clone();
@@ -2745,6 +2763,16 @@ impl Coordinator {
             return Ok(());
         }
         let current = self.task(&op.task_id)?;
+        if let Some(id) = &op.decision_id
+            && (matches!(current.status.as_str(), "Done" | "Cancelled")
+                || self
+                    .store
+                    .get_decision(id)
+                    .map_err(|e| e.to_string())?
+                    .is_some_and(|decision| decision.status == "RETIRED"))
+        {
+            return Ok(());
+        }
         if !current.autonomous_consent
             || current.memory.halt_requested
             || current.status == "Cancelled"
@@ -2765,7 +2793,7 @@ impl Coordinator {
                 now_epoch() + pipeline::retry_backoff(op.attempts as usize),
             )
             .map_err(|e| e.to_string())?;
-        if failed {
+        if failed && !matches!(current.status.as_str(), "Done" | "Cancelled") {
             let task = self.task(&op.task_id)?;
             let (kind, option) = if op.kind == "close" {
                 ("governance_close_failed", "Retry close")
@@ -2803,6 +2831,16 @@ impl Coordinator {
         }
         // Receipt and local transition commit atomically after external acknowledgment.
         let mut task = self.task(&op.task_id)?;
+        if let Some(decision_id) = &op.decision_id
+            && (matches!(task.status.as_str(), "Done" | "Cancelled")
+                || self
+                    .store
+                    .get_decision(decision_id)
+                    .map_err(|e| e.to_string())?
+                    .is_none_or(|decision| decision.status != "RESOLVED"))
+        {
+            return Ok(());
+        }
         if op.kind != "close"
             && (!task.autonomous_consent
                 || task.memory.halt_requested
@@ -3219,6 +3257,10 @@ impl Coordinator {
         decision: &crate::v2::store::PendingDecisionRecord,
     ) -> Result<(), String> {
         let mut task = self.task(&decision.task_id)?;
+        if decision.status != "RESOLVED" || matches!(task.status.as_str(), "Done" | "Cancelled") {
+            return Ok(());
+        }
+
         if task
             .memory
             .applied_decisions
@@ -4474,6 +4516,9 @@ mod tests {
 
     fn rehearsal_startup(c: &mut Coordinator) -> Result<(), String> {
         c.startup_ownership()?;
+        c.store
+            .retire_terminal_decisions()
+            .map_err(|e| e.to_string())?;
         let snapshots = c
             .store
             .list_tasks(None)
@@ -5681,6 +5726,25 @@ mod tests {
             {
                 return Err("STANDARD_OWNER_BINDING".into());
             }
+            let latest_observation = expected.iter().rev().find(|row| {
+                row[1] == V::Text(t.task_id.clone())
+                    && row[4] == V::Text("BOARD_STATUS_OBSERVED".into())
+            });
+            let observed_payload = serde_json::json!({
+                "task_id": t.task_id, "board_status": incoming.status
+            })
+            .to_string();
+            if latest_observation.is_none_or(|row| row[5] != V::Text(observed_payload.clone())) {
+                next = next.checked_add(1).ok_or("STANDARD_EVENT_OVERFLOW")?;
+                expected.push(vec![
+                    V::Integer(next),
+                    V::Text(t.task_id.clone()),
+                    V::Text(t.task_group.clone()),
+                    V::Integer(t.updated_epoch),
+                    V::Text("BOARD_STATUS_OBSERVED".into()),
+                    V::Text(observed_payload),
+                ]);
+            }
             if old.weight == t.weight {
                 continue;
             }
@@ -5712,7 +5776,7 @@ mod tests {
             return Err("STANDARD_EVENTS".into());
         }
         let mut expected_alloc = old_alloc;
-        if count > 0 {
+        if next > high {
             if let Some(row) = expected_alloc.iter_mut().find(|r| r[1] == name) {
                 row[2] = V::Integer(next);
             } else {
@@ -5906,7 +5970,7 @@ mod tests {
         assert_eq!(validate_standard(&o, &w, &raw).unwrap(), 2);
         let events = event_rows(o.after.get("task_events").unwrap()).unwrap();
         assert_eq!(events[14][1], V::Text("z-first".into()));
-        assert_eq!(events[15][1], V::Text("a-second".into()));
+        assert_eq!(events[16][1], V::Text("a-second".into()));
         // Simulate canonical JSON transport sorting, which orders 10 before2.
         for image in [&mut o.before, &mut o.after] {
             image
@@ -5967,7 +6031,7 @@ mod tests {
             c.store.get_task(&returned.task_id).unwrap().unwrap()
         );
         assert_eq!(
-            c.store.list_events_since(None, 0, 100).unwrap()[0].event_type,
+            c.store.list_events_since(None, 0, 100).unwrap()[1].event_type,
             "TASK_DONE"
         );
     }
@@ -6128,8 +6192,8 @@ mod tests {
         assert_eq!(validate_standard(&bad, &w, &raw).unwrap(), 2);
         let rows = bad.after.get_mut("task_events").unwrap();
         let first = rows[0][1].clone();
-        rows[0][1] = rows[1][1].clone();
-        rows[1][1] = first;
+        rows[0][1] = rows[2][1].clone();
+        rows[2][1] = first;
         assert!(validate_standard(&bad, &w, &raw).is_err());
     }
 
@@ -6140,13 +6204,13 @@ mod tests {
         let o = observe_standard(&mut c, &w, &raw).unwrap();
         let mut supported = o.clone();
         supported.allocator_before[0][2] = V::Integer(50);
-        supported.allocator_after[0][2] = V::Integer(51);
-        supported
-            .after
-            .get_mut("task_events")
-            .unwrap()
-            .last_mut()
-            .unwrap()[0] = V::Integer(51);
+        supported.allocator_after[0][2] = V::Integer(52);
+        for (row, seq) in supported.after.get_mut("task_events").unwrap()[2..]
+            .iter_mut()
+            .zip(51..=52)
+        {
+            row[0] = V::Integer(seq);
+        }
         for rows in [
             &mut supported.allocator_before,
             &mut supported.allocator_after,
@@ -6188,13 +6252,13 @@ mod tests {
                 "high-text" => bad.allocator_before[0][2] = V::Text("50".into()),
                 "high-negative" => bad.allocator_before[0][2] = V::Integer(-1),
                 "high-behind" => bad.allocator_before[0][2] = V::Integer(0),
-                "advance" => bad.allocator_after[0][2] = V::Integer(52),
+                "advance" => bad.allocator_after[0][2] = V::Integer(53),
                 "gap" => {
                     bad.after
                         .get_mut("task_events")
                         .unwrap()
                         .last_mut()
-                        .unwrap()[0] = V::Integer(52)
+                        .unwrap()[0] = V::Integer(53)
                 }
                 "overflow" => bad.allocator_before[0][2] = V::Integer(i64::MAX),
                 "unrelated" => bad.allocator_after[1][2] = V::Integer(10),
@@ -6216,11 +6280,7 @@ mod tests {
         let (_dir, mut c, raw, w) = weight_fixture(&[("no-event", "M", "M", "Done")], 0);
         let mut no_event = observe_standard(&mut c, &w, &raw).unwrap();
         assert_eq!(validate_standard(&no_event, &w, &raw).unwrap(), 0);
-        no_event.allocator_after.push(vec![
-            V::Integer(1),
-            V::Text("task_events".into()),
-            V::Integer(1),
-        ]);
+        no_event.allocator_after[0][2] = V::Integer(2);
         refresh_allocator_image(&mut no_event);
         assert!(validate_standard(&no_event, &w, &raw).is_err());
     }
@@ -6236,7 +6296,7 @@ mod tests {
             let (_dir, mut c, raw, w) = weight_fixture(&[("unreviewed", from, to, status)], 0);
             let o = observe_standard(&mut c, &w, &raw).unwrap();
             assert_eq!(
-                c.store.list_events_since(None, 0, 100).unwrap()[0].event_type,
+                c.store.list_events_since(None, 0, 100).unwrap()[1].event_type,
                 "WEIGHT_ESCALATED"
             );
             assert!(validate_standard(&o, &w, &raw).is_err());
@@ -6350,9 +6410,8 @@ mod tests {
             .unwrap();
         let raw=serde_json::json!({"schema_version":2,"tasks":[{"id":old.task_id,"repository":old.repository,"status":"Done","weight":"L","executor":"external","autonomous_consent":false}]}).to_string();
         let w = actual_decode(&raw).unwrap();
-        let events = c.store.list_events_since(None, 0, 100).unwrap();
-        let allocator = standard_allocator(&mut c.store).unwrap();
-        for _ in 0..2 {
+        let mut events = c.store.list_events_since(None, 0, 100).unwrap();
+        for pass in 0..2 {
             c.store
                 .sync_task_with_mode(
                     &w.records[0],
@@ -6360,8 +6419,20 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(c.task(&old.task_id).unwrap().weight, "M");
-            assert_eq!(c.store.list_events_since(None, 0, 100).unwrap(), events);
-            assert_eq!(standard_allocator(&mut c.store).unwrap(), allocator);
+            let after = c.store.list_events_since(None, 0, 100).unwrap();
+            if pass == 0 {
+                assert_eq!(after[..events.len()], events);
+                assert_eq!(
+                    after[events.len()..]
+                        .iter()
+                        .map(|e| e.event_type.as_str())
+                        .collect::<Vec<_>>(),
+                    ["BOARD_STATUS_OBSERVED", "TASK_DONE"]
+                );
+                events = after;
+            } else {
+                assert_eq!(after, events);
+            }
             assert_eq!(
                 c.store.list_stage_attempts(&old.task_id).unwrap(),
                 vec![a.clone()]
@@ -6385,7 +6456,7 @@ mod tests {
         let mut incoming = old.clone();
         incoming.status = "Done".into();
         incoming.weight = "L".into();
-        for _ in 0..2 {
+        for pass in 0..2 {
             let history = c.store.list_events_since(None, 0, 100).unwrap();
             let allocator = standard_allocator(&mut c.store).unwrap();
             c.store
@@ -6395,8 +6466,18 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(c.task(&old.task_id).unwrap().weight, "M");
-            assert_eq!(c.store.list_events_since(None, 0, 100).unwrap(), history);
-            assert_eq!(standard_allocator(&mut c.store).unwrap(), allocator);
+            let after = c.store.list_events_since(None, 0, 100).unwrap();
+            assert_eq!(
+                after
+                    .iter()
+                    .map(|e| e.event_type.as_str())
+                    .collect::<Vec<_>>(),
+                ["BOARD_STATUS_OBSERVED", "TASK_DONE"]
+            );
+            if pass > 0 {
+                assert_eq!(after, history);
+                assert_eq!(standard_allocator(&mut c.store).unwrap(), allocator);
+            }
         }
     }
 
@@ -6828,7 +6909,7 @@ mod tests {
     }
 
     #[test]
-    fn offline_empty_terminal_is_visible_in_actual_snapshot_without_event() {
+    fn offline_empty_terminal_is_visible_in_actual_snapshot_and_event_history() {
         let dir = TestDirectory::new();
         let mut c = coordinator(&dir.0);
         let payload = serde_json::json!({"schema_version":2,"tasks":[{"id":"empty-snapshot","repository":"synthetic","status":"In Progress","autonomous_consent":false}]});
@@ -6844,7 +6925,14 @@ mod tests {
                 crate::v2::store::SyncMode::ReconcileFinishedLegacy,
             )
             .unwrap();
-        assert!(c.store.list_events_since(None, 0, 100).unwrap().is_empty());
+        let events = c.store.list_events_since(None, 0, 100).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|e| e.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["BOARD_STATUS_OBSERVED", "TASK_DONE"]
+        );
         let messages = c
             .socket_command(ClientCommand::Subscribe {
                 group: None,
@@ -6853,7 +6941,10 @@ mod tests {
             })
             .unwrap();
         assert!(
-            matches!(&messages[0],ServerMessage::Snapshot{tasks,..} if tasks.len()==1 && tasks[0].status=="Done")
+            matches!(&messages[0],ServerMessage::Snapshot{tasks,board_statuses,as_of_seq,..}
+                if tasks.len()==1 && tasks[0].status=="Done"
+                && board_statuses.get(&tasks[0].task_id).is_some_and(|s| s == "Done")
+                && *as_of_seq == events[1].seq_id)
         );
     }
 
@@ -7887,6 +7978,105 @@ mod tests {
         socket_thread.join().unwrap().unwrap();
         coordinator_thread.join().unwrap().unwrap();
     }
+    #[test]
+    fn coordinated_socket_delivers_live_terminal_events_and_replays_against_snapshot() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixStream;
+
+        let dir = TestDirectory::new();
+        let (mut c, handle) =
+            Coordinator::create(V2Store::open_in_memory().unwrap(), dir.0.clone());
+        let mut t = task("replay-decision");
+        t.status = "Backlog".into();
+        t.autonomous_consent = false;
+        c.store.sync_task(&t).unwrap();
+        c.store
+            .open_decision(
+                "old",
+                &t.task_id,
+                &t.task_group,
+                "failure",
+                "Retry?",
+                &["Retry stage".into()],
+                None,
+                "context",
+                None,
+            )
+            .unwrap();
+        c.preflight = true;
+        c.reconciled = true;
+        c.synced = true;
+        c.last_export = Instant::now();
+        let commands = handle.commands.clone();
+        let coordinator = std::thread::spawn(move || c.run());
+        let path = PathBuf::from(format!("target/z78-live-{}.sock", std::process::id()));
+        let mut server = crate::v2::socket::DaemonServer::bind(&path, 0).unwrap();
+        let shutdown = server.shutdown.clone();
+        let socket = std::thread::spawn(move || server.run_coordinated(handle, false));
+        let subscribe = |since_seq, once| {
+            let mut client = UnixStream::connect(&path).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            crate::v2::socket::write_ndjson(
+                &mut client,
+                &ClientCommand::Subscribe {
+                    group: Some("test".into()),
+                    since_seq: Some(since_seq),
+                    once: Some(once),
+                },
+            )
+            .unwrap();
+            BufReader::new(client)
+        };
+        let read = |reader: &mut BufReader<UnixStream>| {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()
+        };
+        let mut client = subscribe(0, false);
+        let snapshot = read(&mut client);
+        assert_eq!(snapshot["tasks"][0]["status"], "Blocked");
+        assert_eq!(snapshot["board_statuses"]["replay-decision"], "Backlog");
+        assert_eq!(snapshot["open_decisions"][0]["decision_id"], "old");
+        let cursor = snapshot["as_of_seq"].as_i64().unwrap();
+        for expected in 1..=cursor {
+            assert_eq!(read(&mut client)["event"]["seq_id"], expected);
+        }
+        t.status = "Cancelled".into();
+        commands
+            .send(CoordinatorEvent::DeliveryStore(Box::new(move |store| {
+                store.sync_task(&t).unwrap();
+            })))
+            .unwrap();
+        let live = (0..3).map(|_| read(&mut client)).collect::<Vec<_>>();
+        assert_eq!(
+            live.iter()
+                .map(|e| e["event"]["event_type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "BOARD_STATUS_OBSERVED",
+                "TASK_STATUS_CHANGED",
+                "DECISION_RETIRED"
+            ]
+        );
+        assert_eq!(live[2]["event"]["payload"]["decision_id"], "old");
+        let mut reconnect = subscribe(cursor, true);
+        let snapshot = read(&mut reconnect);
+        assert_eq!(snapshot["as_of_seq"], cursor + 3);
+        assert_eq!(snapshot["tasks"][0]["status"], "Cancelled");
+        assert_eq!(snapshot["board_statuses"]["replay-decision"], "Cancelled");
+        assert_eq!(snapshot["open_decisions"], serde_json::json!([]));
+        for event in live {
+            assert_eq!(read(&mut reconnect), event);
+        }
+        let mut trailing = String::new();
+        assert_eq!(reconnect.read_line(&mut trailing).unwrap(), 0);
+        shutdown.store(true, Ordering::Relaxed);
+        socket.join().unwrap().unwrap();
+        coordinator.join().unwrap().unwrap();
+    }
+
     #[derive(Default)]
     struct RecordingWsTaskClient {
         calls: Mutex<Vec<Vec<String>>>,
@@ -7903,6 +8093,97 @@ mod tests {
             Ok(serde_json::json!({"task_id":id,"stage":args.get(2),"sha":sha,"weight":"M","branch":"task/ordered","worktree":"/governed/ordered"}).to_string())
         }
     }
+    #[test]
+    fn startup_retires_legacy_decisions_and_never_replays_unapplied_publication() {
+        for terminal in ["Done", "Cancelled"] {
+            let dir = TestDirectory::new();
+            let db = dir.0.join("legacy.sqlite3");
+            let mut store = V2Store::open(&db).unwrap();
+            let t = task("legacy-terminal");
+            store.upsert_task(&t).unwrap();
+            for id in ["open", "unapplied"] {
+                store
+                    .open_decision(
+                        id,
+                        &t.task_id,
+                        &t.task_group,
+                        "human-plan-approval",
+                        "Approve?",
+                        &["Approve".into()],
+                        None,
+                        "original context",
+                        None,
+                    )
+                    .unwrap();
+            }
+            store
+                .resolve_decision("unapplied", "Approve", "alice", Some("human note"))
+                .unwrap();
+            let op = LifecycleOperation {
+                operation_id: "approval-intent".into(),
+                task_id: t.task_id.clone(),
+                kind: "human-plan-approval".into(),
+                args: vec![],
+                body_path: None,
+                depends_on: None,
+                state: "PENDING".into(),
+                retry_epoch: 0,
+                attempts: 0,
+                last_error: None,
+                decision_id: Some("unapplied".into()),
+                attempt_id: None,
+            };
+            store.enqueue_lifecycle(&op).unwrap();
+            store
+                .connection_mut()
+                .execute("UPDATE tasks SET status=?1", [terminal])
+                .unwrap();
+            assert!(store.list_decisions(true, None).unwrap().is_empty());
+            drop(store);
+            let (mut c, _handle) = Coordinator::create(V2Store::open(&db).unwrap(), dir.0.clone());
+            c.controller = Arc::new(RehearsalUnits::default());
+            c.submission_probe = Some(BTreeMap::new());
+            rehearsal_startup(&mut c).unwrap();
+            c.replay_lifecycle().unwrap();
+            c.resume_decisions().unwrap();
+            c.lifecycle_ack("approval-intent", "late result").unwrap();
+            c.lifecycle_failed("approval-intent", "late failure")
+                .unwrap();
+            assert_eq!(c.store.lifecycle_ops().unwrap(), vec![op.clone()]);
+            assert_eq!(c.task(&t.task_id).unwrap().status, terminal);
+            assert!(
+                c.task(&t.task_id)
+                    .unwrap()
+                    .memory
+                    .applied_decisions
+                    .is_empty()
+            );
+            let retired = c.store.get_decision("unapplied").unwrap().unwrap();
+            assert_eq!(retired.status, "RETIRED");
+            assert_eq!(retired.choice.as_deref(), Some("Approve"));
+            assert_eq!(retired.note.as_deref(), Some("human note"));
+            let max = c.store.max_seq_id().unwrap();
+            let mut reopened = c.task(&t.task_id).unwrap();
+            reopened.status = "Ready".into();
+            c.save(&reopened).unwrap();
+            c.replay_lifecycle().unwrap();
+            c.resume_decisions().unwrap();
+            c.lifecycle_ack("approval-intent", "replayed result")
+                .unwrap();
+            assert_eq!(c.store.lifecycle_ops().unwrap(), vec![op]);
+            assert_eq!(c.task(&t.task_id).unwrap().status, "Ready");
+            assert_eq!(c.store.max_seq_id().unwrap(), max + 1);
+            let events = c.store.list_task_events(&t.task_id).unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| e.event_type == "DECISION_RETIRED")
+                    .count(),
+                2
+            );
+        }
+    }
+
     #[test]
     fn ws_task_adapter_replays_start_before_plan_and_acknowledges_each_once() {
         let dir = TestDirectory::new();
@@ -8996,7 +9277,18 @@ mod tests {
             hash(
                 &HISTORY
                     .iter()
-                    .map(|name| Ok((*name, selected(i, name, id)?)))
+                    .map(|name| {
+                        let mut table = selected(i, name, id)?;
+                        // Standard separately validates the full event stream and allocator.
+                        // The retained runtime receipt excludes board-only observations.
+                        if *name == "task_events" {
+                            let kind = column(&table, "event_type")?;
+                            table.rows.retain(|row| {
+                                text(&row.values[kind]).ok() != Some("BOARD_STATUS_OBSERVED")
+                            });
+                        }
+                        Ok((*name, table))
+                    })
                     .collect::<Result<BTreeMap<_, _>, String>>()?,
             )
         }
@@ -9499,25 +9791,33 @@ mod tests {
             }
             need(saw_last_sync, "PROFILE_META_LAST_SYNC")?;
 
-            // sqlite_sequence rowid & no-event preservation.
-            let b_ev = before_img
-                .tables
-                .get("task_events")
-                .ok_or("PROFILE_TABLE")?;
-            let a_ev = after_img.tables.get("task_events").ok_or("PROFILE_TABLE")?;
-            let b_seq = before_img
-                .tables
-                .get("sqlite_sequence")
-                .ok_or("PROFILE_TABLE")?;
-            let a_seq = after_img
-                .tables
-                .get("sqlite_sequence")
-                .ok_or("PROFILE_TABLE")?;
-            if b_ev.rows == a_ev.rows {
-                need(b_seq == a_seq, "PROFILE_ALLOCATOR")?;
-            }
-            for (br, ar) in b_seq.rows.iter().zip(&a_seq.rows) {
-                need(br.rowid == ar.rowid, "PROFILE_ALLOCATOR_ROWID")?;
+            // Bind the raw receipt to the exact events and allocator validated above.
+            for (image, observed, allocator) in [
+                (before_img, &obs.before, &obs.allocator_before),
+                (after_img, &obs.after, &obs.allocator_after),
+            ] {
+                for (name, expected) in [
+                    (
+                        "task_events",
+                        event_rows(observed.get("task_events").ok_or("PROFILE_TABLE")?)?,
+                    ),
+                    ("sqlite_sequence", allocator_rows(allocator)?),
+                ] {
+                    let actual = &image.tables.get(name).ok_or("PROFILE_TABLE")?.rows;
+                    need(actual.len() == expected.len(), "PROFILE_EVENT_INVENTORY")?;
+                    for (actual, expected) in actual.iter().zip(expected) {
+                        let cells = expected.into_iter().map(cell).collect::<Vec<_>>();
+                        let values = if name == "sqlite_sequence" {
+                            &cells[1..]
+                        } else {
+                            &cells[..]
+                        };
+                        need(
+                            actual.rowid == number(&cells[0])? && actual.values == values,
+                            "PROFILE_EVENT_BINDING",
+                        )?;
+                    }
+                }
             }
 
             // tasks rowid preservation + exact retained allowlist & receipt generation.

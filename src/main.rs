@@ -129,12 +129,14 @@ fn format_detailed_status(report: &zach::v2::store::DetailedStatusReport) -> Str
         lines.push(format!("Active ({}):", report.active_tasks.len()));
         for a in &report.active_tasks {
             lines.push(format!(
-                "  {:<10} [{:<2}] repo={:<16} group={:<6} status={:<16} exec={:<8} stage={:<11} phase={:<14} slot={} res={} · {}",
+                "  {:<10} [{:<2}] repo={:<16} group={:<6} Effective: {} · GitHub: {} · Decision: {} · exec={:<8} stage={:<11} phase={:<14} slot={} res={} · {}",
                 a.task_id,
                 a.weight,
                 a.repository,
                 a.task_group,
                 a.status,
+                a.board_status.as_deref().unwrap_or("unknown"),
+                a.open_decision_id.as_deref().unwrap_or("-"),
                 a.executor.as_deref().unwrap_or("-"),
                 a.current_stage.as_deref().unwrap_or("-"),
                 a.attempt_phase.as_deref().unwrap_or("-"),
@@ -151,8 +153,10 @@ fn format_detailed_status(report: &zach::v2::store::DetailedStatusReport) -> Str
         lines.push(format!("Waiting ({}):", report.waiting_tasks.len()));
         for w in &report.waiting_tasks {
             lines.push(format!(
-                "  {:<10} [{:<2}] repo={:<16} group={:<6} status={:<8} wait={:<28} · {}",
-                w.task_id, w.weight, w.repository, w.task_group, w.status, w.wait_reason, w.title
+                "  {:<10} [{:<2}] repo={:<16} group={:<6} Effective: {} · GitHub: {} · Decision: {} · wait={} · {}",
+                w.task_id, w.weight, w.repository, w.task_group, w.status,
+                w.board_status.as_deref().unwrap_or("unknown"),
+                w.open_decision_id.as_deref().unwrap_or("-"), w.wait_reason, w.title
             ));
         }
     }
@@ -2305,6 +2309,34 @@ mod tests {
             "repo_locked:ZACH-10"
         );
         assert_eq!(json["path_locks"][0]["task_id"], "ZACH-10");
+
+        active.status = "Backlog".into();
+        active.autonomous_consent = false;
+        store.sync_task(&active).unwrap();
+        store
+            .open_decision(
+                "wait-11",
+                &active.task_id,
+                &active.task_group,
+                "failure",
+                "Retry?",
+                &["Retry stage".into()],
+                None,
+                "failure context",
+                None,
+            )
+            .unwrap();
+        let report = store.detailed_status(Some("ZACH")).unwrap();
+        let text = format_detailed_status(&report);
+        assert!(text.contains("Effective: In Progress · GitHub: unknown"));
+        assert!(text.contains(
+            "Effective: Blocked · GitHub: Backlog · Decision: wait-11 · wait=awaiting_consent"
+        ));
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["waiting_tasks"][0]["status"], "Blocked");
+        assert_eq!(json["waiting_tasks"][0]["board_status"], "Backlog");
+        assert_eq!(json["waiting_tasks"][0]["open_decision_id"], "wait-11");
+        assert_eq!(json["waiting_tasks"][0]["wait_reason"], "awaiting_consent");
     }
 
     #[test]

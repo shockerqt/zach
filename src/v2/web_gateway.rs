@@ -571,6 +571,8 @@ fn read_token(file: File) -> io::Result<String> {
 pub struct SnapshotResponse {
     pub tasks: Vec<TaskRecord>,
     pub open_decisions: Vec<PendingDecisionRecord>,
+    #[serde(default)]
+    pub board_statuses: std::collections::BTreeMap<String, String>,
     pub status: DaemonStatusSummary,
     pub as_of_seq: i64,
 }
@@ -1442,8 +1444,9 @@ fn serve(
                         Some(ServerMessage::Snapshot {
                             tasks,
                             open_decisions,
+                            board_statuses,
                             as_of_seq,
-                        }) => snapshot = Some((tasks, open_decisions, as_of_seq)),
+                        }) => snapshot = Some((tasks, open_decisions, board_statuses, as_of_seq)),
                         Some(ServerMessage::Status {
                             ok: true,
                             status: value,
@@ -1452,10 +1455,11 @@ fn serve(
                         _ => return Err(invalid("backend snapshot unavailable")),
                     }
                 }
-                let (tasks, open_decisions, as_of_seq) = snapshot.unwrap();
+                let (tasks, open_decisions, board_statuses, as_of_seq) = snapshot.unwrap();
                 Ok(SnapshotResponse {
                     tasks,
                     open_decisions,
+                    board_statuses,
                     as_of_seq,
                     status: status.unwrap(),
                 })
@@ -1490,6 +1494,11 @@ fn serve(
                 )?;
                 let record = match backend.receive(stop, deadline)? {
                     Some(ServerMessage::Decision { decision: None }) => {
+                        return Ok(("NOT_FOUND".into(), None));
+                    }
+                    Some(ServerMessage::Decision {
+                        decision: Some(record),
+                    }) if record.decision_id == body.decision_id && record.status == "RETIRED" => {
                         return Ok(("NOT_FOUND".into(), None));
                     }
                     Some(ServerMessage::Decision {
@@ -1792,6 +1801,7 @@ mod tests {
         ServerMessage::Snapshot {
             tasks: vec![],
             open_decisions: vec![],
+            board_statuses: [("SYNTHETIC".into(), "Backlog".into())].into(),
             as_of_seq: 9000,
         }
     }
@@ -1927,6 +1937,7 @@ mod tests {
         let data: SnapshotResponse =
             serde_json::from_str(reply.split_once("\r\n\r\n").unwrap().1).unwrap();
         assert_eq!(data.as_of_seq, 9000);
+        assert_eq!(data.board_statuses["SYNTHETIC"], "Backlog");
         assert_eq!(data.status.max_seq_id, 9001);
         backend.join().unwrap();
     }
@@ -2004,9 +2015,46 @@ mod tests {
             for seq in 42..=5142 {
                 write_ndjson(&mut writer, &event(seq)).unwrap();
             }
+            for (seq, kind, payload) in [
+                (
+                    8999,
+                    "DECISION_REQUIRED",
+                    serde_json::json!({"decision_id":"old"}),
+                ),
+                (
+                    9001,
+                    "BOARD_STATUS_OBSERVED",
+                    serde_json::json!({"board_status":"Cancelled"}),
+                ),
+                (
+                    9002,
+                    "TASK_STATUS_CHANGED",
+                    serde_json::json!({"status":"Cancelled","board_status":"Cancelled"}),
+                ),
+                (
+                    9003,
+                    "DECISION_RETIRED",
+                    serde_json::json!({"decision_id":"old","reason":"Cancelled"}),
+                ),
+            ] {
+                write_ndjson(
+                    &mut writer,
+                    &ServerMessage::Event {
+                        event: TaskEventRecord {
+                            seq_id: seq,
+                            task_id: "SYNTHETIC".into(),
+                            task_group: "test".into(),
+                            ts_epoch: 1,
+                            event_type: kind.into(),
+                            payload,
+                        },
+                    },
+                )
+                .unwrap();
+            }
             write_ndjson(
                 &mut writer,
-                &ServerMessage::ResyncRequired { last_seq_id: 5142 },
+                &ServerMessage::ResyncRequired { last_seq_id: 9003 },
             )
             .unwrap();
         });
@@ -2020,11 +2068,23 @@ mod tests {
             .lines()
             .filter_map(|s| s.strip_prefix("id: ").map(|s| s.parse().unwrap()))
             .collect();
-        assert_eq!(ids, (42..=5142).collect::<Vec<_>>());
+        assert_eq!(
+            ids,
+            (42..=5142)
+                .chain([8999, 9001, 9002, 9003])
+                .collect::<Vec<_>>()
+        );
         assert!(reply.contains("event: task_event"));
         assert!(reply.contains("event: snapshot"));
         assert!(reply.contains("event: resync_required"));
         assert!(!reply.contains("id: 9000"));
+        for kind in [
+            "BOARD_STATUS_OBSERVED",
+            "TASK_STATUS_CHANGED",
+            "DECISION_RETIRED",
+        ] {
+            assert!(reply.contains(kind));
+        }
         backend.join().unwrap();
     }
     #[test]
