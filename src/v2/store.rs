@@ -1884,6 +1884,12 @@ impl V2Store {
             now_epoch()
         };
         let existing = Self::get_task_tx(&tx, &incoming.task_id)?;
+        if mode == SyncMode::ReconcileFinishedLegacy
+            && let Some(old) = existing.as_ref()
+            && Self::offline_identity_conflicts(old, incoming)
+        {
+            return Ok(old.clone());
+        }
         let group = match (&existing, mode) {
             (Some(old), SyncMode::ReconcileFinishedLegacy)
                 if is_terminal_task_status(&incoming.status) =>
@@ -2077,14 +2083,8 @@ impl V2Store {
         Ok(result)
     }
 
-    fn reconcile_offline_tx(
-        tx: &rusqlite::Transaction<'_>,
-        old: &TaskRecord,
-        incoming: &TaskRecord,
-        mut raw: RawTask,
-        now: i64,
-    ) -> Result<TaskRecord, V2StoreError> {
-        let conflicting = old.repository != incoming.repository
+    fn offline_identity_conflicts(old: &TaskRecord, incoming: &TaskRecord) -> bool {
+        old.repository != incoming.repository
             || old
                 .github_repo
                 .as_ref()
@@ -2094,6 +2094,16 @@ impl V2Store {
                 .issue_number
                 .zip(incoming.issue_number)
                 .is_some_and(|(a, b)| a != b)
+    }
+
+    fn reconcile_offline_tx(
+        tx: &rusqlite::Transaction<'_>,
+        old: &TaskRecord,
+        incoming: &TaskRecord,
+        mut raw: RawTask,
+        now: i64,
+    ) -> Result<TaskRecord, V2StoreError> {
+        let conflicting = Self::offline_identity_conflicts(old, incoming)
             || incoming.current_stage.is_some()
             || incoming.lease_owner.is_some()
             || incoming.lease_expires_epoch.is_some()

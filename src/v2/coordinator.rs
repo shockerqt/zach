@@ -9091,7 +9091,7 @@ mod tests {
             let incoming = intake::decode_export_records(&export).unwrap().remove(0);
             let mut conflicting = incoming.clone();
             conflicting.repository = "unrelated".into();
-            for incoming in [&conflicting, &incoming] {
+            for (index, incoming) in [&conflicting, &incoming].into_iter().enumerate() {
                 let declined = c
                     .store
                     .sync_task_with_mode(
@@ -9107,6 +9107,16 @@ mod tests {
                         .is_none()
                 );
                 assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "DISPATCHED");
+                if index == 0 {
+                    assert!(
+                        c.store
+                            .list_task_events(&task.task_id)
+                            .unwrap()
+                            .iter()
+                            .all(|event| event.seq_id <= cursor),
+                        "a conflicting offline identity must not report board status"
+                    );
+                }
             }
             let events = c.store.list_task_events(&task.task_id).unwrap();
             let observed: Vec<_> = events
