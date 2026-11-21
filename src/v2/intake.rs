@@ -407,6 +407,20 @@ pub fn stage_operation(
     sha: Option<&str>,
     actor: &str,
 ) -> crate::v2::store::LifecycleOperation {
+    stage_operation_with_receipt(task, key, stage, body_path, verdict, sha, actor, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn stage_operation_with_receipt(
+    task: &TaskRecord,
+    key: &str,
+    stage: &str,
+    body_path: &Path,
+    verdict: Option<&str>,
+    sha: Option<&str>,
+    actor: &str,
+    receipt_path: Option<&Path>,
+) -> crate::v2::store::LifecycleOperation {
     let mut args = vec![
         "stage".into(),
         task.task_id.clone(),
@@ -421,6 +435,9 @@ pub fn stage_operation(
     }
     if let Some(sha) = sha {
         args.extend(["--sha".into(), sha.into()]);
+    }
+    if let Some(receipt) = receipt_path {
+        args.extend(["--receipt".into(), receipt.to_string_lossy().into_owned()]);
     }
     args.extend(["--idempotency-key".into(), key.into()]);
     crate::v2::store::LifecycleOperation {
