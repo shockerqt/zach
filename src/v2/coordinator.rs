@@ -475,7 +475,9 @@ impl Coordinator {
             CoordinatorEvent::DeliveryStore(_) => true,
             CoordinatorEvent::Socket { command, .. } => matches!(
                 command,
-                ClientCommand::Decide { .. } | ClientCommand::Run { .. }
+                ClientCommand::Decide { .. }
+                    | ClientCommand::Run { .. }
+                    | ClientCommand::StageRun { .. }
             ),
             CoordinatorEvent::Replay { .. } | CoordinatorEvent::Shutdown => false,
         };
@@ -785,6 +787,76 @@ impl Coordinator {
                 // `zach run` wakes delivery follow-up through the daemon owner.
                 self.last_delivery_poll = Instant::now() - Duration::from_secs(10);
                 vec![ServerMessage::RunAccepted { ready: self.ready }]
+            }
+            ClientCommand::StageRun {
+                task,
+                stage,
+                wait: _,
+            } => {
+                if !matches!(
+                    stage.as_str(),
+                    "plan" | "plan-review" | "impl" | "pr-review"
+                ) {
+                    return Ok(vec![ServerMessage::StageRunResult {
+                        ok: false,
+                        task_id: task,
+                        stage: stage.clone(),
+                        status: "REJECTED".to_owned(),
+                        attempt_id: None,
+                        summary: None,
+                        stage_receipt: None,
+                        error: Some(format!(
+                            "unsupported stage '{stage}'; expected plan, plan-review, impl, or pr-review"
+                        )),
+                    }]);
+                }
+                let Some(record) = self.store.get_task(&task).map_err(|e| e.to_string())? else {
+                    return Ok(vec![ServerMessage::StageRunResult {
+                        ok: false,
+                        task_id: task.clone(),
+                        stage,
+                        status: "NOT_FOUND".to_owned(),
+                        attempt_id: None,
+                        summary: None,
+                        stage_receipt: None,
+                        error: Some(format!("task not found: {task}")),
+                    }]);
+                };
+                if !record.autonomous_consent {
+                    return Ok(vec![ServerMessage::StageRunResult {
+                        ok: false,
+                        task_id: task.clone(),
+                        stage,
+                        status: "BLOCKED".to_owned(),
+                        attempt_id: record.active_attempt_id.clone(),
+                        summary: None,
+                        stage_receipt: None,
+                        error: Some(format!(
+                            "task {task} does not have autonomous_consent enabled"
+                        )),
+                    }]);
+                }
+                self.scope = Some((Some(task.clone()), None));
+                let receipt = record.active_attempt_id.as_deref().and_then(|aid| {
+                    let p = self
+                        .state_dir
+                        .join("attempts")
+                        .join(aid)
+                        .join("stage-receipt.json");
+                    std::fs::read_to_string(p)
+                        .ok()
+                        .and_then(|s| serde_json::from_str::<runner::StageReceiptV1>(&s).ok())
+                });
+                vec![ServerMessage::StageRunResult {
+                    ok: true,
+                    task_id: task,
+                    stage,
+                    status: "ACCEPTED".to_owned(),
+                    attempt_id: record.active_attempt_id,
+                    summary: Some("delegated stage admitted to zachd".to_owned()),
+                    stage_receipt: receipt,
+                    error: None,
+                }]
             }
             ClientCommand::ReloadConfig { path } => {
                 match crate::v2::router::reload_router_config(
@@ -1418,7 +1490,15 @@ impl Coordinator {
                 };
                 let verdict = matches!(stage, "plan-review" | "pr-review")
                     .then(|| cp.operation.trim_start_matches("PUBLISH_"));
-                let op = intake::stage_operation(
+                let receipt_candidate = self
+                    .state_dir
+                    .join("attempts")
+                    .join(&cp.attempt_id)
+                    .join("stage-receipt.json");
+                let receipt_opt = receipt_candidate
+                    .is_file()
+                    .then_some(receipt_candidate.as_path());
+                let op = intake::stage_operation_with_receipt(
                     &task,
                     &format!("zach-stage-{}", cp.attempt_id),
                     stage,
@@ -1426,6 +1506,7 @@ impl Coordinator {
                     verdict,
                     sha,
                     "zach",
+                    receipt_opt,
                 );
                 self.store
                     .enqueue_lifecycle(&op)

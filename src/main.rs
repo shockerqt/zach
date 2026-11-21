@@ -58,6 +58,7 @@ fn main() {
         "config" => run_v2_config(&args[2..]),
         "cooldown" => run_v2_cooldown(&args[2..]),
         "run" => run_v2_run(&args[2..]),
+        "stage" => run_v2_stage(&args[2..]),
         "daemon" | "zachd" => run_v2_daemon(&args[2..]),
         "attach" => run_v2_attach(&args[2..]),
         "events" => run_v2_events(&args[2..]),
@@ -937,6 +938,90 @@ fn run_v2_cooldown(args: &[String]) {
     }
 }
 
+fn run_v2_stage(args: &[String]) {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    if sub != "run" {
+        eprintln!(
+            "Usage: zach stage run --task <TASK_ID> --stage <plan|plan-review|impl|pr-review> [--wait] [--json] [--socket <PATH>]"
+        );
+        std::process::exit(2);
+    }
+    let rest = &args[1..];
+    let Some(task) = flag_value(rest, "--task") else {
+        eprintln!("zach stage run requires --task <TASK_ID>");
+        std::process::exit(2);
+    };
+    let Some(stage) = flag_value(rest, "--stage") else {
+        eprintln!("zach stage run requires --stage <plan|plan-review|impl|pr-review>");
+        std::process::exit(2);
+    };
+    if !matches!(
+        stage.as_str(),
+        "plan" | "plan-review" | "impl" | "pr-review"
+    ) {
+        eprintln!(
+            "unsupported stage '{stage}': expected one of plan, plan-review, impl, pr-review"
+        );
+        std::process::exit(2);
+    }
+    let wait = has_flag(rest, "--wait");
+    let json_out = has_flag(rest, "--json");
+    let socket_path = flag_value(rest, "--socket")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_socket_path);
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(&socket_path).unwrap_or_else(|error| {
+            eprintln!("connect to zachd at {}: {error}", socket_path.display());
+            std::process::exit(1)
+        });
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap_or_else(|error| {
+            eprintln!("stage run socket timeout: {error}");
+            std::process::exit(1)
+        });
+    write_ndjson(
+        &mut stream,
+        &ClientCommand::StageRun {
+            task: task.clone(),
+            stage: stage.clone(),
+            wait,
+        },
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("submit stage run: {error}");
+        std::process::exit(1)
+    });
+    use std::io::BufRead;
+    let mut line = String::new();
+    std::io::BufReader::new(stream)
+        .read_line(&mut line)
+        .unwrap_or_else(|error| {
+            eprintln!("stage run acknowledgment: {error}");
+            std::process::exit(1)
+        });
+    let reply: serde_json::Value = serde_json::from_str(&line).unwrap_or_else(|error| {
+        eprintln!("invalid daemon acknowledgment: {error}");
+        std::process::exit(1)
+    });
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&reply).unwrap_or_else(|_| line.trim().to_owned())
+        );
+    } else {
+        println!(
+            "stage run {} [{}]: status={}",
+            task,
+            stage,
+            reply["status"].as_str().unwrap_or("UNKNOWN")
+        );
+    }
+    if reply["type"] == "ERROR" || reply["ok"] == serde_json::Value::Bool(false) {
+        std::process::exit(1);
+    }
+}
+
 fn run_v2_run(args: &[String]) {
     let dry_run = has_flag(args, "--dry-run");
     if !dry_run {
@@ -1601,6 +1686,9 @@ fn print_usage() {
     println!("       zach cooldown clear [<FAMILY> | --all] [--db <PATH>] [--socket <PATH>]");
     println!(
         "       zach run [--task <TASK_ID>] [--group <GROUP>] [--once] [--dry-run] [--json] [--db <PATH>]"
+    );
+    println!(
+        "       zach stage run --task <TASK_ID> --stage <plan|plan-review|impl|pr-review> [--wait] [--json] [--socket <PATH>]"
     );
     println!("       zach doctor [--json] [--worktree <PATH>]");
     println!(

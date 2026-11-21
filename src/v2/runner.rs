@@ -91,6 +91,304 @@ pub struct ReviewedDiffContext {
     pub diff_excerpt: String,
 }
 
+/// ADR-004 / ADR-014 content-safe token usage counters for `StageReceipt` v1.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StageReceiptTokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+}
+
+/// Canonical ADR-004 / ADR-014 `StageReceipt` v1 matching `governance/contracts/stage-contract.yaml`.
+/// Strictly contains operational metadata and numeric counters only (never prompts, responses,
+/// transcripts, raw stdout/stderr, or credentials).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StageReceiptV1 {
+    pub schema_version: u32,
+    pub task_id: String,
+    pub stage: String,
+    pub actor: String,
+    pub executor: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_error_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha_before: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha_after: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<StageReceiptTokenUsage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generated_at: Option<String>,
+}
+
+pub fn build_stage_receipt_v1(
+    task_id: &str,
+    attempt_id: &str,
+    route: &StageRoute,
+    result: &StageExecutionResult,
+    failure_class: Option<&str>,
+) -> StageReceiptV1 {
+    let driver = worker_driver(route.family);
+    let status = if result.status == "PASSED" {
+        "completed"
+    } else if result.status == "BLOCKED" {
+        "blocked"
+    } else {
+        "failed"
+    };
+    let token_usage = match (result.input_tokens, result.output_tokens) {
+        (Some(input_tokens), Some(output_tokens)) => Some(StageReceiptTokenUsage {
+            input_tokens,
+            output_tokens,
+            total_tokens: Some(
+                result
+                    .total_tokens
+                    .unwrap_or_else(|| input_tokens.saturating_add(output_tokens)),
+            ),
+        }),
+        _ => None,
+    };
+    let duration_secs = result
+        .duration_seconds
+        .filter(|d| d.is_finite() && *d >= 0.0)
+        .map(|d| d.round() as u64);
+    StageReceiptV1 {
+        schema_version: 1,
+        task_id: task_id.to_owned(),
+        stage: route.stage.clone(),
+        actor: driver.actor().to_owned(),
+        executor: "zach".to_owned(),
+        status: status.to_owned(),
+        attempt_id: Some(attempt_id.to_owned()),
+        harness: Some(driver.harness().to_owned()),
+        model: (!route.model.trim().is_empty()).then(|| route.model.clone()),
+        effort: Some(route.effort.as_str().to_owned()),
+        failure_class: failure_class
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| truncate_utf8_bytes(s, 128)),
+        duration_secs,
+        retry_count: None,
+        tool_error_count: None,
+        sha_before: result.sha_before.clone(),
+        sha_after: result.sha_after.clone(),
+        token_usage,
+        generated_at: Some(format!("{}", crate::v2::now_epoch())),
+    }
+}
+
+pub fn write_stage_receipt_json(
+    attempt_dir: &std::path::Path,
+    receipt: &StageReceiptV1,
+) -> Result<PathBuf, String> {
+    let path = attempt_dir.join("stage-receipt.json");
+    let bytes = serde_json::to_vec_pretty(receipt)
+        .map_err(|e| format!("failed to serialize stage-receipt.json: {e}"))?;
+    write_secure_file(&path, &bytes)?;
+    Ok(path)
+}
+
+/// Decouples harness-specific CLI invocation, JSON schema attachment, and output/token
+/// parsing from the `systemd-run` + `bwrap` stage supervisor (`ADR-014`).
+pub trait WorkerDriver: Send + Sync {
+    fn harness(&self) -> &'static str;
+    fn actor(&self) -> &'static str;
+    fn build_worker_invocation(
+        &self,
+        task: &TaskRecord,
+        route: &StageRoute,
+        worktree_path: &str,
+        prompt: &str,
+    ) -> Result<(Vec<String>, String), String>;
+    fn attach_output_schema(&self, args: &[String], schema_path: &std::path::Path) -> Vec<String>;
+    fn parse_output(
+        &self,
+        stdout: &str,
+        stderr: &str,
+        exit_code: Option<i32>,
+        is_systemd_timeout: bool,
+    ) -> Result<StageExecutionResult, String>;
+}
+
+pub struct OpenAiSolDriver;
+
+impl WorkerDriver for OpenAiSolDriver {
+    fn harness(&self) -> &'static str {
+        "codex"
+    }
+
+    fn actor(&self) -> &'static str {
+        "codex"
+    }
+
+    fn build_worker_invocation(
+        &self,
+        _task: &TaskRecord,
+        route: &StageRoute,
+        worktree_path: &str,
+        prompt: &str,
+    ) -> Result<(Vec<String>, String), String> {
+        let args = vec![
+            "codex".to_owned(),
+            "exec".to_owned(),
+            "--ignore-user-config".to_owned(),
+            "-m".to_owned(),
+            route.model.clone(),
+            "-c".to_owned(),
+            format!("model_reasoning_effort={}", route.effort.as_str()),
+            "--dangerously-bypass-approvals-and-sandbox".to_owned(),
+            "-C".to_owned(),
+            worktree_path.to_owned(),
+            "--json".to_owned(),
+            "-".to_owned(),
+        ];
+        Ok((args, prompt.to_owned()))
+    }
+
+    fn attach_output_schema(&self, args: &[String], schema_path: &std::path::Path) -> Vec<String> {
+        inject_codex_output_schema_args(args, schema_path)
+    }
+
+    fn parse_output(
+        &self,
+        stdout: &str,
+        stderr: &str,
+        exit_code: Option<i32>,
+        _is_systemd_timeout: bool,
+    ) -> Result<StageExecutionResult, String> {
+        let p = parse_codex_jsonl_output(stdout, stderr, exit_code)?;
+        Ok(StageExecutionResult {
+            status: p.status,
+            summary: p.summary,
+            review_markdown: p.review_markdown,
+            review_output: p.review_output.clone(),
+            stage_output: p.review_output,
+            invocation_id: None,
+            input_tokens: p.input_tokens,
+            output_tokens: p.output_tokens,
+            total_tokens: p.total_tokens,
+            duration_seconds: None,
+            sha_before: None,
+            sha_after: None,
+            diff_files: Vec::new(),
+        })
+    }
+}
+
+pub struct GeminiAgyDriver;
+
+impl WorkerDriver for GeminiAgyDriver {
+    fn harness(&self) -> &'static str {
+        "agy"
+    }
+
+    fn actor(&self) -> &'static str {
+        "antigravity"
+    }
+
+    fn build_worker_invocation(
+        &self,
+        task: &TaskRecord,
+        route: &StageRoute,
+        _worktree_path: &str,
+        prompt: &str,
+    ) -> Result<(Vec<String>, String), String> {
+        let args = vec![
+            "node".to_owned(),
+            GEMINI_WORKER_CLI_SCRIPT.to_owned(),
+            "--cli".to_owned(),
+        ];
+        let payload = crate::v2::pipeline::build_agy_cli_payload(task, route, prompt);
+        let stdin_payload = serde_json::to_string(&payload)
+            .map_err(|e| format!("failed to serialize agy cli payload: {e}"))?;
+        Ok((args, stdin_payload))
+    }
+
+    fn attach_output_schema(&self, args: &[String], schema_path: &std::path::Path) -> Vec<String> {
+        inject_agy_json_schema_args(args, schema_path)
+    }
+
+    fn parse_output(
+        &self,
+        stdout: &str,
+        stderr: &str,
+        exit_code: Option<i32>,
+        is_systemd_timeout: bool,
+    ) -> Result<StageExecutionResult, String> {
+        match crate::v2::pipeline::parse_agy_cli_response(stdout, stderr, exit_code) {
+            Ok(res) => Ok(res),
+            Err(mut agy_err) => {
+                if is_systemd_timeout && agy_err.failure_class == "AGY_EXIT" {
+                    agy_err.failure_class = "AGY_TIMEOUT".to_owned();
+                }
+                if agy_err.input_tokens.is_some()
+                    || agy_err.output_tokens.is_some()
+                    || agy_err.total_tokens.is_some()
+                    || agy_err.duration_seconds.is_some()
+                {
+                    Ok(StageExecutionResult {
+                        status: "FAILED".to_owned(),
+                        summary: truncate_utf8_bytes(&agy_err.to_string(), MAX_SUMMARY_BYTES),
+                        review_markdown: None,
+                        review_output: None,
+                        stage_output: None,
+                        invocation_id: None,
+                        input_tokens: agy_err.input_tokens,
+                        output_tokens: agy_err.output_tokens,
+                        total_tokens: agy_err.total_tokens,
+                        duration_seconds: agy_err.duration_seconds,
+                        sha_before: None,
+                        sha_after: None,
+                        diff_files: Vec::new(),
+                    })
+                } else {
+                    Err(agy_err.to_string())
+                }
+            }
+        }
+    }
+}
+
+pub fn worker_driver(family: ModelFamily) -> Box<dyn WorkerDriver> {
+    match family {
+        ModelFamily::OpenAiSol => Box::new(OpenAiSolDriver),
+        ModelFamily::GeminiAgy => Box::new(GeminiAgyDriver),
+    }
+}
+
+pub fn inject_agy_json_schema_args(args: &[String], schema_path: &std::path::Path) -> Vec<String> {
+    if args.iter().any(|a| a == "--json-schema") {
+        return args.to_vec();
+    }
+    let Some(cli_idx) = args.iter().position(|a| a == "--cli") else {
+        return args.to_vec();
+    };
+    let mut updated = Vec::with_capacity(args.len() + 2);
+    updated.extend_from_slice(&args[..=cli_idx]);
+    updated.push("--json-schema".to_owned());
+    updated.push(schema_path.to_string_lossy().into_owned());
+    updated.extend_from_slice(&args[cli_idx + 1..]);
+    updated
+}
+
 pub trait StageExecutor {
     fn persist_plan_artifact(
         &mut self,
@@ -307,35 +605,10 @@ pub fn build_systemd_stage_command_with_env(
 
     args.push("--".to_owned());
 
-    let stdin_payload = match route.family {
-        ModelFamily::OpenAiSol => {
-            args.extend([
-                "codex".to_owned(),
-                "exec".to_owned(),
-                "--ignore-user-config".to_owned(),
-                "-m".to_owned(),
-                route.model.clone(),
-                "-c".to_owned(),
-                format!("model_reasoning_effort={}", route.effort.as_str()),
-                "--dangerously-bypass-approvals-and-sandbox".to_owned(),
-                "-C".to_owned(),
-                worktree_path.clone(),
-                "--json".to_owned(),
-                "-".to_owned(),
-            ]);
-            prompt.to_owned()
-        }
-        ModelFamily::GeminiAgy => {
-            args.extend([
-                "node".to_owned(),
-                GEMINI_WORKER_CLI_SCRIPT.to_owned(),
-                "--cli".to_owned(),
-            ]);
-            let payload = crate::v2::pipeline::build_agy_cli_payload(task, route, prompt);
-            serde_json::to_string(&payload)
-                .map_err(|e| format!("failed to serialize agy cli payload: {e}"))?
-        }
-    };
+    let driver = worker_driver(route.family);
+    let (worker_args, stdin_payload) =
+        driver.build_worker_invocation(task, route, &worktree_path, prompt)?;
+    args.extend(worker_args);
 
     let output_schema_json = (matches!(route.stage.as_str(), "plan-review" | "pr-review"))
         .then(crate::v2::pipeline::review_verdict_json_schema_string);
@@ -1027,16 +1300,20 @@ impl StageExecutor for SystemdStageExecutor {
         let attempt_dir = ensure_secure_dir(&attempts_root.join(valid_attempt_id))?;
 
         write_secure_file(&attempt_dir.join("prompt.md"), spec.prompt.as_bytes())?;
+        let (_, bootstrap_meta) =
+            crate::v2::pipeline::resolve_stage_bootstrap(task, &route.stage, &spec.worktree_path);
+        if let Ok(bootstrap_bytes) = serde_json::to_vec_pretty(&bootstrap_meta) {
+            let _ = write_secure_file(&attempt_dir.join("bootstrap.json"), &bootstrap_bytes);
+        }
 
+        let driver = worker_driver(route.family);
         let mut effective_args = spec.args.clone();
         let mut readonly_files = Vec::new();
         if let Some(ref schema_json) = spec.output_schema_json {
             let schema_path = attempt_dir.join("review-schema.json");
             write_secure_file(&schema_path, schema_json.as_bytes())?;
-            if route.family == ModelFamily::OpenAiSol {
-                effective_args = inject_codex_output_schema_args(&effective_args, &schema_path);
-                readonly_files.push(schema_path);
-            }
+            effective_args = driver.attach_output_schema(&effective_args, &schema_path);
+            readonly_files.push(schema_path);
         }
 
         let _resources = if fixture_transport {
@@ -1172,82 +1449,72 @@ impl StageExecutor for SystemdStageExecutor {
         let sha_after = git_head_sha(&spec.worktree_path);
         let diff_files = collect_worktree_diff_entries(&spec.worktree_path);
 
-        match route.family {
-            ModelFamily::GeminiAgy => {
-                match crate::v2::pipeline::parse_agy_cli_response(
-                    &stdout,
-                    &stderr,
-                    output.status.code(),
-                ) {
-                    Ok(mut parsed) => {
-                        parsed.sha_before = sha_before;
-                        parsed.sha_after = sha_after;
-                        parsed.diff_files = diff_files;
-                        parsed.summary = truncate_utf8_bytes(&parsed.summary, MAX_SUMMARY_BYTES);
-                        write_stage_result_json(
-                            &attempt_dir,
-                            valid_attempt_id,
-                            &task.task_id,
-                            &route.stage,
-                            output.status.code(),
-                            &parsed,
-                        )?;
-                        let _ = crate::v2::audit::extract_and_write_attempt_audit(&attempt_dir);
-                        Ok(parsed)
-                    }
-                    Err(agy_err) => {
-                        let err_msg = truncate_utf8_bytes(&agy_err.to_string(), MAX_SUMMARY_BYTES);
-                        let result_json = serde_json::json!({
-                            "attempt_id": valid_attempt_id,
-                            "task_id": task.task_id,
-                            "stage": route.stage,
-                            "status": "FAILED",
-                            "failure_class": agy_err.failure_class,
-                            "exit_code": output.status.code(),
-                            "summary": err_msg,
-                            "input_tokens": agy_err.input_tokens,
-                            "output_tokens": agy_err.output_tokens,
-                            "total_tokens": agy_err.total_tokens,
-                            "duration_seconds": agy_err.duration_seconds,
-                        });
-                        write_secure_file(
-                            &attempt_dir.join("result.json"),
-                            serde_json::to_string_pretty(&result_json)
-                                .unwrap_or_default()
-                                .as_bytes(),
-                        )?;
-                        let _ = crate::v2::audit::extract_and_write_attempt_audit(&attempt_dir);
-                        Err(err_msg)
-                    }
-                }
-            }
-            ModelFamily::OpenAiSol => {
-                let parsed = parse_codex_jsonl_output(&stdout, &stderr, output.status.code())?;
-                let result = StageExecutionResult {
-                    status: parsed.status,
-                    summary: parsed.summary,
-                    review_markdown: parsed.review_markdown,
-                    stage_output: parsed.review_output.clone(),
-                    review_output: parsed.review_output,
-                    invocation_id: None,
-                    input_tokens: parsed.input_tokens,
-                    output_tokens: parsed.output_tokens,
-                    total_tokens: parsed.total_tokens,
-                    duration_seconds: None,
-                    sha_before,
-                    sha_after,
-                    diff_files,
-                };
+        match driver.parse_output(&stdout, &stderr, output.status.code(), false) {
+            Ok(mut parsed) => {
+                parsed.sha_before = sha_before;
+                parsed.sha_after = sha_after;
+                parsed.diff_files = diff_files;
+                parsed.summary = truncate_utf8_bytes(&parsed.summary, MAX_SUMMARY_BYTES);
                 write_stage_result_json(
                     &attempt_dir,
                     valid_attempt_id,
                     &task.task_id,
                     &route.stage,
                     output.status.code(),
-                    &result,
+                    &parsed,
                 )?;
+                let receipt = build_stage_receipt_v1(
+                    &task.task_id,
+                    valid_attempt_id,
+                    route,
+                    &parsed,
+                    (parsed.status != "PASSED").then_some("STAGE_FAILED"),
+                );
+                let _ = write_stage_receipt_json(&attempt_dir, &receipt);
                 let _ = crate::v2::audit::extract_and_write_attempt_audit(&attempt_dir);
-                Ok(result)
+                Ok(parsed)
+            }
+            Err(err_raw) => {
+                let err_msg = truncate_utf8_bytes(&err_raw, MAX_SUMMARY_BYTES);
+                let result_json = serde_json::json!({
+                    "attempt_id": valid_attempt_id,
+                    "task_id": task.task_id,
+                    "stage": route.stage,
+                    "status": "FAILED",
+                    "exit_code": output.status.code(),
+                    "summary": err_msg,
+                });
+                write_secure_file(
+                    &attempt_dir.join("result.json"),
+                    serde_json::to_string_pretty(&result_json)
+                        .unwrap_or_default()
+                        .as_bytes(),
+                )?;
+                let failed_res = StageExecutionResult {
+                    status: "FAILED".to_owned(),
+                    summary: err_msg.clone(),
+                    review_markdown: None,
+                    review_output: None,
+                    stage_output: None,
+                    invocation_id: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    total_tokens: None,
+                    duration_seconds: None,
+                    sha_before,
+                    sha_after,
+                    diff_files,
+                };
+                let receipt = build_stage_receipt_v1(
+                    &task.task_id,
+                    valid_attempt_id,
+                    route,
+                    &failed_res,
+                    Some("DRIVER_ERROR"),
+                );
+                let _ = write_stage_receipt_json(&attempt_dir, &receipt);
+                let _ = crate::v2::audit::extract_and_write_attempt_audit(&attempt_dir);
+                Err(err_msg)
             }
         }
     }
@@ -2508,6 +2775,11 @@ fn prepare_detached_launch_in_dir(
     }
     let sha_before = git_head_sha(&spec.worktree_path).ok_or("cannot resolve sha_before")?;
     write_secure_file(&dir.join("prompt.md"), spec.prompt.as_bytes())?;
+    let (_, bootstrap_meta) =
+        crate::v2::pipeline::resolve_stage_bootstrap(task, &route.stage, &spec.worktree_path);
+    if let Ok(bootstrap_bytes) = serde_json::to_vec_pretty(&bootstrap_meta) {
+        let _ = write_secure_file(&dir.join("bootstrap.json"), &bootstrap_bytes);
+    }
     write_secure_file(&dir.join("stdin"), spec.stdin_payload.as_bytes())?;
     for name in ["stdout.jsonl", "stderr.log"] {
         write_secure_file(&dir.join(name), b"")?;
@@ -2524,10 +2796,9 @@ fn prepare_detached_launch_in_dir(
     if let Some(schema) = &spec.output_schema_json {
         let path = dir.join("review-schema.json");
         write_secure_file(&path, schema.as_bytes())?;
-        if route.family == ModelFamily::OpenAiSol {
-            resources.layout.readonly_files.push(path.clone());
-            spec.args = inject_codex_output_schema_args(&spec.args, &path);
-        }
+        let driver = worker_driver(route.family);
+        resources.layout.readonly_files.push(path.clone());
+        spec.args = driver.attach_output_schema(&spec.args, &path);
     }
     spec.args = replace_sandbox_args(&spec.args, &resources.layout)?;
     let separator = spec
@@ -2663,64 +2934,25 @@ pub fn harvest_detached(
     } else {
         stderr.clone()
     };
-    let mut result = match manifest.route.family {
-        ModelFamily::GeminiAgy => {
-            match crate::v2::pipeline::parse_agy_cli_response(&stdout, &effective_stderr, code) {
-                Ok(res) => res,
-                Err(mut agy_err) => {
-                    if is_systemd_timeout && agy_err.failure_class == "AGY_EXIT" {
-                        agy_err.failure_class = "AGY_TIMEOUT".to_owned();
-                    }
-                    if agy_err.input_tokens.is_some()
-                        || agy_err.output_tokens.is_some()
-                        || agy_err.total_tokens.is_some()
-                        || agy_err.duration_seconds.is_some()
-                    {
-                        StageExecutionResult {
-                            status: "FAILED".to_owned(),
-                            summary: truncate_utf8_bytes(&agy_err.to_string(), MAX_SUMMARY_BYTES),
-                            review_markdown: None,
-                            review_output: None,
-                            stage_output: None,
-                            invocation_id: None,
-                            input_tokens: agy_err.input_tokens,
-                            output_tokens: agy_err.output_tokens,
-                            total_tokens: agy_err.total_tokens,
-                            duration_seconds: agy_err.duration_seconds,
-                            sha_before: None,
-                            sha_after: None,
-                            diff_files: Vec::new(),
-                        }
-                    } else {
-                        return Err(agy_err.to_string());
-                    }
-                }
-            }
-        }
-        ModelFamily::OpenAiSol => {
-            let p = parse_codex_jsonl_output(&stdout, &effective_stderr, code)?;
-            StageExecutionResult {
-                status: p.status,
-                summary: p.summary,
-                review_markdown: p.review_markdown,
-                review_output: p.review_output.clone(),
-                stage_output: p.review_output,
-                invocation_id: None,
-                input_tokens: p.input_tokens,
-                output_tokens: p.output_tokens,
-                total_tokens: p.total_tokens,
-                duration_seconds: None,
-                sha_before: None,
-                sha_after: None,
-                diff_files: Vec::new(),
-            }
-        }
-    };
+    let driver = worker_driver(manifest.route.family);
+    let mut result = driver.parse_output(&stdout, &effective_stderr, code, is_systemd_timeout)?;
     result.sha_before = Some(manifest.sha_before.clone());
     result.sha_after = git_head_sha(&manifest.spec.worktree_path);
     result.invocation_id =
         (!observation.invocation_id.is_empty()).then(|| observation.invocation_id.clone());
     result.diff_files = collect_worktree_diff_entries(&manifest.spec.worktree_path);
+    let receipt = build_stage_receipt_v1(
+        &manifest.task_id,
+        &manifest.attempt_id,
+        &manifest.route,
+        &result,
+        (result.status != "PASSED").then_some(if is_systemd_timeout {
+            "TIMEOUT"
+        } else {
+            "STAGE_FAILED"
+        }),
+    );
+    let _ = write_stage_receipt_json(&manifest.attempt_dir, &receipt);
     let harvest_path = manifest.attempt_dir.join("harvest.json");
     let harvest_bytes = serde_json::to_vec(&result)
         .map_err(|e| path_io_err("serializing harvest", &harvest_path, e))?;
@@ -4836,5 +5068,224 @@ Binary files /dev/null and b/assets/logo.bin differ
         assert_eq!(report.tool_call_count, 2);
         assert_eq!(report.tool_error_count, 1);
         assert_eq!(report.edit_compile_fail_loops, 1);
+    }
+
+    #[test]
+    fn zach_074_worker_driver_gemini_schema_and_stage_receipt_v1() {
+        use std::path::Path;
+        let mut task = sample_task();
+        task.task_id = "ZACH-074".to_owned();
+        task.autonomous_consent = true;
+        task.worktree_path = Some("/tmp/zach-074-wt".to_owned());
+
+        let mut gemini_route =
+            resolve_stage_route("M", "pr-review", 0, Some(ModelFamily::OpenAiSol))
+                .unwrap()
+                .unwrap();
+        gemini_route.family = ModelFamily::GeminiAgy;
+        gemini_route.model = "gemini-4-hydrogen-high".to_owned();
+
+        // 1. WorkerDriver builds clean stage_mode + json_schema payload and attaches --json-schema
+        let clean_env = BTreeMap::from([("HOME".to_owned(), "/home/ubuntu".to_owned())]);
+        let spec = build_systemd_stage_command_with_env(
+            &task,
+            "att-zach-074-rev",
+            &gemini_route,
+            "review prompt",
+            &clean_env,
+        )
+        .expect("build gemini review command");
+        assert!(spec.output_schema_json.is_some());
+        assert!(!spec.writable, "pr-review must stay read-only");
+        let payload: serde_json::Value =
+            serde_json::from_str(&spec.stdin_payload).expect("valid agy stdin json");
+        assert_eq!(payload["harness"], "agy");
+        assert_eq!(payload["stage_mode"], true);
+        assert_eq!(payload["stream_json"], true);
+        assert_eq!(payload["task_id"], "ZACH-074");
+        assert_eq!(payload["stage"], "pr-review");
+        assert!(payload["json_schema"].is_object());
+
+        let driver = worker_driver(ModelFamily::GeminiAgy);
+        let schema_attached =
+            driver.attach_output_schema(&spec.args, Path::new("/tmp/schema.json"));
+        assert!(schema_attached.contains(&"--json-schema".to_owned()));
+        assert!(schema_attached.contains(&"/tmp/schema.json".to_owned()));
+
+        // 2. WorkerDriver parses multi-line NDJSON (liveness + terminal envelope)
+        let ndjson = format!(
+            "{}\n{}\n",
+            serde_json::json!({"event":"agy_stream","type":"turn","turn":1}),
+            serde_json::json!({
+                "execution_succeeded": true,
+                "status": "SUCCESS",
+                "response": "{\"verdict\":\"APPROVED\",\"ac_results\":[],\"findings\":[],\"summary\":\"ok\"}",
+                "usage": {"input_tokens": 300, "output_tokens": 50, "total_tokens": 350},
+                "duration_seconds": 14.2
+            })
+        );
+        let parsed = driver
+            .parse_output(&ndjson, "", Some(0), false)
+            .expect("parse multi-line agy stream output");
+        assert_eq!(parsed.status, "PASSED");
+        assert_eq!(parsed.input_tokens, Some(300));
+        assert_eq!(parsed.output_tokens, Some(50));
+        assert_eq!(parsed.total_tokens, Some(350));
+
+        // 3. StageReceiptV1 is ADR-004 content-safe and wired into intake::stage_operation_with_receipt
+        let receipt = build_stage_receipt_v1(
+            &task.task_id,
+            "att-zach-074-rev",
+            &gemini_route,
+            &parsed,
+            None,
+        );
+        assert_eq!(receipt.schema_version, 1);
+        assert_eq!(receipt.actor, "antigravity");
+        assert_eq!(receipt.executor, "zach");
+        assert_eq!(receipt.status, "completed");
+        assert_eq!(receipt.harness.as_deref(), Some("agy"));
+        assert_eq!(receipt.duration_secs, Some(14));
+        assert_eq!(
+            receipt.token_usage,
+            Some(StageReceiptTokenUsage {
+                input_tokens: 300,
+                output_tokens: 50,
+                total_tokens: Some(350),
+            })
+        );
+        let receipt_json = serde_json::to_string(&receipt).unwrap();
+        assert!(!receipt_json.contains("prompt"));
+        assert!(!receipt_json.contains("transcript"));
+
+        let op = crate::v2::intake::stage_operation_with_receipt(
+            &task,
+            "k-1",
+            "pr-review",
+            Path::new("/tmp/body.md"),
+            Some("APPROVED"),
+            Some("abc1234"),
+            "zach",
+            Some(Path::new("/tmp/stage-receipt.json")),
+        );
+        assert!(op.args.contains(&"--receipt".to_owned()));
+        assert!(op.args.contains(&"/tmp/stage-receipt.json".to_owned()));
+    }
+
+    #[test]
+    fn zach_074_four_role_bootstrap_fixtures_isolation_and_diagnostics() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "zach-074-bootstrap-test-{}-{}",
+            std::process::id(),
+            crate::v2::now_epoch()
+        ));
+        let _ = std::fs::remove_dir_all(&base_dir);
+        let gov_root = base_dir.join("governance");
+        let worktree = base_dir.join("repo-instructions-only");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join("INSTRUCTIONS.md"),
+            "# Repo Instructions\nAlways run targeted checks.\n",
+        )
+        .unwrap();
+
+        for (stage, skill) in [
+            ("plan", "governance-planner"),
+            ("plan-review", "governance-plan-reviewer"),
+            ("impl", "governance-implementer"),
+            ("pr-review", "governance-pr-reviewer"),
+        ] {
+            let skill_dir = gov_root.join(".agents/skills").join(skill);
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                format!("# {skill}\nRole guidance for {stage}.\n"),
+            )
+            .unwrap();
+        }
+
+        let mut task = sample_task();
+        task.task_id = "ZACH-074".to_owned();
+        task.autonomous_consent = true;
+        task.repository = "zach".to_owned();
+        task.branch = Some("task/ZACH-074-test".to_owned());
+        task.worktree_path = Some(worktree.to_string_lossy().into_owned());
+        let clean_env = BTreeMap::from([("HOME".to_owned(), "/home/ubuntu".to_owned())]);
+
+        // AC-B1 & AC-B2: Verify all 4 roles observe real cwd, repo/worktree, isolation,
+        // INSTRUCTIONS.md bootstrap, sibling governance skill, and bounded learnings.
+        for stage in ["plan", "plan-review", "impl", "pr-review"] {
+            let (sections, meta) = crate::v2::pipeline::resolve_stage_bootstrap_from_roots(
+                &task,
+                stage,
+                &worktree.to_string_lossy(),
+                &gov_root,
+                Some("Known pitfall: run cargo fmt before commit.".to_owned()),
+            );
+            assert_eq!(meta.role, stage);
+            assert_eq!(meta.cwd, worktree.to_string_lossy());
+            assert_eq!(meta.repository, "zach");
+            assert_eq!(meta.branch, "task/ZACH-074-test");
+            assert_eq!(meta.writable, stage == "impl");
+            assert!(meta.repo_instructions_loaded);
+            assert_eq!(
+                meta.repo_instruction_paths,
+                vec!["INSTRUCTIONS.md".to_owned()]
+            );
+            assert!(meta.role_skill_loaded);
+            assert!(
+                meta.role_skill_path
+                    .as_deref()
+                    .unwrap()
+                    .contains(".agents/skills")
+            );
+            assert!(meta.learnings_loaded);
+            assert!(meta.learnings_chars <= crate::v2::pipeline::LEARNINGS_MAX_CHARS);
+            assert!(meta.missing_required_instructions.is_empty());
+            assert!(sections.iter().any(|(k, _)| k == "Repository Instructions"));
+            assert!(sections.iter().any(|(k, _)| k == "Operational Learnings"));
+
+            let route = resolve_stage_route("M", stage, 0, None).unwrap().unwrap();
+            let spec = build_systemd_stage_command_with_env(
+                &task,
+                &format!("att-role-{stage}"),
+                &route,
+                "prompt",
+                &clean_env,
+            )
+            .expect("build command for role");
+            assert_eq!(spec.worktree_path, worktree.to_string_lossy());
+            assert_eq!(spec.writable, stage == "impl");
+        }
+
+        // AC-B3: Missing mandatory instructions are observable in bounded metadata without prompt content
+        let empty_wt = base_dir.join("empty-wt");
+        let missing_gov = base_dir.join("missing-gov");
+        std::fs::create_dir_all(&empty_wt).unwrap();
+        let (_, missing_meta) = crate::v2::pipeline::resolve_stage_bootstrap_from_roots(
+            &task,
+            "impl",
+            &empty_wt.to_string_lossy(),
+            &missing_gov,
+            None,
+        );
+        assert!(!missing_meta.repo_instructions_loaded);
+        assert!(!missing_meta.role_skill_loaded);
+        assert!(
+            missing_meta
+                .missing_required_instructions
+                .iter()
+                .any(|m| m.contains("governance-implementer"))
+        );
+        assert!(
+            missing_meta
+                .missing_required_instructions
+                .iter()
+                .any(|m| m.contains("AGENTS.md|INSTRUCTIONS.md"))
+        );
+        let meta_json = serde_json::to_string(&missing_meta).unwrap();
+        assert!(!meta_json.contains("Known pitfall"));
+        assert!(!meta_json.contains("Always run targeted checks"));
+        let _ = std::fs::remove_dir_all(&base_dir);
     }
 }
