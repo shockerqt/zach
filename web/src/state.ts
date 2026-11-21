@@ -197,6 +197,10 @@ export function observedStage(s: State, t: Task): Stage | undefined {
     ? s.stages[t.task_id + ":" + t.current_stage]
     : undefined;
 }
+export function taskDecision(s: State, t: Task): Decision | undefined {
+  const open = s.decisions.filter((d) => d.task_id === t.task_id);
+  return open.findLast((d) => d.linked_unverified_delivery) ?? open.at(-1);
+}
 export function taskLane(s: State, t: Task): "active" | "queued" | "terminal" {
   const status = t.status.toLowerCase();
   if (["done", "completed", "cancelled"].includes(status)) return "terminal";

@@ -9011,6 +9011,49 @@ mod tests {
         assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "ACKNOWLEDGED");
     }
 
+    fn assert_publication_terminal_event_order(
+        store: &V2Store,
+        task_id: &str,
+        terminal: &str,
+        board_status: &str,
+        retired_ids: &[&str],
+    ) {
+        let events = store.list_task_events(task_id).unwrap();
+        let effective = events
+            .iter()
+            .find(|event| {
+                matches!(
+                    event.event_type.as_str(),
+                    "TASK_DONE" | "TASK_STATUS_CHANGED"
+                ) && event.payload["status"] == terminal
+            })
+            .unwrap();
+        assert_eq!(effective.payload["task_id"], task_id);
+        assert_eq!(effective.payload["board_status"], board_status);
+        let observation = events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.seq_id < effective.seq_id && event.event_type == "BOARD_STATUS_OBSERVED"
+            })
+            .unwrap();
+        assert_eq!(observation.payload["board_status"], board_status);
+        let retirements: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == "DECISION_RETIRED")
+            .collect();
+        assert_eq!(retirements.len(), retired_ids.len());
+        for id in retired_ids {
+            let retired = retirements
+                .iter()
+                .find(|event| event.payload["decision_id"] == *id)
+                .unwrap();
+            assert!(effective.seq_id < retired.seq_id);
+            assert_eq!(retired.payload["task_id"], task_id);
+            assert_eq!(retired.payload["reason"], terminal);
+        }
+    }
+
     #[test]
     fn grant_before_launch_can_be_settled_after_restart_without_replay() {
         for terminal in ["Done", "Cancelled"] {
@@ -9040,6 +9083,39 @@ mod tests {
             c.ws = ws.clone();
             c.recover_lifecycle_journal().unwrap();
             task.status = terminal.into();
+            let before = c.task(&task.task_id).unwrap();
+            let cursor = c.store.max_seq_id().unwrap();
+            let export = ws
+                .execute(&["export".into(), "--sync".into(), "--json".into()])
+                .unwrap();
+            let incoming = intake::decode_export_records(&export).unwrap().remove(0);
+            let mut conflicting = incoming.clone();
+            conflicting.repository = "unrelated".into();
+            for incoming in [&conflicting, &incoming] {
+                let declined = c
+                    .store
+                    .sync_task_with_mode(
+                        incoming,
+                        crate::v2::store::SyncMode::ReconcileFinishedLegacy,
+                    )
+                    .unwrap();
+                assert_eq!(declined, before);
+                assert!(
+                    c.store
+                        .deferred_terminal(&op.operation_id, &before)
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "DISPATCHED");
+            }
+            let events = c.store.list_task_events(&task.task_id).unwrap();
+            let observed: Vec<_> = events
+                .iter()
+                .filter(|event| event.seq_id > cursor)
+                .collect();
+            assert_eq!(observed.len(), 1);
+            assert_eq!(observed[0].event_type, "BOARD_STATUS_OBSERVED");
+            assert_eq!(observed[0].payload["board_status"], terminal);
             c.worker_result(WorkerResult::Export(vec![task.clone()]))
                 .unwrap();
             let id = format!("settle-{}", op.operation_id);
@@ -9102,6 +9178,14 @@ mod tests {
             assert_eq!(
                 c.store.get_decision(&id).unwrap().unwrap().status,
                 "RESOLVED"
+            );
+
+            assert_publication_terminal_event_order(
+                &c.store,
+                &op.task_id,
+                terminal,
+                terminal,
+                &[op.decision_id.as_deref().unwrap()],
             );
 
             task.status = "Ready".into();
@@ -9211,6 +9295,13 @@ mod tests {
                 .unwrap()
                 .status,
             "RETIRED"
+        );
+        assert_publication_terminal_event_order(
+            &c.store,
+            &op.task_id,
+            "Cancelled",
+            "Planning",
+            &[op.decision_id.as_deref().unwrap(), &settlement_id],
         );
         assert_eq!(ws.recording.calls.lock().unwrap().len(), 1);
     }

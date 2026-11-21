@@ -8,7 +8,7 @@ import "@fontsource/space-grotesk/latin-700.css";
 import "@fontsource/jetbrains-mono/latin-400.css";
 import "./style.css";
 import { Connection, type AuthMode } from "./connection";
-import { initial, mood, taskLane, observedStage, type State } from "./state";
+import { initial, mood, taskLane, taskDecision, observedStage, type State } from "./state";
 import { github, type Task, type Decision } from "./protocol";
 import { Mascot, moodText } from "./Mascot";
 import { Sound } from "./sound";
@@ -112,7 +112,7 @@ function DecisionCard({
 }
 function TaskCard({ t, s }: { t: Task; s: State }) {
   const pr = github(t, "pull");
-  const openDecision = s.decisions.filter((d) => d.task_id === t.task_id).at(-1);
+  const openDecision = taskDecision(s, t);
   return (
     <article className="card task">
       <div className="taskhead">

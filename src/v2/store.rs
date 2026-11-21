@@ -444,6 +444,8 @@ pub struct PendingDecisionRecord {
     pub note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retirement_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub linked_unverified_delivery: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1402,42 +1404,45 @@ impl V2Store {
             )?;
         }
         let now = now_epoch();
-        if let Some(settlement_id) = settlement_id {
+        let retirement = if let Some(settlement_id) = settlement_id {
             if op.state != "DISPATCHED" {
                 return Err(V2StoreError("publication is no longer dispatched".into()));
             }
             let id = op
                 .decision_id
-                .as_deref()
+                .clone()
                 .ok_or_else(|| V2StoreError("publication has no decision".into()))?;
+            next.memory.applied_decisions.push(settlement_id.into());
+            if !is_terminal_task_status(&next.status) && !is_post_merge_status(&next.status) {
+                next.memory.halt_requested = true;
+            }
+            Some((id, "publication_settled"))
+        } else if op.state == "DISPATCHED" {
+            let id = format!("settle-{}", op.operation_id);
+            Self::get_decision_on(&tx, &id)?
+                .filter(|decision| decision.status != "RETIRED")
+                .map(|_| (id, "publication_confirmed"))
+        } else {
+            None
+        };
+        let saved = Self::update_task_tx(&tx, &old, &next, now)?;
+        if let Some((id, reason)) = retirement
+            && Self::get_decision_on(&tx, &id)?.is_some_and(|decision| decision.status != "RETIRED")
+        {
+            let reason = if is_terminal_task_status(&saved.status) {
+                saved.status.as_str()
+            } else {
+                reason
+            };
             Self::insert_event_tx(
                 &tx,
                 &task.task_id,
                 &task.task_group,
                 now,
                 "DECISION_RETIRED",
-                &serde_json::json!({"decision_id":id,"reason":"publication_settled","settlement_id":settlement_id}),
+                &serde_json::json!({"task_id":task.task_id,"decision_id":id,"reason":reason,"settlement_id":settlement_id}),
             )?;
-            next.memory.applied_decisions.push(settlement_id.into());
-            if !is_terminal_task_status(&next.status) && !is_post_merge_status(&next.status) {
-                next.memory.halt_requested = true;
-            }
-        } else if op.state == "DISPATCHED" {
-            let settlement_id = format!("settle-{}", op.operation_id);
-            if Self::get_decision_on(&tx, &settlement_id)?
-                .is_some_and(|decision| decision.status != "RETIRED")
-            {
-                Self::insert_event_tx(
-                    &tx,
-                    &task.task_id,
-                    &task.task_group,
-                    now,
-                    "DECISION_RETIRED",
-                    &serde_json::json!({"decision_id":settlement_id,"reason":"publication_confirmed"}),
-                )?;
-            }
         }
-        Self::update_task_tx(&tx, &old, &next, now_epoch())?;
         if let Some(id) = attempt_id {
             tx.execute(
                 "UPDATE stage_attempts SET phase='COMPLETE' WHERE attempt_id=?1",
@@ -1900,6 +1905,18 @@ impl V2Store {
         }
         let result = match existing {
             Some(mut old) => {
+                if mode == SyncMode::ReconcileFinishedLegacy
+                    && is_terminal_task_status(&incoming.status)
+                {
+                    if !matches!(incoming.status.as_str(), "Done" | "Cancelled") {
+                        tx.commit()?;
+                        return Ok(old);
+                    }
+                    let raw = strict_task_json(&tx, &mut old)?;
+                    let saved = Self::reconcile_offline_tx(&tx, &old, incoming, raw, now)?;
+                    tx.commit()?;
+                    return Ok(saved);
+                }
                 let delivery_hold = is_terminal_task_status(&incoming.status)
                     && Self::delivery_holds_terminal(&tx, &old)?;
                 if !delivery_hold
@@ -1922,14 +1939,6 @@ impl V2Store {
                     }
                     tx.commit()?;
                     return Ok(old);
-                }
-                if mode == SyncMode::ReconcileFinishedLegacy
-                    && matches!(incoming.status.as_str(), "Done" | "Cancelled")
-                {
-                    let raw = strict_task_json(&tx, &mut old)?;
-                    let saved = Self::reconcile_offline_tx(&tx, &old, incoming, raw, now)?;
-                    tx.commit()?;
-                    return Ok(saved);
                 }
                 let mut next = incoming.clone();
                 let verified_delivery: bool = old.status == "Done" && tx.query_row(
@@ -2880,6 +2889,12 @@ impl V2Store {
                 "cannot open a decision for a terminal task".into(),
             ));
         }
+        let linked_unverified_delivery: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM post_merge_deliveries
+                           WHERE task_id=?1 AND decision_id=?2 AND state NOT IN ('verified','aborted'))",
+            params![task_id, decision_id],
+            |row| row.get(0),
+        )?;
         let seq_id = Self::insert_event_tx(
             &tx,
             task_id,
@@ -2892,6 +2907,7 @@ impl V2Store {
                 "question": question,
                 "options": options,
                 "recommended_option": recommended_option,
+                "linked_unverified_delivery": linked_unverified_delivery,
                 "sha": sha,
             }),
         )?;
@@ -3156,7 +3172,10 @@ impl V2Store {
                     ORDER BY seq_id DESC LIMIT 1),
                    (SELECT t.status FROM tasks t WHERE t.task_id=d.task_id
                     AND d.status='OPEN' AND lower(t.status) IN ('done','cancelled'))
-               ) AS retirement_reason
+               ) AS retirement_reason,
+               EXISTS(SELECT 1 FROM post_merge_deliveries p
+                      WHERE p.task_id=d.task_id AND p.decision_id=d.decision_id
+                      AND p.state NOT IN ('verified','aborted'))
         FROM pending_decisions d";
 
     fn get_decision_on(
@@ -4099,8 +4118,8 @@ impl V2Store {
             let board_status = board_statuses.get(&task.task_id).cloned();
             let open_decision_id = open_decisions
                 .iter()
-                .rev()
-                .find(|decision| decision.task_id == task.task_id)
+                .filter(|decision| decision.task_id == task.task_id)
+                .max_by_key(|decision| (decision.linked_unverified_delivery, decision.created_seq))
                 .map(|decision| decision.decision_id.clone());
 
             let target_files: Vec<String> = task
@@ -4299,6 +4318,7 @@ impl V2Store {
             choice: row.get(13)?,
             note: row.get(14)?,
             retirement_reason,
+            linked_unverified_delivery: row.get(16)?,
         })
     }
 
@@ -6334,6 +6354,22 @@ mod tests {
                     None,
                 )
                 .unwrap();
+            let unrelated = store
+                .open_decision(
+                    "newer",
+                    &task.task_id,
+                    &task.task_group,
+                    "failure",
+                    "Retry?",
+                    &["Retry stage".into()],
+                    None,
+                    "unrelated",
+                    None,
+                )
+                .unwrap();
+            assert!(original.linked_unverified_delivery);
+            assert!(!unrelated.linked_unverified_delivery);
+            assert!(unrelated.created_seq > original.created_seq);
             let cursor = store.max_seq_id().unwrap();
             drop(store);
             let mut store = V2Store::open(&db.0).unwrap();
@@ -6349,9 +6385,14 @@ mod tests {
                 assert_eq!(store.list_deliveries(None).unwrap(), vec![row.clone()]);
                 assert_eq!(
                     store.list_decisions(true, None).unwrap(),
-                    vec![original.clone()]
+                    vec![original.clone(), unrelated.clone()]
                 );
                 assert_eq!(store.board_statuses(None).unwrap()[&task.task_id], terminal);
+                let detail = store.detailed_status(None).unwrap();
+                assert_eq!(
+                    detail.waiting_tasks[0].open_decision_id.as_deref(),
+                    Some(id.as_str())
+                );
                 assert_eq!(store.max_seq_id().unwrap(), cursor);
             }
             row.state = "verified".into();

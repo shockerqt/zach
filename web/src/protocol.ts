@@ -48,6 +48,7 @@ export interface Decision {
   context_summary: string;
   status: string;
   choice?: string;
+  linked_unverified_delivery?: boolean;
 }
 export interface Snapshot {
   tasks: Task[];
@@ -98,6 +99,7 @@ export function decision(v: unknown, eventTask?: string): Decision {
         : string(o.context_summary),
     status: o.status == null ? "OPEN" : string(o.status),
     choice: optional(o.choice),
+    linked_unverified_delivery: o.linked_unverified_delivery === true,
   };
 }
 export function snapshot(v: unknown, requireStatus = false): Snapshot {

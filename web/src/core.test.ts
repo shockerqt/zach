@@ -8,6 +8,7 @@ import {
   mood,
   layers,
   taskLane,
+  taskDecision,
   observedStage,
 } from "./state";
 export const sampleTask = {
@@ -121,6 +122,35 @@ describe("authoritative replay projection", () => {
     expect(s.decisions).toHaveLength(0);
     expect(s.feed).toHaveLength(0);
     expect(s.cursor).toBe(2);
+  });
+  it("prefers the linked delivery gate over a newer decision in snapshots and live events", () => {
+    const linked = {
+      decision_id: "delivery",
+      task_id: sampleTask.task_id,
+      kind: "prod_promotion_approval",
+      question: "Promote?",
+      options: ["Approve", "Reject"],
+      linked_unverified_delivery: true,
+    };
+    const newer = {
+      ...linked,
+      decision_id: "newer",
+      question: "Retry?",
+      linked_unverified_delivery: false,
+    };
+    const fromSnapshot = acceptSnapshot(initial, snapshot({
+      ...snap,
+      open_decisions: [linked, newer],
+    }));
+    expect(taskDecision(fromSnapshot, fromSnapshot.tasks[0])?.decision_id).toBe("delivery");
+    let live = acceptSnapshot(initial, snapshot(snap));
+    live = applyEvent(live, ev(11, "DECISION_REQUIRED", linked));
+    live = applyEvent(live, ev(12, "DECISION_REQUIRED", newer));
+    expect(taskDecision(live, live.tasks[0])?.decision_id).toBe("delivery");
+    live = applyEvent(live, ev(13, "DECISION_RESOLVED", {
+      decision_id: linked.decision_id, choice: "Approve",
+    }));
+    expect(taskDecision(live, live.tasks[0])?.decision_id).toBe("newer");
   });
   it("keeps board and effective status independent through live retirement and replay", () => {
     const d = {
