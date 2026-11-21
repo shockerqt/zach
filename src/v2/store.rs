@@ -2302,8 +2302,11 @@ impl V2Store {
         {
             return Ok(true);
         }
+        let confirmed_terminal_history = task.memory.governance_terminal_observed
+            && matches!(task.status.as_str(), "Done" | "Cancelled");
         if attempts.iter().any(|a| {
-            !matches!(a.status.as_str(), "PASSED" | "FAILED")
+            !(matches!(a.status.as_str(), "PASSED" | "FAILED")
+                || (confirmed_terminal_history && a.status == "LOST"))
                 || (a.status == "PASSED"
                     && !task.memory.governance_terminal_observed
                     && !task.stages_completed.contains(&a.stage))
@@ -7585,5 +7588,50 @@ mod tests {
         let list = store.list_attempt_audits("ZACH-072").unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].attempt_id, "att-1");
+    }
+
+    #[test]
+    fn zach_080_startup_guard_accepts_lost_complete_only_for_confirmed_terminal_rows() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        let mut task = sample_task("GOV-066", "Done", vec![]);
+        task.executor = None;
+        task.active_attempt_id = None;
+        task.memory.governance_terminal_observed = true;
+        store.upsert_task(&task).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO stage_attempts(attempt_id,task_id,stage,model,effort,started_epoch,ended_epoch,status,phase) \
+                 VALUES('gov-066-plan-lost','GOV-066','plan','gemini-4-hydrogen-high','high',100,200,'LOST','COMPLETE')",
+            )
+            .unwrap();
+
+        // 1. Confirmed Done with LOST/COMPLETE historical attempt passes as closed history (not native-owned).
+        assert_eq!(store.native_startup_owned(&task).unwrap(), false);
+
+        // 2. Confirmed Cancelled with LOST/COMPLETE also passes as closed history.
+        task.status = "Cancelled".to_owned();
+        store.upsert_task(&task).unwrap();
+        assert_eq!(store.native_startup_owned(&task).unwrap(), false);
+
+        // 3. Same row without governance_terminal_observed still fails closed.
+        task.status = "Done".to_owned();
+        task.memory.governance_terminal_observed = false;
+        store.upsert_task(&task).unwrap();
+        let err = store.native_startup_owned(&task).unwrap_err();
+        assert!(
+            err.to_string().contains("ambiguous native startup history"),
+            "unexpected error: {err}"
+        );
+
+        // 4. Same row in Planning (even with governance_terminal_observed=true) still fails closed.
+        task.status = "Planning".to_owned();
+        task.memory.governance_terminal_observed = true;
+        store.upsert_task(&task).unwrap();
+        let err = store.native_startup_owned(&task).unwrap_err();
+        assert!(
+            err.to_string().contains("ambiguous native startup history"),
+            "unexpected error: {err}"
+        );
     }
 }
