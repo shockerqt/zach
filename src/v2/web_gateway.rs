@@ -2967,4 +2967,59 @@ mod tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn sse_forwards_session_announcement_and_claim_changed_events() {
+        let f = Fixture::new();
+        let backend = f.backend(|stream| {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+            assert_eq!(
+                command(&mut reader),
+                ClientCommand::Subscribe {
+                    group: Some(crate::v2::socket::SESSION_GROUP_NAME.into()),
+                    since_seq: Some(0),
+                    once: Some(false),
+                }
+            );
+            write_ndjson(
+                &mut writer,
+                &ServerMessage::Event {
+                    event: TaskEventRecord {
+                        seq_id: 42,
+                        task_id: "ZACH-079".into(),
+                        task_group: crate::v2::socket::SESSION_GROUP_NAME.into(),
+                        ts_epoch: 1_700_000_000,
+                        event_type: "SESSION_ANNOUNCEMENT".into(),
+                        payload: serde_json::json!({"holder":"abc123","intent":"implementing"}),
+                    },
+                },
+            )
+            .unwrap();
+            write_ndjson(
+                &mut writer,
+                &ServerMessage::Event {
+                    event: TaskEventRecord {
+                        seq_id: 43,
+                        task_id: "ZACH-079".into(),
+                        task_group: crate::v2::socket::SESSION_GROUP_NAME.into(),
+                        ts_epoch: 1_700_000_001,
+                        event_type: "CLAIM_CHANGED".into(),
+                        payload: serde_json::json!({"task_id":"ZACH-079","incoming_executor":"session"}),
+                    },
+                },
+            )
+            .unwrap();
+        });
+        let reply = read_all(f.request(
+            "GET",
+            "/api/events?since_seq=0&group=_sessions",
+            &f.auth(),
+            "",
+        ));
+        backend.join().unwrap();
+        assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
+        assert!(reply.contains("SESSION_ANNOUNCEMENT"), "{reply}");
+        assert!(reply.contains("CLAIM_CHANGED"), "{reply}");
+    }
 }
