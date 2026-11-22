@@ -975,45 +975,106 @@ fn run_v2_stage(args: &[String]) {
     let socket_path = flag_value(rest, "--socket")
         .map(PathBuf::from)
         .unwrap_or_else(default_socket_path);
-    let mut stream =
-        std::os::unix::net::UnixStream::connect(&socket_path).unwrap_or_else(|error| {
-            eprintln!("connect to zachd at {}: {error}", socket_path.display());
-            std::process::exit(1)
-        });
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+    let submit_stage = |wait_flag: bool| -> serde_json::Value {
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(&socket_path).unwrap_or_else(|error| {
+                eprintln!("connect to zachd at {}: {error}", socket_path.display());
+                std::process::exit(1)
+            });
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap_or_else(|error| {
+                eprintln!("stage run socket timeout: {error}");
+                std::process::exit(1)
+            });
+        write_ndjson(
+            &mut stream,
+            &ClientCommand::StageRun {
+                task: task.clone(),
+                stage: stage.clone(),
+                wait: wait_flag,
+            },
+        )
         .unwrap_or_else(|error| {
-            eprintln!("stage run socket timeout: {error}");
+            eprintln!("submit stage run: {error}");
             std::process::exit(1)
         });
-    write_ndjson(
-        &mut stream,
-        &ClientCommand::StageRun {
-            task: task.clone(),
-            stage: stage.clone(),
-            wait,
-        },
-    )
-    .unwrap_or_else(|error| {
-        eprintln!("submit stage run: {error}");
-        std::process::exit(1)
-    });
-    use std::io::BufRead;
-    let mut line = String::new();
-    std::io::BufReader::new(stream)
-        .read_line(&mut line)
+        use std::io::BufRead;
+        let mut line = String::new();
+        std::io::BufReader::new(stream)
+            .read_line(&mut line)
+            .unwrap_or_else(|error| {
+                eprintln!("stage run acknowledgment: {error}");
+                std::process::exit(1)
+            });
+        serde_json::from_str(&line).unwrap_or_else(|error| {
+            eprintln!("invalid daemon acknowledgment: {error}");
+            std::process::exit(1)
+        })
+    };
+
+    let mut reply = submit_stage(wait);
+    if wait
+        && reply["type"] != "ERROR"
+        && reply["ok"] == serde_json::Value::Bool(true)
+        && reply["status"].as_str() == Some("ACCEPTED")
+    {
+        let mut sub_stream =
+            std::os::unix::net::UnixStream::connect(&socket_path).unwrap_or_else(|error| {
+                eprintln!(
+                    "connect to zachd for wait at {}: {error}",
+                    socket_path.display()
+                );
+                std::process::exit(1)
+            });
+        write_ndjson(
+            &mut sub_stream,
+            &ClientCommand::Subscribe {
+                group: None,
+                since_seq: Some(0),
+                once: Some(false),
+            },
+        )
         .unwrap_or_else(|error| {
-            eprintln!("stage run acknowledgment: {error}");
+            eprintln!("subscribe for stage run wait: {error}");
             std::process::exit(1)
         });
-    let reply: serde_json::Value = serde_json::from_str(&line).unwrap_or_else(|error| {
-        eprintln!("invalid daemon acknowledgment: {error}");
-        std::process::exit(1)
-    });
+        use std::io::BufRead;
+        let mut reader = std::io::BufReader::new(sub_stream);
+        loop {
+            let mut ev_line = String::new();
+            match reader.read_line(&mut ev_line) {
+                Ok(0) => {
+                    eprintln!("zachd closed event stream before stage '{stage}' finished");
+                    std::process::exit(1);
+                }
+                Ok(_) => {
+                    let trimmed = ev_line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed)
+                        && v["type"] == "EVENT"
+                        && v["event"]["event_type"] == "STAGE_RUN_FINISHED"
+                        && v["event"]["task_id"] == task
+                        && v["event"]["payload"]["stage"] == stage
+                    {
+                        reply = submit_stage(false);
+                        break;
+                    }
+                }
+                Err(error) => {
+                    eprintln!("waiting for stage run result failed: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
     if json_out {
         println!(
             "{}",
-            serde_json::to_string_pretty(&reply).unwrap_or_else(|_| line.trim().to_owned())
+            serde_json::to_string_pretty(&reply).unwrap_or_default()
         );
     } else {
         println!(
@@ -1023,7 +1084,11 @@ fn run_v2_stage(args: &[String]) {
             reply["status"].as_str().unwrap_or("UNKNOWN")
         );
     }
-    if reply["type"] == "ERROR" || reply["ok"] == serde_json::Value::Bool(false) {
+    let final_status = reply["status"].as_str().unwrap_or("");
+    if reply["type"] == "ERROR"
+        || reply["ok"] == serde_json::Value::Bool(false)
+        || (wait && final_status != "PASSED")
+    {
         std::process::exit(1);
     }
 }

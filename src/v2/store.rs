@@ -77,6 +77,20 @@ pub enum SyncMode {
     ReconcileFinishedLegacy,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StageRunGrant {
+    pub stage: String,
+    pub granted_epoch: i64,
+    #[serde(default)]
+    pub consumed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_attempt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_summary: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct TaskMemory {
     /// An authoritative Governance export observed a terminal task. Local
@@ -105,6 +119,8 @@ pub struct TaskMemory {
     pub retry_generation: u64,
     #[serde(default)]
     pub pipeline_checkpoint: Option<PipelineCheckpoint>,
+    #[serde(default)]
+    pub stage_run_grant: Option<StageRunGrant>,
     #[serde(default)]
     pub merge_checkpoint: Option<MergeCheckpoint>,
     #[serde(default)]
@@ -355,6 +371,29 @@ pub struct TaskRecord {
     pub memory: TaskMemory,
     pub version: i64,
     pub updated_epoch: i64,
+}
+
+impl TaskRecord {
+    pub fn has_active_stage_grant(&self) -> bool {
+        self.memory
+            .stage_run_grant
+            .as_ref()
+            .is_some_and(|g| !g.consumed)
+    }
+
+    pub fn has_any_execution_grant(&self) -> bool {
+        self.autonomous_consent || self.has_active_stage_grant()
+    }
+
+    pub fn has_execution_grant_for(&self, stage: Option<&str>) -> bool {
+        if self.autonomous_consent {
+            return true;
+        }
+        self.memory
+            .stage_run_grant
+            .as_ref()
+            .is_some_and(|g| !g.consumed && stage.is_none_or(|s| s == g.stage))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2862,8 +2901,17 @@ impl V2Store {
             {
                 continue;
             }
-            if task.status != "Ready"
-                || !task.autonomous_consent
+            let has_active_grant = task.has_active_stage_grant();
+            let status_eligible = task.status == "Ready"
+                || (has_active_grant
+                    && matches!(
+                        task.status.as_str(),
+                        "Planning" | "Plan Review" | "In Progress" | "PR Review"
+                    )
+                    && task.active_attempt_id.is_none()
+                    && task.memory.pipeline_checkpoint.is_none());
+            if !status_eligible
+                || !task.has_any_execution_grant()
                 || task.next_retry_epoch > now_epoch()
                 || self.has_pending_lifecycle(&task.task_id)?
             {

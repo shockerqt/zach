@@ -117,6 +117,9 @@ pub fn schedule_scoped_dispatches(
         let Some(stage) = determine_next_stage(&task) else {
             continue;
         };
+        if !task.has_execution_grant_for(Some(&stage)) {
+            continue;
+        }
         let author_stage = match stage.as_str() {
             "plan-review" => Some("plan"),
             "pr-review" => Some("impl"),

@@ -632,7 +632,7 @@ impl Coordinator {
             }
             if op.state == "FAILED" {
                 let task = self.task(&op.task_id)?;
-                if task.autonomous_consent
+                if task.has_any_execution_grant()
                     && !task.memory.halt_requested
                     && !matches!(task.status.as_str(), "Done" | "Cancelled")
                 {
@@ -1030,7 +1030,8 @@ impl Coordinator {
                         )),
                     }]);
                 }
-                let Some(record) = self.store.get_task(&task).map_err(|e| e.to_string())? else {
+                let Some(mut record) = self.store.get_task(&task).map_err(|e| e.to_string())?
+                else {
                     return Ok(vec![ServerMessage::StageRunResult {
                         ok: false,
                         task_id: task.clone(),
@@ -1042,38 +1043,115 @@ impl Coordinator {
                         error: Some(format!("task not found: {task}")),
                     }]);
                 };
-                if !record.autonomous_consent {
+                if matches!(record.status.as_str(), "Done" | "Cancelled") {
                     return Ok(vec![ServerMessage::StageRunResult {
                         ok: false,
                         task_id: task.clone(),
                         stage,
-                        status: "BLOCKED".to_owned(),
+                        status: "REJECTED".to_owned(),
                         attempt_id: record.active_attempt_id.clone(),
                         summary: None,
                         stage_receipt: None,
                         error: Some(format!(
-                            "task {task} does not have autonomous_consent enabled"
+                            "task {task} is already terminal ({})",
+                            record.status
                         )),
                     }]);
                 }
-                self.scope = Some((Some(task.clone()), None));
-                let receipt = record.active_attempt_id.as_deref().and_then(|aid| {
-                    let p = self
-                        .state_dir
-                        .join("attempts")
-                        .join(aid)
-                        .join("stage-receipt.json");
-                    std::fs::read_to_string(p)
-                        .ok()
-                        .and_then(|s| serde_json::from_str::<runner::StageReceiptV1>(&s).ok())
+                let state_dir = self.state_dir.clone();
+                let load_receipt = |aid: Option<&str>| {
+                    aid.and_then(|id| {
+                        let p = state_dir
+                            .join("attempts")
+                            .join(id)
+                            .join("stage-receipt.json");
+                        std::fs::read_to_string(p)
+                            .ok()
+                            .and_then(|s| serde_json::from_str::<runner::StageReceiptV1>(&s).ok())
+                    })
+                };
+                // Re-attach to an already-consumed (terminal) or in-flight grant for this stage.
+                if let Some(existing) = record.memory.stage_run_grant.as_ref()
+                    && existing.stage == stage
+                {
+                    if existing.consumed {
+                        let term_status = existing
+                            .terminal_status
+                            .clone()
+                            .unwrap_or_else(|| "COMPLETED".to_owned());
+                        let ok = term_status == "PASSED";
+                        let receipt = load_receipt(existing.terminal_attempt_id.as_deref());
+                        return Ok(vec![ServerMessage::StageRunResult {
+                            ok,
+                            task_id: task,
+                            stage,
+                            status: term_status,
+                            attempt_id: existing.terminal_attempt_id.clone(),
+                            summary: existing.terminal_summary.clone(),
+                            stage_receipt: receipt,
+                            error: if ok {
+                                None
+                            } else {
+                                existing.terminal_summary.clone()
+                            },
+                        }]);
+                    }
+                    let receipt = load_receipt(record.active_attempt_id.as_deref());
+                    return Ok(vec![ServerMessage::StageRunResult {
+                        ok: true,
+                        task_id: task,
+                        stage,
+                        status: "ACCEPTED".to_owned(),
+                        attempt_id: record.active_attempt_id.clone(),
+                        summary: Some("delegated stage grant already active".to_owned()),
+                        stage_receipt: receipt,
+                        error: None,
+                    }]);
+                }
+                let next_expected = scheduler::determine_next_stage(&record);
+                if next_expected.as_deref() != Some(stage.as_str()) {
+                    return Ok(vec![ServerMessage::StageRunResult {
+                        ok: false,
+                        task_id: task.clone(),
+                        stage: stage.clone(),
+                        status: "REJECTED".to_owned(),
+                        attempt_id: record.active_attempt_id.clone(),
+                        summary: None,
+                        stage_receipt: None,
+                        error: Some(format!(
+                            "stage '{stage}' is not the next eligible stage for {task} (next={})",
+                            next_expected.as_deref().unwrap_or("none")
+                        )),
+                    }]);
+                }
+                record.memory.stage_run_grant = Some(crate::v2::store::StageRunGrant {
+                    stage: stage.clone(),
+                    granted_epoch: now_epoch(),
+                    consumed: false,
+                    terminal_status: None,
+                    terminal_attempt_id: None,
+                    terminal_summary: None,
                 });
+                self.store.upsert_task(&record).map_err(|e| e.to_string())?;
+                self.invalidate_tasks_cache();
+                let _ = self.store.append_event(
+                    &record.task_id,
+                    &record.task_group,
+                    "STAGE_RUN_GRANTED",
+                    &serde_json::json!({
+                        "task_id": record.task_id,
+                        "stage": stage,
+                        "autonomous_consent": record.autonomous_consent,
+                    }),
+                );
+                let receipt = load_receipt(record.active_attempt_id.as_deref());
                 vec![ServerMessage::StageRunResult {
                     ok: true,
                     task_id: task,
                     stage,
                     status: "ACCEPTED".to_owned(),
                     attempt_id: record.active_attempt_id,
-                    summary: Some("delegated stage admitted to zachd".to_owned()),
+                    summary: Some("single-stage grant persisted".to_owned()),
                     stage_receipt: receipt,
                     error: None,
                 }]
@@ -1476,7 +1554,7 @@ impl Coordinator {
                 task = recovered;
             }
             if !matches!(task.status.as_str(), "Done" | "Cancelled")
-                && task.autonomous_consent
+                && task.has_any_execution_grant()
                 && !task.memory.halt_requested
             {
                 continue;
@@ -1720,7 +1798,7 @@ impl Coordinator {
 
     fn resume_pipeline_steps(&mut self) -> Result<(), String> {
         for task in self.list_all_tasks_cached()? {
-            if !task.autonomous_consent
+            if !task.has_execution_grant_for(task.current_stage.as_deref())
                 || matches!(task.status.as_str(), "Done" | "Cancelled" | "Blocked")
             {
                 continue;
@@ -2217,7 +2295,7 @@ impl Coordinator {
                     .pipeline_checkpoint
                     .as_ref()
                     .is_none_or(|c| c.attempt_id != manifest.attempt_id)
-                    || !task.autonomous_consent
+                    || !task.has_execution_grant_for(Some(&manifest.route.stage))
                     || matches!(task.status.as_str(), "Done" | "Cancelled" | "Blocked")
                 {
                     resources.cleanup_after_stop()?;
@@ -2422,7 +2500,7 @@ impl Coordinator {
                 self.attached.remove(&id);
                 self.manifests.remove(&id);
                 let mut task = self.task(&attempt.task_id)?;
-                if !task.autonomous_consent
+                if !task.has_execution_grant_for(Some(&attempt.stage))
                     || task.memory.halt_requested
                     || matches!(task.status.as_str(), "Done" | "Cancelled")
                 {
@@ -2465,7 +2543,7 @@ impl Coordinator {
                 {
                     return Ok(());
                 }
-                if !current.autonomous_consent
+                if !current.has_execution_grant_for(current.current_stage.as_deref())
                     || current.memory.halt_requested
                     || matches!(current.status.as_str(), "Done" | "Cancelled")
                 {
@@ -2584,7 +2662,7 @@ impl Coordinator {
         }
         let force_reason = if identity_conflict {
             Some("InvocationID identity conflict".to_owned())
-        } else if !task.autonomous_consent
+        } else if !task.has_execution_grant_for(Some(&attempt.stage))
             || task.memory.halt_requested
             || matches!(task.status.as_str(), "Done" | "Cancelled")
         {
@@ -2718,7 +2796,31 @@ impl Coordinator {
     }
 
     fn quarantine_task(&mut self, id: &str, error: &str) -> Result<(), String> {
-        let task = self.task(id)?;
+        let mut task = self.task(id)?;
+        if let Some(grant) = task.memory.stage_run_grant.as_mut()
+            && !grant.consumed
+        {
+            grant.consumed = true;
+            grant.terminal_status = Some("BLOCKED".to_owned());
+            grant.terminal_attempt_id = task.active_attempt_id.clone();
+            grant.terminal_summary = Some(error.to_owned());
+            let stage = grant.stage.clone();
+            let attempt_id = grant.terminal_attempt_id.clone();
+            self.store.upsert_task(&task).map_err(|e| e.to_string())?;
+            self.invalidate_tasks_cache();
+            let _ = self.store.append_event(
+                &task.task_id,
+                &task.task_group,
+                "STAGE_RUN_FINISHED",
+                &serde_json::json!({
+                    "task_id": task.task_id,
+                    "stage": stage,
+                    "status": "BLOCKED",
+                    "attempt_id": attempt_id,
+                    "summary": error,
+                }),
+            );
+        }
         self.store
             .open_decision(
                 &format!(
@@ -3028,7 +3130,10 @@ impl Coordinator {
                 .args
                 .windows(2)
                 .any(|args| args[0] == "--verdict" && args[1] == "CHANGES_REQUESTED");
-        Ok(task.autonomous_consent
+        let has_grant = task.autonomous_consent
+            || (op.kind == "start" && task.has_active_stage_grant())
+            || task.has_execution_grant_for(Some(&op.kind));
+        Ok(has_grant
             && (!task.memory.halt_requested || negative_human)
             && task.status != "Cancelled"
             && (task.status != "Done" || (op.kind == "close" && self.delivery_verified(task)?)))
@@ -3390,8 +3495,11 @@ impl Coordinator {
             self.invalidate_tasks_cache();
             return Ok(());
         }
+        let has_op_grant = task.autonomous_consent
+            || (op.kind == "start" && task.has_active_stage_grant())
+            || task.has_execution_grant_for(Some(&op.kind));
         if op.kind != "close"
-            && (!task.autonomous_consent
+            && (!has_op_grant
                 || task.memory.halt_requested
                 || matches!(task.status.as_str(), "Done" | "Cancelled"))
         {
@@ -3565,22 +3673,55 @@ impl Coordinator {
                     .pipeline_checkpoint
                     .clone()
                     .ok_or("publication missing pipeline checkpoint")?;
-                if cp.operation == "PUBLISH_CHANGES_REQUESTED" {
+                let outcome_status = if cp.operation == "PUBLISH_CHANGES_REQUESTED" {
                     self.review_rework(&mut task, stage)?;
+                    "CHANGES_REQUESTED"
                 } else {
                     if !task.stages_completed.iter().any(|s| s == stage) {
                         task.stages_completed.push(stage.into());
                     }
                     task.status = "Ready".into();
-                }
-                completed_attempt = Some(cp.attempt_id);
+                    "PASSED"
+                };
+                completed_attempt = Some(cp.attempt_id.clone());
                 task.active_attempt_id = None;
                 task.memory.pipeline_checkpoint = None;
+                if let Some(grant) = task.memory.stage_run_grant.as_mut()
+                    && !grant.consumed
+                    && grant.stage == stage
+                {
+                    grant.consumed = true;
+                    grant.terminal_status = Some(outcome_status.to_owned());
+                    grant.terminal_attempt_id = Some(cp.attempt_id.clone());
+                    grant.terminal_summary = Some(format!(
+                        "stage {stage} finished with status {outcome_status}"
+                    ));
+                }
             }
         }
+        let finished_grant = task
+            .memory
+            .stage_run_grant
+            .as_ref()
+            .filter(|g| g.consumed && g.stage == op.kind)
+            .cloned();
         self.store
             .acknowledge_lifecycle(&task, &op, completed_attempt.as_deref())
             .map_err(|e| e.to_string())?;
+        if let Some(grant) = finished_grant {
+            let _ = self.store.append_event(
+                &task.task_id,
+                &task.task_group,
+                "STAGE_RUN_FINISHED",
+                &serde_json::json!({
+                    "task_id": task.task_id,
+                    "stage": grant.stage,
+                    "status": grant.terminal_status.unwrap_or_else(|| "COMPLETED".to_owned()),
+                    "attempt_id": grant.terminal_attempt_id,
+                    "summary": grant.terminal_summary,
+                }),
+            );
+        }
         if op.kind == "close" || task.status == "Blocked" {
             self.emit_task_audit_digest(&task.task_id)?;
         }
@@ -12800,5 +12941,149 @@ mod tests {
         assert!(done_digest.check_divergence);
         assert_eq!(done_digest.tool_error_count, 1);
         assert_eq!(done_digest.edit_compile_fail_loops, 1);
+    }
+
+    #[test]
+    fn stage_run_grant_executes_single_stage_and_stops_before_next() {
+        let dir = std::env::temp_dir().join(format!("zach-stage-run-grant-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = coordinator(&dir);
+        let mut t = task("ZACH-081-T1");
+        t.weight = "M".into();
+        t.status = "Ready".into();
+        t.autonomous_consent = false;
+        t.memory.governance_started = true;
+        t.required_stages = vec![
+            "plan".into(),
+            "plan-review".into(),
+            "impl".into(),
+            "pr-review".into(),
+        ];
+        c.store.upsert_task(&t).unwrap();
+
+        // 1. Without autonomous_consent and without a stage grant, scheduler dispatches nothing.
+        assert!(
+            scheduler::schedule_scoped_dispatches(&mut c.store, None, None)
+                .unwrap()
+                .is_empty()
+        );
+
+        // 2. Requesting a non-next stage ('impl' before 'plan') is rejected fail-closed.
+        let rejected = c
+            .socket_command(ClientCommand::StageRun {
+                task: "ZACH-081-T1".into(),
+                stage: "impl".into(),
+                wait: true,
+            })
+            .unwrap();
+        match &rejected[0] {
+            ServerMessage::StageRunResult { ok, status, .. } => {
+                assert!(!ok);
+                assert_eq!(status, "REJECTED");
+            }
+            other => panic!("expected REJECTED StageRunResult, got {other:?}"),
+        }
+
+        // 3. StageRun for 'plan' succeeds WITHOUT global autonomous_consent and WITHOUT mutating self.scope.
+        assert!(c.scope.is_none());
+        let admitted = c
+            .socket_command(ClientCommand::StageRun {
+                task: "ZACH-081-T1".into(),
+                stage: "plan".into(),
+                wait: true,
+            })
+            .unwrap();
+        assert!(
+            c.scope.is_none(),
+            "StageRun must not mutate coordinator.scope"
+        );
+        match &admitted[0] {
+            ServerMessage::StageRunResult { ok, status, .. } => {
+                assert!(ok);
+                assert_eq!(status, "ACCEPTED");
+            }
+            other => panic!("expected ACCEPTED StageRunResult, got {other:?}"),
+        }
+
+        // 4. Scheduler now dispatches ONLY 'plan'.
+        let dispatches = scheduler::schedule_scoped_dispatches(&mut c.store, None, None).unwrap();
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(dispatches[0].task_id, "ZACH-081-T1");
+        assert_eq!(dispatches[0].stage, "plan");
+
+        // 5. Simulate 'plan' publication completing via lifecycle_ack.
+        let mut live = c.task("ZACH-081-T1").unwrap();
+        live.current_stage = Some("plan".into());
+        live.active_attempt_id = Some("att-plan-081".into());
+        live.memory.pipeline_checkpoint = Some(PipelineCheckpoint {
+            attempt_id: "att-plan-081".into(),
+            operation: "PUBLISH".into(),
+        });
+        c.store
+            .checkpoint_with_lifecycle(
+                &live,
+                &LifecycleOperation {
+                    attempt_id: Some("att-plan-081".into()),
+                    decision_id: None,
+                    operation_id: "pub-plan-081".into(),
+                    task_id: "ZACH-081-T1".into(),
+                    kind: "plan".into(),
+                    args: vec!["stage".into(), "ZACH-081-T1".into(), "plan".into()],
+                    body_path: None,
+                    depends_on: None,
+                    state: "DISPATCHED".into(),
+                    retry_epoch: 0,
+                    attempts: 1,
+                    last_error: None,
+                },
+            )
+            .unwrap();
+        c.lifecycle_ack(
+            "pub-plan-081",
+            r#"{"task_id":"ZACH-081-T1","stage":"plan","weight":"M"}"#,
+        )
+        .unwrap();
+
+        // 6. Grant is now consumed, STAGE_RUN_FINISHED was emitted, and 'plan' is completed.
+        let after = c.task("ZACH-081-T1").unwrap();
+        assert!(after.stages_completed.iter().any(|s| s == "plan"));
+        let grant = after.memory.stage_run_grant.as_ref().unwrap();
+        assert!(grant.consumed);
+        assert_eq!(grant.terminal_status.as_deref(), Some("PASSED"));
+        assert_eq!(grant.terminal_attempt_id.as_deref(), Some("att-plan-081"));
+        let events = c.store.list_task_events("ZACH-081-T1").unwrap();
+        assert!(events.iter().any(|e| e.event_type == "STAGE_RUN_GRANTED"));
+        assert!(events.iter().any(|e| e.event_type == "STAGE_RUN_FINISHED"));
+
+        // 7. Re-attaching via StageRun returns the durable terminal PASSED result.
+        let reattached = c
+            .socket_command(ClientCommand::StageRun {
+                task: "ZACH-081-T1".into(),
+                stage: "plan".into(),
+                wait: true,
+            })
+            .unwrap();
+        match &reattached[0] {
+            ServerMessage::StageRunResult {
+                ok,
+                status,
+                attempt_id,
+                ..
+            } => {
+                assert!(ok);
+                assert_eq!(status, "PASSED");
+                assert_eq!(attempt_id.as_deref(), Some("att-plan-081"));
+            }
+            other => panic!("expected terminal PASSED StageRunResult, got {other:?}"),
+        }
+
+        // 8. Subsequent scheduler ticks MUST NOT dispatch 'plan-review' (daemon stops after requested stage).
+        assert!(
+            scheduler::schedule_scoped_dispatches(&mut c.store, None, None)
+                .unwrap()
+                .is_empty(),
+            "daemon must stop after the single granted stage and never dispatch plan-review"
+        );
     }
 }
