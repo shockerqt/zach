@@ -59,6 +59,8 @@ fn main() {
         "cooldown" => run_v2_cooldown(&args[2..]),
         "run" => run_v2_run(&args[2..]),
         "stage" => run_v2_stage(&args[2..]),
+        "announce" => run_v2_announce(&args[2..]),
+        "sessions" => run_v2_sessions(&args[2..]),
         "daemon" | "zachd" => run_v2_daemon(&args[2..]),
         "attach" => run_v2_attach(&args[2..]),
         "events" => run_v2_events(&args[2..]),
@@ -1026,6 +1028,216 @@ fn run_v2_stage(args: &[String]) {
     }
 }
 
+fn run_v2_announce(args: &[String]) {
+    let Some(intent) = flag_value(args, "--intent") else {
+        eprintln!(
+            "zach announce requires --intent <starting|planning|implementing|reviewing|merging|handoff|idle|done|blocked|heartbeat>"
+        );
+        std::process::exit(2);
+    };
+    let holder = flag_value(args, "--holder");
+    let executor = flag_value(args, "--executor");
+    let actor = flag_value(args, "--actor");
+    let task_id = flag_value(args, "--task");
+    let repo = flag_value(args, "--repo");
+    let stage = flag_value(args, "--stage");
+    let note = flag_value(args, "--note");
+    let ttl_secs = flag_value(args, "--ttl").map(|raw| {
+        raw.parse::<i64>().unwrap_or_else(|_| {
+            eprintln!("invalid --ttl value '{raw}': expected integer seconds");
+            std::process::exit(2);
+        })
+    });
+    let json_out = has_flag(args, "--json");
+    let socket_path = flag_value(args, "--socket")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_socket_path);
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(&socket_path).unwrap_or_else(|error| {
+            eprintln!(
+                "zachd is offline or unreachable at {}: {error}",
+                socket_path.display()
+            );
+            std::process::exit(1)
+        });
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+    write_ndjson(
+        &mut stream,
+        &ClientCommand::Announce {
+            holder,
+            executor,
+            actor,
+            intent,
+            task_id,
+            repo,
+            stage,
+            note,
+            ttl_secs,
+        },
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("send announce command: {error}");
+        std::process::exit(1)
+    });
+    use std::io::BufRead;
+    let mut line = String::new();
+    std::io::BufReader::new(stream)
+        .read_line(&mut line)
+        .unwrap_or_else(|error| {
+            eprintln!("read announce response: {error}");
+            std::process::exit(1)
+        });
+    let reply: serde_json::Value = serde_json::from_str(&line).unwrap_or_else(|error| {
+        eprintln!("invalid daemon response: {error}");
+        std::process::exit(1)
+    });
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&reply).unwrap_or_else(|_| line.trim().to_owned())
+        );
+    } else if reply["type"] == "ERROR" {
+        eprintln!(
+            "announce rejected: {}",
+            reply["error"].as_str().unwrap_or("unknown error")
+        );
+    } else {
+        println!(
+            "announced seq={} holder={} intent={}",
+            reply["seq_id"].as_i64().unwrap_or(0),
+            reply["announcement"]["holder"].as_str().unwrap_or("?"),
+            reply["announcement"]["intent"].as_str().unwrap_or("?"),
+        );
+    }
+    if reply["type"] == "ERROR" || reply["ok"] == serde_json::Value::Bool(false) {
+        std::process::exit(1);
+    }
+}
+
+fn run_v2_sessions(args: &[String]) {
+    let include_stale = has_flag(args, "--all");
+    let follow = has_flag(args, "--follow");
+    let json_out = has_flag(args, "--json");
+    let socket_path = flag_value(args, "--socket")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_socket_path);
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(&socket_path).unwrap_or_else(|error| {
+            eprintln!(
+                "zachd is offline or unreachable at {}: {error}",
+                socket_path.display()
+            );
+            std::process::exit(1)
+        });
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+    write_ndjson(&mut stream, &ClientCommand::Sessions { include_stale }).unwrap_or_else(|error| {
+        eprintln!("send sessions command: {error}");
+        std::process::exit(1)
+    });
+    use std::io::BufRead;
+    let mut line = String::new();
+    std::io::BufReader::new(stream)
+        .read_line(&mut line)
+        .unwrap_or_else(|error| {
+            eprintln!("read sessions response: {error}");
+            std::process::exit(1)
+        });
+    let reply: serde_json::Value = serde_json::from_str(&line).unwrap_or_else(|error| {
+        eprintln!("invalid daemon response: {error}");
+        std::process::exit(1)
+    });
+    if reply["type"] == "ERROR" {
+        eprintln!(
+            "sessions error: {}",
+            reply["error"].as_str().unwrap_or("unknown error")
+        );
+        std::process::exit(1);
+    }
+    let as_of_seq = reply["as_of_seq"].as_i64().unwrap_or(0);
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&reply).unwrap_or_else(|_| line.trim().to_owned())
+        );
+    } else if let Some(arr) = reply["sessions"].as_array() {
+        if arr.is_empty() {
+            println!("No active sessions on zachd.");
+        } else {
+            println!(
+                "{:<16} {:<12} {:<13} {:<10} {:<14} NOTE",
+                "HOLDER", "ACTOR", "INTENT", "TASK", "REPO"
+            );
+            for s in arr {
+                println!(
+                    "{:<16} {:<12} {:<13} {:<10} {:<14} {}",
+                    s["holder"].as_str().unwrap_or("?"),
+                    s["actor"].as_str().unwrap_or("?"),
+                    s["intent"].as_str().unwrap_or("?"),
+                    s["task_id"].as_str().unwrap_or("-"),
+                    s["repo"].as_str().unwrap_or("-"),
+                    s["note"].as_str().unwrap_or(""),
+                );
+            }
+        }
+    }
+    if !follow {
+        return;
+    }
+    let mut sub_stream =
+        std::os::unix::net::UnixStream::connect(&socket_path).unwrap_or_else(|error| {
+            eprintln!(
+                "zachd is offline or unreachable at {}: {error}",
+                socket_path.display()
+            );
+            std::process::exit(1)
+        });
+    write_ndjson(
+        &mut sub_stream,
+        &ClientCommand::Subscribe {
+            group: Some(zach::v2::socket::SESSION_GROUP_NAME.to_owned()),
+            since_seq: Some(as_of_seq),
+            once: Some(false),
+        },
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("subscribe to _sessions: {error}");
+        std::process::exit(1)
+    });
+    let mut reader = std::io::BufReader::new(sub_stream);
+    loop {
+        let mut ev_line = String::new();
+        match reader.read_line(&mut ev_line) {
+            Ok(0) => break,
+            Ok(_) => {
+                let trimmed = ev_line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if json_out {
+                    println!("{trimmed}");
+                } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed)
+                    && v["type"] == "EVENT"
+                {
+                    let ev = &v["event"];
+                    println!(
+                        "seq={} {} task={} payload={}",
+                        ev["seq_id"].as_i64().unwrap_or(0),
+                        ev["event_type"].as_str().unwrap_or("?"),
+                        ev["task_id"].as_str().unwrap_or("-"),
+                        ev["payload"],
+                    );
+                }
+            }
+            Err(error) => {
+                eprintln!("sessions stream closed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
 fn run_v2_run(args: &[String]) {
     let dry_run = has_flag(args, "--dry-run");
     if !dry_run {
@@ -1694,6 +1906,10 @@ fn print_usage() {
     println!(
         "       zach stage run --task <TASK_ID> --stage <plan|plan-review|impl|pr-review> [--wait] [--json] [--socket <PATH>]"
     );
+    println!(
+        "       zach announce --intent <INTENT> [--task <TASK_ID>] [--repo <REPO>] [--stage <STAGE>] [--note <NOTE>] [--ttl <SECS>] [--json] [--socket <PATH>]"
+    );
+    println!("       zach sessions [--all] [--follow] [--json] [--socket <PATH>]");
     println!("       zach doctor [--json] [--worktree <PATH>]");
     println!(
         "       zach daemon [--socket <PATH>] [--db <PATH>] [--once] [--web] [--web-port <PORT>] [--web-bind <IP:PORT>]"

@@ -1935,11 +1935,55 @@ impl V2Store {
                     "SELECT EXISTS(SELECT 1 FROM lifecycle_ops WHERE task_id=?1 AND state='DISPATCHED')",
                     [&old.task_id], |row| row.get::<_, bool>(0),
                 )? {
+                    let foreign_executor = incoming.executor.as_deref().filter(|executor| {
+                        !executor.trim().is_empty() && !executor.eq_ignore_ascii_case("zach")
+                    });
                     let mut next = old.clone();
-                    next.autonomous_consent &= incoming.autonomous_consent
-                        && !incoming.executor.as_deref().is_some_and(|executor| {
-                            !executor.trim().is_empty() && !executor.eq_ignore_ascii_case("zach")
-                        });
+                    next.autonomous_consent &= incoming.autonomous_consent && foreign_executor.is_none();
+                    if let Some(foreign) = foreign_executor {
+                        if old.autonomous_consent
+                            || old.active_attempt_id.is_some()
+                            || old
+                                .executor
+                                .as_deref()
+                                .is_some_and(|e| e.eq_ignore_ascii_case("zach"))
+                        {
+                            let payload = serde_json::json!({
+                                "task_id": old.task_id,
+                                "previous_executor": old.executor,
+                                "incoming_executor": foreign,
+                                "active_attempt_id": old.active_attempt_id,
+                            });
+                            Self::insert_event_tx(
+                                &tx,
+                                &old.task_id,
+                                &old.task_group,
+                                now,
+                                "CLAIM_CONFLICT_OBSERVED",
+                                &payload,
+                            )?;
+                            Self::insert_event_tx(
+                                &tx,
+                                &old.task_id,
+                                crate::v2::socket::SESSION_GROUP_NAME,
+                                now,
+                                "CLAIM_CHANGED",
+                                &payload,
+                            )?;
+                        }
+                    } else if old.autonomous_consent && !incoming.autonomous_consent {
+                        Self::insert_event_tx(
+                            &tx,
+                            &old.task_id,
+                            &old.task_group,
+                            now,
+                            "CONSENT_REVOKED_EXTERNALLY",
+                            &serde_json::json!({
+                                "task_id": old.task_id,
+                                "active_attempt_id": old.active_attempt_id,
+                            }),
+                        )?;
+                    }
                     if next.autonomous_consent != old.autonomous_consent {
                         old = Self::update_task_tx(&tx, &old, &next, now)?;
                     }
@@ -1988,10 +2032,50 @@ impl V2Store {
                     next.reviewed_sha = old.reviewed_sha.clone();
                     next.pr_number = old.pr_number;
                     next.executor = old.executor.clone();
-                    if incoming.executor.as_deref().is_some_and(|executor| {
+                    let foreign_executor = incoming.executor.as_deref().filter(|executor| {
                         !executor.trim().is_empty() && !executor.eq_ignore_ascii_case("zach")
-                    }) {
+                    });
+                    if let Some(foreign) = foreign_executor {
                         next.autonomous_consent = false;
+                        if old.active_attempt_id.is_some() {
+                            let payload = serde_json::json!({
+                                "task_id": old.task_id,
+                                "previous_executor": old.executor,
+                                "incoming_executor": foreign,
+                                "active_attempt_id": old.active_attempt_id,
+                            });
+                            Self::insert_event_tx(
+                                &tx,
+                                &old.task_id,
+                                &old.task_group,
+                                now,
+                                "CLAIM_CONFLICT_OBSERVED",
+                                &payload,
+                            )?;
+                            Self::insert_event_tx(
+                                &tx,
+                                &old.task_id,
+                                crate::v2::socket::SESSION_GROUP_NAME,
+                                now,
+                                "CLAIM_CHANGED",
+                                &payload,
+                            )?;
+                        }
+                    } else if old.active_attempt_id.is_some()
+                        && old.autonomous_consent
+                        && !incoming.autonomous_consent
+                    {
+                        Self::insert_event_tx(
+                            &tx,
+                            &old.task_id,
+                            &old.task_group,
+                            now,
+                            "CONSENT_REVOKED_EXTERNALLY",
+                            &serde_json::json!({
+                                "task_id": old.task_id,
+                                "active_attempt_id": old.active_attempt_id,
+                            }),
+                        )?;
                     }
                     next.retry_count = old.retry_count;
                     next.memory = old.memory.clone();
@@ -2833,6 +2917,70 @@ impl V2Store {
             params![task_id, task_group, ts_epoch, event_type, payload_json],
         )?;
         Ok(tx.last_insert_rowid())
+    }
+
+    pub fn record_session_announcement(
+        &mut self,
+        announcement: &crate::v2::socket::SessionAnnouncementRecord,
+    ) -> Result<TaskEventRecord, V2StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let task_id = announcement
+            .task_id
+            .as_deref()
+            .unwrap_or(crate::v2::socket::SESSION_GROUP_NAME);
+        let payload = serde_json::to_value(announcement)?;
+        let seq_id = Self::insert_event_tx(
+            &tx,
+            task_id,
+            crate::v2::socket::SESSION_GROUP_NAME,
+            announcement.announced_at_epoch,
+            "SESSION_ANNOUNCEMENT",
+            &payload,
+        )?;
+        tx.commit()?;
+        Ok(TaskEventRecord {
+            seq_id,
+            task_id: task_id.to_owned(),
+            task_group: crate::v2::socket::SESSION_GROUP_NAME.to_owned(),
+            ts_epoch: announcement.announced_at_epoch,
+            event_type: "SESSION_ANNOUNCEMENT".to_owned(),
+            payload,
+        })
+    }
+
+    pub fn list_session_announcements(
+        &self,
+        include_stale: bool,
+        now: i64,
+    ) -> Result<Vec<crate::v2::socket::SessionAnnouncementRecord>, V2StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT payload_json FROM task_events
+             WHERE task_group = ?1 AND event_type = 'SESSION_ANNOUNCEMENT'
+             ORDER BY seq_id ASC",
+        )?;
+        let mut by_holder = std::collections::BTreeMap::<
+            String,
+            crate::v2::socket::SessionAnnouncementRecord,
+        >::new();
+        let rows = stmt.query_map(params![crate::v2::socket::SESSION_GROUP_NAME], |row| {
+            row.get::<_, String>(0)
+        })?;
+        for row in rows {
+            let raw = row?;
+            if let Ok(rec) =
+                serde_json::from_str::<crate::v2::socket::SessionAnnouncementRecord>(&raw)
+            {
+                by_holder.insert(rec.holder.clone(), rec);
+            }
+        }
+        let mut out: Vec<_> = by_holder
+            .into_values()
+            .filter(|rec| include_stale || rec.expires_at_epoch >= now)
+            .collect();
+        out.sort_by(|a, b| a.holder.cmp(&b.holder));
+        Ok(out)
     }
 
     pub fn list_events_since(
@@ -7632,6 +7780,62 @@ mod tests {
         assert!(
             err.to_string().contains("ambiguous native startup history"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn sync_task_emits_claim_conflict_and_consent_revocation_events() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        let mut task = sample_task("ZACH-790", "In Progress", vec![]);
+        task.status = "In Progress".to_owned();
+        task.executor = Some("zach".to_owned());
+        task.autonomous_consent = true;
+        task.active_attempt_id = Some("att-live-790".to_owned());
+        store.upsert_task(&task).unwrap();
+
+        // 1. Foreign executor takeover during active zach attempt emits CLAIM_CONFLICT_OBSERVED + CLAIM_CHANGED
+        let mut incoming_conflict = task.clone();
+        incoming_conflict.executor = Some("session".to_owned());
+        incoming_conflict.active_attempt_id = None;
+        let synced = store
+            .sync_task_with_mode(&incoming_conflict, SyncMode::Standard)
+            .unwrap();
+        assert!(!synced.autonomous_consent);
+        let events = store.list_events_since(None, 0, 100).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_type == "CLAIM_CONFLICT_OBSERVED" && e.task_id == "ZACH-790"),
+            "expected CLAIM_CONFLICT_OBSERVED event, got: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| {
+                e.event_type == "CLAIM_CHANGED"
+                    && e.task_group == crate::v2::socket::SESSION_GROUP_NAME
+            }),
+            "expected CLAIM_CHANGED event on _sessions group, got: {events:?}"
+        );
+
+        // 2. External consent revocation (without foreign executor) emits CONSENT_REVOKED_EXTERNALLY
+        let mut task2 = sample_task("ZACH-791", "In Progress", vec![]);
+        task2.status = "In Progress".to_owned();
+        task2.executor = Some("zach".to_owned());
+        task2.autonomous_consent = true;
+        task2.active_attempt_id = Some("att-live-791".to_owned());
+        store.upsert_task(&task2).unwrap();
+
+        let mut incoming_revoke = task2.clone();
+        incoming_revoke.autonomous_consent = false;
+        incoming_revoke.active_attempt_id = None;
+        store
+            .sync_task_with_mode(&incoming_revoke, SyncMode::Standard)
+            .unwrap();
+        let events2 = store.list_events_since(None, 0, 100).unwrap();
+        assert!(
+            events2
+                .iter()
+                .any(|e| e.event_type == "CONSENT_REVOKED_EXTERNALLY" && e.task_id == "ZACH-791"),
+            "expected CONSENT_REVOKED_EXTERNALLY event, got: {events2:?}"
         );
     }
 }

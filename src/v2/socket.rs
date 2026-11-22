@@ -72,6 +72,204 @@ pub enum ClientCommand {
         #[serde(default)]
         wait: bool,
     },
+    #[serde(alias = "ANNOUNCE", alias = "Announce")]
+    Announce {
+        #[serde(default)]
+        holder: Option<String>,
+        #[serde(default)]
+        executor: Option<String>,
+        #[serde(default)]
+        actor: Option<String>,
+        intent: String,
+        #[serde(default)]
+        task_id: Option<String>,
+        #[serde(default)]
+        repo: Option<String>,
+        #[serde(default)]
+        stage: Option<String>,
+        #[serde(default)]
+        note: Option<String>,
+        #[serde(default)]
+        ttl_secs: Option<i64>,
+    },
+    #[serde(alias = "SESSIONS", alias = "Sessions")]
+    Sessions {
+        #[serde(default)]
+        include_stale: bool,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionAnnouncementRecord {
+    pub holder: String,
+    pub executor: String,
+    pub actor: String,
+    pub intent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub announced_at_epoch: i64,
+    pub ttl_secs: i64,
+    pub expires_at_epoch: i64,
+}
+
+pub const SESSION_GROUP_NAME: &str = "_sessions";
+
+pub const VALID_SESSION_INTENTS: &[&str] = &[
+    "starting",
+    "planning",
+    "implementing",
+    "reviewing",
+    "merging",
+    "handoff",
+    "idle",
+    "done",
+    "blocked",
+    "heartbeat",
+];
+
+#[allow(clippy::too_many_arguments)]
+pub fn validate_session_announcement(
+    holder: Option<&str>,
+    executor: Option<&str>,
+    actor: Option<&str>,
+    intent: &str,
+    task_id: Option<&str>,
+    repo: Option<&str>,
+    stage: Option<&str>,
+    note: Option<&str>,
+    ttl_secs: Option<i64>,
+    now: i64,
+) -> Result<SessionAnnouncementRecord, String> {
+    if !VALID_SESSION_INTENTS.contains(&intent) {
+        return Err(format!(
+            "invalid announcement intent '{intent}': must be one of {}",
+            VALID_SESSION_INTENTS.join(", ")
+        ));
+    }
+    let holder_str = holder.unwrap_or("cli").trim();
+    if holder_str.is_empty()
+        || holder_str.len() > 64
+        || !holder_str
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("invalid announcement holder".into());
+    }
+    let executor_str = executor.unwrap_or("session").trim();
+    if !matches!(executor_str, "session" | "zach") {
+        return Err(format!("invalid announcement executor '{executor_str}'"));
+    }
+    let actor_str = actor.unwrap_or("unknown").trim();
+    if actor_str.is_empty()
+        || actor_str.len() > 32
+        || !actor_str
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("invalid announcement actor".into());
+    }
+    let clean_task_id = match task_id.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(t) => {
+            if t.len() > 32
+                || !t.contains('-')
+                || !t
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '-')
+            {
+                return Err(format!("invalid announcement task_id '{t}'"));
+            }
+            Some(t.to_owned())
+        }
+        None => None,
+    };
+    let clean_repo = match repo.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(r) => {
+            if r.len() > 64
+                || !r.chars().all(|c| {
+                    c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-')
+                })
+            {
+                return Err(format!("invalid announcement repo '{r}'"));
+            }
+            Some(r.to_owned())
+        }
+        None => None,
+    };
+    let clean_stage = match stage.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => {
+            if s.len() > 32
+                || !s
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-'))
+            {
+                return Err(format!("invalid announcement stage '{s}'"));
+            }
+            Some(s.to_owned())
+        }
+        None => None,
+    };
+    let clean_note = match note.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(n) => {
+            if n.contains('\n') || n.contains('\r') {
+                return Err("announcement note must be a single line".into());
+            }
+            if n.chars().count() > 120 {
+                return Err("announcement note exceeds 120 characters".into());
+            }
+            const FORBIDDEN_SNIPPETS: &[&str] = &[
+                "/home/",
+                "/etc/",
+                "/opt/",
+                "/tmp/",
+                "/var/",
+                "/usr/",
+                "/root/",
+                "/proc/",
+                "/Users/",
+                "~/",
+                "C:\\",
+                "ghp_",
+                "gho_",
+                "github_pat_",
+                "sk-",
+                "AKIA",
+                "AIza",
+                "BEGIN PRIVATE KEY",
+                "Bearer ",
+            ];
+            if FORBIDDEN_SNIPPETS.iter().any(|pat| n.contains(pat)) {
+                return Err(
+                    "announcement note rejected by ADR-004 content safety (path or secret pattern)"
+                        .into(),
+                );
+            }
+            Some(n.to_owned())
+        }
+        None => None,
+    };
+    let ttl = ttl_secs.unwrap_or(1800);
+    if !(60..=7200).contains(&ttl) {
+        return Err("announcement ttl_secs must be between 60 and 7200".into());
+    }
+    Ok(SessionAnnouncementRecord {
+        holder: holder_str.to_owned(),
+        executor: executor_str.to_owned(),
+        actor: actor_str.to_owned(),
+        intent: intent.to_owned(),
+        task_id: clean_task_id,
+        repo: clean_repo,
+        stage: clean_stage,
+        note: clean_note,
+        announced_at_epoch: now,
+        ttl_secs: ttl,
+        expires_at_epoch: now + ttl,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -133,6 +331,17 @@ pub enum ServerMessage {
         stage_receipt: Option<crate::v2::runner::StageReceiptV1>,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+    },
+    #[serde(rename = "SESSION_ANNOUNCEMENT")]
+    SessionAnnouncement {
+        ok: bool,
+        announcement: SessionAnnouncementRecord,
+        seq_id: i64,
+    },
+    #[serde(rename = "SESSIONS_LIST")]
+    SessionsList {
+        sessions: Vec<SessionAnnouncementRecord>,
+        as_of_seq: i64,
     },
     #[serde(rename = "ERROR")]
     Error { error: String },
@@ -546,6 +755,53 @@ impl DaemonServer {
                     let cleared = store.clear_provider_cooldown(family.as_deref())?;
                     let _ =
                         write_ndjson(&mut sub.stream, &ServerMessage::CooldownCleared { cleared });
+                }
+                Ok(ClientCommand::Announce {
+                    holder,
+                    executor,
+                    actor,
+                    intent,
+                    task_id,
+                    repo,
+                    stage,
+                    note,
+                    ttl_secs,
+                }) => {
+                    let now = now_epoch();
+                    let msg = match validate_session_announcement(
+                        holder.as_deref(),
+                        executor.as_deref(),
+                        actor.as_deref(),
+                        &intent,
+                        task_id.as_deref(),
+                        repo.as_deref(),
+                        stage.as_deref(),
+                        note.as_deref(),
+                        ttl_secs,
+                        now,
+                    ) {
+                        Ok(announcement) => {
+                            let event = store.record_session_announcement(&announcement)?;
+                            ServerMessage::SessionAnnouncement {
+                                ok: true,
+                                announcement,
+                                seq_id: event.seq_id,
+                            }
+                        }
+                        Err(error) => ServerMessage::Error { error },
+                    };
+                    let _ = write_ndjson(&mut sub.stream, &msg);
+                }
+                Ok(ClientCommand::Sessions { include_stale }) => {
+                    let as_of_seq = store.max_seq_id()?;
+                    let sessions = store.list_session_announcements(include_stale, now_epoch())?;
+                    let _ = write_ndjson(
+                        &mut sub.stream,
+                        &ServerMessage::SessionsList {
+                            sessions,
+                            as_of_seq,
+                        },
+                    );
                 }
                 Err(e) => {
                     let msg = ServerMessage::Error {
@@ -1435,6 +1691,115 @@ mod tests {
         reader.read_line(&mut line).unwrap();
         let cleared_all: ServerMessage = serde_json::from_str(&line).unwrap();
         assert_eq!(cleared_all, ServerMessage::CooldownCleared { cleared: 1 });
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn announce_and_sessions_socket_commands_validate_adr004_and_broadcast() {
+        assert!(
+            validate_session_announcement(
+                Some("abc123"),
+                Some("session"),
+                Some("antigravity"),
+                "bad-intent",
+                None,
+                None,
+                None,
+                None,
+                Some(600),
+                1000,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_session_announcement(
+                Some("abc123"),
+                Some("session"),
+                Some("antigravity"),
+                "implementing",
+                Some("ZACH-079"),
+                Some("zach"),
+                Some("impl"),
+                Some("editing /home/ubuntu/secret"),
+                Some(600),
+                1000,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_session_announcement(
+                Some("abc123"),
+                Some("session"),
+                Some("antigravity"),
+                "implementing",
+                Some("ZACH-079"),
+                Some("zach"),
+                Some("impl"),
+                Some("token ghp_1234567890abcdef"),
+                Some(600),
+                1000,
+            )
+            .is_err()
+        );
+        let wire = r#"{"cmd":"announce","holder":"deadbeef1234","executor":"session","actor":"antigravity","intent":"implementing","task_id":"ZACH-079","repo":"zach","stage":"impl","note":"Layer 2 wire check","ttl_secs":900}"#;
+        let parsed: ClientCommand = serde_json::from_str(wire).unwrap();
+        assert!(matches!(parsed, ClientCommand::Announce { .. }));
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("zach-sock-sessions-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+        let sock_path = temp_dir.join("zach.sock");
+        let mut store = V2Store::open_in_memory().unwrap();
+        let mut server = DaemonServer::bind(&sock_path, 0).unwrap();
+
+        let mut client = UnixStream::connect(&sock_path).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write_ndjson(&mut client, &parsed).unwrap();
+        server.tick(&mut store).unwrap();
+
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let reply: ServerMessage = serde_json::from_str(&line).unwrap();
+        match reply {
+            ServerMessage::SessionAnnouncement {
+                ok,
+                announcement,
+                seq_id,
+            } => {
+                assert!(ok);
+                assert_eq!(announcement.holder, "deadbeef1234");
+                assert!(seq_id > 0);
+            }
+            other => panic!("expected SESSION_ANNOUNCEMENT, got {other:?}"),
+        }
+
+        write_ndjson(
+            &mut client,
+            &ClientCommand::Sessions {
+                include_stale: false,
+            },
+        )
+        .unwrap();
+        server.tick(&mut store).unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        let list_reply: ServerMessage = serde_json::from_str(&line).unwrap();
+        match list_reply {
+            ServerMessage::SessionsList {
+                sessions,
+                as_of_seq,
+            } => {
+                assert_eq!(sessions.len(), 1);
+                assert_eq!(sessions[0].task_id.as_deref(), Some("ZACH-079"));
+                assert!(as_of_seq > 0);
+            }
+            other => panic!("expected SESSIONS_LIST, got {other:?}"),
+        }
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

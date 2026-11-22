@@ -1113,6 +1113,55 @@ impl Coordinator {
                     .map_err(|e| e.to_string())?;
                 vec![ServerMessage::CooldownCleared { cleared }]
             }
+            ClientCommand::Announce {
+                holder,
+                executor,
+                actor,
+                intent,
+                task_id,
+                repo,
+                stage,
+                note,
+                ttl_secs,
+            } => {
+                let now = now_epoch();
+                match crate::v2::socket::validate_session_announcement(
+                    holder.as_deref(),
+                    executor.as_deref(),
+                    actor.as_deref(),
+                    &intent,
+                    task_id.as_deref(),
+                    repo.as_deref(),
+                    stage.as_deref(),
+                    note.as_deref(),
+                    ttl_secs,
+                    now,
+                ) {
+                    Ok(announcement) => {
+                        let event = self
+                            .store
+                            .record_session_announcement(&announcement)
+                            .map_err(|e| e.to_string())?;
+                        vec![ServerMessage::SessionAnnouncement {
+                            ok: true,
+                            announcement,
+                            seq_id: event.seq_id,
+                        }]
+                    }
+                    Err(error) => vec![ServerMessage::Error { error }],
+                }
+            }
+            ClientCommand::Sessions { include_stale } => {
+                let as_of_seq = self.store.max_seq_id().map_err(|e| e.to_string())?;
+                let sessions = self
+                    .store
+                    .list_session_announcements(include_stale, now_epoch())
+                    .map_err(|e| e.to_string())?;
+                vec![ServerMessage::SessionsList {
+                    sessions,
+                    as_of_seq,
+                }]
+            }
         })
     }
 
@@ -1139,18 +1188,46 @@ impl Coordinator {
 
     fn maybe_heartbeat(&mut self) -> Result<(), String> {
         if self.last_heartbeat.elapsed() >= Duration::from_secs(1) {
+            let now = now_epoch();
             self.store
-                .record_heartbeat(now_epoch())
+                .record_heartbeat(now)
                 .map_err(|e| e.to_string())?;
             self.store
-                .set_meta(
-                    "daemon_lease_expires_epoch",
-                    &(now_epoch() + 15).to_string(),
-                )
+                .set_meta("daemon_lease_expires_epoch", &(now + 15).to_string())
                 .map_err(|e| e.to_string())?;
+            self.write_presence_heartbeat_file(now);
             self.last_heartbeat = Instant::now();
         }
         Ok(())
+    }
+
+    fn write_presence_heartbeat_file(&self, now: i64) {
+        let path = std::env::var_os("ZACH_HEARTBEAT_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.state_dir.join("heartbeat.json"));
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "executor": "zach",
+            "pid": std::process::id(),
+            "ts_epoch": now,
+        });
+        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+        if let Ok(bytes) = serde_json::to_vec(&payload)
+            && std::fs::write(&tmp, bytes).is_ok()
+        {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+            }
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 
     fn sync_interval_secs() -> u64 {
