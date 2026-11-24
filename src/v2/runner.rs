@@ -1156,7 +1156,6 @@ pub fn parse_codex_jsonl_output(
     }
 
     let succeeded = exit_code == Some(0) && !saw_turn_failed;
-    let status = if succeeded { "PASSED" } else { "FAILED" }.to_owned();
     let (input_tokens, output_tokens, total_tokens) = if saw_valid_turn_usage {
         (Some(sum_input), Some(sum_output), Some(sum_total))
     } else {
@@ -1164,7 +1163,19 @@ pub fn parse_codex_jsonl_output(
     };
 
     let last_agent_message = agent_messages.last().cloned();
-    let raw_summary = if !succeeded && let Some(err) = error_messages.last() {
+    let structured_rejection = if succeeded {
+        last_agent_message
+            .as_deref()
+            .and_then(|msg| crate::v2::pipeline::validate_structured_impl_report(msg).err())
+    } else {
+        None
+    };
+
+    let final_succeeded = succeeded && structured_rejection.is_none();
+    let status = if final_succeeded { "PASSED" } else { "FAILED" }.to_owned();
+    let raw_summary = if let Some(ref rejection) = structured_rejection {
+        rejection.clone()
+    } else if !final_succeeded && let Some(err) = error_messages.last() {
         err.clone()
     } else if let Some(ref msg) = last_agent_message {
         msg.clone()
@@ -1180,9 +1191,15 @@ pub fn parse_codex_jsonl_output(
     let summary = truncate_utf8_bytes(&raw_summary, MAX_SUMMARY_BYTES);
 
     let review_output = last_agent_message.clone();
-    let review_markdown = last_agent_message
-        .filter(|msg| msg.contains('|'))
-        .or_else(|| (parsed_json_events == 0 && stdout.contains('|')).then(|| stdout.to_owned()));
+    let review_markdown = if structured_rejection.is_some() {
+        None
+    } else {
+        last_agent_message
+            .filter(|msg| msg.contains('|'))
+            .or_else(|| {
+                (parsed_json_events == 0 && stdout.contains('|')).then(|| stdout.to_owned())
+            })
+    };
 
     Ok(ParsedCodexOutput {
         status,
@@ -1457,6 +1474,14 @@ impl StageExecutor for SystemdStageExecutor {
 
         match driver.parse_output(&stdout, &stderr, output.status.code(), false) {
             Ok(mut parsed) => {
+                if route.stage == "impl"
+                    && parsed.status == "PASSED"
+                    && let Err(rejection) =
+                        crate::v2::pipeline::validate_impl_execution_result(&parsed)
+                {
+                    parsed.status = "FAILED".to_owned();
+                    parsed.summary = truncate_utf8_bytes(&rejection, MAX_SUMMARY_BYTES);
+                }
                 parsed.sha_before = sha_before;
                 parsed.sha_after = sha_after;
                 parsed.diff_files = diff_files;
@@ -1469,12 +1494,24 @@ impl StageExecutor for SystemdStageExecutor {
                     output.status.code(),
                     &parsed,
                 )?;
+                let failure_class = if parsed.status == "PASSED" {
+                    None
+                } else if route.stage == "impl"
+                    && parsed
+                        .summary
+                        .to_ascii_lowercase()
+                        .contains("impl_validation_failed:")
+                {
+                    Some(crate::v2::pipeline::FAILURE_CLASS_SEMANTIC)
+                } else {
+                    Some("STAGE_FAILED")
+                };
                 let receipt = build_stage_receipt_v1(
                     &task.task_id,
                     valid_attempt_id,
                     route,
                     &parsed,
-                    (parsed.status != "PASSED").then_some("STAGE_FAILED"),
+                    failure_class,
                 );
                 let _ = write_stage_receipt_json(&attempt_dir, &receipt);
                 let _ = crate::v2::audit::extract_and_write_attempt_audit(&attempt_dir);
@@ -2358,6 +2395,329 @@ pub fn collect_worktree_diff_entries(worktree_path: &str) -> Vec<DiffFileEntry> 
     entries.into_values().collect()
 }
 
+pub(crate) fn is_valid_git_worktree(worktree_path: &str) -> bool {
+    let trimmed = worktree_path.trim();
+    if trimmed.is_empty() || trimmed == "none" {
+        return false;
+    }
+    let path = std::path::Path::new(trimmed);
+    if !path.is_dir() {
+        return false;
+    }
+    let Ok(out) = Command::new("git")
+        .args(["-C", trimmed, "rev-parse", "--show-toplevel"])
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let toplevel = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if toplevel.is_empty() {
+        return false;
+    }
+    match (
+        std::fs::canonicalize(path),
+        std::fs::canonicalize(std::path::Path::new(&toplevel)),
+    ) {
+        (Ok(wt_canon), Ok(top_canon)) => wt_canon == top_canon,
+        _ => false,
+    }
+}
+
+fn run_git_status_porcelain(worktree_path: &str) -> Result<bool, String> {
+    let out = Command::new("git")
+        .args(["-C", worktree_path, "status", "--porcelain"])
+        .output()
+        .map_err(|e| format!("failed to run git status in '{worktree_path}': {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git status failed in '{}': {}",
+            worktree_path,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
+}
+
+pub(crate) fn reset_worktree_uncommitted_changes(worktree_path: &str) -> Result<(), String> {
+    if !is_valid_git_worktree(worktree_path) {
+        return Ok(());
+    }
+    if !run_git_status_porcelain(worktree_path)? {
+        return Ok(());
+    }
+    let reset_out = Command::new("git")
+        .args(["-C", worktree_path, "reset", "--hard", "HEAD"])
+        .output()
+        .map_err(|e| format!("failed to run git reset --hard HEAD in '{worktree_path}': {e}"))?;
+    if !reset_out.status.success() {
+        return Err(format!(
+            "git reset --hard HEAD failed in '{}': {}",
+            worktree_path,
+            String::from_utf8_lossy(&reset_out.stderr).trim()
+        ));
+    }
+    // Never pass -x so .gitignored caches such as target/ and web/node_modules/ survive.
+    let clean_out = Command::new("git")
+        .args(["-C", worktree_path, "clean", "-fd"])
+        .output()
+        .map_err(|e| format!("failed to run git clean -fd in '{worktree_path}': {e}"))?;
+    if !clean_out.status.success() {
+        return Err(format!(
+            "git clean -fd failed in '{}': {}",
+            worktree_path,
+            String::from_utf8_lossy(&clean_out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+fn suspended_impl_snapshot_ref(attempt_id: &str) -> Result<String, String> {
+    let valid = validate_attempt_id(attempt_id)?;
+    let sanitized: String = valid
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    Ok(format!("refs/zach/suspended-impl/{sanitized}"))
+}
+
+pub(crate) fn drop_suspended_impl_snapshot_ref(worktree_path: &str, attempt_id: &str) {
+    if !is_valid_git_worktree(worktree_path) {
+        return;
+    }
+    if let Ok(snap_ref) = suspended_impl_snapshot_ref(attempt_id) {
+        let _ = Command::new("git")
+            .args(["-C", worktree_path, "update-ref", "-d", &snap_ref])
+            .output();
+    }
+}
+
+pub(crate) fn snapshot_and_clean_suspended_impl_worktree(
+    worktree_path: &str,
+    attempt_id: &str,
+) -> Result<Option<String>, String> {
+    if !is_valid_git_worktree(worktree_path) {
+        return Ok(None);
+    }
+    if !run_git_status_porcelain(worktree_path)? {
+        return Ok(None);
+    }
+    let head_sha = git_head_sha(worktree_path)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("cannot resolve HEAD SHA in '{worktree_path}'"))?;
+    let snap_ref = suspended_impl_snapshot_ref(attempt_id)?;
+    let git_dir_out = Command::new("git")
+        .args(["-C", worktree_path, "rev-parse", "--git-dir"])
+        .output()
+        .map_err(|e| format!("failed to resolve git dir in '{worktree_path}': {e}"))?;
+    if !git_dir_out.status.success() {
+        return Err(format!(
+            "git rev-parse --git-dir failed in '{}': {}",
+            worktree_path,
+            String::from_utf8_lossy(&git_dir_out.stderr).trim()
+        ));
+    }
+    let raw_git_dir = String::from_utf8_lossy(&git_dir_out.stdout)
+        .trim()
+        .to_owned();
+    let git_dir = {
+        let p = PathBuf::from(&raw_git_dir);
+        if p.is_absolute() {
+            p
+        } else {
+            std::path::Path::new(worktree_path).join(p)
+        }
+    };
+    static SNAP_IDX_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let idx_path = git_dir.join(format!(
+        "zach-suspended-idx-{}-{}",
+        std::process::id(),
+        SNAP_IDX_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_file(&idx_path);
+    struct TempIndexGuard(PathBuf);
+    impl Drop for TempIndexGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _guard = TempIndexGuard(idx_path.clone());
+
+    let read_tree = Command::new("git")
+        .args(["-C", worktree_path, "read-tree", "HEAD"])
+        .env("GIT_INDEX_FILE", &idx_path)
+        .output()
+        .map_err(|e| format!("git read-tree HEAD failed in '{worktree_path}': {e}"))?;
+    if !read_tree.status.success() {
+        return Err(format!(
+            "git read-tree HEAD failed in '{}': {}",
+            worktree_path,
+            String::from_utf8_lossy(&read_tree.stderr).trim()
+        ));
+    }
+
+    let add_out = Command::new("git")
+        .args(["-C", worktree_path, "add", "-A"])
+        .env("GIT_INDEX_FILE", &idx_path)
+        .output()
+        .map_err(|e| format!("git add -A failed in '{worktree_path}': {e}"))?;
+    if !add_out.status.success() {
+        return Err(format!(
+            "git add -A failed in '{}': {}",
+            worktree_path,
+            String::from_utf8_lossy(&add_out.stderr).trim()
+        ));
+    }
+
+    let write_tree = Command::new("git")
+        .args(["-C", worktree_path, "write-tree"])
+        .env("GIT_INDEX_FILE", &idx_path)
+        .output()
+        .map_err(|e| format!("git write-tree failed in '{worktree_path}': {e}"))?;
+    if !write_tree.status.success() {
+        return Err(format!(
+            "git write-tree failed in '{}': {}",
+            worktree_path,
+            String::from_utf8_lossy(&write_tree.stderr).trim()
+        ));
+    }
+    let tree_sha = String::from_utf8_lossy(&write_tree.stdout)
+        .trim()
+        .to_owned();
+    if tree_sha.is_empty() {
+        return Err(format!(
+            "git write-tree returned empty SHA in '{worktree_path}'"
+        ));
+    }
+
+    let commit_out = Command::new("git")
+        .args([
+            "-C",
+            worktree_path,
+            "commit-tree",
+            &tree_sha,
+            "-p",
+            &head_sha,
+            "-m",
+            &format!("zach suspended impl snapshot for {attempt_id}"),
+        ])
+        .env("GIT_INDEX_FILE", &idx_path)
+        .env("GIT_AUTHOR_NAME", "Zach")
+        .env("GIT_AUTHOR_EMAIL", "zach@localhost")
+        .env("GIT_COMMITTER_NAME", "Zach")
+        .env("GIT_COMMITTER_EMAIL", "zach@localhost")
+        .output()
+        .map_err(|e| format!("git commit-tree failed in '{worktree_path}': {e}"))?;
+    if !commit_out.status.success() {
+        return Err(format!(
+            "git commit-tree failed in '{}': {}",
+            worktree_path,
+            String::from_utf8_lossy(&commit_out.stderr).trim()
+        ));
+    }
+    let snapshot_sha = String::from_utf8_lossy(&commit_out.stdout)
+        .trim()
+        .to_owned();
+    if snapshot_sha.is_empty() {
+        return Err(format!(
+            "git commit-tree returned empty SHA in '{worktree_path}'"
+        ));
+    }
+
+    let update_ref = Command::new("git")
+        .args(["-C", worktree_path, "update-ref", &snap_ref, &snapshot_sha])
+        .output()
+        .map_err(|e| format!("git update-ref failed in '{worktree_path}': {e}"))?;
+    if !update_ref.status.success() {
+        return Err(format!(
+            "git update-ref failed in '{}': {}",
+            worktree_path,
+            String::from_utf8_lossy(&update_ref.stderr).trim()
+        ));
+    }
+
+    if let Err(err) = reset_worktree_uncommitted_changes(worktree_path) {
+        drop_suspended_impl_snapshot_ref(worktree_path, attempt_id);
+        return Err(err);
+    }
+
+    Ok(Some(snapshot_sha))
+}
+
+pub(crate) fn restore_suspended_impl_snapshot(
+    worktree_path: &str,
+    snapshot_sha: &str,
+    attempt_id: &str,
+) -> Result<(), String> {
+    if !is_valid_git_worktree(worktree_path) {
+        return Ok(());
+    }
+    let head_sha = git_head_sha(worktree_path)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("cannot resolve HEAD SHA in '{worktree_path}'"))?;
+    let parent_spec = format!("{snapshot_sha}^");
+    let parent_out = Command::new("git")
+        .args(["-C", worktree_path, "rev-parse", "--verify", &parent_spec])
+        .output()
+        .map_err(|e| format!("failed to verify suspended impl snapshot parent: {e}"))?;
+    if !parent_out.status.success() {
+        return Err(format!(
+            "suspended impl snapshot {snapshot_sha} parent cannot be resolved: {}",
+            String::from_utf8_lossy(&parent_out.stderr).trim()
+        ));
+    }
+    let parent_sha = String::from_utf8_lossy(&parent_out.stdout)
+        .trim()
+        .to_owned();
+    if parent_sha != head_sha {
+        return Err(format!(
+            "suspended impl snapshot {snapshot_sha} parent {parent_sha} does not match current HEAD {head_sha}"
+        ));
+    }
+
+    let read_tree = Command::new("git")
+        .args([
+            "-C",
+            worktree_path,
+            "read-tree",
+            "--reset",
+            "-u",
+            snapshot_sha,
+        ])
+        .output()
+        .map_err(|e| format!("git read-tree --reset -u failed in '{worktree_path}': {e}"))?;
+    if !read_tree.status.success() {
+        return Err(format!(
+            "git read-tree --reset -u failed in '{}': {}",
+            worktree_path,
+            String::from_utf8_lossy(&read_tree.stderr).trim()
+        ));
+    }
+
+    let reset_mixed = Command::new("git")
+        .args(["-C", worktree_path, "reset", "--mixed", "HEAD"])
+        .output()
+        .map_err(|e| format!("git reset --mixed HEAD failed in '{worktree_path}': {e}"))?;
+    if !reset_mixed.status.success() {
+        return Err(format!(
+            "git reset --mixed HEAD failed in '{}': {}",
+            worktree_path,
+            String::from_utf8_lossy(&reset_mixed.stderr).trim()
+        ));
+    }
+
+    drop_suspended_impl_snapshot_ref(worktree_path, attempt_id);
+    Ok(())
+}
+
 pub struct MockStageExecutor {
     pub plan_artifacts: BTreeMap<PathBuf, String>,
     pub published_plans: Vec<(PathBuf, String)>,
@@ -3012,21 +3372,38 @@ pub fn harvest_detached(
     };
     let driver = worker_driver(manifest.route.family);
     let mut result = driver.parse_output(&stdout, &effective_stderr, code, is_systemd_timeout)?;
+    if manifest.route.stage == "impl"
+        && result.status == "PASSED"
+        && let Err(rejection) = crate::v2::pipeline::validate_impl_execution_result(&result)
+    {
+        result.status = "FAILED".to_owned();
+        result.summary = truncate_utf8_bytes(&rejection, MAX_SUMMARY_BYTES);
+    }
     result.sha_before = Some(manifest.sha_before.clone());
     result.sha_after = git_head_sha(&manifest.spec.worktree_path);
     result.invocation_id =
         (!observation.invocation_id.is_empty()).then(|| observation.invocation_id.clone());
     result.diff_files = collect_worktree_diff_entries(&manifest.spec.worktree_path);
+    let failure_class = if result.status == "PASSED" {
+        None
+    } else if is_systemd_timeout {
+        Some("TIMEOUT")
+    } else if manifest.route.stage == "impl"
+        && result
+            .summary
+            .to_ascii_lowercase()
+            .contains("impl_validation_failed:")
+    {
+        Some(crate::v2::pipeline::FAILURE_CLASS_SEMANTIC)
+    } else {
+        Some("STAGE_FAILED")
+    };
     let receipt = build_stage_receipt_v1(
         &manifest.task_id,
         &manifest.attempt_id,
         &manifest.route,
         &result,
-        (result.status != "PASSED").then_some(if is_systemd_timeout {
-            "TIMEOUT"
-        } else {
-            "STAGE_FAILED"
-        }),
+        failure_class,
     );
     let _ = write_stage_receipt_json(&manifest.attempt_dir, &receipt);
     let harvest_path = manifest.attempt_dir.join("harvest.json");
@@ -5405,5 +5782,279 @@ Binary files /dev/null and b/assets/logo.bin differ
         std::fs::remove_dir_all(wt.join("web/node_modules")).unwrap();
         symlink(root.path(), wt.join("web/node_modules")).unwrap();
         assert!(prepare_web_node_modules(&home, &wt).is_err());
+    }
+
+    #[test]
+    fn parse_codex_jsonl_output_rejects_partial_blocked_and_failed_validation_impl_reports_preserving_usage()
+     {
+        let partial_jsonl = [
+            serde_json::json!({"type": "turn.completed", "usage": {"input_tokens": 300, "output_tokens": 40}}).to_string(),
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {
+                    "type": "agent_message",
+                    "text": "{\"status\":\"partial\",\"summary\":\"left tests failing\",\"validation\":{\"passed\":false,\"summary\":\"cargo test failed\"}}"
+                }
+            }).to_string(),
+            serde_json::json!({"type": "turn.completed", "usage": {"input_tokens": 200, "output_tokens": 60}}).to_string(),
+        ]
+        .join("\n");
+        let parsed = parse_codex_jsonl_output(&partial_jsonl, "", Some(0)).unwrap();
+        assert_eq!(parsed.status, "FAILED");
+        assert!(
+            parsed.summary.starts_with("impl_validation_failed:"),
+            "summary={}",
+            parsed.summary
+        );
+        assert!(parsed.summary.contains("status=partial"));
+        assert!(parsed.review_output.is_some());
+        assert!(parsed.review_markdown.is_none());
+        assert_eq!(parsed.input_tokens, Some(500));
+        assert_eq!(parsed.output_tokens, Some(100));
+        assert_eq!(parsed.total_tokens, Some(600));
+
+        let blocked_fenced = [
+            serde_json::json!({"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 20}}).to_string(),
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {
+                    "type": "agent_message",
+                    "text": "```json\n{\"status\":\"blocked\",\"summary\":\"blocked on missing fixture\"}\n```"
+                }
+            }).to_string(),
+        ]
+        .join("\n");
+        let blocked = parse_codex_jsonl_output(&blocked_fenced, "", Some(0)).unwrap();
+        assert_eq!(blocked.status, "FAILED");
+        assert!(blocked.summary.starts_with("impl_validation_failed:"));
+        assert!(blocked.summary.contains("status=blocked"));
+        assert_eq!(blocked.total_tokens, Some(120));
+
+        let completed_null = [
+            serde_json::json!({"type": "turn.completed", "usage": {"input_tokens": 50, "output_tokens": 10}}).to_string(),
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {
+                    "type": "agent_message",
+                    "text": "{\"status\":\"completed\",\"summary\":\"done\",\"validation\":{\"passed\":null}}"
+                }
+            }).to_string(),
+        ]
+        .join("\n");
+        let ok = parse_codex_jsonl_output(&completed_null, "", Some(0)).unwrap();
+        assert_eq!(ok.status, "PASSED");
+    }
+
+    #[test]
+    fn harvest_detached_persists_failed_status_on_partial_or_failed_validation_impl_report() {
+        let root = TempTestDir::new("zach063-harvest-partial");
+        let obs = UnitObservation::parse(
+            "LoadState=loaded\nActiveState=inactive\nSubState=dead\nResult=success\nExecMainCode=1\nExecMainStatus=0\nInvocationID=inv-063\nControlGroup=/user.slice/zach\n",
+        );
+
+        // 1. AGY impl partial report -> harvest.json FAILED + stage-receipt.json failure_class="semantic"
+        let agy_dir = root.path().join("att-agy");
+        std::fs::create_dir_all(&agy_dir).unwrap();
+        let mut task = sample_task();
+        task.worktree_path = Some(root.path().display().to_string());
+        let mut agy_route = resolve_stage_route("S", "impl", 0, Some(ModelFamily::GeminiAgy))
+            .unwrap()
+            .unwrap();
+        agy_route.family = ModelFamily::GeminiAgy;
+        let env = BTreeMap::from([("HOME".into(), root.path().display().to_string())]);
+        let agy_spec =
+            build_systemd_stage_command_with_env(&task, "att-agy", &agy_route, "p", &env).unwrap();
+        let agy_manifest = AttemptManifest {
+            mount_layout_version: 1,
+            attempt_id: "att-agy".into(),
+            task_id: task.task_id.clone(),
+            route: agy_route,
+            spec: agy_spec,
+            sha_before: "abc1234".into(),
+            attempt_dir: agy_dir.clone(),
+        };
+        std::fs::write(
+            agy_dir.join("stdout.jsonl"),
+            serde_json::json!({
+                "status": "ok",
+                "execution_succeeded": true,
+                "response": "{\"status\":\"partial\",\"summary\":\"half done\",\"validation\":{\"passed\":false,\"summary\":\"tests failed\"}}",
+                "duration_seconds": 33.2,
+                "usage": { "input_tokens": 900, "output_tokens": 100, "total_tokens": 1000 }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(agy_dir.join("stderr.log"), "").unwrap();
+
+        let res = harvest_detached(&agy_manifest, &obs).unwrap();
+        assert_eq!(res.status, "FAILED");
+        assert!(res.summary.starts_with("impl_validation_failed:"));
+        let harvest_json: StageExecutionResult =
+            serde_json::from_slice(&std::fs::read(agy_dir.join("harvest.json")).unwrap()).unwrap();
+        assert_eq!(harvest_json.status, "FAILED");
+        let receipt_json: StageReceiptV1 =
+            serde_json::from_slice(&std::fs::read(agy_dir.join("stage-receipt.json")).unwrap())
+                .unwrap();
+        assert_eq!(receipt_json.status, "failed");
+        assert_eq!(receipt_json.failure_class.as_deref(), Some("semantic"));
+
+        // 2. Codex impl blocked report -> harvest.json FAILED + stage-receipt.json failure_class="semantic"
+        let codex_dir = root.path().join("att-codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        let mut codex_route = resolve_stage_route("S", "impl", 0, Some(ModelFamily::OpenAiSol))
+            .unwrap()
+            .unwrap();
+        codex_route.family = ModelFamily::OpenAiSol;
+        let codex_spec =
+            build_systemd_stage_command_with_env(&task, "att-codex", &codex_route, "p", &env)
+                .unwrap();
+        let codex_manifest = AttemptManifest {
+            mount_layout_version: 1,
+            attempt_id: "att-codex".into(),
+            task_id: task.task_id.clone(),
+            route: codex_route,
+            spec: codex_spec,
+            sha_before: "abc1234".into(),
+            attempt_dir: codex_dir.clone(),
+        };
+        std::fs::write(
+            codex_dir.join("stdout.jsonl"),
+            [
+                serde_json::json!({"type":"turn.completed","usage":{"input_tokens":200,"output_tokens":50}}).to_string(),
+                serde_json::json!({"type":"item.completed","item":{"type":"agent_message","text":"{\"status\":\"blocked\",\"summary\":\"cannot compile\"}"}}).to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        std::fs::write(codex_dir.join("stderr.log"), "").unwrap();
+        let codex_res = harvest_detached(&codex_manifest, &obs).unwrap();
+        assert_eq!(codex_res.status, "FAILED");
+        let codex_receipt: StageReceiptV1 =
+            serde_json::from_slice(&std::fs::read(codex_dir.join("stage-receipt.json")).unwrap())
+                .unwrap();
+        assert_eq!(codex_receipt.failure_class.as_deref(), Some("semantic"));
+    }
+
+    #[test]
+    fn worktree_snapshot_clean_and_restore_preserves_ignored_dirs_and_resets_failed_edits() {
+        let root = TempTestDir::new("zach063-git-wt");
+        let non_git = root.path().join("plain-dir");
+        std::fs::create_dir_all(&non_git).unwrap();
+        assert!(!is_valid_git_worktree(non_git.to_str().unwrap()));
+        assert_eq!(
+            snapshot_and_clean_suspended_impl_worktree(non_git.to_str().unwrap(), "att-1").unwrap(),
+            None
+        );
+
+        let wt = root.path().join("repo");
+        std::fs::create_dir_all(&wt).unwrap();
+        git(&wt, &["init", "-b", "main"]);
+        // Initialize base commit using explicit -c identity so local repo has NO user.name/user.email config.
+        write_rel(&wt, ".gitignore", "target/\nweb/node_modules/\n");
+        write_rel(&wt, "src/lib.rs", "pub fn base() -> i32 { 1 }\n");
+        write_rel(&wt, "src/old.rs", "pub fn remove_me() {}\n");
+        git(&wt, &["add", "."]);
+        git(
+            &wt,
+            &[
+                "-c",
+                "user.name=Init",
+                "-c",
+                "user.email=init@localhost",
+                "commit",
+                "-m",
+                "base",
+            ],
+        );
+
+        // Ignored build/dependency caches that MUST survive every clean/snapshot/restore.
+        write_rel(&wt, "target/debug/cache.bin", "cached-rust-artifact");
+        write_rel(&wt, "web/node_modules/pkg/index.js", "module.exports = 1;");
+
+        // Uncommitted impl edits: modify tracked, delete tracked, add untracked.
+        write_rel(&wt, "src/lib.rs", "pub fn base() -> i32 { 42 }\n");
+        std::fs::remove_file(wt.join("src/old.rs")).unwrap();
+        write_rel(&wt, "src/new_mod.rs", "pub fn added() {}\n");
+
+        // Snapshot succeeds even without repo/global git identity!
+        let snap_sha =
+            snapshot_and_clean_suspended_impl_worktree(wt.to_str().unwrap(), "att-snap-1")
+                .unwrap()
+                .expect("dirty git worktree yields snapshot SHA");
+        assert!(
+            git(&wt, &["status", "--porcelain"]).trim().is_empty(),
+            "worktree must be clean after snapshot"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join("src/lib.rs")).unwrap(),
+            "pub fn base() -> i32 { 1 }\n"
+        );
+        assert!(wt.join("src/old.rs").is_file());
+        assert!(!wt.join("src/new_mod.rs").exists());
+        assert!(wt.join("target/debug/cache.bin").is_file());
+        assert!(wt.join("web/node_modules/pkg/index.js").is_file());
+        let ref_sha = git(&wt, &["rev-parse", "refs/zach/suspended-impl/att-snap-1"]);
+        assert_eq!(ref_sha.trim(), snap_sha);
+
+        // Restore brings back exact dirty edits + deletes + untracked files and removes the ref.
+        restore_suspended_impl_snapshot(wt.to_str().unwrap(), &snap_sha, "att-snap-1").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(wt.join("src/lib.rs")).unwrap(),
+            "pub fn base() -> i32 { 42 }\n"
+        );
+        assert!(!wt.join("src/old.rs").exists());
+        assert_eq!(
+            std::fs::read_to_string(wt.join("src/new_mod.rs")).unwrap(),
+            "pub fn added() {}\n"
+        );
+        assert!(wt.join("target/debug/cache.bin").is_file());
+        assert!(wt.join("web/node_modules/pkg/index.js").is_file());
+        let ref_check = Command::new("git")
+            .args([
+                "-C",
+                wt.to_str().unwrap(),
+                "rev-parse",
+                "--verify",
+                "refs/zach/suspended-impl/att-snap-1",
+            ])
+            .output()
+            .unwrap();
+        assert!(!ref_check.status.success());
+
+        // Reset cleans uncommitted changes while preserving ignored directories.
+        reset_worktree_uncommitted_changes(wt.to_str().unwrap()).unwrap();
+        assert!(git(&wt, &["status", "--porcelain"]).trim().is_empty());
+        assert!(wt.join("target/debug/cache.bin").is_file());
+        assert!(wt.join("web/node_modules/pkg/index.js").is_file());
+
+        // Fail closed when HEAD advances past snapshot parent.
+        write_rel(&wt, "src/lib.rs", "pub fn base() -> i32 { 99 }\n");
+        let drifted_snap =
+            snapshot_and_clean_suspended_impl_worktree(wt.to_str().unwrap(), "att-snap-2")
+                .unwrap()
+                .unwrap();
+        write_rel(&wt, "src/other.rs", "pub fn moved() {}\n");
+        git(&wt, &["add", "src/other.rs"]);
+        git(
+            &wt,
+            &[
+                "-c",
+                "user.name=Init",
+                "-c",
+                "user.email=init@localhost",
+                "commit",
+                "-m",
+                "advance head",
+            ],
+        );
+        let drift_err =
+            restore_suspended_impl_snapshot(wt.to_str().unwrap(), &drifted_snap, "att-snap-2")
+                .unwrap_err();
+        assert!(
+            drift_err.contains("does not match current HEAD"),
+            "err={drift_err}"
+        );
+        drop_suspended_impl_snapshot_ref(wt.to_str().unwrap(), "att-snap-2");
     }
 }
