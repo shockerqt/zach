@@ -1538,6 +1538,39 @@ fn prompt_diagnostic(text: &Option<String>) -> String {
     truncate_utf8_bytes(text.as_deref().unwrap_or_default(), MAX_SUMMARY_BYTES)
 }
 
+pub(crate) fn format_post_impl_escalation_summary(
+    from_weight: &str,
+    to_weight: &str,
+    reason: &str,
+    attempt_id: &str,
+    snapshot_sha: Option<&str>,
+    diff_files: &[DiffFileEntry],
+) -> String {
+    let mut lines = vec![
+        format!("escalation: {from_weight} -> {to_weight}"),
+        format!("reason: {}", truncate_utf8_bytes(reason.trim(), 256)),
+        format!("suspended_impl_attempt_id: {attempt_id}"),
+    ];
+    if let Some(sha) = snapshot_sha.map(str::trim).filter(|s| !s.is_empty()) {
+        lines.push(format!("snapshot_sha: {sha}"));
+    }
+    if diff_files.is_empty() {
+        lines.push("changed_files: (none recorded)".to_owned());
+    } else {
+        lines.push("changed_files:".to_owned());
+        for entry in diff_files.iter().take(32) {
+            lines.push(format!(
+                "- {} ({}, +{}, -{})",
+                entry.path, entry.status, entry.added_lines, entry.deleted_lines
+            ));
+        }
+        if diff_files.len() > 32 {
+            lines.push(format!("- ... and {} more files", diff_files.len() - 32));
+        }
+    }
+    truncate_utf8_bytes(&lines.join("\n"), MAX_APPROVED_PLAN_BYTES)
+}
+
 pub fn build_plan_prompt(task: &TaskRecord, worktree_path: &str) -> String {
     let (mut sections, _) = resolve_stage_bootstrap(task, "plan", worktree_path);
     sections.extend([
@@ -1548,6 +1581,18 @@ pub fn build_plan_prompt(task: &TaskRecord, worktree_path: &str) -> String {
             prompt_diagnostic(&task.memory.last_plan_review_findings),
         ),
     ]);
+    if let Some(escalation) = task
+        .memory
+        .post_impl_escalation
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        sections.push((
+            "Post-Impl Weight Escalation Context".to_owned(),
+            truncate_utf8_bytes(escalation, MAX_APPROVED_PLAN_BYTES),
+        ));
+    }
     bounded_prompt(
         format!(
             "Plan task {} ({}) inside governed worktree {}.\nDaemon mode: read-only. Return the full plan; do not publish stages or call ws-task, git, or gh. Use only the supported YAML subset: scalars, block lists/maps, and inline []. Preserve forbidden_paths and acceptance criteria.\n",
@@ -1572,6 +1617,18 @@ pub fn build_plan_review_prompt(task: &TaskRecord, worktree_path: &str, plan: &s
             prompt_diagnostic(&task.memory.last_plan_review_findings),
         ),
     ]);
+    if let Some(escalation) = task
+        .memory
+        .post_impl_escalation
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        sections.push((
+            "Post-Impl Weight Escalation Context".to_owned(),
+            truncate_utf8_bytes(escalation, MAX_APPROVED_PLAN_BYTES),
+        ));
+    }
     bounded_prompt(
         format!(
             "Review architectural plan for {} ({}) inside {}.\nDaemon mode: read-only; return JSON only; do not publish or call ws-task, git, or gh. Citations must use line >= 1 in plan, the candidate artifact, or existing/proposed repository files. APPROVED requires every AC PASS and no blocking findings.\n",
@@ -1677,6 +1734,135 @@ pub fn build_pr_review_prompt(
         ),
         sections,
     )
+}
+
+fn strip_optional_json_fence(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix("```")
+        && let Some(nl) = rest.find('\n')
+    {
+        let lang = rest[..nl].trim();
+        if (lang.is_empty() || lang.eq_ignore_ascii_case("json"))
+            && let Some(inner) = rest[nl + 1..].strip_suffix("```")
+        {
+            return inner.trim();
+        }
+    }
+    trimmed
+}
+
+fn inspect_structured_worker_report(value: &serde_json::Value) -> Result<(), String> {
+    let Some(obj) = value.as_object() else {
+        return Ok(());
+    };
+    // ReviewVerdict payloads (plan-review / pr-review) are validated separately.
+    if obj.contains_key("verdict") && obj.contains_key("ac_results") {
+        return Ok(());
+    }
+    let status = obj.get("status").and_then(|v| v.as_str()).map(str::trim);
+    let worker_outcome = obj
+        .get("worker_outcome")
+        .and_then(|v| v.as_str())
+        .map(str::trim);
+    let validation_obj = obj.get("validation").and_then(|v| v.as_object());
+    let validation_passed = validation_obj
+        .and_then(|v| v.get("passed"))
+        .and_then(|v| v.as_bool());
+
+    let is_rejected_status = |s: &str| {
+        matches!(
+            s.to_ascii_lowercase().as_str(),
+            "partial" | "blocked" | "failed" | "error" | "incomplete"
+        )
+    };
+    let bad_status = status.is_some_and(is_rejected_status);
+    let bad_outcome = worker_outcome.is_some_and(is_rejected_status);
+    let bad_validation = validation_passed == Some(false);
+
+    if !bad_status && !bad_outcome && !bad_validation {
+        return Ok(());
+    }
+
+    let mut parts = Vec::new();
+    if let Some(s) = status {
+        parts.push(format!("status={s}"));
+    }
+    if let Some(o) = worker_outcome {
+        parts.push(format!("worker_outcome={o}"));
+    }
+    if let Some(passed) = validation_passed {
+        parts.push(format!("validation.passed={passed}"));
+    }
+    if let Some(val_summary) = validation_obj
+        .and_then(|v| v.get("summary"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        parts.push(format!(
+            "validation.summary={}",
+            truncate_utf8_bytes(val_summary, 256)
+        ));
+    }
+    if let Some(summary) = obj
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        parts.push(format!("summary={}", truncate_utf8_bytes(summary, 256)));
+    }
+    let detail = truncate_utf8_bytes(&parts.join("; "), MAX_SUMMARY_BYTES.saturating_sub(32));
+    Err(format!("impl_validation_failed: {detail}"))
+}
+
+pub(crate) fn validate_structured_impl_report(raw: &str) -> Result<(), String> {
+    let candidate = strip_optional_json_fence(raw);
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) else {
+        return Ok(());
+    };
+    inspect_structured_worker_report(&value)
+}
+
+pub(crate) fn validate_impl_execution_result(result: &StageExecutionResult) -> Result<(), String> {
+    if let Some(output) = result.stage_output.as_deref() {
+        validate_structured_impl_report(output)?;
+    }
+    if let Some(output) = result.review_output.as_deref()
+        && result.stage_output.as_deref() != Some(output)
+    {
+        validate_structured_impl_report(output)?;
+    }
+    validate_structured_impl_report(&result.summary)?;
+    if result
+        .summary
+        .to_ascii_lowercase()
+        .contains("impl_validation_failed:")
+    {
+        return Err(result.summary.clone());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_harvested_impl_attempt(
+    state_dir: &Path,
+    attempt_id: &str,
+) -> Result<(), String> {
+    let harvest_path = state_dir
+        .join("attempts")
+        .join(attempt_id)
+        .join("harvest.json");
+    let bytes = match std::fs::read(&harvest_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("failed reading {}: {e}", harvest_path.display())),
+    };
+    let result: StageExecutionResult =
+        serde_json::from_slice(&bytes).map_err(|e| format!("invalid harvest.json: {e}"))?;
+    if result.status != "PASSED" {
+        return Err(result.summary);
+    }
+    validate_impl_execution_result(&result)
 }
 
 /// Parses the JSON stdout/stderr produced by `worker.mjs --cli`, mapping infrastructure
@@ -1864,6 +2050,36 @@ pub fn parse_agy_cli_response(
         .or_else(|| json.get("run_id"))
         .and_then(|v| v.as_str())
         .map(str::to_owned);
+
+    let validation_err = inspect_structured_worker_report(&json)
+        .err()
+        .or_else(|| {
+            review_output
+                .as_deref()
+                .and_then(|raw| validate_structured_impl_report(raw).err())
+        })
+        .or_else(|| {
+            json.get("summary")
+                .and_then(|v| v.as_str())
+                .and_then(|s| validate_structured_impl_report(s).err())
+        });
+    if let Some(rejection_msg) = validation_err {
+        return Ok(StageExecutionResult {
+            status: "FAILED".to_owned(),
+            summary: truncate_utf8_bytes(&rejection_msg, MAX_SUMMARY_BYTES),
+            review_markdown: None,
+            stage_output: review_output.clone(),
+            review_output,
+            invocation_id,
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            duration_seconds,
+            sha_before: None,
+            sha_after: None,
+            diff_files: Vec::new(),
+        });
+    }
 
     Ok(StageExecutionResult {
         status: "PASSED".to_owned(),
@@ -2278,6 +2494,9 @@ pub fn classify_failure_class(stage: &str, status: &str, message: &str) -> &'sta
 
     if lower_status == "stalled" || lower_status == "lost" || lower_status == "timeout" {
         return FAILURE_CLASS_INFRA;
+    }
+    if lower_msg.contains("impl_validation_failed:") {
+        return FAILURE_CLASS_SEMANTIC;
     }
     if is_quota_or_usage_limit_error(message) {
         return FAILURE_CLASS_INFRA;
@@ -3058,6 +3277,7 @@ pub fn execute_xs_s_pipeline_with_executor_and_ws_task(
                         err.clone(),
                         true,
                     )?;
+                    let _ = crate::v2::runner::reset_worktree_uncommitted_changes(&worktree_path);
                     return Err(format!("impl stage failed for {}: {}", task.task_id, err));
                 }
             };
@@ -3087,10 +3307,23 @@ pub fn execute_xs_s_pipeline_with_executor_and_ws_task(
                     impl_result.summary.clone(),
                     true,
                 )?;
+                let _ = crate::v2::runner::reset_worktree_uncommitted_changes(&worktree_path);
                 return Err(format!(
                     "impl stage failed for {}: {}",
                     task.task_id, impl_result.summary
                 ));
+            }
+            if let Err(err) = validate_impl_execution_result(&impl_result) {
+                fail_stage_attempt(
+                    store,
+                    &mut task,
+                    &mut attempt_rec,
+                    FAILURE_CLASS_SEMANTIC,
+                    err.clone(),
+                    true,
+                )?;
+                let _ = crate::v2::runner::reset_worktree_uncommitted_changes(&worktree_path);
+                return Err(format!("impl stage failed for {}: {}", task.task_id, err));
             }
 
             attempt_rec.failure_class = None;
@@ -3120,6 +3353,7 @@ pub fn execute_xs_s_pipeline_with_executor_and_ws_task(
                         err_msg.clone(),
                         true,
                     )?;
+                    let _ = crate::v2::runner::reset_worktree_uncommitted_changes(&worktree_path);
                     let dec_id = format!("dec-{}-forbidden", task.task_id.to_ascii_lowercase());
                     let bounded_context =
                         truncate_utf8_bytes(&impl_result.summary, MAX_SUMMARY_BYTES);
@@ -3152,6 +3386,7 @@ pub fn execute_xs_s_pipeline_with_executor_and_ws_task(
                         err_msg.clone(),
                         true,
                     )?;
+                    let _ = crate::v2::runner::reset_worktree_uncommitted_changes(&worktree_path);
                     let dec_id = format!("dec-{}-scope", task.task_id.to_ascii_lowercase());
                     let bounded_context =
                         truncate_utf8_bytes(&impl_result.summary, MAX_SUMMARY_BYTES);
@@ -3172,12 +3407,20 @@ pub fn execute_xs_s_pipeline_with_executor_and_ws_task(
                     return Err(err_msg);
                 }
                 Ok(DiffCheckOutcome::WeightEscalated {
-                    from_weight: _,
+                    from_weight,
                     to_weight,
                     required_stages,
                     reason,
                 }) => {
                     apply_weight_escalation(&mut task, to_weight.clone(), required_stages, &reason);
+                    task.memory.post_impl_escalation = Some(format_post_impl_escalation_summary(
+                        &from_weight,
+                        &to_weight,
+                        &reason,
+                        &impl_attempt_id,
+                        None,
+                        &impl_result.diff_files,
+                    ));
                     task = store.upsert_task(&task).map_err(|e| e.to_string())?;
                     if matches!(to_weight.as_str(), "M" | "L") {
                         let _ = store.release_path_locks(&task.task_id);
@@ -3193,6 +3436,7 @@ pub fn execute_xs_s_pipeline_with_executor_and_ws_task(
                         err.clone(),
                         true,
                     )?;
+                    let _ = crate::v2::runner::reset_worktree_uncommitted_changes(&worktree_path);
                     return Err(err);
                 }
             }
@@ -3206,7 +3450,10 @@ pub fn execute_xs_s_pipeline_with_executor_and_ws_task(
                 executor,
                 &worktree_path,
                 &worker_checks,
-            )?;
+            )
+            .inspect_err(|_| {
+                let _ = crate::v2::runner::reset_worktree_uncommitted_changes(&worktree_path);
+            })?;
             let gate_checks = task.context_pack.gate_checks.clone();
             run_host_gate_checks(
                 store,
@@ -3215,10 +3462,17 @@ pub fn execute_xs_s_pipeline_with_executor_and_ws_task(
                 executor,
                 &worktree_path,
                 &gate_checks,
-            )?;
+            )
+            .inspect_err(|_| {
+                let _ = crate::v2::runner::reset_worktree_uncommitted_changes(&worktree_path);
+            })?;
 
             let _committed_sha =
-                commit_impl_worktree(store, executor, &mut task, &mut attempt_rec, &worktree_path)?;
+                commit_impl_worktree(store, executor, &mut task, &mut attempt_rec, &worktree_path)
+                    .inspect_err(|_| {
+                        let _ =
+                            crate::v2::runner::reset_worktree_uncommitted_changes(&worktree_path);
+                    })?;
             impl_committed_in_run = true;
         }
 
@@ -4026,6 +4280,7 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                         err.clone(),
                         true,
                     )?;
+                    let _ = crate::v2::runner::reset_worktree_uncommitted_changes(&worktree_path);
                     return Err(format!("impl stage failed for {}: {}", task.task_id, err));
                 }
             };
@@ -4045,10 +4300,23 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                     impl_result.summary.clone(),
                     true,
                 )?;
+                let _ = crate::v2::runner::reset_worktree_uncommitted_changes(&worktree_path);
                 return Err(format!(
                     "impl stage failed for {}: {}",
                     task.task_id, impl_result.summary
                 ));
+            }
+            if let Err(err) = validate_impl_execution_result(&impl_result) {
+                fail_stage_attempt(
+                    store,
+                    &mut task,
+                    &mut attempt_rec,
+                    FAILURE_CLASS_SEMANTIC,
+                    err.clone(),
+                    true,
+                )?;
+                let _ = crate::v2::runner::reset_worktree_uncommitted_changes(&worktree_path);
+                return Err(format!("impl stage failed for {}: {}", task.task_id, err));
             }
 
             attempt_rec.failure_class = None;
@@ -4078,6 +4346,7 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                         err_msg.clone(),
                         true,
                     )?;
+                    let _ = crate::v2::runner::reset_worktree_uncommitted_changes(&worktree_path);
                     return Err(err_msg);
                 }
                 Ok(DiffCheckOutcome::OutOfScopeFiles { files }) => {
@@ -4093,6 +4362,7 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                         err_msg.clone(),
                         true,
                     )?;
+                    let _ = crate::v2::runner::reset_worktree_uncommitted_changes(&worktree_path);
                     return Err(err_msg);
                 }
                 Ok(DiffCheckOutcome::WeightEscalated {
@@ -4113,6 +4383,7 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                         err.clone(),
                         true,
                     )?;
+                    let _ = crate::v2::runner::reset_worktree_uncommitted_changes(&worktree_path);
                     return Err(err);
                 }
             }
@@ -4125,7 +4396,10 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                 executor,
                 &worktree_path,
                 &worker_checks,
-            )?;
+            )
+            .inspect_err(|_| {
+                let _ = crate::v2::runner::reset_worktree_uncommitted_changes(&worktree_path);
+            })?;
             let gate_checks = task.context_pack.gate_checks.clone();
             run_host_gate_checks(
                 store,
@@ -4134,10 +4408,17 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                 executor,
                 &worktree_path,
                 &gate_checks,
-            )?;
+            )
+            .inspect_err(|_| {
+                let _ = crate::v2::runner::reset_worktree_uncommitted_changes(&worktree_path);
+            })?;
 
             let _committed_sha =
-                commit_impl_worktree(store, executor, &mut task, &mut attempt_rec, &worktree_path)?;
+                commit_impl_worktree(store, executor, &mut task, &mut attempt_rec, &worktree_path)
+                    .inspect_err(|_| {
+                        let _ =
+                            crate::v2::runner::reset_worktree_uncommitted_changes(&worktree_path);
+                    })?;
             impl_committed_in_run = true;
         }
 
@@ -4521,21 +4802,49 @@ pub fn run_supervised_pipeline_step(
                     "PUBLISH"
                 }
                 "impl" => {
+                    validate_impl_execution_result(&result)?;
+                    if let Some(snapshot_sha) = task.memory.suspended_impl_snapshot_sha.take() {
+                        crate::v2::runner::restore_suspended_impl_snapshot(
+                            &worktree,
+                            &snapshot_sha,
+                            &attempt.attempt_id,
+                        )?;
+                    }
+                    task.memory.post_impl_escalation = None;
+                    let diff_files = if crate::v2::runner::is_valid_git_worktree(&worktree) {
+                        crate::v2::runner::collect_worktree_diff_entries(&worktree)
+                    } else {
+                        result.diff_files.clone()
+                    };
                     match verify_worktree_diff_with(
                         &task.repository,
                         &task.weight,
                         &task.context_pack,
-                        &result.diff_files,
+                        &diff_files,
                         ws_task_bin,
                     )? {
                         DiffCheckOutcome::Clean => {}
                         DiffCheckOutcome::WeightEscalated {
+                            from_weight,
                             to_weight,
                             required_stages,
                             reason,
-                            ..
                         } => {
-                            apply_weight_escalation(&mut task, to_weight, required_stages, &reason);
+                            apply_weight_escalation(
+                                &mut task,
+                                to_weight.clone(),
+                                required_stages,
+                                &reason,
+                            );
+                            task.memory.post_impl_escalation =
+                                Some(format_post_impl_escalation_summary(
+                                    &from_weight,
+                                    &to_weight,
+                                    &reason,
+                                    &attempt.attempt_id,
+                                    None,
+                                    &diff_files,
+                                ));
                             return Ok(PipelineStepResult {
                                 task,
                                 next_operation: "PLAN_PREREQUISITES".into(),
@@ -9347,5 +9656,249 @@ raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={
                 handle.join().expect("parallel stub worker thread panicked");
             }
         });
+    }
+
+    #[test]
+    fn parse_agy_cli_response_rejects_partial_blocked_or_failed_validation_impl_report_with_usage()
+    {
+        // 1. Top-level envelope status=partial with execution_succeeded=true and usage -> Ok(FAILED) preserving usage
+        let top_partial = serde_json::json!({
+            "status": "partial",
+            "execution_succeeded": true,
+            "summary": "stopped halfway through changes",
+            "duration_seconds": 45.5,
+            "usage": { "input_tokens": 1200, "output_tokens": 300, "total_tokens": 1500 }
+        })
+        .to_string();
+        let res = parse_agy_cli_response(&top_partial, "", Some(0))
+            .expect("partial envelope should return Ok(FAILED), not Err(AgyCliError)");
+        assert_eq!(res.status, "FAILED");
+        assert!(
+            res.summary.starts_with("impl_validation_failed:"),
+            "summary={}",
+            res.summary
+        );
+        assert!(res.summary.contains("status=partial"));
+        assert_eq!(res.input_tokens, Some(1200));
+        assert_eq!(res.output_tokens, Some(300));
+        assert_eq!(res.total_tokens, Some(1500));
+        assert_eq!(res.duration_seconds, Some(45.5));
+
+        // 2. Top-level blocked without usage -> still Ok(FAILED) (not AgyCliError)
+        let top_blocked_no_usage = serde_json::json!({
+            "status": "blocked",
+            "worker_outcome": "blocked",
+            "execution_succeeded": true,
+            "summary": "missing env var"
+        })
+        .to_string();
+        let res = parse_agy_cli_response(&top_blocked_no_usage, "", Some(0))
+            .expect("blocked envelope without usage should return Ok(FAILED)");
+        assert_eq!(res.status, "FAILED");
+        assert!(res.summary.starts_with("impl_validation_failed:"));
+        assert_eq!(res.total_tokens, None);
+
+        // 3. Inner fenced JSON response with validation.passed=false -> Ok(FAILED) preserving usage
+        let inner_failed_val = serde_json::json!({
+            "status": "ok",
+            "execution_succeeded": true,
+            "response": "```json\n{\"status\":\"completed\",\"summary\":\"edits applied\",\"validation\":{\"passed\":false,\"summary\":\"cargo test failed: 2 failed\"}}\n```",
+            "duration_seconds": 12.0,
+            "usage": { "input_tokens": 800, "output_tokens": 150, "total_tokens": 950 }
+        })
+        .to_string();
+        let res = parse_agy_cli_response(&inner_failed_val, "", Some(0)).unwrap();
+        assert_eq!(res.status, "FAILED");
+        assert!(res.summary.starts_with("impl_validation_failed:"));
+        assert!(res.summary.contains("validation.passed=false"));
+        assert!(res.summary.contains("cargo test failed"));
+        assert_eq!(res.total_tokens, Some(950));
+        assert_eq!(res.duration_seconds, Some(12.0));
+
+        // 4. status=completed with validation.passed=null remains PASSED
+        let valid_null = serde_json::json!({
+            "status": "ok",
+            "execution_succeeded": true,
+            "response": "{\"status\":\"completed\",\"summary\":\"ready for checks\",\"validation\":{\"passed\":null}}",
+            "usage": { "input_tokens": 400, "output_tokens": 80, "total_tokens": 480 }
+        })
+        .to_string();
+        let res = parse_agy_cli_response(&valid_null, "", Some(0)).unwrap();
+        assert_eq!(res.status, "PASSED");
+        assert_eq!(res.total_tokens, Some(480));
+
+        // 5. ReviewVerdict JSON and plain text remain PASSED
+        let verdict = serde_json::json!({
+            "status": "ok",
+            "execution_succeeded": true,
+            "response": "{\"verdict\":\"APPROVED\",\"ac_results\":[],\"findings\":[],\"summary\":\"ok\"}"
+        })
+        .to_string();
+        assert_eq!(
+            parse_agy_cli_response(&verdict, "", Some(0))
+                .unwrap()
+                .status,
+            "PASSED"
+        );
+        let plain = serde_json::json!({
+            "status": "ok",
+            "execution_succeeded": true,
+            "response": "Implemented all changes cleanly."
+        })
+        .to_string();
+        assert_eq!(
+            parse_agy_cli_response(&plain, "", Some(0)).unwrap().status,
+            "PASSED"
+        );
+    }
+
+    #[test]
+    fn run_supervised_pipeline_step_rejects_partial_and_failed_validation_impl_before_weight_escalation()
+     {
+        let root =
+            std::env::temp_dir().join(format!("zach063-validate-step-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let wt = root.join("wt");
+        let att_dir = root.join("attempts").join("att-partial-063");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&att_dir).unwrap();
+
+        let harvest = StageExecutionResult {
+            status: "PASSED".to_owned(),
+            summary: "bypassed harvest".to_owned(),
+            review_markdown: None,
+            review_output: Some(
+                serde_json::json!({
+                    "status": "partial",
+                    "summary": "only updated half the callers",
+                    "validation": { "passed": false, "summary": "cargo test failed" }
+                })
+                .to_string(),
+            ),
+            stage_output: Some(
+                serde_json::json!({
+                    "status": "partial",
+                    "summary": "only updated half the callers",
+                    "validation": { "passed": false, "summary": "cargo test failed" }
+                })
+                .to_string(),
+            ),
+            invocation_id: None,
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+            total_tokens: Some(150),
+            duration_seconds: Some(5.0),
+            sha_before: Some("base".to_owned()),
+            sha_after: Some("base".to_owned()),
+            diff_files: vec![DiffFileEntry {
+                path: "src/v2/runner.rs".to_owned(),
+                status: "M".to_owned(),
+                added_lines: 200,
+                deleted_lines: 10,
+            }],
+        };
+        std::fs::write(
+            att_dir.join("harvest.json"),
+            serde_json::to_vec(&harvest).unwrap(),
+        )
+        .unwrap();
+
+        let mut task = sample_s_task("ZACH-063-VAL");
+        task.worktree_path = Some(wt.to_string_lossy().into_owned());
+        let attempt = StageAttemptRecord {
+            attempt_id: "att-partial-063".to_owned(),
+            task_id: task.task_id.clone(),
+            stage: "impl".to_owned(),
+            model: "gemini-4-hydrogen-high".to_owned(),
+            effort: "high".to_owned(),
+            systemd_unit: None,
+            invocation_id: None,
+            started_epoch: 10,
+            ended_epoch: Some(20),
+            status: "PASSED".to_owned(),
+            failure_class: None,
+            summary: None,
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+            total_tokens: Some(150),
+            sha_before: Some("base".to_owned()),
+            sha_after: Some("base".to_owned()),
+            phase: "POSTPROCESSING".to_owned(),
+            last_liveness_epoch: 20,
+            last_output_bytes: 0,
+            last_cpu_usage_usec: None,
+            control_group: None,
+            exit_code: Some(0),
+            exit_code_kind: Some("exited".to_owned()),
+            retry_generation: 0,
+        };
+        let sem = crate::v2::scheduler::HeavyCheckSemaphore::new();
+        // Passing a nonexistent ws-task binary proves validate_impl_execution_result rejects
+        // BEFORE verify_worktree_diff_with / weight escalation can run.
+        let Err(err) = run_supervised_pipeline_step(
+            &root,
+            Path::new("/nonexistent/ws-task-must-not-run"),
+            task,
+            &attempt,
+            "VALIDATE",
+            &sem,
+        ) else {
+            panic!("expected validation rejection");
+        };
+        assert!(err.starts_with("impl_validation_failed:"), "err={err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn classify_failure_class_maps_structured_impl_rejections_to_semantic_even_with_timeout_words()
+    {
+        assert_eq!(
+            classify_failure_class(
+                "impl",
+                "FAILED",
+                "impl_validation_failed: status=partial; validation.passed=false; validation.summary=http 429 rate limit and cargo test timed out before timeout"
+            ),
+            FAILURE_CLASS_SEMANTIC
+        );
+        assert_eq!(
+            classify_failure_class(
+                "impl",
+                "FAILED",
+                "impl_validation_failed: status=blocked; summary=out-of-scope file needed"
+            ),
+            FAILURE_CLASS_SEMANTIC
+        );
+    }
+
+    #[test]
+    fn build_plan_and_plan_review_prompts_surface_post_impl_escalation_context() {
+        let mut task = sample_plan_task("ZACH-063-PROMPTS");
+        let plan_no_esc = build_plan_prompt(&task, "/wt");
+        let review_no_esc = build_plan_review_prompt(&task, "/wt", "## [PLAN]");
+        assert!(!plan_no_esc.contains("## Post-Impl Weight Escalation Context:"));
+        assert!(!review_no_esc.contains("## Post-Impl Weight Escalation Context:"));
+
+        task.memory.post_impl_escalation = Some(format_post_impl_escalation_summary(
+            "S",
+            "M",
+            "exceeds S diff ceiling",
+            "att-esc-1",
+            Some("deadbeef1234"),
+            &[DiffFileEntry {
+                path: "src/v2/coordinator.rs".to_owned(),
+                status: "M".to_owned(),
+                added_lines: 180,
+                deleted_lines: 12,
+            }],
+        ));
+        let plan_with_esc = build_plan_prompt(&task, "/wt");
+        let review_with_esc = build_plan_review_prompt(&task, "/wt", "## [PLAN]");
+        for prompt in [&plan_with_esc, &review_with_esc] {
+            assert!(prompt.chars().count() <= MAX_WORKER_PROMPT_CHARS);
+            assert!(prompt.contains("## Post-Impl Weight Escalation Context:"));
+            assert!(prompt.contains("escalation: S -> M"));
+            assert!(prompt.contains("src/v2/coordinator.rs (M, +180, -12)"));
+            assert!(prompt.contains("snapshot_sha: deadbeef1234"));
+        }
     }
 }

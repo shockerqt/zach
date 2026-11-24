@@ -1910,12 +1910,29 @@ impl Coordinator {
                         .take_while(|s| s.as_str() != "impl")
                         .all(|s| task.stages_completed.contains(s))
                 {
+                    if let Err(err) = pipeline::validate_harvested_impl_attempt(
+                        &self.state_dir,
+                        &attempt.attempt_id,
+                    ) {
+                        self.fail_task(
+                            &task.task_id,
+                            &err,
+                            Some(pipeline::FAILURE_CLASS_SEMANTIC),
+                        )?;
+                        continue;
+                    }
                     let mut task = task;
-                    task.memory.suspended_impl_attempt_id = Some(attempt.attempt_id);
-                    task.active_attempt_id = None;
-                    task.memory.pipeline_checkpoint = None;
-                    task.status = "Ready".into();
-                    task.current_stage = scheduler::determine_next_stage(&task);
+                    if let Err(err) =
+                        self.suspend_escalated_impl(&mut task, attempt.attempt_id, None)
+                    {
+                        self.error_event(
+                            Some(&task.task_id),
+                            Some("suspend-escalated-impl"),
+                            &err,
+                        )?;
+                        self.fail_task(&task.task_id, &err, Some("infra"))?;
+                        continue;
+                    }
                     self.save(&task)?;
                     continue;
                 }
@@ -2504,6 +2521,15 @@ impl Coordinator {
                     || task.memory.halt_requested
                     || matches!(task.status.as_str(), "Done" | "Cancelled")
                 {
+                    if attempt.stage == "impl"
+                        && let Err(err) = self.clear_suspended_impl_state_and_clean_worktree(
+                            &mut task,
+                            Some(&attempt.attempt_id),
+                        )
+                    {
+                        let _ =
+                            self.error_event(Some(&task.task_id), Some("worktree-cleanup"), &err);
+                    }
                     attempt.phase = "COMPLETE".into();
                     task.active_attempt_id = None;
                     task.memory.pipeline_checkpoint = None;
@@ -2549,18 +2575,33 @@ impl Coordinator {
                 {
                     return Ok(());
                 }
+                let new_escalation_logs: Vec<String> = step
+                    .task
+                    .memory
+                    .decisions_log
+                    .iter()
+                    .filter(|entry| {
+                        entry.starts_with("weight escalated to ")
+                            && !current.memory.decisions_log.contains(entry)
+                    })
+                    .cloned()
+                    .collect();
                 let mut task = step.task;
                 task.memory.governance_started = current.memory.governance_started;
                 task.memory.applied_decisions = current.memory.applied_decisions;
                 task.memory.decisions_log = current.memory.decisions_log;
+                for entry in &new_escalation_logs {
+                    task.memory.decisions_log.push(entry.clone());
+                    if task.memory.decisions_log.len() > 20 {
+                        let drain = task.memory.decisions_log.len() - 20;
+                        task.memory.decisions_log.drain(0..drain);
+                    }
+                }
                 task.lease_owner = current.lease_owner;
                 task.lease_expires_epoch = current.lease_expires_epoch;
                 if step.next_operation == "PLAN_PREREQUISITES" {
-                    task.memory.suspended_impl_attempt_id = Some(attempt_id);
-                    task.memory.pipeline_checkpoint = None;
-                    task.active_attempt_id = None;
-                    task.status = "Ready".into();
-                    task.current_stage = scheduler::determine_next_stage(&task);
+                    let reason = new_escalation_logs.last().cloned();
+                    self.suspend_escalated_impl(&mut task, attempt_id, reason)?;
                     self.save(&task)?;
                     return Ok(());
                 }
@@ -2893,6 +2934,106 @@ impl Coordinator {
         }
     }
 
+    fn clear_suspended_impl_state_and_clean_worktree(
+        &mut self,
+        task: &mut TaskRecord,
+        attempt_id: Option<&str>,
+    ) -> Result<(), String> {
+        let mut cleanup_err = None;
+        if let Some(wt) = task.worktree_path.as_deref() {
+            if let Err(err) = runner::reset_worktree_uncommitted_changes(wt) {
+                cleanup_err = Some(err);
+            }
+            if let Some(id) = attempt_id {
+                runner::drop_suspended_impl_snapshot_ref(wt, id);
+            }
+            if let Some(ref susp_id) = task.memory.suspended_impl_attempt_id
+                && attempt_id != Some(susp_id.as_str())
+            {
+                runner::drop_suspended_impl_snapshot_ref(wt, susp_id);
+            }
+        }
+        task.memory.suspended_impl_attempt_id = None;
+        task.memory.suspended_impl_snapshot_sha = None;
+        task.memory.post_impl_escalation = None;
+        match cleanup_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    fn suspend_escalated_impl(
+        &mut self,
+        task: &mut TaskRecord,
+        attempt_id: String,
+        escalation_reason: Option<String>,
+    ) -> Result<(), String> {
+        let wt = task.worktree_path.as_deref().unwrap_or("");
+        let diff_files = if task.memory.post_impl_escalation.is_none() {
+            let harvest_path = self
+                .state_dir
+                .join("attempts")
+                .join(&attempt_id)
+                .join("harvest.json");
+            let from_harvest = std::fs::read(&harvest_path)
+                .ok()
+                .and_then(|bytes| {
+                    serde_json::from_slice::<runner::StageExecutionResult>(&bytes).ok()
+                })
+                .map(|res| res.diff_files)
+                .unwrap_or_default();
+            if !from_harvest.is_empty() {
+                from_harvest
+            } else if runner::is_valid_git_worktree(wt) {
+                runner::collect_worktree_diff_entries(wt)
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        let snapshot_sha = runner::snapshot_and_clean_suspended_impl_worktree(wt, &attempt_id)?;
+        task.memory.suspended_impl_snapshot_sha = snapshot_sha.clone();
+
+        if let Some(existing) = task.memory.post_impl_escalation.as_mut() {
+            if let Some(ref sha) = snapshot_sha
+                && !existing.contains("snapshot_sha:")
+            {
+                let updated = format!("{existing}\nsnapshot_sha: {sha}");
+                *existing =
+                    runner::truncate_utf8_bytes(&updated, pipeline::MAX_APPROVED_PLAN_BYTES);
+            }
+        } else {
+            let reason = escalation_reason
+                .as_deref()
+                .or_else(|| {
+                    task.memory
+                        .decisions_log
+                        .iter()
+                        .rev()
+                        .find(|entry| entry.starts_with("weight escalated to "))
+                        .map(String::as_str)
+                })
+                .unwrap_or("weight escalated after impl diff classification");
+            task.memory.post_impl_escalation = Some(pipeline::format_post_impl_escalation_summary(
+                "S",
+                &task.weight,
+                reason,
+                &attempt_id,
+                snapshot_sha.as_deref(),
+                &diff_files,
+            ));
+        }
+
+        task.memory.suspended_impl_attempt_id = Some(attempt_id);
+        task.memory.pipeline_checkpoint = None;
+        task.active_attempt_id = None;
+        task.status = "Ready".into();
+        task.current_stage = scheduler::determine_next_stage(task);
+        Ok(())
+    }
+
     fn fail_task(&mut self, task_id: &str, error: &str, class: Option<&str>) -> Result<(), String> {
         let mut task = self.task(task_id)?;
         let stage = task.current_stage.clone().unwrap_or_else(|| "impl".into());
@@ -3027,6 +3168,19 @@ impl Coordinator {
         task.lease_owner = None;
         task.lease_expires_epoch = None;
         task.memory.last_check_failure = Some(runner::truncate_utf8_bytes(error, 1024));
+        let worktree_cleanup_error = if stage == "impl" {
+            match self
+                .clear_suspended_impl_state_and_clean_worktree(&mut task, Some(&attempt.attempt_id))
+            {
+                Ok(()) => None,
+                Err(err) => {
+                    let _ = self.error_event(Some(&task.task_id), Some("worktree-cleanup"), &err);
+                    Some(err)
+                }
+            }
+        } else {
+            None
+        };
         let route_for_fallback = if !matches!(stage.as_str(), "plan-review" | "pr-review")
             && !task.memory.fallback_stages.iter().any(|s| s == &stage)
         {
@@ -3059,7 +3213,26 @@ impl Coordinator {
                 .is_none(),
             None => false,
         };
-        let decision = if is_quota && has_usable_fallback {
+        let decision = if let Some(ref cleanup_err) = worktree_cleanup_error {
+            task.status = "Blocked".into();
+            Some(crate::v2::store::FailureDecision {
+                decision_id: format!(
+                    "worktree-cleanup-{}-{}-{}",
+                    task.task_id, stage, task.memory.retry_generation
+                ),
+                kind: "worktree_cleanup_failed".into(),
+                question: format!(
+                    "{} worktree cleanup failed; manual inspection required before retrying",
+                    task.task_id
+                ),
+                options: vec!["Retry stage".into(), "Abort task".into()],
+                context: runner::truncate_utf8_bytes(
+                    &format!("{error}; worktree cleanup failed: {cleanup_err}"),
+                    1024,
+                ),
+                sha: task.reviewed_sha.clone(),
+            })
+        } else if is_quota && has_usable_fallback {
             task.memory.fallback_stages.push(stage.clone());
             task.status = "Ready".into();
             task.next_retry_epoch = now;
@@ -4059,6 +4232,12 @@ impl Coordinator {
                 .map_err(|e| e.to_string())?;
             if !matches!(choice, "Approve" | "Request Changes") {
                 task.memory.halt_requested = true;
+                if task.active_attempt_id.is_none()
+                    && let Err(err) =
+                        self.clear_suspended_impl_state_and_clean_worktree(&mut task, None)
+                {
+                    let _ = self.error_event(Some(&task.task_id), Some("worktree-cleanup"), &err);
+                }
                 task.memory
                     .applied_decisions
                     .push(decision.decision_id.clone());
@@ -4078,6 +4257,13 @@ impl Coordinator {
                 if task.active_attempt_id.is_some() {
                     return Err("cannot retry while an attempt still needs cleanup".into());
                 }
+                if task.current_stage.as_deref().is_none_or(|s| s == "impl")
+                    && let Err(err) =
+                        self.clear_suspended_impl_state_and_clean_worktree(&mut task, None)
+                {
+                    let _ = self.error_event(Some(&task.task_id), Some("worktree-cleanup"), &err);
+                    return Err(err);
+                }
                 task.memory.retry_generation += 1;
                 task.memory.retry_reset_epoch = now_epoch();
                 task.next_retry_epoch = 0;
@@ -4088,6 +4274,13 @@ impl Coordinator {
                 task.memory.halt_requested = false;
                 if task.active_attempt_id.is_some() {
                     return Err("cannot retry while an attempt still needs cleanup".into());
+                }
+                if task.current_stage.as_deref().is_none_or(|s| s == "impl")
+                    && let Err(err) =
+                        self.clear_suspended_impl_state_and_clean_worktree(&mut task, None)
+                {
+                    let _ = self.error_event(Some(&task.task_id), Some("worktree-cleanup"), &err);
+                    return Err(err);
                 }
                 let stage = task.current_stage.clone().unwrap_or_else(|| "impl".into());
                 if !task.memory.fallback_stages.iter().any(|s| s == &stage) {
@@ -4220,25 +4413,35 @@ impl Coordinator {
                 if decision.decision_id.starts_with("delivery-close-readback-") {
                     task.memory.halt_requested = true;
                 }
-                if matches!(choice, "Abort task" | "Reject" | "Cancel / Block") {
+                if matches!(
+                    choice,
+                    "Abort task" | "Reject" | "Reject attempt" | "Cancel / Block"
+                ) {
                     task.memory.halt_requested = true;
                 }
                 task.status = "Blocked".into();
-                if task.active_attempt_id.is_none()
-                    && task.memory.merge_checkpoint.as_ref().is_none_or(|c| {
+                if task.active_attempt_id.is_none() {
+                    if task.memory.halt_requested
+                        && let Err(err) =
+                            self.clear_suspended_impl_state_and_clean_worktree(&mut task, None)
+                    {
+                        let _ =
+                            self.error_event(Some(&task.task_id), Some("worktree-cleanup"), &err);
+                    }
+                    if task.memory.merge_checkpoint.as_ref().is_none_or(|c| {
                         c.merge_sha.is_none()
                             && c.phase != "MERGE_PENDING"
                             && c.phase != "CLOSE_PENDING"
-                    })
-                {
-                    task.memory.merge_checkpoint = None;
-                    task.memory.merge_lane_released = true;
-                    self.store
-                        .remove_merge_queue_entry(&task.repository, &task.task_id)
-                        .map_err(|e| e.to_string())?;
-                    self.store
-                        .release_path_locks(&task.task_id)
-                        .map_err(|e| e.to_string())?;
+                    }) {
+                        task.memory.merge_checkpoint = None;
+                        task.memory.merge_lane_released = true;
+                        self.store
+                            .remove_merge_queue_entry(&task.repository, &task.task_id)
+                            .map_err(|e| e.to_string())?;
+                        self.store
+                            .release_path_locks(&task.task_id)
+                            .map_err(|e| e.to_string())?;
+                    }
                 }
             }
         }
@@ -13085,5 +13288,502 @@ mod tests {
                 .is_empty(),
             "daemon must stop after the single granted stage and never dispatch plan-review"
         );
+    }
+
+    fn init_git_worktree_for_test(wt: &Path) {
+        std::fs::create_dir_all(wt).unwrap();
+        let run_git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(wt)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run_git(&["init", "-b", "main"]);
+        std::fs::write(wt.join(".gitignore"), "target/\nweb/node_modules/\n").unwrap();
+        std::fs::create_dir_all(wt.join("src/v2")).unwrap();
+        std::fs::write(wt.join("src/v2/router.rs"), "pub fn route() {}\n").unwrap();
+        run_git(&["add", "."]);
+        run_git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@localhost",
+            "commit",
+            "-m",
+            "base commit",
+        ]);
+        std::fs::create_dir_all(wt.join("target")).unwrap();
+        std::fs::write(wt.join("target/cache.bin"), "keep").unwrap();
+    }
+
+    fn git_porcelain(wt: &Path) -> String {
+        let out = std::process::Command::new("git")
+            .args(["-C", wt.to_str().unwrap(), "status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn write_test_ws_task_stub(dir: &Path, name: &str, json_body: &str) -> PathBuf {
+        use std::io::Write;
+        let script_path = dir.join(name);
+        let body = format!("#!/usr/bin/env python3\nprint({json_body:?})\n");
+        let mut writer = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(r#"umask 022 && cat > "$1" && chmod 0755 "$1""#)
+            .arg("sh")
+            .arg(&script_path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        writer
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(body.as_bytes())
+            .unwrap();
+        assert!(writer.wait().unwrap().success());
+        script_path
+    }
+
+    #[test]
+    fn failed_impl_resets_uncommitted_worktree_edits_before_retry_and_escalation() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        let wt = dir.0.join("wt-fail");
+        init_git_worktree_for_test(&wt);
+
+        // 1. Retryable impl failure cleans worktree edits while preserving ignored target/ cache.
+        let mut t1 = task("ZACH-063-F1");
+        t1.worktree_path = Some(wt.to_string_lossy().into_owned());
+        t1.memory.suspended_impl_snapshot_sha = Some("stale-sha".into());
+        t1.memory.post_impl_escalation = Some("stale-escalation".into());
+        let _a1 = seed_attempt(&mut c, t1, "att-fail-1");
+        std::fs::write(wt.join("src/v2/router.rs"), "pub fn broken() {}\n").unwrap();
+        std::fs::write(wt.join("untracked.rs"), "// dirty").unwrap();
+        assert!(!git_porcelain(&wt).trim().is_empty());
+
+        c.fail_task(
+            "ZACH-063-F1",
+            "impl_validation_failed: status=partial",
+            Some("semantic"),
+        )
+        .unwrap();
+        assert!(
+            git_porcelain(&wt).trim().is_empty(),
+            "dirty edits must be cleaned before Ready retry"
+        );
+        assert!(wt.join("target/cache.bin").is_file());
+        let saved1 = c.task("ZACH-063-F1").unwrap();
+        assert_eq!(saved1.status, "Ready");
+        assert!(saved1.memory.suspended_impl_snapshot_sha.is_none());
+        assert!(saved1.memory.post_impl_escalation.is_none());
+
+        // 2. WorkerResult::Stopped after halt_requested on impl cleans dirty worktree edits.
+        let mut t2 = task("ZACH-063-F2");
+        t2.worktree_path = Some(wt.to_string_lossy().into_owned());
+        t2.memory.halt_requested = true;
+        let a2 = seed_attempt(&mut c, t2, "att-stop-2");
+        std::fs::write(wt.join("src/v2/router.rs"), "pub fn stopped_edit() {}\n").unwrap();
+        c.worker_result(WorkerResult::Stopped(a2.attempt_id))
+            .unwrap();
+        assert!(git_porcelain(&wt).trim().is_empty());
+        assert_eq!(c.task("ZACH-063-F2").unwrap().status, "Blocked");
+
+        // 3. Worktree cleanup failure forces Blocked, opens FailureDecision, emits SUPERVISOR_ERROR,
+        //    and clears dangling suspended_impl_* fields.
+        let mut t3 = task("ZACH-063-F3");
+        t3.worktree_path = Some(wt.to_string_lossy().into_owned());
+        t3.memory.suspended_impl_attempt_id = Some("att-dangling".into());
+        t3.memory.suspended_impl_snapshot_sha = Some("deadbeef".into());
+        t3.memory.post_impl_escalation = Some("escalation: S -> M".into());
+        let _a3 = seed_attempt(&mut c, t3, "att-fail-3");
+        std::fs::write(wt.join("src/v2/router.rs"), "pub fn locked_dirty() {}\n").unwrap();
+        std::fs::write(wt.join(".git/index.lock"), "lock").unwrap();
+
+        c.fail_task("ZACH-063-F3", "impl error", Some("semantic"))
+            .unwrap();
+        let _ = std::fs::remove_file(wt.join(".git/index.lock"));
+
+        let blocked = c.task("ZACH-063-F3").unwrap();
+        assert_eq!(blocked.status, "Blocked");
+        assert!(blocked.memory.suspended_impl_attempt_id.is_none());
+        assert!(blocked.memory.suspended_impl_snapshot_sha.is_none());
+        assert!(blocked.memory.post_impl_escalation.is_none());
+        let decisions: Vec<_> = c
+            .store
+            .list_decisions(true, None)
+            .unwrap()
+            .into_iter()
+            .filter(|d| d.task_id == "ZACH-063-F3")
+            .collect();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].kind, "worktree_cleanup_failed");
+        let events = c.store.list_task_events("ZACH-063-F3").unwrap();
+        assert!(events.iter().any(|e| e.event_type == "SUPERVISOR_ERROR"));
+    }
+
+    #[test]
+    fn escalated_s_to_m_plan_prerequisites_cleans_worktree_surfaces_diff_and_restores_on_validate()
+    {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        let wt = dir.0.join("wt-esc");
+        init_git_worktree_for_test(&wt);
+
+        // Seed dirty S-impl changes (both modified tracked file and untracked file) + harvest.json.
+        std::fs::write(
+            wt.join("src/v2/router.rs"),
+            "pub fn route() { /* s impl */ }\n",
+        )
+        .unwrap();
+        std::fs::write(wt.join("src/v2/extra.rs"), "pub fn extra() {}\n").unwrap();
+        let diff = runner::collect_worktree_diff_entries(wt.to_str().unwrap());
+        assert!(!diff.is_empty());
+
+        let mut t = task("ZACH-063-ESC");
+        t.worktree_path = Some(wt.to_string_lossy().into_owned());
+        t.lease_owner = Some(c.instance.clone());
+        t.lease_expires_epoch = Some(now_epoch() + 60);
+        let mut a = seed_attempt(&mut c, t.clone(), "att-esc-impl");
+        a.phase = "POSTPROCESSING".into();
+        a.status = "PASSED".into();
+        c.store.record_stage_attempt(&a).unwrap();
+
+        let att_dir = dir.0.join("attempts").join("att-esc-impl");
+        std::fs::create_dir_all(&att_dir).unwrap();
+        let harvest = StageExecutionResult {
+            status: "PASSED".into(),
+            summary: "implemented S task".into(),
+            review_markdown: None,
+            review_output: Some(
+                "{\"status\":\"completed\",\"validation\":{\"passed\":null}}".into(),
+            ),
+            stage_output: Some(
+                "{\"status\":\"completed\",\"validation\":{\"passed\":null}}".into(),
+            ),
+            invocation_id: None,
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+            total_tokens: Some(150),
+            duration_seconds: Some(10.0),
+            sha_before: Some("base".into()),
+            sha_after: Some("base".into()),
+            diff_files: diff.clone(),
+        };
+        std::fs::write(
+            att_dir.join("harvest.json"),
+            serde_json::to_vec(&harvest).unwrap(),
+        )
+        .unwrap();
+
+        let esc_stub = write_test_ws_task_stub(
+            &dir.0,
+            "ws-task-esc",
+            r#"{"repository":"ZACH-063-ESC","requested_weight":"S","floor_weight":"M","effective_weight":"M","escalated":true,"required_stages":["plan","plan-review","impl","pr-review"],"reasons":["exceeds S diff ceiling"]}"#,
+        );
+        let step = pipeline::run_supervised_pipeline_step(
+            &dir.0,
+            &esc_stub,
+            c.task("ZACH-063-ESC").unwrap(),
+            &a,
+            "VALIDATE",
+            &c.semaphore,
+        )
+        .unwrap();
+        assert_eq!(step.next_operation, "PLAN_PREREQUISITES");
+
+        c.worker_result(WorkerResult::Pipeline {
+            attempt_id: a.attempt_id.clone(),
+            step,
+        })
+        .unwrap();
+
+        // Worktree is cleaned to base_sha while target/cache.bin survives.
+        assert!(
+            git_porcelain(&wt).trim().is_empty(),
+            "worktree must be clean during plan/plan-review after S->M escalation"
+        );
+        assert!(wt.join("target/cache.bin").is_file());
+
+        let saved = c.task("ZACH-063-ESC").unwrap();
+        assert_eq!(saved.current_stage.as_deref(), Some("plan"));
+        assert_eq!(
+            saved.memory.suspended_impl_attempt_id.as_deref(),
+            Some("att-esc-impl")
+        );
+        let snap_sha = saved
+            .memory
+            .suspended_impl_snapshot_sha
+            .clone()
+            .expect("snapshot SHA recorded");
+        assert!(
+            saved
+                .memory
+                .decisions_log
+                .iter()
+                .any(|d| d.contains("weight escalated to M")),
+            "decisions_log must preserve escalation reason: {:?}",
+            saved.memory.decisions_log
+        );
+        let esc_ctx = saved
+            .memory
+            .post_impl_escalation
+            .as_deref()
+            .expect("post_impl_escalation recorded");
+        assert!(esc_ctx.contains("escalation: S -> M"), "ctx={esc_ctx}");
+        assert!(esc_ctx.contains(&snap_sha), "ctx={esc_ctx}");
+        assert!(esc_ctx.contains("src/v2/router.rs"), "ctx={esc_ctx}");
+
+        // Plan & plan-review prompts surface Post-Impl Weight Escalation Context.
+        let plan_prompt = pipeline::build_plan_prompt(&saved, wt.to_str().unwrap());
+        let review_prompt =
+            pipeline::build_plan_review_prompt(&saved, wt.to_str().unwrap(), "## [PLAN]");
+        assert!(plan_prompt.contains("## Post-Impl Weight Escalation Context:"));
+        assert!(review_prompt.contains("## Post-Impl Weight Escalation Context:"));
+
+        // Complete plan & plan-review prerequisites and resume suspended impl via dispatch.
+        let mut ready = saved;
+        ready.status = "Ready".into();
+        ready.stages_completed = vec!["plan".into(), "plan-review".into()];
+        ready.current_stage = Some("impl".into());
+        c.save(&ready).unwrap();
+        c.dispatch().unwrap();
+
+        let dispatched = c.task("ZACH-063-ESC").unwrap();
+        assert_eq!(
+            dispatched.active_attempt_id.as_deref(),
+            Some("att-esc-impl")
+        );
+        assert_eq!(
+            dispatched
+                .memory
+                .pipeline_checkpoint
+                .as_ref()
+                .unwrap()
+                .operation,
+            "VALIDATE"
+        );
+
+        let clean_stub = write_test_ws_task_stub(
+            &dir.0,
+            "ws-task-clean",
+            r#"{"repository":"ZACH-063-ESC","requested_weight":"M","floor_weight":"M","effective_weight":"M","escalated":false,"required_stages":["plan","plan-review","impl","pr-review"],"reasons":[]}"#,
+        );
+        let resumed = pipeline::run_supervised_pipeline_step(
+            &dir.0,
+            &clean_stub,
+            dispatched,
+            &a,
+            "VALIDATE",
+            &c.semaphore,
+        )
+        .unwrap();
+        assert_eq!(resumed.next_operation, "CHECKS");
+        assert!(resumed.task.memory.suspended_impl_snapshot_sha.is_none());
+        assert!(resumed.task.memory.post_impl_escalation.is_none());
+        assert_eq!(
+            std::fs::read_to_string(wt.join("src/v2/router.rs")).unwrap(),
+            "pub fn route() { /* s impl */ }\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join("src/v2/extra.rs")).unwrap(),
+            "pub fn extra() {}\n"
+        );
+        assert!(wt.join("target/cache.bin").is_file());
+
+        // Also verify resume_pipeline_steps rejects a partial harvest.json BEFORE suspending.
+        let dir2 = TestDirectory::new();
+        let mut c2 = coordinator(&dir2.0);
+        let wt_bad = dir2.0.join("wt-bad-resume");
+        init_git_worktree_for_test(&wt_bad);
+        std::fs::write(
+            wt_bad.join("src/v2/router.rs"),
+            "pub fn route() { /* bad partial */ }\n",
+        )
+        .unwrap();
+        let mut t_bad = task("ZACH-063-RESUME-BAD");
+        t_bad.weight = "M".into();
+        t_bad.required_stages = intake::default_required_stages("M");
+        t_bad.stages_completed = Vec::new();
+        t_bad.current_stage = Some("impl".into());
+        t_bad.worktree_path = Some(wt_bad.to_string_lossy().into_owned());
+        t_bad.memory.pipeline_checkpoint = Some(PipelineCheckpoint {
+            attempt_id: "att-bad-resume".into(),
+            operation: "VALIDATE".into(),
+        });
+        let mut a_bad = seed_attempt(&mut c2, t_bad, "att-bad-resume");
+        a_bad.phase = "POSTPROCESSING".into();
+        a_bad.status = "PASSED".into();
+        c2.store.record_stage_attempt(&a_bad).unwrap();
+        let bad_dir = dir2.0.join("attempts").join("att-bad-resume");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        let bad_harvest = StageExecutionResult {
+            status: "PASSED".into(),
+            summary: "bypass".into(),
+            review_markdown: None,
+            review_output: Some(
+                "{\"status\":\"partial\",\"validation\":{\"passed\":false}}".into(),
+            ),
+            stage_output: Some("{\"status\":\"partial\",\"validation\":{\"passed\":false}}".into()),
+            invocation_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            duration_seconds: None,
+            sha_before: Some("base".into()),
+            sha_after: Some("base".into()),
+            diff_files: Vec::new(),
+        };
+        std::fs::write(
+            bad_dir.join("harvest.json"),
+            serde_json::to_vec(&bad_harvest).unwrap(),
+        )
+        .unwrap();
+        c2.resume_pipeline_steps().unwrap();
+        let rejected = c2.task("ZACH-063-RESUME-BAD").unwrap();
+        assert!(rejected.memory.suspended_impl_attempt_id.is_none());
+        let bad_attempt = c2
+            .store
+            .get_stage_attempt("att-bad-resume")
+            .unwrap()
+            .unwrap();
+        assert_eq!(bad_attempt.status, "FAILED");
+        assert_eq!(bad_attempt.failure_class.as_deref(), Some("semantic"));
+        assert!(git_porcelain(&wt_bad).trim().is_empty());
+    }
+
+    #[test]
+    fn aborted_or_rejected_escalated_task_cleans_suspended_impl_snapshot_and_worktree() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        let wt = dir.0.join("wt-abort");
+        init_git_worktree_for_test(&wt);
+
+        std::fs::write(
+            wt.join("src/v2/router.rs"),
+            "pub fn route() { /* dirty */ }\n",
+        )
+        .unwrap();
+        let snap_sha =
+            runner::snapshot_and_clean_suspended_impl_worktree(wt.to_str().unwrap(), "att-abort-1")
+                .unwrap()
+                .unwrap();
+        // Leave an extra uncommitted edit too so we verify abort cleans worktree + snapshot ref.
+        std::fs::write(wt.join("leftover.txt"), "dirty").unwrap();
+
+        let mut t = task("ZACH-063-ABORT");
+        t.status = "Blocked".into();
+        t.worktree_path = Some(wt.to_string_lossy().into_owned());
+        t.memory.suspended_impl_attempt_id = Some("att-abort-1".into());
+        t.memory.suspended_impl_snapshot_sha = Some(snap_sha);
+        t.memory.post_impl_escalation = Some("escalation: S -> M".into());
+        c.save(&t).unwrap();
+
+        c.store
+            .open_decision(
+                "dec-abort-063",
+                "ZACH-063-ABORT",
+                "test",
+                "retries_exhausted",
+                "Proceed?",
+                &["Retry stage".into(), "Abort task".into()],
+                Some(0),
+                "context",
+                None,
+            )
+            .unwrap();
+        let DecisionResolution::Resolved(resolved) = c
+            .store
+            .resolve_decision("dec-abort-063", "Abort task", "human", None)
+            .unwrap()
+        else {
+            panic!("expected Resolved decision");
+        };
+        c.apply_decision(&resolved).unwrap();
+
+        let after = c.task("ZACH-063-ABORT").unwrap();
+        assert_eq!(after.status, "Blocked");
+        assert!(after.memory.halt_requested);
+        assert!(after.memory.suspended_impl_attempt_id.is_none());
+        assert!(after.memory.suspended_impl_snapshot_sha.is_none());
+        assert!(after.memory.post_impl_escalation.is_none());
+        assert!(git_porcelain(&wt).trim().is_empty());
+        let ref_check = std::process::Command::new("git")
+            .args([
+                "-C",
+                wt.to_str().unwrap(),
+                "rev-parse",
+                "--verify",
+                "refs/zach/suspended-impl/att-abort-1",
+            ])
+            .output()
+            .unwrap();
+        assert!(!ref_check.status.success());
+
+        // Also test Reject on human-plan-approval cleans suspended snapshot and dirty worktree.
+        std::fs::write(
+            wt.join("src/v2/router.rs"),
+            "pub fn route() { /* dirty2 */ }\n",
+        )
+        .unwrap();
+        let snap2 = runner::snapshot_and_clean_suspended_impl_worktree(
+            wt.to_str().unwrap(),
+            "att-reject-2",
+        )
+        .unwrap()
+        .unwrap();
+        std::fs::write(wt.join("leftover2.txt"), "dirty").unwrap();
+        let mut t2 = task("ZACH-063-REJECT");
+        t2.status = "Blocked".into();
+        t2.weight = "L".into();
+        t2.current_stage = Some("human-plan-approval".into());
+        t2.plan_base_sha = Some("base".into());
+        t2.worktree_path = Some(wt.to_string_lossy().into_owned());
+        t2.memory.suspended_impl_attempt_id = Some("att-reject-2".into());
+        t2.memory.suspended_impl_snapshot_sha = Some(snap2);
+        t2.memory.post_impl_escalation = Some("escalation: M -> L".into());
+        c.save(&t2).unwrap();
+        c.store
+            .open_decision(
+                "human-ZACH-063-REJECT-human-plan-approval-base-0-0-p0-r0",
+                "ZACH-063-REJECT",
+                "test",
+                "human-plan-approval",
+                "Approve?",
+                &["Approve".into(), "Reject".into()],
+                Some(0),
+                "context",
+                Some("base"),
+            )
+            .unwrap();
+        let DecisionResolution::Resolved(resolved2) = c
+            .store
+            .resolve_decision(
+                "human-ZACH-063-REJECT-human-plan-approval-base-0-0-p0-r0",
+                "Reject",
+                "human",
+                None,
+            )
+            .unwrap()
+        else {
+            panic!("expected Resolved decision");
+        };
+        c.apply_decision(&resolved2).unwrap();
+        let after2 = c.task("ZACH-063-REJECT").unwrap();
+        assert!(after2.memory.halt_requested);
+        assert!(after2.memory.suspended_impl_attempt_id.is_none());
+        assert!(after2.memory.suspended_impl_snapshot_sha.is_none());
+        assert!(after2.memory.post_impl_escalation.is_none());
+        assert!(git_porcelain(&wt).trim().is_empty());
     }
 }

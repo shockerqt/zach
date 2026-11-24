@@ -108,6 +108,10 @@ pub struct TaskMemory {
     #[serde(default)]
     pub suspended_impl_attempt_id: Option<String>,
     #[serde(default)]
+    pub suspended_impl_snapshot_sha: Option<String>,
+    #[serde(default)]
+    pub post_impl_escalation: Option<String>,
+    #[serde(default)]
     pub merge_lane_released: bool,
     #[serde(default)]
     pub plan_rework_generation: u64,
@@ -2341,6 +2345,8 @@ impl V2Store {
             || incoming.memory.pipeline_checkpoint.is_some()
             || incoming.memory.merge_checkpoint.is_some()
             || incoming.memory.suspended_impl_attempt_id.is_some()
+            || incoming.memory.suspended_impl_snapshot_sha.is_some()
+            || incoming.memory.post_impl_escalation.is_some()
         {
             return Ok(false);
         }
@@ -2383,7 +2389,8 @@ impl V2Store {
         ) && task.active_attempt_id.is_none()
             && task.memory.pipeline_checkpoint.is_none()
             && (task.memory.merge_checkpoint.is_some()
-                || task.memory.suspended_impl_attempt_id.is_some())
+                || task.memory.suspended_impl_attempt_id.is_some()
+                || task.memory.suspended_impl_snapshot_sha.is_some())
         {
             return Err(V2StoreError(
                 "ambiguous native startup checkpoint status".into(),
@@ -2397,6 +2404,7 @@ impl V2Store {
             || task.memory.pipeline_checkpoint.is_some()
             || task.memory.merge_checkpoint.is_some()
             || task.memory.suspended_impl_attempt_id.is_some()
+            || task.memory.suspended_impl_snapshot_sha.is_some()
         {
             return Ok(true);
         }
@@ -2479,6 +2487,7 @@ impl V2Store {
             t.memory.pipeline_checkpoint.is_some()
                 || t.memory.merge_checkpoint.is_some()
                 || t.memory.suspended_impl_attempt_id.is_some()
+                || t.memory.suspended_impl_snapshot_sha.is_some()
         };
         if old.repository != incoming.repository
             || pending_memory(old)
@@ -4677,10 +4686,24 @@ fn coalesce_runtime_fields(old: &TaskRecord, next: &mut TaskRecord) {
     let incoming_governance_started = next.memory.governance_started;
     if next.memory == TaskMemory::default() {
         next.memory = old.memory.clone();
-    } else if next.memory.merge_checkpoint.is_none() {
-        // Board exports cannot replace a durable merge/delivery receipt.
-        next.memory.merge_checkpoint = old.memory.merge_checkpoint.clone();
-        next.memory.merge_lane_released = old.memory.merge_lane_released;
+    } else {
+        if next.memory.merge_checkpoint.is_none() {
+            // Board exports cannot replace a durable merge/delivery receipt.
+            next.memory.merge_checkpoint = old.memory.merge_checkpoint.clone();
+            next.memory.merge_lane_released = old.memory.merge_lane_released;
+        }
+        if next.memory.suspended_impl_attempt_id.is_none()
+            && old.memory.suspended_impl_attempt_id.is_some()
+        {
+            next.memory.suspended_impl_attempt_id = old.memory.suspended_impl_attempt_id.clone();
+            if next.memory.suspended_impl_snapshot_sha.is_none() {
+                next.memory.suspended_impl_snapshot_sha =
+                    old.memory.suspended_impl_snapshot_sha.clone();
+            }
+            if next.memory.post_impl_escalation.is_none() {
+                next.memory.post_impl_escalation = old.memory.post_impl_escalation.clone();
+            }
+        }
     }
     if matches!(next.status.as_str(), "Backlog" | "Ready")
         && !incoming_governance_started
@@ -7884,6 +7907,59 @@ mod tests {
                 .iter()
                 .any(|e| e.event_type == "CONSENT_REVOKED_EXTERNALLY" && e.task_id == "ZACH-791"),
             "expected CONSENT_REVOKED_EXTERNALLY event, got: {events2:?}"
+        );
+    }
+
+    #[test]
+    fn coalesce_runtime_fields_and_sync_preserve_suspended_impl_snapshot_and_escalation() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        let mut task = sample_task("ZACH-063-STORE", "Ready", vec![]);
+        task.executor = Some("zach".into());
+        task.current_stage = Some("plan".into());
+        task.memory.governance_started = true;
+        task.memory.suspended_impl_attempt_id = Some("att-impl-063".into());
+        task.memory.suspended_impl_snapshot_sha = Some("deadbeef".repeat(5));
+        task.memory.post_impl_escalation =
+            Some("escalation: S -> M\nchanged_files:\n- src/v2/runner.rs (M, +10, -2)".into());
+        store.upsert_task(&task).unwrap();
+
+        assert!(store.native_startup_owned(&task).unwrap());
+
+        let mut export_task = sample_task("ZACH-063-STORE", "Ready", vec![]);
+        export_task.executor = Some("zach".into());
+        export_task.memory.governance_started = true;
+        let synced = store
+            .sync_task_with_mode(&export_task, SyncMode::Standard)
+            .unwrap();
+        assert_eq!(
+            synced.memory.suspended_impl_attempt_id.as_deref(),
+            Some("att-impl-063")
+        );
+        assert_eq!(
+            synced.memory.suspended_impl_snapshot_sha.as_deref(),
+            Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+        );
+        assert!(
+            synced
+                .memory
+                .post_impl_escalation
+                .as_deref()
+                .is_some_and(|s| s.contains("src/v2/runner.rs"))
+        );
+
+        let mut next = export_task.clone();
+        coalesce_runtime_fields(&synced, &mut next);
+        assert_eq!(
+            next.memory.suspended_impl_attempt_id.as_deref(),
+            Some("att-impl-063")
+        );
+        assert_eq!(
+            next.memory.suspended_impl_snapshot_sha,
+            synced.memory.suspended_impl_snapshot_sha
+        );
+        assert_eq!(
+            next.memory.post_impl_escalation,
+            synced.memory.post_impl_escalation
         );
     }
 }
