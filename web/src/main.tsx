@@ -177,6 +177,73 @@ function TaskCard({ t, s }: { t: Task; s: State }) {
     </article>
   );
 }
+export function ConnectionBar({
+  authMode,
+  connected,
+  notice,
+  inputRef,
+  onConnect,
+  onReconnect,
+  onDisconnect,
+}: {
+  authMode: AuthMode;
+  connected: boolean;
+  notice: string;
+  inputRef?: React.RefObject<HTMLInputElement | null>;
+  onConnect: (token: string) => void;
+  onReconnect: () => void;
+  onDisconnect: () => void;
+}) {
+  if (authMode === "access") {
+    if (connected) return null;
+    return (
+      <section aria-label="Conexión de sesión" className="connection">
+        <div className="status" role="status">
+          {notice}
+        </div>
+        <button className="primary" type="button" onClick={onReconnect}>
+          Reconectar
+        </button>
+      </section>
+    );
+  }
+  return (
+    <form
+      aria-label="Conexión de sesión"
+      className="connection"
+      onSubmit={(e) => {
+        e.preventDefault();
+        const token = inputRef?.current?.value ?? "";
+        if (inputRef?.current) inputRef.current.value = "";
+        onConnect(token);
+      }}
+    >
+      <label>
+        Credencial de sesión
+        <input
+          ref={inputRef}
+          type="password"
+          autoComplete="off"
+          name="session-credential"
+          required
+        />
+      </label>
+      <button className="primary" type="submit">
+        Conectar
+      </button>
+      <button type="button" onClick={onDisconnect}>
+        Desconectar
+      </button>
+      <p>
+        Solo en memoria durante la conexión. El campo se borra al conectar.
+      </p>
+      <div className="status" role="status">
+        {connected ? "● " : ""}
+        {notice}
+      </div>
+    </form>
+  );
+}
 function App() {
   const [s, setS] = useState(initial),
     [notice, setNotice] = useState("Desconectado"),
@@ -269,85 +336,31 @@ function App() {
           </button>
         </div>
       </header>
-      {authMode === "access" ? (
-        <section aria-label="Conexión de sesión" className="connection">
-          <p>Sesión autenticada mediante Cloudflare Access.</p>
-          <button
-            className="primary"
-            type="button"
-            onClick={() => {
-              setEpoch((x) => x + 1);
-              sound.current.mute();
-              setOn(false);
-              void c.connectAuto();
-            }}
-          >
-            Reconectar
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              c.disconnect();
-              sound.current.mute();
-              setOn(false);
-              setEpoch((x) => x + 1);
-            }}
-          >
-            Desconectar
-          </button>
-          <div className="status" role="status">
-            {connected ? "● " : ""}
-            {notice}
-          </div>
-        </section>
-      ) : (
-        <form
-          aria-label="Conexión de sesión"
-          className="connection"
-          onSubmit={(e) => {
-            e.preventDefault();
-            const token = input.current?.value ?? "";
-            if (input.current) input.current.value = "";
-            setEpoch((x) => x + 1);
-            sound.current.mute();
-            setOn(false);
-            void c.connect(token);
-          }}
-        >
-          <label>
-            Credencial de sesión
-            <input
-              ref={input}
-              type="password"
-              autoComplete="off"
-              name="session-credential"
-              required
-            />
-          </label>
-          <button className="primary" type="submit">
-            Conectar
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              c.disconnect();
-              sound.current.mute();
-              setOn(false);
-              setEpoch((x) => x + 1);
-              if (input.current) input.current.value = "";
-            }}
-          >
-            Desconectar
-          </button>
-          <p>
-            Solo en memoria durante la conexión. El campo se borra al conectar.
-          </p>
-          <div className="status" role="status">
-            {connected ? "● " : ""}
-            {notice}
-          </div>
-        </form>
-      )}
+      <ConnectionBar
+        authMode={authMode}
+        connected={connected}
+        notice={notice}
+        inputRef={input}
+        onConnect={(token) => {
+          setEpoch((x) => x + 1);
+          sound.current.mute();
+          setOn(false);
+          void c.connect(token);
+        }}
+        onReconnect={() => {
+          setEpoch((x) => x + 1);
+          sound.current.mute();
+          setOn(false);
+          void c.connectAuto();
+        }}
+        onDisconnect={() => {
+          c.disconnect();
+          sound.current.mute();
+          setOn(false);
+          setEpoch((x) => x + 1);
+          if (input.current) input.current.value = "";
+        }}
+      />
       <main id="main">
         <section className="column" aria-label="Decisiones pendientes">
           {s.decisions.length ? (
@@ -460,8 +473,13 @@ function App() {
     </>
   );
 }
-createRoot(document.getElementById("root")!).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>,
-);
+if (typeof document !== "undefined") {
+  const root = document.getElementById("root");
+  if (root) {
+    createRoot(root).render(
+      <React.StrictMode>
+        <App />
+      </React.StrictMode>,
+    );
+  }
+}
