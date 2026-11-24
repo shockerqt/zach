@@ -1,5 +1,8 @@
 import { afterEach, describe, it, expect, vi } from "vitest";
+import React from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { Connection } from "./connection";
+import { ConnectionBar } from "./main";
 const snap = {
   tasks: [],
   open_decisions: [],
@@ -304,4 +307,78 @@ it("connectAuto connects without Authorization header on 200 and falls back to n
   expect(c.authMode).toBe("none");
   expect(notices.at(-1)).toBe("Desconectado");
   c.disconnect();
+});
+
+describe("ConnectionBar in access mode", () => {
+  it("hides connection section and buttons when connected", () => {
+    const html = renderToStaticMarkup(
+      React.createElement(ConnectionBar, {
+        authMode: "access",
+        connected: true,
+        notice: "Conectado · SSE",
+        onConnect: () => {},
+        onReconnect: () => {},
+        onDisconnect: () => {},
+      }),
+    );
+    expect(html).toBe("");
+    expect(html).not.toContain("Conexión de sesión");
+    expect(html).not.toContain("Reconectar");
+    expect(html).not.toContain("Desconectar");
+  });
+
+  it("renders only status notice and Reconectar button when disconnected", () => {
+    const html = renderToStaticMarkup(
+      React.createElement(ConnectionBar, {
+        authMode: "access",
+        connected: false,
+        notice: "Desconectado",
+        onConnect: () => {},
+        onReconnect: () => {},
+        onDisconnect: () => {},
+      }),
+    );
+    expect(html).toContain('aria-label="Conexión de sesión"');
+    expect(html).toContain('role="status"');
+    expect(html).toContain("Desconectado");
+    expect(html).toContain("Reconectar");
+    expect(html).not.toContain("Desconectar");
+    expect(html).not.toContain("Cloudflare Access");
+    expect(html).not.toContain("<input");
+  });
+
+  it("triggers onReconnect callback to re-establish access session", async () => {
+    const calls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        calls.push(url);
+        if (url.endsWith("snapshot")) return Response.json(snap);
+        return new Response(frame("snapshot", { ...snap, status: undefined }), {
+          headers: { "content-type": "text/event-stream" },
+        });
+      }),
+    );
+    const c = new Connection(
+      () => {},
+      () => {},
+    );
+    const element = React.createElement(ConnectionBar, {
+      authMode: "access",
+      connected: false,
+      notice: "Desconectado",
+      onConnect: () => {},
+      onReconnect: () => {
+        void c.connectAuto();
+      },
+      onDisconnect: () => {},
+    });
+    expect(element.props.onReconnect).toBeTypeOf("function");
+    element.props.onReconnect();
+    await flush();
+    expect(c.active).toBe(true);
+    expect(c.authMode).toBe("access");
+    expect(calls.some((u) => u.endsWith("snapshot"))).toBe(true);
+    c.disconnect();
+  });
 });
