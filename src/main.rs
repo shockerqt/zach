@@ -49,17 +49,23 @@ fn main() {
                 std::process::exit(1);
             }
         },
-        "status" => run_v2_status(&args[2..]),
+        "status" => run_v2_status(&args[2..], false),
+        "ps" => run_v2_status(&args[2..], true),
         "queue" => run_v2_queue(&args[2..]),
         "decisions" => run_v2_decisions(&args[2..]),
         "decide" => run_v2_decide(&args[2..]),
         "sync" => run_v2_sync(&args[2..]),
         "config" => run_v2_config(&args[2..]),
+        "cooldown" => run_v2_cooldown(&args[2..]),
         "run" => run_v2_run(&args[2..]),
+        "stage" => run_v2_stage(&args[2..]),
+        "announce" => run_v2_announce(&args[2..]),
+        "sessions" => run_v2_sessions(&args[2..]),
         "daemon" | "zachd" => run_v2_daemon(&args[2..]),
         "attach" => run_v2_attach(&args[2..]),
         "events" => run_v2_events(&args[2..]),
         "web" => run_v2_web(&args[2..]),
+        "audit" => run_v2_audit(&args[2..]),
         "--help" | "-h" => print_usage(),
         unknown => {
             eprintln!("unknown option: {unknown}");
@@ -102,13 +108,121 @@ fn open_store(args: &[String]) -> V2Store {
     })
 }
 
-fn run_v2_status(args: &[String]) {
+fn format_summary_line(summary: &zach::v2::store::DaemonStatusSummary) -> String {
+    format!(
+        "Zach v{} · max_parallel={} · tasks={} · ready_eligible={} · in_progress={} · open_decisions={} · locks={} · merge_queue={} · max_seq={}",
+        summary.schema_version,
+        summary.max_parallel_tasks,
+        summary.total_tasks,
+        summary.ready_eligible_count,
+        summary.in_progress_count,
+        summary.open_decisions_count,
+        summary.active_locks_count,
+        summary.merge_queue_count,
+        summary.max_seq_id
+    )
+}
+
+fn format_detailed_status(report: &zach::v2::store::DetailedStatusReport) -> String {
+    let mut lines = vec![format_summary_line(&report.summary)];
+
+    if report.active_tasks.is_empty() {
+        lines.push("Active: none".to_owned());
+    } else {
+        lines.push(format!("Active ({}):", report.active_tasks.len()));
+        for a in &report.active_tasks {
+            lines.push(format!(
+                "  {:<10} [{:<2}] repo={:<16} group={:<6} Effective: {} · GitHub: {} · Decision: {} · exec={:<8} stage={:<11} phase={:<14} slot={} res={} · {}",
+                a.task_id,
+                a.weight,
+                a.repository,
+                a.task_group,
+                a.status,
+                a.board_status.as_deref().unwrap_or("unknown"),
+                a.open_decision_id.as_deref().unwrap_or("-"),
+                a.executor.as_deref().unwrap_or("-"),
+                a.current_stage.as_deref().unwrap_or("-"),
+                a.attempt_phase.as_deref().unwrap_or("-"),
+                a.occupies_slot,
+                a.reservation,
+                a.title
+            ));
+        }
+    }
+
+    if report.waiting_tasks.is_empty() {
+        lines.push("Waiting: none".to_owned());
+    } else {
+        lines.push(format!("Waiting ({}):", report.waiting_tasks.len()));
+        for w in &report.waiting_tasks {
+            lines.push(format!(
+                "  {:<10} [{:<2}] repo={:<16} group={:<6} Effective: {} · GitHub: {} · Decision: {} · wait={} · {}",
+                w.task_id, w.weight, w.repository, w.task_group, w.status,
+                w.board_status.as_deref().unwrap_or("unknown"),
+                w.open_decision_id.as_deref().unwrap_or("-"), w.wait_reason, w.title
+            ));
+        }
+    }
+
+    if !report.path_locks.is_empty() {
+        lines.push(format!("Path locks ({}):", report.path_locks.len()));
+        for lock in &report.path_locks {
+            lines.push(format!(
+                "  {:<16} {:<10} path={}",
+                lock.repo, lock.task_id, lock.path
+            ));
+        }
+    }
+
+    if !report.merge_queue.is_empty() {
+        lines.push(format!("Merge queue ({}):", report.merge_queue.len()));
+        for m in &report.merge_queue {
+            lines.push(format!(
+                "  {:<16} {:<10} PR #{:<5} state={}",
+                m.repo, m.task_id, m.pr_number, m.state
+            ));
+        }
+    }
+
+    if !report.open_decisions.is_empty() {
+        lines.push(format!("Open decisions ({}):", report.open_decisions.len()));
+        for d in &report.open_decisions {
+            lines.push(format!(
+                "  {:<12} task={:<10} kind={:<16} · {}",
+                d.decision_id, d.task_id, d.kind, d.question
+            ));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn run_v2_status(args: &[String], force_detail: bool) {
     let mut store = open_store(args);
     if has_flag(args, "--sync") {
         let ws_task = default_ws_task_bin();
         if let Err(error) = sync_from_ws_task(&mut store, &ws_task) {
             eprintln!("warning: ws-task sync failed: {error}");
         }
+    }
+    let detail = force_detail || has_flag(args, "--detail");
+    let group = flag_value(args, "--group");
+    if detail {
+        let report = store
+            .detailed_status(group.as_deref())
+            .unwrap_or_else(|error| {
+                eprintln!("status query failed: {error}");
+                std::process::exit(1);
+            });
+        if has_flag(args, "--json") {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_owned())
+            );
+        } else {
+            println!("{}", format_detailed_status(&report));
+        }
+        return;
     }
     let summary = store.status_summary().unwrap_or_else(|error| {
         eprintln!("status query failed: {error}");
@@ -120,18 +234,7 @@ fn run_v2_status(args: &[String]) {
             serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_owned())
         );
     } else {
-        println!(
-            "Zach v{} · max_parallel={} · tasks={} · ready_eligible={} · in_progress={} · open_decisions={} · locks={} · merge_queue={} · max_seq={}",
-            summary.schema_version,
-            summary.max_parallel_tasks,
-            summary.total_tasks,
-            summary.ready_eligible_count,
-            summary.in_progress_count,
-            summary.open_decisions_count,
-            summary.active_locks_count,
-            summary.merge_queue_count,
-            summary.max_seq_id
-        );
+        println!("{}", format_summary_line(&summary));
     }
 }
 
@@ -580,6 +683,113 @@ fn run_v2_sync(args: &[String]) {
 }
 
 fn run_v2_config(args: &[String]) {
+    if let Some(sub) = args.first().map(String::as_str) {
+        match sub {
+            "init" => {
+                let explicit = flag_value(&args[1..], "--file");
+                let force = has_flag(&args[1..], "--force");
+                match zach::v2::router::init_router_config(
+                    explicit.as_deref().map(std::path::Path::new),
+                    force,
+                ) {
+                    Ok(written) => {
+                        println!("router_config={}", written.display());
+                        return;
+                    }
+                    Err(err) => {
+                        eprintln!("router config init failed: {err}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            "validate" => {
+                let explicit = flag_value(&args[1..], "--file");
+                let path = explicit
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(zach::v2::router::default_router_config_path);
+                let (cfg, warnings) = if path.exists() {
+                    match zach::v2::router::load_router_config_from_path(&path) {
+                        Ok(res) => res,
+                        Err(err) => {
+                            eprintln!("router config validation failed: {err}");
+                            std::process::exit(1);
+                        }
+                    }
+                } else if explicit.is_some() {
+                    eprintln!("router config file not found: {}", path.display());
+                    std::process::exit(1);
+                } else {
+                    let cfg = zach::v2::router::RouterConfig::default();
+                    let warnings =
+                        zach::v2::router::validate_router_config(&cfg).unwrap_or_else(|err| {
+                            eprintln!("router config validation failed: {err}");
+                            std::process::exit(1);
+                        });
+                    (cfg, warnings)
+                };
+                println!(
+                    "router_config={} ({})",
+                    path.display(),
+                    if path.exists() {
+                        "file"
+                    } else {
+                        "built-in defaults"
+                    }
+                );
+                for w in &warnings {
+                    eprintln!("warning: {w}");
+                }
+                println!("{}", zach::v2::router::format_effective_routes_table(&cfg));
+                return;
+            }
+            "reload" => {
+                let file_path = flag_value(&args[1..], "--file");
+                let socket_path = flag_value(&args[1..], "--socket")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(default_socket_path);
+                let mut stream = std::os::unix::net::UnixStream::connect(&socket_path)
+                    .unwrap_or_else(|error| {
+                        eprintln!("connect to zachd at {}: {error}", socket_path.display());
+                        std::process::exit(1)
+                    });
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap_or_else(|error| {
+                        eprintln!("reload socket timeout: {error}");
+                        std::process::exit(1)
+                    });
+                write_ndjson(
+                    &mut stream,
+                    &ClientCommand::ReloadConfig { path: file_path },
+                )
+                .unwrap_or_else(|error| {
+                    eprintln!("submit reload: {error}");
+                    std::process::exit(1)
+                });
+                use std::io::BufRead;
+                let mut line = String::new();
+                std::io::BufReader::new(stream)
+                    .read_line(&mut line)
+                    .unwrap_or_else(|error| {
+                        eprintln!("reload acknowledgment: {error}");
+                        std::process::exit(1)
+                    });
+                let reply: serde_json::Value =
+                    serde_json::from_str(&line).unwrap_or_else(|error| {
+                        eprintln!("invalid daemon acknowledgment: {error}");
+                        std::process::exit(1)
+                    });
+                println!("{}", line.trim());
+                if reply["type"] == "ERROR" || reply["ok"] == false {
+                    std::process::exit(1);
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
+
     let mut store = open_store(args);
     if let Some(raw_max) = flag_value(args, "--max-parallel") {
         let parsed = raw_max
@@ -591,7 +801,506 @@ fn run_v2_config(args: &[String]) {
         }
     }
     let max_parallel = store.max_parallel_tasks().unwrap_or(2);
+    let router_path = zach::v2::router::default_router_config_path();
     println!("max_parallel_tasks={max_parallel}");
+    println!("router_config={}", router_path.display());
+}
+
+fn try_cooldown_socket(
+    socket_path: &std::path::Path,
+    cmd: &ClientCommand,
+) -> Option<Result<zach::v2::socket::ServerMessage, String>> {
+    use std::io::BufRead;
+    let mut stream = std::os::unix::net::UnixStream::connect(socket_path).ok()?;
+    if let Err(err) = stream.set_read_timeout(Some(std::time::Duration::from_secs(5))) {
+        return Some(Err(format!("cooldown socket timeout: {err}")));
+    }
+    if let Err(err) = write_ndjson(&mut stream, cmd) {
+        return Some(Err(format!("submit cooldown command: {err}")));
+    }
+    let mut line = String::new();
+    if let Err(err) = std::io::BufReader::new(stream).read_line(&mut line) {
+        return Some(Err(format!("read cooldown reply: {err}")));
+    }
+    Some(
+        serde_json::from_str::<zach::v2::socket::ServerMessage>(&line)
+            .map_err(|err| format!("invalid daemon reply: {err}")),
+    )
+}
+
+fn cooldown_list_with_fallback(
+    args: &[String],
+) -> Result<Vec<zach::v2::store::ProviderCooldownRecord>, String> {
+    let socket_path = flag_value(args, "--socket")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_socket_path);
+    if flag_value(args, "--db").is_none()
+        && let Some(res) = try_cooldown_socket(&socket_path, &ClientCommand::CooldownList)
+    {
+        return match res? {
+            zach::v2::socket::ServerMessage::Cooldowns { cooldowns } => Ok(cooldowns),
+            zach::v2::socket::ServerMessage::Error { error } => Err(error),
+            other => Err(format!("unexpected daemon reply: {other:?}")),
+        };
+    }
+    let store = open_store(args);
+    store
+        .list_provider_cooldowns(Some(zach::v2::now_epoch()))
+        .map_err(|e| e.to_string())
+}
+
+fn cooldown_clear_with_fallback(args: &[String], family: Option<String>) -> Result<usize, String> {
+    let socket_path = flag_value(args, "--socket")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_socket_path);
+    if flag_value(args, "--db").is_none()
+        && let Some(res) = try_cooldown_socket(
+            &socket_path,
+            &ClientCommand::CooldownClear {
+                family: family.clone(),
+            },
+        )
+    {
+        return match res? {
+            zach::v2::socket::ServerMessage::CooldownCleared { cleared } => Ok(cleared),
+            zach::v2::socket::ServerMessage::Error { error } => Err(error),
+            other => Err(format!("unexpected daemon reply: {other:?}")),
+        };
+    }
+    let mut store = open_store(args);
+    store
+        .clear_provider_cooldown(family.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+fn extract_clear_family(args: &[String]) -> Result<Option<String>, String> {
+    let clear_all = has_flag(args, "--all");
+    let mut positional: Option<String> = None;
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = args[idx].as_str();
+        if matches!(arg, "--db" | "--socket") {
+            idx += 2;
+            continue;
+        }
+        if arg == "--all" || arg == "--json" {
+            idx += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            return Err(format!("unknown flag: {arg}"));
+        }
+        if positional.is_some() {
+            return Err("unexpected extra argument".into());
+        }
+        positional = Some(arg.to_owned());
+        idx += 1;
+    }
+    if clear_all && positional.is_some() {
+        return Err("cannot pass both <family> and --all".into());
+    }
+    if !clear_all && positional.is_none() {
+        return Err("specify <family> or --all".into());
+    }
+    Ok(positional)
+}
+
+fn run_v2_cooldown(args: &[String]) {
+    let sub = args.first().map(String::as_str).unwrap_or("list");
+    let rest = if args.is_empty() { &[][..] } else { &args[1..] };
+    match sub {
+        "list" => {
+            let cooldowns = cooldown_list_with_fallback(rest).unwrap_or_else(|err| {
+                eprintln!("cooldown list failed: {err}");
+                std::process::exit(1);
+            });
+            if has_flag(rest, "--json") {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&cooldowns).unwrap_or_default()
+                );
+            } else if cooldowns.is_empty() {
+                println!("no active provider cooldowns");
+            } else {
+                let now = zach::v2::now_epoch();
+                for cd in &cooldowns {
+                    let remaining = (cd.until_epoch - now).max(0);
+                    println!(
+                        "{}\tuntil={}\tremaining={}s\treason={}",
+                        cd.family, cd.until_epoch, remaining, cd.reason
+                    );
+                }
+            }
+        }
+        "clear" => {
+            let family = extract_clear_family(rest).unwrap_or_else(|err| usage_error(&err));
+            let cleared = cooldown_clear_with_fallback(rest, family).unwrap_or_else(|err| {
+                eprintln!("cooldown clear failed: {err}");
+                std::process::exit(1);
+            });
+            println!("cleared={cleared}");
+        }
+        other => usage_error(&format!("unknown cooldown subcommand: {other}")),
+    }
+}
+
+fn run_v2_stage(args: &[String]) {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    if sub != "run" {
+        eprintln!(
+            "Usage: zach stage run --task <TASK_ID> --stage <plan|plan-review|impl|pr-review> [--wait] [--json] [--socket <PATH>]"
+        );
+        std::process::exit(2);
+    }
+    let rest = &args[1..];
+    let Some(task) = flag_value(rest, "--task") else {
+        eprintln!("zach stage run requires --task <TASK_ID>");
+        std::process::exit(2);
+    };
+    let Some(stage) = flag_value(rest, "--stage") else {
+        eprintln!("zach stage run requires --stage <plan|plan-review|impl|pr-review>");
+        std::process::exit(2);
+    };
+    if !matches!(
+        stage.as_str(),
+        "plan" | "plan-review" | "impl" | "pr-review"
+    ) {
+        eprintln!(
+            "unsupported stage '{stage}': expected one of plan, plan-review, impl, pr-review"
+        );
+        std::process::exit(2);
+    }
+    let wait = has_flag(rest, "--wait");
+    let json_out = has_flag(rest, "--json");
+    let socket_path = flag_value(rest, "--socket")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_socket_path);
+    let submit_stage = |wait_flag: bool| -> serde_json::Value {
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(&socket_path).unwrap_or_else(|error| {
+                eprintln!("connect to zachd at {}: {error}", socket_path.display());
+                std::process::exit(1)
+            });
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap_or_else(|error| {
+                eprintln!("stage run socket timeout: {error}");
+                std::process::exit(1)
+            });
+        write_ndjson(
+            &mut stream,
+            &ClientCommand::StageRun {
+                task: task.clone(),
+                stage: stage.clone(),
+                wait: wait_flag,
+            },
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("submit stage run: {error}");
+            std::process::exit(1)
+        });
+        use std::io::BufRead;
+        let mut line = String::new();
+        std::io::BufReader::new(stream)
+            .read_line(&mut line)
+            .unwrap_or_else(|error| {
+                eprintln!("stage run acknowledgment: {error}");
+                std::process::exit(1)
+            });
+        serde_json::from_str(&line).unwrap_or_else(|error| {
+            eprintln!("invalid daemon acknowledgment: {error}");
+            std::process::exit(1)
+        })
+    };
+
+    let mut reply = submit_stage(wait);
+    if wait
+        && reply["type"] != "ERROR"
+        && reply["ok"] == serde_json::Value::Bool(true)
+        && reply["status"].as_str() == Some("ACCEPTED")
+    {
+        let mut sub_stream =
+            std::os::unix::net::UnixStream::connect(&socket_path).unwrap_or_else(|error| {
+                eprintln!(
+                    "connect to zachd for wait at {}: {error}",
+                    socket_path.display()
+                );
+                std::process::exit(1)
+            });
+        write_ndjson(
+            &mut sub_stream,
+            &ClientCommand::Subscribe {
+                group: None,
+                since_seq: Some(0),
+                once: Some(false),
+            },
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("subscribe for stage run wait: {error}");
+            std::process::exit(1)
+        });
+        use std::io::BufRead;
+        let mut reader = std::io::BufReader::new(sub_stream);
+        loop {
+            let mut ev_line = String::new();
+            match reader.read_line(&mut ev_line) {
+                Ok(0) => {
+                    eprintln!("zachd closed event stream before stage '{stage}' finished");
+                    std::process::exit(1);
+                }
+                Ok(_) => {
+                    let trimmed = ev_line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed)
+                        && v["type"] == "EVENT"
+                        && v["event"]["event_type"] == "STAGE_RUN_FINISHED"
+                        && v["event"]["task_id"] == task
+                        && v["event"]["payload"]["stage"] == stage
+                    {
+                        reply = submit_stage(false);
+                        break;
+                    }
+                }
+                Err(error) => {
+                    eprintln!("waiting for stage run result failed: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&reply).unwrap_or_default()
+        );
+    } else {
+        println!(
+            "stage run {} [{}]: status={}",
+            task,
+            stage,
+            reply["status"].as_str().unwrap_or("UNKNOWN")
+        );
+    }
+    let final_status = reply["status"].as_str().unwrap_or("");
+    if reply["type"] == "ERROR"
+        || reply["ok"] == serde_json::Value::Bool(false)
+        || (wait && final_status != "PASSED")
+    {
+        std::process::exit(1);
+    }
+}
+
+fn run_v2_announce(args: &[String]) {
+    let Some(intent) = flag_value(args, "--intent") else {
+        eprintln!(
+            "zach announce requires --intent <starting|planning|implementing|reviewing|merging|handoff|idle|done|blocked|heartbeat>"
+        );
+        std::process::exit(2);
+    };
+    let holder = flag_value(args, "--holder");
+    let executor = flag_value(args, "--executor");
+    let actor = flag_value(args, "--actor");
+    let task_id = flag_value(args, "--task");
+    let repo = flag_value(args, "--repo");
+    let stage = flag_value(args, "--stage");
+    let note = flag_value(args, "--note");
+    let ttl_secs = flag_value(args, "--ttl").map(|raw| {
+        raw.parse::<i64>().unwrap_or_else(|_| {
+            eprintln!("invalid --ttl value '{raw}': expected integer seconds");
+            std::process::exit(2);
+        })
+    });
+    let json_out = has_flag(args, "--json");
+    let socket_path = flag_value(args, "--socket")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_socket_path);
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(&socket_path).unwrap_or_else(|error| {
+            eprintln!(
+                "zachd is offline or unreachable at {}: {error}",
+                socket_path.display()
+            );
+            std::process::exit(1)
+        });
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+    write_ndjson(
+        &mut stream,
+        &ClientCommand::Announce {
+            holder,
+            executor,
+            actor,
+            intent,
+            task_id,
+            repo,
+            stage,
+            note,
+            ttl_secs,
+        },
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("send announce command: {error}");
+        std::process::exit(1)
+    });
+    use std::io::BufRead;
+    let mut line = String::new();
+    std::io::BufReader::new(stream)
+        .read_line(&mut line)
+        .unwrap_or_else(|error| {
+            eprintln!("read announce response: {error}");
+            std::process::exit(1)
+        });
+    let reply: serde_json::Value = serde_json::from_str(&line).unwrap_or_else(|error| {
+        eprintln!("invalid daemon response: {error}");
+        std::process::exit(1)
+    });
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&reply).unwrap_or_else(|_| line.trim().to_owned())
+        );
+    } else if reply["type"] == "ERROR" {
+        eprintln!(
+            "announce rejected: {}",
+            reply["error"].as_str().unwrap_or("unknown error")
+        );
+    } else {
+        println!(
+            "announced seq={} holder={} intent={}",
+            reply["seq_id"].as_i64().unwrap_or(0),
+            reply["announcement"]["holder"].as_str().unwrap_or("?"),
+            reply["announcement"]["intent"].as_str().unwrap_or("?"),
+        );
+    }
+    if reply["type"] == "ERROR" || reply["ok"] == serde_json::Value::Bool(false) {
+        std::process::exit(1);
+    }
+}
+
+fn run_v2_sessions(args: &[String]) {
+    let include_stale = has_flag(args, "--all");
+    let follow = has_flag(args, "--follow");
+    let json_out = has_flag(args, "--json");
+    let socket_path = flag_value(args, "--socket")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_socket_path);
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(&socket_path).unwrap_or_else(|error| {
+            eprintln!(
+                "zachd is offline or unreachable at {}: {error}",
+                socket_path.display()
+            );
+            std::process::exit(1)
+        });
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+    write_ndjson(&mut stream, &ClientCommand::Sessions { include_stale }).unwrap_or_else(|error| {
+        eprintln!("send sessions command: {error}");
+        std::process::exit(1)
+    });
+    use std::io::BufRead;
+    let mut line = String::new();
+    std::io::BufReader::new(stream)
+        .read_line(&mut line)
+        .unwrap_or_else(|error| {
+            eprintln!("read sessions response: {error}");
+            std::process::exit(1)
+        });
+    let reply: serde_json::Value = serde_json::from_str(&line).unwrap_or_else(|error| {
+        eprintln!("invalid daemon response: {error}");
+        std::process::exit(1)
+    });
+    if reply["type"] == "ERROR" {
+        eprintln!(
+            "sessions error: {}",
+            reply["error"].as_str().unwrap_or("unknown error")
+        );
+        std::process::exit(1);
+    }
+    let as_of_seq = reply["as_of_seq"].as_i64().unwrap_or(0);
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&reply).unwrap_or_else(|_| line.trim().to_owned())
+        );
+    } else if let Some(arr) = reply["sessions"].as_array() {
+        if arr.is_empty() {
+            println!("No active sessions on zachd.");
+        } else {
+            println!(
+                "{:<16} {:<12} {:<13} {:<10} {:<14} NOTE",
+                "HOLDER", "ACTOR", "INTENT", "TASK", "REPO"
+            );
+            for s in arr {
+                println!(
+                    "{:<16} {:<12} {:<13} {:<10} {:<14} {}",
+                    s["holder"].as_str().unwrap_or("?"),
+                    s["actor"].as_str().unwrap_or("?"),
+                    s["intent"].as_str().unwrap_or("?"),
+                    s["task_id"].as_str().unwrap_or("-"),
+                    s["repo"].as_str().unwrap_or("-"),
+                    s["note"].as_str().unwrap_or(""),
+                );
+            }
+        }
+    }
+    if !follow {
+        return;
+    }
+    let mut sub_stream =
+        std::os::unix::net::UnixStream::connect(&socket_path).unwrap_or_else(|error| {
+            eprintln!(
+                "zachd is offline or unreachable at {}: {error}",
+                socket_path.display()
+            );
+            std::process::exit(1)
+        });
+    write_ndjson(
+        &mut sub_stream,
+        &ClientCommand::Subscribe {
+            group: Some(zach::v2::socket::SESSION_GROUP_NAME.to_owned()),
+            since_seq: Some(as_of_seq),
+            once: Some(false),
+        },
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("subscribe to _sessions: {error}");
+        std::process::exit(1)
+    });
+    let mut reader = std::io::BufReader::new(sub_stream);
+    loop {
+        let mut ev_line = String::new();
+        match reader.read_line(&mut ev_line) {
+            Ok(0) => break,
+            Ok(_) => {
+                let trimmed = ev_line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if json_out {
+                    println!("{trimmed}");
+                } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed)
+                    && v["type"] == "EVENT"
+                {
+                    let ev = &v["event"];
+                    println!(
+                        "seq={} {} task={} payload={}",
+                        ev["seq_id"].as_i64().unwrap_or(0),
+                        ev["event_type"].as_str().unwrap_or("?"),
+                        ev["task_id"].as_str().unwrap_or("-"),
+                        ev["payload"],
+                    );
+                }
+            }
+            Err(error) => {
+                eprintln!("sessions stream closed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
 }
 
 fn run_v2_run(args: &[String]) {
@@ -733,6 +1442,84 @@ fn run_audit(args: &[String]) {
     }
 }
 
+fn parse_v2_audit_args(args: &[String]) -> Result<(String, Option<PathBuf>), String> {
+    let mut task_id: Option<String> = None;
+    let mut db_path: Option<PathBuf> = None;
+    let mut json = false;
+    let mut idx = 0usize;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--json" => {
+                json = true;
+                idx += 1;
+            }
+            "--db" => {
+                let value = args
+                    .get(idx + 1)
+                    .filter(|v| !v.starts_with('-'))
+                    .ok_or_else(|| "missing value for --db".to_owned())?;
+                db_path = Some(PathBuf::from(value));
+                idx += 2;
+            }
+            "--task" | "--task-id" => {
+                let value = args
+                    .get(idx + 1)
+                    .filter(|v| !v.starts_with('-'))
+                    .ok_or_else(|| format!("missing value for {}", args[idx]))?;
+                if task_id.is_some() {
+                    return Err("duplicate task id".to_owned());
+                }
+                task_id = Some(value.clone());
+                idx += 2;
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown option for audit: {other}"));
+            }
+            positional => {
+                if task_id.is_some() {
+                    return Err(format!("unexpected extra argument: {positional}"));
+                }
+                task_id = Some(positional.to_owned());
+                idx += 1;
+            }
+        }
+    }
+    let task_id = task_id
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "missing <TASK_ID>".to_owned())?;
+    if !json {
+        return Err("missing required --json flag".to_owned());
+    }
+    Ok((task_id, db_path))
+}
+
+fn run_v2_audit(args: &[String]) {
+    if has_flag(args, "--help") || has_flag(args, "-h") {
+        print_usage();
+        return;
+    }
+    let (task_id, db_path) = parse_v2_audit_args(args).unwrap_or_else(|err| usage_error(&err));
+    let db_path = db_path.unwrap_or_else(default_db_path);
+    let store = V2Store::open(&db_path).unwrap_or_else(|error| {
+        eprintln!("failed to open v2 store {}: {error}", db_path.display());
+        std::process::exit(1);
+    });
+    match zach::v2::audit::build_task_audit_digest(&store, &task_id) {
+        Ok(digest) => match serde_json::to_string_pretty(&digest) {
+            Ok(rendered) => println!("{rendered}"),
+            Err(error) => {
+                eprintln!("audit serialization failed: {error}");
+                std::process::exit(1);
+            }
+        },
+        Err(error) => {
+            eprintln!("audit failed: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
     args.windows(2)
         .find(|pair| pair[0] == flag)
@@ -807,20 +1594,46 @@ fn run_v2_daemon(args: &[String]) {
     }
 }
 
-fn gateway_options(args: &[String], daemon: bool) -> Option<GatewayConfig> {
-    let env_bind = match env::var("ZACH_WEB_ADDR") {
+fn env_optional(name: &str) -> Option<String> {
+    match env::var(name) {
         Ok(value) => Some(value),
         Err(env::VarError::NotPresent) => None,
-        Err(_) => usage_error("ZACH_WEB_ADDR must be valid UTF-8"),
-    };
-    parse_gateway_options(args, daemon, env_bind.as_deref())
-        .unwrap_or_else(|error| usage_error(&error))
+        Err(_) => usage_error(&format!("{name} must be valid UTF-8")),
+    }
 }
 
+fn gateway_options(args: &[String], daemon: bool) -> Option<GatewayConfig> {
+    let env_bind = env_optional("ZACH_WEB_ADDR");
+    let env_cf_team = env_optional("ZACH_WEB_CF_ACCESS_TEAM_DOMAIN");
+    let env_cf_aud = env_optional("ZACH_WEB_CF_ACCESS_AUD");
+    let env_cf_email = env_optional("ZACH_WEB_CF_ACCESS_EMAIL");
+    parse_gateway_options_with_env(
+        args,
+        daemon,
+        env_bind.as_deref(),
+        env_cf_team.as_deref(),
+        env_cf_aud.as_deref(),
+        env_cf_email.as_deref(),
+    )
+    .unwrap_or_else(|error| usage_error(&error))
+}
+
+#[cfg(test)]
 fn parse_gateway_options(
     args: &[String],
     daemon: bool,
     env_bind: Option<&str>,
+) -> Result<Option<GatewayConfig>, String> {
+    parse_gateway_options_with_env(args, daemon, env_bind, None, None, None)
+}
+
+fn parse_gateway_options_with_env(
+    args: &[String],
+    daemon: bool,
+    env_bind: Option<&str>,
+    env_cf_team: Option<&str>,
+    env_cf_aud: Option<&str>,
+    env_cf_email: Option<&str>,
 ) -> Result<Option<GatewayConfig>, String> {
     let mut enabled = !daemon;
     let mut port = None;
@@ -828,6 +1641,9 @@ fn parse_gateway_options(
     let mut socket = None;
     let mut allowed_origins = Vec::new();
     let mut allowed_decision_kinds = Vec::new();
+    let mut cf_team_domain: Option<String> = None;
+    let mut cf_aud: Option<String> = None;
+    let mut cf_emails: Vec<String> = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     let mut i = 0;
     while i < args.len() {
@@ -837,6 +1653,9 @@ fn parse_gateway_options(
             "--db" if daemon => "db",
             "--web-allow-origin" => "origin",
             "--web-allow-decision-kind" => "kind",
+            "--web-cf-team-domain" => "cf_team",
+            "--web-cf-aud" => "cf_aud",
+            "--web-cf-email" => "cf_email",
             "--socket" => "socket",
             "--web-port" => "port",
             "--port" if !daemon => "port",
@@ -844,7 +1663,7 @@ fn parse_gateway_options(
             "--web-bind" if daemon => "bind",
             _ => return Err("unsupported web/daemon option; see --help".into()),
         };
-        if !matches!(key, "origin" | "kind") && !seen.insert(key) {
+        if !matches!(key, "origin" | "kind" | "cf_email") && !seen.insert(key) {
             return Err("duplicate web/daemon option".into());
         }
         if key == "web" {
@@ -879,6 +1698,14 @@ fn parse_gateway_options(
                     }
                     allowed_decision_kinds.push(value.clone());
                 }
+                "cf_team" => cf_team_domain = Some(value.clone()),
+                "cf_aud" => cf_aud = Some(value.clone()),
+                "cf_email" => {
+                    if cf_emails.len() >= 16 {
+                        return Err("too many Cloudflare Access emails".into());
+                    }
+                    cf_emails.push(value.clone());
+                }
                 _ => {}
             }
         }
@@ -891,6 +1718,9 @@ fn parse_gateway_options(
             || bind.is_some()
             || !allowed_origins.is_empty()
             || !allowed_decision_kinds.is_empty()
+            || cf_team_domain.is_some()
+            || cf_aud.is_some()
+            || !cf_emails.is_empty()
         {
             return Err("web binding options require --web".into());
         }
@@ -899,6 +1729,46 @@ fn parse_gateway_options(
     if port.is_some() && bind.is_some() {
         return Err("use a bind address with port, or --web-port; do not combine them".into());
     }
+    let resolved_cf_team = cf_team_domain.or_else(|| {
+        env_cf_team
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    });
+    let resolved_cf_aud = cf_aud.or_else(|| {
+        env_cf_aud
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    });
+    let resolved_cf_emails = if !cf_emails.is_empty() {
+        cf_emails
+    } else if let Some(raw) = env_cf_email.map(str::trim).filter(|v| !v.is_empty()) {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let cf_access = match (
+        resolved_cf_team.as_deref(),
+        resolved_cf_aud.as_deref(),
+        resolved_cf_emails.is_empty(),
+    ) {
+        (None, None, true) => None,
+        (Some(team), Some(aud), false) => Some(
+            zach::v2::web_gateway::normalize_cf_access_config(team, aud, &resolved_cf_emails)
+                .map_err(|_| "invalid Cloudflare Access configuration")?,
+        ),
+        _ => {
+            return Err(
+                "Cloudflare Access requires team domain, aud, and at least one allowed email"
+                    .into(),
+            );
+        }
+    };
     let default = format!("127.0.0.1:{DEFAULT_WEB_PORT}");
     let mut addr: std::net::SocketAddr = bind
         .or(env_bind)
@@ -917,6 +1787,7 @@ fn parse_gateway_options(
         state_dir: default_state_dir(),
         allowed_origins,
         allowed_decision_kinds,
+        cf_access,
     }))
 }
 
@@ -1078,7 +1949,8 @@ fn print_usage() {
     println!(
         "       zach governance.audit-task-integration --task-id <TASK-ID> --request-id <REQUEST-ID>"
     );
-    println!("       zach status [--sync] [--json] [--db <PATH>]");
+    println!("       zach status [--detail] [--group <GROUP>] [--sync] [--json] [--db <PATH>]");
+    println!("       zach ps [--group <GROUP>] [--sync] [--json] [--db <PATH>]");
     println!("       zach queue [--group <GROUP>] [--merge-queue] [--sync] [--json] [--db <PATH>]");
     println!("       zach decisions [--group <GROUP>] [--all] [--json] [--db <PATH>]");
     println!(
@@ -1088,9 +1960,21 @@ fn print_usage() {
         "       zach sync [--export-file <PATH>] [--ws-task-bin <PATH>] [--db <PATH>] [--reconcile-finished-legacy]"
     );
     println!("       zach config [--max-parallel <1..16>] [--db <PATH>]");
+    println!("       zach config init [--file <PATH>] [--force]");
+    println!("       zach config validate [--file <PATH>]");
+    println!("       zach config reload [--file <PATH>] [--socket <PATH>]");
+    println!("       zach cooldown list [--json] [--db <PATH>] [--socket <PATH>]");
+    println!("       zach cooldown clear [<FAMILY> | --all] [--db <PATH>] [--socket <PATH>]");
     println!(
         "       zach run [--task <TASK_ID>] [--group <GROUP>] [--once] [--dry-run] [--json] [--db <PATH>]"
     );
+    println!(
+        "       zach stage run --task <TASK_ID> --stage <plan|plan-review|impl|pr-review> [--wait] [--json] [--socket <PATH>]"
+    );
+    println!(
+        "       zach announce --intent <INTENT> [--task <TASK_ID>] [--repo <REPO>] [--stage <STAGE>] [--note <NOTE>] [--ttl <SECS>] [--json] [--socket <PATH>]"
+    );
+    println!("       zach sessions [--all] [--follow] [--json] [--socket <PATH>]");
     println!("       zach doctor [--json] [--worktree <PATH>]");
     println!(
         "       zach daemon [--socket <PATH>] [--db <PATH>] [--once] [--web] [--web-port <PORT>] [--web-bind <IP:PORT>]"
@@ -1099,10 +1983,14 @@ fn print_usage() {
     println!(
         "       Web policy (both forms): [--web-allow-origin <ORIGIN>] [--web-allow-decision-kind <KIND>] (repeatable)"
     );
+    println!(
+        "       Web Access auth (both forms): [--web-cf-team-domain <DOMAIN>] [--web-cf-aud <AUD>] [--web-cf-email <EMAIL>] (repeatable)"
+    );
     println!("       zach attach [--group <GROUP>] [--since-seq <N>] [--once] [--socket <PATH>]");
     println!(
         "       zach events [--group <GROUP>] [--since-seq <N>] [--wait] [--socket <PATH>] [--db <PATH>]"
     );
+    println!("       zach audit <TASK_ID> --json [--db <PATH>]");
 }
 
 #[cfg(test)]
@@ -1640,5 +2528,400 @@ mod tests {
         }
         assert!(web_options(&["--web-allow-origin", "https://a"], true, None).is_err());
         assert!(web_options(&["--web-allow-decision-kind", "merge_approval"], true, None).is_err());
+    }
+
+    #[test]
+    fn web_options_cf_access_cli_and_env_validation() {
+        let config = parse_gateway_options_with_env(
+            &[],
+            false,
+            None,
+            Some("team.cloudflareaccess.com"),
+            Some("aud-tag-123"),
+            Some("op@example.com, backup@example.com"),
+        )
+        .unwrap()
+        .unwrap();
+        let cf = config.cf_access.unwrap();
+        assert_eq!(cf.team_domain, "team.cloudflareaccess.com");
+        assert_eq!(cf.aud, "aud-tag-123");
+        assert_eq!(
+            cf.allowed_emails,
+            vec!["op@example.com", "backup@example.com"]
+        );
+
+        let args = vec![
+            "--web".to_string(),
+            "--web-cf-team-domain".to_string(),
+            "TEAM.cloudflareaccess.com".to_string(),
+            "--web-cf-aud".to_string(),
+            "aud-cli".to_string(),
+            "--web-cf-email".to_string(),
+            "Cli@Example.com".to_string(),
+        ];
+        let daemon_cf = parse_gateway_options_with_env(&args, true, None, None, None, None)
+            .unwrap()
+            .unwrap()
+            .cf_access
+            .unwrap();
+        assert_eq!(daemon_cf.team_domain, "team.cloudflareaccess.com");
+        assert_eq!(daemon_cf.aud, "aud-cli");
+        assert_eq!(daemon_cf.allowed_emails, vec!["cli@example.com"]);
+
+        // Partial configuration fails closed
+        assert!(
+            parse_gateway_options_with_env(
+                &[],
+                false,
+                None,
+                Some("team.cloudflareaccess.com"),
+                Some("aud-tag-123"),
+                None,
+            )
+            .is_err()
+        );
+
+        // --web-cf-* in daemon mode without --web is rejected
+        assert!(
+            parse_gateway_options_with_env(
+                &[
+                    "--web-cf-team-domain".to_string(),
+                    "team.cloudflareaccess.com".to_string(),
+                ],
+                true,
+                None,
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn detailed_status_formatting_and_flags_preserve_summary_and_render_sections() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        let mut active = zach::v2::store::TaskRecord {
+            task_id: "ZACH-10".to_owned(),
+            task_group: "ZACH".to_owned(),
+            title: "Active session task".to_owned(),
+            repository: "zach".to_owned(),
+            github_repo: None,
+            issue_number: None,
+            weight: "M".to_owned(),
+            status: "In Progress".to_owned(),
+            worktree_path: None,
+            branch: None,
+            context_pack: zach::v2::store::ContextPackSpec {
+                target_files: vec![zach::v2::store::TargetFileSpec {
+                    path: "src/v2/store.rs".to_owned(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            depends_on: vec![],
+            required_stages: vec!["impl".to_owned()],
+            stages_completed: vec![],
+            current_stage: Some("impl".to_owned()),
+            active_attempt_id: None,
+            plan_base_sha: None,
+            reviewed_sha: None,
+            pr_number: None,
+            executor: Some("session".to_owned()),
+            autonomous_consent: true,
+            retry_count: 0,
+            next_retry_epoch: 0,
+            lease_owner: None,
+            lease_expires_epoch: None,
+            memory: zach::v2::store::TaskMemory::default(),
+            version: 1,
+            updated_epoch: 0,
+        };
+        store.upsert_task(&active).unwrap();
+
+        active.task_id = "ZACH-11".to_owned();
+        active.status = "Ready".to_owned();
+        active.executor = None;
+        active.current_stage = None;
+        active.title = "Waiting overlapping task".to_owned();
+        store.upsert_task(&active).unwrap();
+
+        let summary = store.status_summary().unwrap();
+        let summary_line = format_summary_line(&summary);
+        assert!(summary_line.contains("tasks=2"));
+        assert!(summary_line.contains("in_progress=1"));
+
+        let report = store.detailed_status(Some("ZACH")).unwrap();
+        let formatted = format_detailed_status(&report);
+        assert!(formatted.contains("Active (1):"));
+        assert!(formatted.contains("ZACH-10"));
+        assert!(formatted.contains("res=scoped_paths"));
+        assert!(formatted.contains("Waiting (1):"));
+        assert!(formatted.contains("ZACH-11"));
+        assert!(formatted.contains("wait=path_conflict:ZACH-10:src/v2/store.rs"));
+
+        assert!(
+            store
+                .acquire_path_locks("zach", &["*".to_owned()], "ZACH-10")
+                .unwrap()
+        );
+        let with_locks = store.detailed_status(Some("ZACH")).unwrap();
+        let formatted_with_locks = format_detailed_status(&with_locks);
+        assert!(formatted_with_locks.contains("Path locks (1):"));
+        assert!(formatted_with_locks.contains("zach             ZACH-10    path=*"));
+
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&with_locks).unwrap()).unwrap();
+        assert_eq!(json["active_tasks"][0]["task_id"], "ZACH-10");
+        assert_eq!(
+            json["waiting_tasks"][0]["wait_reason"],
+            "repo_locked:ZACH-10"
+        );
+        assert_eq!(json["path_locks"][0]["task_id"], "ZACH-10");
+
+        active.status = "Backlog".into();
+        active.autonomous_consent = false;
+        store.sync_task(&active).unwrap();
+        store
+            .open_decision(
+                "wait-11",
+                &active.task_id,
+                &active.task_group,
+                "failure",
+                "Retry?",
+                &["Retry stage".into()],
+                None,
+                "failure context",
+                None,
+            )
+            .unwrap();
+        let report = store.detailed_status(Some("ZACH")).unwrap();
+        let text = format_detailed_status(&report);
+        assert!(text.contains("Effective: In Progress · GitHub: unknown"));
+        assert!(text.contains(
+            "Effective: Blocked · GitHub: Backlog · Decision: wait-11 · wait=awaiting_consent"
+        ));
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["waiting_tasks"][0]["status"], "Blocked");
+        assert_eq!(json["waiting_tasks"][0]["board_status"], "Backlog");
+        assert_eq!(json["waiting_tasks"][0]["open_decision_id"], "wait-11");
+        assert_eq!(json["waiting_tasks"][0]["wait_reason"], "awaiting_consent");
+    }
+
+    #[test]
+    fn cli_cooldown_list_and_clear_work_offline_via_store_fallback() {
+        let dir = OfflineTestDir::new();
+        let db_path = dir.0.join("zach.db");
+        let sock_path = dir.0.join("missing.sock");
+        {
+            let mut store = V2Store::open(&db_path).unwrap();
+            let future = zach::v2::now_epoch() + 1800;
+            store
+                .upsert_provider_cooldown("openai-sol", future, "usage limit")
+                .unwrap();
+            store
+                .upsert_provider_cooldown("gemini-agy", future + 60, "429")
+                .unwrap();
+        }
+        let args = vec![
+            "--db".to_owned(),
+            db_path.to_string_lossy().into_owned(),
+            "--socket".to_owned(),
+            sock_path.to_string_lossy().into_owned(),
+        ];
+        let listed = cooldown_list_with_fallback(&args).unwrap();
+        assert_eq!(listed.len(), 2);
+
+        let clear_args = vec![
+            "openai-sol".to_owned(),
+            "--db".to_owned(),
+            db_path.to_string_lossy().into_owned(),
+            "--socket".to_owned(),
+            sock_path.to_string_lossy().into_owned(),
+        ];
+        let family = extract_clear_family(&clear_args).unwrap();
+        assert_eq!(family.as_deref(), Some("openai-sol"));
+        assert_eq!(
+            cooldown_clear_with_fallback(&clear_args, family).unwrap(),
+            1
+        );
+        assert_eq!(cooldown_list_with_fallback(&args).unwrap().len(), 1);
+
+        let clear_all_args = vec![
+            "--all".to_owned(),
+            "--db".to_owned(),
+            db_path.to_string_lossy().into_owned(),
+            "--socket".to_owned(),
+            sock_path.to_string_lossy().into_owned(),
+        ];
+        let all_family = extract_clear_family(&clear_all_args).unwrap();
+        assert_eq!(all_family, None);
+        assert_eq!(
+            cooldown_clear_with_fallback(&clear_all_args, all_family).unwrap(),
+            1
+        );
+        assert!(cooldown_list_with_fallback(&args).unwrap().is_empty());
+    }
+
+    #[test]
+    fn zach_audit_cli_args_and_json_output_match_governance_validate_audit_digest_contract() {
+        let parsed = parse_v2_audit_args(&[
+            "ZACH-072".to_owned(),
+            "--json".to_owned(),
+            "--db".to_owned(),
+            "/tmp/test.sqlite3".to_owned(),
+        ])
+        .expect("parse valid audit args");
+        assert_eq!(parsed.0, "ZACH-072");
+        assert_eq!(parsed.1, Some(PathBuf::from("/tmp/test.sqlite3")));
+
+        assert!(parse_v2_audit_args(&["ZACH-072".to_owned()]).is_err());
+        assert!(parse_v2_audit_args(&["--json".to_owned()]).is_err());
+        assert!(
+            parse_v2_audit_args(&[
+                "ZACH-072".to_owned(),
+                "--json".to_owned(),
+                "--bogus".to_owned(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_v2_audit_args(&[
+                "ZACH-072".to_owned(),
+                "EXTRA".to_owned(),
+                "--json".to_owned(),
+            ])
+            .is_err()
+        );
+
+        let dir = OfflineTestDir::new();
+        let db_path = dir.0.join("audit-cli.sqlite3");
+        let mut store = V2Store::open(&db_path).expect("open store");
+        let task = zach::v2::store::TaskRecord {
+            task_id: "ZACH-072".to_owned(),
+            task_group: "zach".to_owned(),
+            title: "Extract audit digest".to_owned(),
+            repository: "zach".to_owned(),
+            github_repo: Some("shockerqt/zach".to_owned()),
+            issue_number: Some(146),
+            weight: "M".to_owned(),
+            status: "Done".to_owned(),
+            worktree_path: None,
+            branch: None,
+            context_pack: zach::v2::store::ContextPackSpec::default(),
+            depends_on: vec![],
+            required_stages: vec![
+                "plan".to_owned(),
+                "plan-review".to_owned(),
+                "impl".to_owned(),
+                "pr-review".to_owned(),
+            ],
+            stages_completed: vec![
+                "plan".to_owned(),
+                "plan-review".to_owned(),
+                "impl".to_owned(),
+                "pr-review".to_owned(),
+            ],
+            current_stage: None,
+            active_attempt_id: None,
+            plan_base_sha: None,
+            reviewed_sha: Some("abc1234".to_owned()),
+            pr_number: Some(155),
+            executor: Some("zach".to_owned()),
+            autonomous_consent: true,
+            retry_count: 1,
+            next_retry_epoch: 0,
+            lease_owner: None,
+            lease_expires_epoch: None,
+            memory: zach::v2::store::TaskMemory {
+                review_rework_count: 1,
+                ..Default::default()
+            },
+            version: 1,
+            updated_epoch: 1_700_000_100,
+        };
+        store.upsert_task(&task).unwrap();
+        store
+            .record_stage_attempt(&zach::v2::store::StageAttemptRecord {
+                attempt_id: "att-cli-1".to_owned(),
+                task_id: "ZACH-072".to_owned(),
+                stage: "impl".to_owned(),
+                model: "gpt-6.1-sol".to_owned(),
+                effort: "medium".to_owned(),
+                systemd_unit: None,
+                invocation_id: None,
+                started_epoch: 1_700_000_010,
+                ended_epoch: Some(1_700_000_050),
+                status: "FAILED".to_owned(),
+                failure_class: Some("semantic".to_owned()),
+                summary: Some("prompt: api_key=sk-1234567890abcdefghij123456 test fail".to_owned()),
+                input_tokens: Some(1200),
+                output_tokens: Some(300),
+                total_tokens: Some(1500),
+                sha_before: None,
+                sha_after: None,
+                phase: "COMPLETE".to_owned(),
+                last_liveness_epoch: 1_700_000_050,
+                last_output_bytes: 0,
+                last_cpu_usage_usec: None,
+                control_group: None,
+                exit_code: Some(1),
+                exit_code_kind: Some("exited".to_owned()),
+                retry_generation: 0,
+            })
+            .unwrap();
+        store
+            .record_attempt_audit(&zach::v2::store::AttemptAuditRecord {
+                attempt_id: "att-cli-1".to_owned(),
+                task_id: "ZACH-072".to_owned(),
+                stage: "impl".to_owned(),
+                turn_count: 3,
+                tool_call_count: 7,
+                tool_error_count: 2,
+                edit_compile_fail_loops: 1,
+                redundant_read_count: 1,
+                cached_input_tokens: Some(400),
+                reasoning_tokens: Some(100),
+                check_divergence: true,
+                error_code: Some("check_failed".to_owned()),
+                created_epoch: 1_700_000_050,
+            })
+            .unwrap();
+
+        let digest = zach::v2::audit::build_task_audit_digest(&store, "ZACH-072")
+            .expect("build task audit digest");
+        let val = zach::v2::audit::validate_task_audit_digest(&digest)
+            .expect("validate digest against TASK_AUDIT_DIGEST v1");
+        let obj = val.as_object().unwrap();
+        for key in obj.keys() {
+            assert!(
+                zach::v2::audit::AUDIT_DIGEST_ALLOWED_KEYS.contains(&key.as_str()),
+                "unexpected digest key: {key}"
+            );
+        }
+        assert_eq!(obj["schema_version"], 1);
+        assert_eq!(obj["task_id"], "ZACH-072");
+        assert_eq!(obj["executor"], "zach");
+        assert_eq!(obj["stage_attempts_count"], 1);
+        assert_eq!(obj["rework_count"], 1);
+        assert_eq!(obj["retry_count"], 1);
+        assert_eq!(obj["tool_error_count"], 2);
+        assert_eq!(obj["edit_compile_fail_loops"], 1);
+        assert_eq!(obj["check_divergence"], true);
+
+        let tu = obj["token_usage"].as_object().unwrap();
+        assert_eq!(tu.len(), 3);
+        assert_eq!(tu["input_tokens"], 1200);
+        assert_eq!(tu["output_tokens"], 300);
+        assert_eq!(tu["total_tokens"], 1500);
+
+        let sigs = obj["error_signatures"].as_array().unwrap();
+        assert!(!sigs.is_empty() && sigs.len() <= 10);
+        for sig in sigs {
+            let s = sig.as_str().unwrap();
+            assert!(!s.is_empty() && s.chars().count() <= 160);
+            assert!(!s.contains("sk-1234567890"));
+            assert!(!s.to_ascii_lowercase().starts_with("prompt:"));
+        }
     }
 }

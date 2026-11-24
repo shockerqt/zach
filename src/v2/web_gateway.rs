@@ -10,10 +10,10 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 
 const REQUEST_LINE_LIMIT: usize = 4096;
@@ -35,6 +35,7 @@ const DEFAULT_DECISION_KINDS: &[&str] = &[
     "review_rework_limit",
     "governance_close_failed",
     "governance_publication_failed",
+    "governance_publication_uncertain",
     "checkpoint_unverifiable",
     "repository_ownership_conflict",
     "cross_family_reviewer_unavailable",
@@ -193,18 +194,105 @@ fn preflight(
     write_bounded(stream, head.as_bytes(), stop, Instant::now() + WAIT)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CfAccessConfig {
+    pub team_domain: String,
+    pub aud: String,
+    pub allowed_emails: Vec<String>,
+}
+
+fn valid_hostname(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host.is_ascii()
+        && !host
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+        && !host.contains(['/', '?', '#', '@', ':', '\\', '*'])
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+
+fn valid_email(email: &str) -> bool {
+    if email.is_empty()
+        || email.len() > 254
+        || !email.is_ascii()
+        || email
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return false;
+    }
+    let Some((local, domain)) = email.split_once('@') else {
+        return false;
+    };
+    !local.is_empty() && !domain.contains('@') && valid_hostname(domain)
+}
+
+pub fn normalize_cf_access_config(
+    team_domain: &str,
+    aud: &str,
+    emails: &[String],
+) -> io::Result<CfAccessConfig> {
+    let config = CfAccessConfig {
+        team_domain: team_domain.trim().to_ascii_lowercase(),
+        aud: aud.trim().to_string(),
+        allowed_emails: emails
+            .iter()
+            .map(|e| e.trim().to_ascii_lowercase())
+            .collect(),
+    };
+    validate_cf_access_config(&config)?;
+    Ok(config)
+}
+
+pub fn validate_cf_access_config(config: &CfAccessConfig) -> io::Result<()> {
+    if !valid_hostname(&config.team_domain) {
+        return Err(invalid("invalid Cloudflare Access team domain"));
+    }
+    if config.aud.is_empty()
+        || config.aud.len() > 512
+        || !config.aud.is_ascii()
+        || config
+            .aud
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return Err(invalid("invalid Cloudflare Access aud"));
+    }
+    if config.allowed_emails.is_empty() || config.allowed_emails.len() > 16 {
+        return Err(invalid("invalid Cloudflare Access email list"));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for email in &config.allowed_emails {
+        if !valid_email(email) || !seen.insert(email.to_ascii_lowercase()) {
+            return Err(invalid("invalid or duplicate Cloudflare Access email"));
+        }
+    }
+    Ok(())
+}
+
 pub struct GatewayConfig {
     pub bind_addr: SocketAddr,
     pub socket_path: PathBuf,
     pub state_dir: PathBuf,
     pub allowed_origins: Vec<String>,
     pub allowed_decision_kinds: Vec<String>,
+    pub cf_access: Option<CfAccessConfig>,
 }
 pub struct WebGateway {
     listener: TcpListener,
     socket_path: PathBuf,
     token: String,
     policy: Arc<Policy>,
+    cf_access: Option<Arc<AccessJwtVerifier>>,
 }
 pub struct GatewayHandle {
     stop: Arc<AtomicBool>,
@@ -236,10 +324,21 @@ impl Drop for GatewayHandle {
 }
 impl WebGateway {
     pub fn bind(config: GatewayConfig) -> io::Result<Self> {
+        Self::bind_with_jwks_fetcher(config, Arc::new(fetch_cf_jwks))
+    }
+
+    fn bind_with_jwks_fetcher(config: GatewayConfig, fetcher: JwksFetcher) -> io::Result<Self> {
         if !config.bind_addr.ip().is_loopback() {
             return Err(invalid("loopback address required"));
         }
         validate_web_policy(&config.allowed_origins, &config.allowed_decision_kinds)?;
+        let cf_access = match config.cf_access {
+            Some(cf) => {
+                validate_cf_access_config(&cf)?;
+                Some(Arc::new(AccessJwtVerifier::new(cf, fetcher)))
+            }
+            None => None,
+        };
         let listener = TcpListener::bind(config.bind_addr)?;
         let policy = Arc::new(Policy {
             bind_origin: format!("http://{}", listener.local_addr()?),
@@ -253,6 +352,7 @@ impl WebGateway {
             socket_path: config.socket_path,
             token,
             policy,
+            cf_access,
         })
     }
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -291,6 +391,7 @@ impl WebGateway {
                     let path = self.socket_path.clone();
                     let token = self.token.clone();
                     let policy = self.policy.clone();
+                    let cf_access = self.cf_access.clone();
                     let stop = stop.clone();
                     let sse = sse.clone();
                     match thread::Builder::new()
@@ -298,7 +399,15 @@ impl WebGateway {
                         .spawn(move || {
                             let _ = stream.set_read_timeout(Some(TICK));
                             let _ = stream.set_write_timeout(Some(TICK));
-                            let _ = serve(&mut stream, &path, &token, &stop, &sse, &policy);
+                            let _ = serve(
+                                &mut stream,
+                                &path,
+                                &token,
+                                &stop,
+                                &sse,
+                                &policy,
+                                cf_access.as_deref(),
+                            );
                         }) {
                         Ok(t) => workers.push(t),
                         Err(e) => {
@@ -463,6 +572,8 @@ fn read_token(file: File) -> io::Result<String> {
 pub struct SnapshotResponse {
     pub tasks: Vec<TaskRecord>,
     pub open_decisions: Vec<PendingDecisionRecord>,
+    #[serde(default)]
+    pub board_statuses: std::collections::BTreeMap<String, String>,
     pub status: DaemonStatusSummary,
     pub as_of_seq: i64,
 }
@@ -712,6 +823,434 @@ fn authorized(value: Option<&String>, token: &str) -> bool {
     bool::from(supplied.as_bytes().ct_eq(token.as_bytes()))
 }
 
+const JWKS_TTL: Duration = Duration::from_secs(3600);
+const JWKS_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
+const JWT_CLOCK_SKEW_SECS: u64 = 60;
+const MAX_JWT_LEN: usize = 8192;
+
+type JwksFetcher = Arc<dyn Fn(&str) -> io::Result<Vec<u8>> + Send + Sync>;
+
+struct JwksCache {
+    keys: HashMap<String, String>,
+    fetched_at: Option<Instant>,
+    last_refresh_attempt: Option<Instant>,
+}
+
+struct AccessJwtVerifier {
+    config: CfAccessConfig,
+    fetcher: JwksFetcher,
+    cache: Mutex<JwksCache>,
+}
+
+#[derive(Deserialize)]
+struct JwtHeader {
+    alg: String,
+    kid: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AudClaim {
+    One(String),
+    Many(Vec<String>),
+}
+
+#[derive(Deserialize)]
+struct AccessClaims {
+    aud: AudClaim,
+    exp: u64,
+    nbf: Option<u64>,
+    iss: Option<String>,
+    email: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct JwksPayload {
+    keys: Vec<JwkKey>,
+}
+
+#[derive(Deserialize)]
+struct JwkKey {
+    kty: String,
+    kid: Option<String>,
+    n: Option<String>,
+    e: Option<String>,
+    alg: Option<String>,
+    #[serde(rename = "use")]
+    use_: Option<String>,
+}
+
+impl AccessJwtVerifier {
+    fn new(config: CfAccessConfig, fetcher: JwksFetcher) -> Self {
+        Self {
+            config,
+            fetcher,
+            cache: Mutex::new(JwksCache {
+                keys: HashMap::new(),
+                fetched_at: None,
+                last_refresh_attempt: None,
+            }),
+        }
+    }
+
+    fn verify(&self, token: &str) -> bool {
+        if token.is_empty() || token.len() > MAX_JWT_LEN {
+            return false;
+        }
+        let mut parts = token.split('.');
+        let (Some(header_b64), Some(payload_b64), Some(sig_b64), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return false;
+        };
+        if header_b64.is_empty() || payload_b64.is_empty() || sig_b64.is_empty() {
+            return false;
+        }
+        let Some(header_bytes) = base64url_decode(header_b64) else {
+            return false;
+        };
+        let Ok(header) = serde_json::from_slice::<JwtHeader>(&header_bytes) else {
+            return false;
+        };
+        let Some(kid) = header.kid.as_deref().filter(|k| !k.is_empty()) else {
+            return false;
+        };
+        if header.alg != "RS256" {
+            return false;
+        }
+        let Some(signature) = base64url_decode(sig_b64) else {
+            return false;
+        };
+        if signature.is_empty() {
+            return false;
+        }
+        let Some(pem) = self.public_key_pem(kid) else {
+            return false;
+        };
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        if !verify_rs256_pem(&pem, signing_input.as_bytes(), &signature) {
+            return false;
+        }
+        let Some(payload_bytes) = base64url_decode(payload_b64) else {
+            return false;
+        };
+        let Ok(claims) = serde_json::from_slice::<AccessClaims>(&payload_bytes) else {
+            return false;
+        };
+        let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+            return false;
+        };
+        self.claims_valid(&claims, now.as_secs())
+    }
+
+    fn claims_valid(&self, claims: &AccessClaims, now_secs: u64) -> bool {
+        if now_secs > claims.exp.saturating_add(JWT_CLOCK_SKEW_SECS) {
+            return false;
+        }
+        if let Some(nbf) = claims.nbf
+            && now_secs.saturating_add(JWT_CLOCK_SKEW_SECS) < nbf
+        {
+            return false;
+        }
+        if let Some(iss) = claims.iss.as_deref() {
+            let expected_iss = format!("https://{}", self.config.team_domain);
+            if iss != expected_iss {
+                return false;
+            }
+        }
+        let aud_matches = match &claims.aud {
+            AudClaim::One(a) => a == &self.config.aud,
+            AudClaim::Many(list) => list.iter().any(|a| a == &self.config.aud),
+        };
+        if !aud_matches {
+            return false;
+        }
+        let Some(email) = claims.email.as_deref() else {
+            return false;
+        };
+        self.config
+            .allowed_emails
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(email))
+    }
+
+    fn public_key_pem(&self, kid: &str) -> Option<String> {
+        let now = Instant::now();
+        {
+            let cache = self.cache.lock().ok()?;
+            let fresh = cache
+                .fetched_at
+                .is_some_and(|t| now.saturating_duration_since(t) < JWKS_TTL);
+            if fresh && let Some(pem) = cache.keys.get(kid) {
+                return Some(pem.clone());
+            }
+            let cooled_down = cache
+                .last_refresh_attempt
+                .is_none_or(|t| now.saturating_duration_since(t) >= JWKS_REFRESH_COOLDOWN);
+            if !cooled_down {
+                return if fresh {
+                    cache.keys.get(kid).cloned()
+                } else {
+                    None
+                };
+            }
+        }
+        {
+            let mut cache = self.cache.lock().ok()?;
+            cache.last_refresh_attempt = Some(Instant::now());
+        }
+        let raw = (self.fetcher)(&self.config.team_domain).ok()?;
+        let parsed = parse_jwks(&raw)?;
+        let mut cache = self.cache.lock().ok()?;
+        cache.keys = parsed;
+        cache.fetched_at = Some(Instant::now());
+        cache.keys.get(kid).cloned()
+    }
+}
+
+fn fetch_cf_jwks(team_domain: &str) -> io::Result<Vec<u8>> {
+    let url = format!("https://{team_domain}/cdn-cgi/access/certs");
+    let output = std::process::Command::new("curl")
+        .args([
+            "--proto",
+            "=https",
+            "--tlsv1.2",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--connect-timeout",
+            "3",
+            "--max-time",
+            "5",
+            &url,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other("jwks fetch failed"));
+    }
+    Ok(output.stdout)
+}
+
+fn parse_jwks(raw: &[u8]) -> Option<HashMap<String, String>> {
+    let payload: JwksPayload = serde_json::from_slice(raw).ok()?;
+    let mut keys = HashMap::new();
+    for key in payload.keys {
+        if key.kty != "RSA" {
+            continue;
+        }
+        if key.alg.as_deref().is_some_and(|a| a != "RS256") {
+            continue;
+        }
+        if key.use_.as_deref().is_some_and(|u| u != "sig") {
+            continue;
+        }
+        let (Some(kid), Some(n), Some(e)) = (key.kid, key.n, key.e) else {
+            continue;
+        };
+        if kid.is_empty() {
+            continue;
+        }
+        if let Some(pem) = jwk_rsa_to_spki_pem(&n, &e) {
+            keys.insert(kid, pem);
+        }
+    }
+    Some(keys)
+}
+
+fn base64url_decode(input: &str) -> Option<Vec<u8>> {
+    let stripped = input.trim_end_matches('=');
+    if stripped.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(stripped.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits: u8 = 0;
+    for b in stripped.bytes() {
+        let val = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        };
+        buf = (buf << 6) | u32::from(val);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xff) as u8);
+        }
+    }
+    if bits > 0 && (buf & ((1 << bits) - 1)) != 0 {
+        return None;
+    }
+    Some(out)
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = chunk.get(1).copied().map_or(0, u32::from);
+        let b2 = chunk.get(2).copied().map_or(0, u32::from);
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((triple >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(triple & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn der_len(len: usize, out: &mut Vec<u8>) {
+    if len < 0x80 {
+        out.push(len as u8);
+    } else {
+        let bytes = len.to_be_bytes();
+        let first = bytes
+            .iter()
+            .position(|&b| b != 0)
+            .unwrap_or(bytes.len() - 1);
+        let slice = &bytes[first..];
+        out.push(0x80 | (slice.len() as u8));
+        out.extend_from_slice(slice);
+    }
+}
+
+fn der_tlv(tag: u8, value: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(value.len() + 6);
+    out.push(tag);
+    der_len(value.len(), &mut out);
+    out.extend_from_slice(value);
+    out
+}
+
+fn der_integer(unsigned: &[u8]) -> Option<Vec<u8>> {
+    let first = unsigned.iter().position(|&b| b != 0)?;
+    let trimmed = &unsigned[first..];
+    let mut body = Vec::with_capacity(trimmed.len() + 1);
+    if trimmed[0] & 0x80 != 0 {
+        body.push(0);
+    }
+    body.extend_from_slice(trimmed);
+    Some(der_tlv(0x02, &body))
+}
+
+fn jwk_rsa_to_spki_pem(n_b64: &str, e_b64: &str) -> Option<String> {
+    let n = base64url_decode(n_b64)?;
+    let e = base64url_decode(e_b64)?;
+    let n_first = n.iter().position(|&b| b != 0)?;
+    let n_trimmed = &n[n_first..];
+    if n_trimmed.len() < 256 {
+        return None;
+    }
+    let e_first = e.iter().position(|&b| b != 0)?;
+    let e_trimmed = &e[e_first..];
+    if e_trimmed.last().copied().unwrap_or(0) & 1 == 0 {
+        return None;
+    }
+    let mut rsa_pub = Vec::new();
+    rsa_pub.extend_from_slice(&der_integer(n_trimmed)?);
+    rsa_pub.extend_from_slice(&der_integer(e_trimmed)?);
+    let rsa_seq = der_tlv(0x30, &rsa_pub);
+
+    let mut bit_string = Vec::with_capacity(1 + rsa_seq.len());
+    bit_string.push(0);
+    bit_string.extend_from_slice(&rsa_seq);
+    let spki_bit_string = der_tlv(0x03, &bit_string);
+
+    // rsaEncryption OID (1.2.840.113549.1.1.1) + NULL
+    const RSA_ALG_ID: &[u8] = &[
+        0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00,
+    ];
+    let mut spki_body = Vec::with_capacity(RSA_ALG_ID.len() + spki_bit_string.len());
+    spki_body.extend_from_slice(RSA_ALG_ID);
+    spki_body.extend_from_slice(&spki_bit_string);
+    let spki = der_tlv(0x30, &spki_body);
+
+    let b64 = base64_encode(&spki);
+    let mut pem = String::from("-----BEGIN PUBLIC KEY-----\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(chunk).ok()?);
+        pem.push('\n');
+    }
+    pem.push_str("-----END PUBLIC KEY-----\n");
+    Some(pem)
+}
+
+struct TempGuard(PathBuf);
+impl Drop for TempGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn write_temp_secret(prefix: &str, bytes: &[u8]) -> io::Result<TempGuard> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    for _ in 0..8 {
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("zach-{prefix}-{pid}-{n}.tmp"));
+        match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                file.write_all(bytes)?;
+                return Ok(TempGuard(path));
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "cannot allocate temp file",
+    ))
+}
+
+fn verify_rs256_pem(pem: &str, signing_input: &[u8], signature: &[u8]) -> bool {
+    let Ok(pem_file) = write_temp_secret("jwks-pem", pem.as_bytes()) else {
+        return false;
+    };
+    let Ok(sig_file) = write_temp_secret("jwt-sig", signature) else {
+        return false;
+    };
+    let Ok(mut child) = std::process::Command::new("openssl")
+        .arg("dgst")
+        .arg("-sha256")
+        .arg("-verify")
+        .arg(&pem_file.0)
+        .arg("-signature")
+        .arg(&sig_file.0)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take()
+        && stdin.write_all(signing_input).is_err()
+    {
+        let _ = child.wait();
+        return false;
+    }
+    child.wait().is_ok_and(|s| s.success())
+}
+
 struct Backend {
     stream: UnixStream,
     bytes: Vec<u8>,
@@ -861,6 +1400,7 @@ fn serve(
     stop: &AtomicBool,
     sse: &std::sync::atomic::AtomicUsize,
     policy: &Policy,
+    cf_access: Option<&AccessJwtVerifier>,
 ) -> io::Result<()> {
     let req = match read_request(stream, stop) {
         Ok(r) => r,
@@ -875,7 +1415,11 @@ fn serve(
     if req.method == "OPTIONS" {
         return preflight(stream, &req, origin, stop);
     }
-    if !authorized(req.headers.get("authorization"), token) {
+    let is_authorized = match (cf_access, req.headers.get("cf-access-jwt-assertion")) {
+        (Some(verifier), Some(jwt)) => verifier.verify(jwt),
+        _ => authorized(req.headers.get("authorization"), token),
+    };
+    if !is_authorized {
         return error(stream, 401, "unauthorized", stop, origin);
     }
     let group = req.query.get("group").cloned();
@@ -901,8 +1445,9 @@ fn serve(
                         Some(ServerMessage::Snapshot {
                             tasks,
                             open_decisions,
+                            board_statuses,
                             as_of_seq,
-                        }) => snapshot = Some((tasks, open_decisions, as_of_seq)),
+                        }) => snapshot = Some((tasks, open_decisions, board_statuses, as_of_seq)),
                         Some(ServerMessage::Status {
                             ok: true,
                             status: value,
@@ -911,10 +1456,11 @@ fn serve(
                         _ => return Err(invalid("backend snapshot unavailable")),
                     }
                 }
-                let (tasks, open_decisions, as_of_seq) = snapshot.unwrap();
+                let (tasks, open_decisions, board_statuses, as_of_seq) = snapshot.unwrap();
                 Ok(SnapshotResponse {
                     tasks,
                     open_decisions,
+                    board_statuses,
                     as_of_seq,
                     status: status.unwrap(),
                 })
@@ -949,6 +1495,11 @@ fn serve(
                 )?;
                 let record = match backend.receive(stop, deadline)? {
                     Some(ServerMessage::Decision { decision: None }) => {
+                        return Ok(("NOT_FOUND".into(), None));
+                    }
+                    Some(ServerMessage::Decision {
+                        decision: Some(record),
+                    }) if record.decision_id == body.decision_id && record.status == "RETIRED" => {
                         return Ok(("NOT_FOUND".into(), None));
                     }
                     Some(ServerMessage::Decision {
@@ -1126,19 +1677,36 @@ mod tests {
             Self::with_policy(vec![], vec![])
         }
         fn with_policy(allowed_origins: Vec<String>, allowed_decision_kinds: Vec<String>) -> Self {
+            Self::with_cf_access(
+                allowed_origins,
+                allowed_decision_kinds,
+                None,
+                Arc::new(fetch_cf_jwks),
+            )
+        }
+        fn with_cf_access(
+            allowed_origins: Vec<String>,
+            allowed_decision_kinds: Vec<String>,
+            cf_access: Option<CfAccessConfig>,
+            fetcher: JwksFetcher,
+        ) -> Self {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
             let dir = std::env::temp_dir().join(format!(
                 "zach-web-test-{}-{}",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
-            let gateway = WebGateway::bind(GatewayConfig {
-                bind_addr: "127.0.0.1:0".parse().unwrap(),
-                socket_path: dir.join("backend.sock"),
-                state_dir: dir.clone(),
-                allowed_origins,
-                allowed_decision_kinds,
-            })
+            let gateway = WebGateway::bind_with_jwks_fetcher(
+                GatewayConfig {
+                    bind_addr: "127.0.0.1:0".parse().unwrap(),
+                    socket_path: dir.join("backend.sock"),
+                    state_dir: dir.clone(),
+                    allowed_origins,
+                    allowed_decision_kinds,
+                    cf_access,
+                },
+                fetcher,
+            )
             .unwrap();
             let addr = gateway.local_addr().unwrap();
             let token = gateway.token.clone();
@@ -1150,7 +1718,9 @@ mod tests {
             }
         }
         fn backend(&self, run: impl FnOnce(UnixStream) + Send + 'static) -> JoinHandle<()> {
-            let listener = UnixListener::bind(self.dir.join("backend.sock")).unwrap();
+            let sock = self.dir.join("backend.sock");
+            let _ = std::fs::remove_file(&sock);
+            let listener = UnixListener::bind(sock).unwrap();
             thread::spawn(move || {
                 let (stream, _) = listener.accept().unwrap();
                 stream.set_read_timeout(Some(WAIT)).unwrap();
@@ -1232,6 +1802,7 @@ mod tests {
         ServerMessage::Snapshot {
             tasks: vec![],
             open_decisions: vec![],
+            board_statuses: [("SYNTHETIC".into(), "Backlog".into())].into(),
             as_of_seq: 9000,
         }
     }
@@ -1306,7 +1877,8 @@ mod tests {
                 socket_path: bad,
                 allowed_origins: vec![],
                 allowed_decision_kinds: vec![],
-                state_dir: f.dir.clone()
+                state_dir: f.dir.clone(),
+                cf_access: None,
             })
             .is_err()
         );
@@ -1366,6 +1938,7 @@ mod tests {
         let data: SnapshotResponse =
             serde_json::from_str(reply.split_once("\r\n\r\n").unwrap().1).unwrap();
         assert_eq!(data.as_of_seq, 9000);
+        assert_eq!(data.board_statuses["SYNTHETIC"], "Backlog");
         assert_eq!(data.status.max_seq_id, 9001);
         backend.join().unwrap();
     }
@@ -1443,9 +2016,46 @@ mod tests {
             for seq in 42..=5142 {
                 write_ndjson(&mut writer, &event(seq)).unwrap();
             }
+            for (seq, kind, payload) in [
+                (
+                    8999,
+                    "DECISION_REQUIRED",
+                    serde_json::json!({"decision_id":"old"}),
+                ),
+                (
+                    9001,
+                    "BOARD_STATUS_OBSERVED",
+                    serde_json::json!({"board_status":"Cancelled"}),
+                ),
+                (
+                    9002,
+                    "TASK_STATUS_CHANGED",
+                    serde_json::json!({"status":"Cancelled","board_status":"Cancelled"}),
+                ),
+                (
+                    9003,
+                    "DECISION_RETIRED",
+                    serde_json::json!({"decision_id":"old","reason":"Cancelled"}),
+                ),
+            ] {
+                write_ndjson(
+                    &mut writer,
+                    &ServerMessage::Event {
+                        event: TaskEventRecord {
+                            seq_id: seq,
+                            task_id: "SYNTHETIC".into(),
+                            task_group: "test".into(),
+                            ts_epoch: 1,
+                            event_type: kind.into(),
+                            payload,
+                        },
+                    },
+                )
+                .unwrap();
+            }
             write_ndjson(
                 &mut writer,
-                &ServerMessage::ResyncRequired { last_seq_id: 5142 },
+                &ServerMessage::ResyncRequired { last_seq_id: 9003 },
             )
             .unwrap();
         });
@@ -1459,11 +2069,23 @@ mod tests {
             .lines()
             .filter_map(|s| s.strip_prefix("id: ").map(|s| s.parse().unwrap()))
             .collect();
-        assert_eq!(ids, (42..=5142).collect::<Vec<_>>());
+        assert_eq!(
+            ids,
+            (42..=5142)
+                .chain([8999, 9001, 9002, 9003])
+                .collect::<Vec<_>>()
+        );
         assert!(reply.contains("event: task_event"));
         assert!(reply.contains("event: snapshot"));
         assert!(reply.contains("event: resync_required"));
         assert!(!reply.contains("id: 9000"));
+        for kind in [
+            "BOARD_STATUS_OBSERVED",
+            "TASK_STATUS_CHANGED",
+            "DECISION_RETIRED",
+        ] {
+            assert!(reply.contains(kind));
+        }
         backend.join().unwrap();
     }
     #[test]
@@ -1676,7 +2298,8 @@ mod tests {
                 socket_path: f.dir.join("absent"),
                 state_dir: f.dir.clone(),
                 allowed_origins: vec![],
-                allowed_decision_kinds: vec![]
+                allowed_decision_kinds: vec![],
+                cf_access: None,
             })
             .is_err()
         );
@@ -1892,7 +2515,8 @@ mod tests {
                 socket_path: f.dir.join("absent"),
                 state_dir: f.dir.clone(),
                 allowed_origins: vec!["*".into()],
-                allowed_decision_kinds: vec![]
+                allowed_decision_kinds: vec![],
+                cf_access: None,
             })
             .is_err()
         );
@@ -2055,5 +2679,347 @@ mod tests {
         )));
         assert!(reply.contains("event: snapshot"));
         backend.join().unwrap();
+    }
+
+    fn base64url_encode(bytes: &[u8]) -> String {
+        base64_encode(bytes)
+            .replace('+', "-")
+            .replace('/', "_")
+            .trim_end_matches('=')
+            .to_string()
+    }
+
+    fn generate_test_rsa_keypair(dir: &Path) -> (PathBuf, String, String) {
+        let priv_path = dir.join("test-cf-priv.pem");
+        let status = std::process::Command::new("openssl")
+            .args([
+                "genpkey",
+                "-algorithm",
+                "RSA",
+                "-pkeyopt",
+                "rsa_keygen_bits:2048",
+                "-out",
+            ])
+            .arg(&priv_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "openssl genpkey failed");
+
+        let mod_out = std::process::Command::new("openssl")
+            .args(["rsa", "-in"])
+            .arg(&priv_path)
+            .args(["-modulus", "-noout"])
+            .output()
+            .unwrap();
+        assert!(mod_out.status.success(), "openssl rsa -modulus failed");
+        let mod_str = String::from_utf8(mod_out.stdout).unwrap();
+        let hex_n = mod_str.trim().strip_prefix("Modulus=").unwrap();
+        let n_bytes: Vec<u8> = (0..hex_n.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex_n[i..i + 2], 16).unwrap())
+            .collect();
+        let n_b64 = base64url_encode(&n_bytes);
+        let e_b64 = base64url_encode(&[0x01, 0x00, 0x01]);
+        (priv_path, n_b64, e_b64)
+    }
+
+    fn sign_test_jwt(
+        priv_path: &Path,
+        header: &serde_json::Value,
+        claims: &serde_json::Value,
+    ) -> String {
+        let header_b64 = base64url_encode(&serde_json::to_vec(header).unwrap());
+        let claims_b64 = base64url_encode(&serde_json::to_vec(claims).unwrap());
+        let signing_input = format!("{header_b64}.{claims_b64}");
+        let mut child = std::process::Command::new("openssl")
+            .args(["dgst", "-sha256", "-sign"])
+            .arg(priv_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(signing_input.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "openssl dgst -sign failed");
+        let sig_b64 = base64url_encode(&output.stdout);
+        format!("{signing_input}.{sig_b64}")
+    }
+
+    #[test]
+    fn web_gateway_cf_access_jwt_verification_and_bearer_fallback() {
+        let key_dir = std::env::temp_dir().join(format!("zach-cf-key-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&key_dir);
+        let (priv_path, n_b64, e_b64) = generate_test_rsa_keypair(&key_dir);
+        let jwks_json = serde_json::json!({
+            "keys": [{
+                "kty": "RSA",
+                "kid": "cf-key-1",
+                "alg": "RS256",
+                "use": "sig",
+                "n": n_b64,
+                "e": e_b64,
+            }]
+        })
+        .to_string()
+        .into_bytes();
+
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let fetches_clone = fetches.clone();
+        let fetcher: JwksFetcher = Arc::new(move |domain| {
+            assert_eq!(domain, "team.cloudflareaccess.com");
+            fetches_clone.fetch_add(1, Ordering::Relaxed);
+            Ok(jwks_json.clone())
+        });
+
+        let cf_cfg = normalize_cf_access_config(
+            "team.cloudflareaccess.com",
+            "expected-aud-tag",
+            &["Operator@Example.com".into()],
+        )
+        .unwrap();
+        let f = Fixture::with_cf_access(vec![], vec![], Some(cf_cfg), fetcher);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let header = serde_json::json!({ "alg": "RS256", "kid": "cf-key-1", "typ": "JWT" });
+
+        // 1. Valid JWT (with aud array and uppercase email) -> 200, JWKS cached
+        let valid_jwt = sign_test_jwt(
+            &priv_path,
+            &header,
+            &serde_json::json!({
+                "aud": ["expected-aud-tag"],
+                "email": "operator@example.com",
+                "iss": "https://team.cloudflareaccess.com",
+                "iat": now - 10,
+                "nbf": now - 10,
+                "exp": now + 300,
+            }),
+        );
+        let backend = f.backend(|stream| {
+            let mut reader = BufReader::new(stream);
+            let _ = raw_command(&mut reader);
+            let _ = raw_command(&mut reader);
+            write_ndjson(reader.get_mut(), &snapshot()).unwrap();
+            let status: DaemonStatusSummary = serde_json::from_value(serde_json::json!({"schema_version":4,"max_parallel_tasks":2,"heartbeat_epoch":1,"max_seq_id":9001,"total_tasks":0,"ready_eligible_count":0,"in_progress_count":0,"open_decisions_count":0,"active_locks_count":0,"merge_queue_count":0})).unwrap();
+            write_ndjson(reader.get_mut(), &ServerMessage::Status { ok: true, status }).unwrap();
+        });
+        let reply = read_all(f.request(
+            "GET",
+            "/api/snapshot",
+            &format!("Cf-Access-Jwt-Assertion: {valid_jwt}\r\n"),
+            "",
+        ));
+        assert!(reply.starts_with("HTTP/1.1 200"), "valid jwt: {reply}");
+        backend.join().unwrap();
+        assert_eq!(fetches.load(Ordering::Relaxed), 1);
+
+        // 2. Wrong aud -> 401
+        let wrong_aud = sign_test_jwt(
+            &priv_path,
+            &header,
+            &serde_json::json!({
+                "aud": "other-aud",
+                "email": "operator@example.com",
+                "iss": "https://team.cloudflareaccess.com",
+                "exp": now + 300,
+            }),
+        );
+        let reply = read_all(f.request(
+            "GET",
+            "/api/snapshot",
+            &format!("Cf-Access-Jwt-Assertion: {wrong_aud}\r\n"),
+            "",
+        ));
+        assert!(reply.starts_with("HTTP/1.1 401"), "wrong aud: {reply}");
+
+        // 3. Wrong email -> 401
+        let wrong_email = sign_test_jwt(
+            &priv_path,
+            &header,
+            &serde_json::json!({
+                "aud": "expected-aud-tag",
+                "email": "intruder@example.com",
+                "iss": "https://team.cloudflareaccess.com",
+                "exp": now + 300,
+            }),
+        );
+        let reply = read_all(f.request(
+            "GET",
+            "/api/snapshot",
+            &format!("Cf-Access-Jwt-Assertion: {wrong_email}\r\n"),
+            "",
+        ));
+        assert!(reply.starts_with("HTTP/1.1 401"), "wrong email: {reply}");
+
+        // 4. Expired JWT -> 401
+        let expired_jwt = sign_test_jwt(
+            &priv_path,
+            &header,
+            &serde_json::json!({
+                "aud": "expected-aud-tag",
+                "email": "operator@example.com",
+                "iss": "https://team.cloudflareaccess.com",
+                "exp": now - 120,
+            }),
+        );
+        let reply = read_all(f.request(
+            "GET",
+            "/api/snapshot",
+            &format!("Cf-Access-Jwt-Assertion: {expired_jwt}\r\n"),
+            "",
+        ));
+        assert!(reply.starts_with("HTTP/1.1 401"), "expired jwt: {reply}");
+
+        // 5. Invalid signature (tampered payload) -> 401
+        let mut parts: Vec<&str> = valid_jwt.split('.').collect();
+        let tampered_claims = base64url_encode(
+            &serde_json::to_vec(&serde_json::json!({
+                "aud": "expected-aud-tag",
+                "email": "operator@example.com",
+                "exp": now + 999,
+            }))
+            .unwrap(),
+        );
+        parts[1] = &tampered_claims;
+        let tampered_jwt = parts.join(".");
+        let reply = read_all(f.request(
+            "GET",
+            "/api/snapshot",
+            &format!("Cf-Access-Jwt-Assertion: {tampered_jwt}\r\n"),
+            "",
+        ));
+        assert!(reply.starts_with("HTTP/1.1 401"), "tampered jwt: {reply}");
+
+        // 6. Invalid JWT + valid Bearer -> 401 (no Bearer fallback when Access JWT is presented)
+        let reply = read_all(f.request(
+            "GET",
+            "/api/snapshot",
+            &format!("{}Cf-Access-Jwt-Assertion: {tampered_jwt}\r\n", f.auth()),
+            "",
+        ));
+        assert!(
+            reply.starts_with("HTTP/1.1 401"),
+            "invalid jwt must not fall back to bearer: {reply}"
+        );
+
+        // 7. Missing Access JWT + valid Bearer -> 200 (loopback CLI/healthcheck fallback)
+        let backend = f.backend(|stream| {
+            let mut reader = BufReader::new(stream);
+            let _ = raw_command(&mut reader);
+            let _ = raw_command(&mut reader);
+            write_ndjson(reader.get_mut(), &snapshot()).unwrap();
+            let status: DaemonStatusSummary = serde_json::from_value(serde_json::json!({"schema_version":4,"max_parallel_tasks":2,"heartbeat_epoch":1,"max_seq_id":9001,"total_tasks":0,"ready_eligible_count":0,"in_progress_count":0,"open_decisions_count":0,"active_locks_count":0,"merge_queue_count":0})).unwrap();
+            write_ndjson(reader.get_mut(), &ServerMessage::Status { ok: true, status }).unwrap();
+        });
+        let reply = read_all(f.request("GET", "/api/snapshot", &f.auth(), ""));
+        assert!(
+            reply.starts_with("HTTP/1.1 200"),
+            "bearer fallback: {reply}"
+        );
+        backend.join().unwrap();
+
+        // JWKS stayed cached across all checks with the same kid
+        assert_eq!(fetches.load(Ordering::Relaxed), 1);
+        let _ = std::fs::remove_dir_all(&key_dir);
+    }
+
+    #[test]
+    fn cf_access_config_validation_rejects_invalid_inputs() {
+        assert!(normalize_cf_access_config("", "aud", &["a@b.com".into()]).is_err());
+        assert!(
+            normalize_cf_access_config(
+                "https://team.cloudflareaccess.com",
+                "aud",
+                &["a@b.com".into()]
+            )
+            .is_err()
+        );
+        assert!(
+            normalize_cf_access_config("team.cloudflareaccess.com", "", &["a@b.com".into()])
+                .is_err()
+        );
+        assert!(normalize_cf_access_config("team.cloudflareaccess.com", "aud", &[]).is_err());
+        assert!(
+            normalize_cf_access_config(
+                "team.cloudflareaccess.com",
+                "aud",
+                &["not-an-email".into()]
+            )
+            .is_err()
+        );
+        assert!(
+            normalize_cf_access_config(
+                "team.cloudflareaccess.com",
+                "aud",
+                &["op@example.com".into(), "OP@example.com".into()]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sse_forwards_session_announcement_and_claim_changed_events() {
+        let f = Fixture::new();
+        let backend = f.backend(|stream| {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+            assert_eq!(
+                command(&mut reader),
+                ClientCommand::Subscribe {
+                    group: Some(crate::v2::socket::SESSION_GROUP_NAME.into()),
+                    since_seq: Some(0),
+                    once: Some(false),
+                }
+            );
+            write_ndjson(
+                &mut writer,
+                &ServerMessage::Event {
+                    event: TaskEventRecord {
+                        seq_id: 42,
+                        task_id: "ZACH-079".into(),
+                        task_group: crate::v2::socket::SESSION_GROUP_NAME.into(),
+                        ts_epoch: 1_700_000_000,
+                        event_type: "SESSION_ANNOUNCEMENT".into(),
+                        payload: serde_json::json!({"holder":"abc123","intent":"implementing"}),
+                    },
+                },
+            )
+            .unwrap();
+            write_ndjson(
+                &mut writer,
+                &ServerMessage::Event {
+                    event: TaskEventRecord {
+                        seq_id: 43,
+                        task_id: "ZACH-079".into(),
+                        task_group: crate::v2::socket::SESSION_GROUP_NAME.into(),
+                        ts_epoch: 1_700_000_001,
+                        event_type: "CLAIM_CHANGED".into(),
+                        payload: serde_json::json!({"task_id":"ZACH-079","incoming_executor":"session"}),
+                    },
+                },
+            )
+            .unwrap();
+        });
+        let reply = read_all(f.request(
+            "GET",
+            "/api/events?since_seq=0&group=_sessions",
+            &f.auth(),
+            "",
+        ));
+        backend.join().unwrap();
+        assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
+        assert!(reply.contains("SESSION_ANNOUNCEMENT"), "{reply}");
+        assert!(reply.contains("CLAIM_CHANGED"), "{reply}");
     }
 }

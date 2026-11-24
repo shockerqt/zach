@@ -20,6 +20,20 @@ pub struct ExportContract {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExportClaimSummary {
+    #[serde(default)]
+    pub executor: Option<String>,
+    #[serde(default)]
+    pub holder: Option<String>,
+    #[serde(default)]
+    pub actor: Option<String>,
+    #[serde(default)]
+    pub alive: bool,
+    #[serde(default)]
+    pub state: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExportTaskItem {
     pub id: String,
     #[serde(default)]
@@ -50,6 +64,8 @@ pub struct ExportTaskItem {
     pub reviewed_sha: Option<String>,
     #[serde(default)]
     pub executor: Option<String>,
+    #[serde(default)]
+    pub claim: Option<ExportClaimSummary>,
     #[serde(default = "default_true")]
     pub autonomous_consent: bool,
     #[serde(default)]
@@ -259,6 +275,12 @@ pub fn decode_export_records(json_payload: &str) -> Result<Vec<TaskRecord>, V2St
             .filter(|w| !w.is_empty() && w.as_str() != "none")
             .cloned();
 
+        let effective_executor = item
+            .claim
+            .as_ref()
+            .filter(|c| c.alive)
+            .and_then(|c| c.executor.clone())
+            .or_else(|| item.executor.clone());
         let record = TaskRecord {
             task_id: item.id.clone(),
             task_group,
@@ -287,15 +309,14 @@ pub fn decode_export_records(json_payload: &str) -> Result<Vec<TaskRecord>, V2St
             plan_base_sha,
             reviewed_sha: item.reviewed_sha.clone(),
             pr_number: None,
-            executor: item.executor.clone(),
+            executor: effective_executor.clone(),
             autonomous_consent: item.autonomous_consent,
             retry_count: 0,
             next_retry_epoch: 0,
             lease_owner: None,
             lease_expires_epoch: None,
             memory: TaskMemory {
-                governance_started: item
-                    .executor
+                governance_started: effective_executor
                     .as_deref()
                     .is_some_and(|executor| executor.eq_ignore_ascii_case("zach"))
                     && matches!(
@@ -355,6 +376,7 @@ pub fn sync_from_ws_task(
     ws_task_bin: &Path,
 ) -> Result<IntakeSummary, V2StoreError> {
     let output = Command::new(ws_task_bin)
+        .env("WS_TASK_EXECUTOR", "zach")
         .args(["export", "--sync", "--json"])
         .output()
         .map_err(|e| V2StoreError(format!("failed to invoke {}: {e}", ws_task_bin.display())))?;
@@ -383,6 +405,7 @@ pub struct SystemWsTaskClient {
 impl WsTaskClient for SystemWsTaskClient {
     fn execute(&self, args: &[String]) -> Result<String, String> {
         let out = Command::new(&self.bin)
+            .env("WS_TASK_EXECUTOR", "zach")
             .args(args)
             .output()
             .map_err(|e| format!("ws-task spawn: {e}"))?;
@@ -407,6 +430,20 @@ pub fn stage_operation(
     sha: Option<&str>,
     actor: &str,
 ) -> crate::v2::store::LifecycleOperation {
+    stage_operation_with_receipt(task, key, stage, body_path, verdict, sha, actor, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn stage_operation_with_receipt(
+    task: &TaskRecord,
+    key: &str,
+    stage: &str,
+    body_path: &Path,
+    verdict: Option<&str>,
+    sha: Option<&str>,
+    actor: &str,
+    receipt_path: Option<&Path>,
+) -> crate::v2::store::LifecycleOperation {
     let mut args = vec![
         "stage".into(),
         task.task_id.clone(),
@@ -421,6 +458,9 @@ pub fn stage_operation(
     }
     if let Some(sha) = sha {
         args.extend(["--sha".into(), sha.into()]);
+    }
+    if let Some(receipt) = receipt_path {
+        args.extend(["--receipt".into(), receipt.to_string_lossy().into_owned()]);
     }
     args.extend(["--idempotency-key".into(), key.into()]);
     crate::v2::store::LifecycleOperation {

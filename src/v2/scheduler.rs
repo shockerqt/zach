@@ -1,5 +1,5 @@
 use crate::v2::intake::default_required_stages;
-use crate::v2::store::{TaskRecord, V2Store};
+use crate::v2::store::{RepoReservation, TaskRecord, V2Store, repo_conflict_for_task};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -97,23 +97,9 @@ pub fn schedule_scoped_dispatches(
         .filter(|occupied| **occupied)
         .count();
     let available_slots = max_parallel.saturating_sub(active_count);
-    let mut occupied = std::collections::BTreeMap::new();
-    for lock in store.list_path_locks(None).map_err(|e| e.to_string())? {
-        occupied.insert(lock.repo, lock.task_id);
-    }
-    for t in &all_tasks {
-        if matches!(
-            t.status.as_str(),
-            "Planning" | "Plan Review" | "In Progress" | "PR Review" | "Queued for Merge"
-        ) {
-            occupied
-                .entry(t.repository.clone())
-                .or_insert_with(|| t.task_id.clone());
-        }
-    }
-    for e in store.list_merge_queue(None).map_err(|e| e.to_string())? {
-        occupied.entry(e.repo).or_insert(e.task_id);
-    }
+    let mut reservations = store
+        .repo_reservations(&all_tasks)
+        .map_err(|e| e.to_string())?;
     let ready_tasks = store.list_ready_queue(group).map_err(|e| e.to_string())?;
     let mut dispatches = Vec::new();
     for mut task in ready_tasks {
@@ -123,15 +109,64 @@ pub fn schedule_scoped_dispatches(
         if task_id.is_some_and(|id| id != task.task_id) {
             continue;
         }
-        if occupied
-            .get(&task.repository)
-            .is_some_and(|owner| owner != &task.task_id)
+        if let Some(repo_res) = reservations.get(&task.repository)
+            && repo_conflict_for_task(repo_res, &task).is_some()
         {
             continue;
         }
         let Some(stage) = determine_next_stage(&task) else {
             continue;
         };
+        if !task.has_execution_grant_for(Some(&stage)) {
+            continue;
+        }
+        let author_stage = match stage.as_str() {
+            "plan-review" => Some("plan"),
+            "pr-review" => Some("impl"),
+            _ => None,
+        };
+        let author_family = if let Some(src_stage) = author_stage {
+            store
+                .list_stage_attempts(&task.task_id)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .rev()
+                .find(|a| a.stage == src_stage && a.status == "PASSED")
+                .map(|a| crate::v2::router::infer_model_family(&a.model))
+        } else {
+            None
+        };
+        if let Ok(Some(base_route)) = crate::v2::router::resolve_stage_route(
+            &task.weight,
+            &stage,
+            task.retry_count,
+            author_family,
+        ) {
+            let route = crate::v2::pipeline::apply_stage_fallback_route(&task, base_route);
+            let now = crate::v2::now_epoch();
+            if store
+                .get_active_provider_cooldown(route.family.as_str(), now)
+                .map_err(|e| e.to_string())?
+                .is_some()
+            {
+                let can_fallback = !matches!(stage.as_str(), "plan-review" | "pr-review")
+                    && route.fallback_model.is_some()
+                    && match route.fallback_family {
+                        Some(fb_family) => store
+                            .get_active_provider_cooldown(fb_family.as_str(), now)
+                            .map_err(|e| e.to_string())?
+                            .is_none(),
+                        None => false,
+                    };
+                if can_fallback {
+                    if !task.memory.fallback_stages.iter().any(|s| s == &stage) {
+                        task.memory.fallback_stages.push(stage.clone());
+                    }
+                } else {
+                    continue;
+                }
+            }
+        }
         let status = match stage.as_str() {
             "plan" => "Planning",
             "plan-review" => "Plan Review",
@@ -149,7 +184,12 @@ pub fn schedule_scoped_dispatches(
         task.status = status.to_owned();
         task.current_stage = Some(stage.clone());
         store.upsert_task(&task).map_err(|e| e.to_string())?;
-        occupied.insert(task.repository.clone(), task.task_id.clone());
+        reservations
+            .entry(task.repository.clone())
+            .or_default()
+            .push(RepoReservation::WholeRepo {
+                task_id: task.task_id.clone(),
+            });
         dispatches.push(ScheduledDispatch {
             task_id: task.task_id,
             repository: task.repository,
@@ -585,5 +625,156 @@ mod tests {
                 .unwrap();
             assert_eq!(raw, memory);
         }
+    }
+
+    #[test]
+    fn scheduler_allows_disjoint_session_target_files_and_blocks_overlapping_or_empty() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        store.set_max_parallel_tasks(2).unwrap();
+
+        let mut active_session = make_test_task(
+            "SESSION-1",
+            "zach",
+            "S",
+            "In Progress",
+            vec!["./src/v2/store.rs"],
+            vec![],
+        );
+        active_session.executor = Some("session".into());
+        store.upsert_task(&active_session).unwrap();
+
+        let ready_overlap =
+            make_test_task("A-OVERLAP", "zach", "S", "Ready", vec!["src/v2"], vec![]);
+        let ready_empty = make_test_task("B-EMPTY", "zach", "S", "Ready", vec![], vec![]);
+        let ready_disjoint = make_test_task(
+            "C-DISJOINT",
+            "zach",
+            "S",
+            "Ready",
+            vec!["src/v2/scheduler.rs"],
+            vec![],
+        );
+        store.upsert_task(&ready_overlap).unwrap();
+        store.upsert_task(&ready_empty).unwrap();
+        store.upsert_task(&ready_disjoint).unwrap();
+
+        let dispatches = schedule_next_dispatches(&mut store).unwrap();
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(dispatches[0].task_id, "C-DISJOINT");
+        assert_eq!(dispatches[0].acquired_paths, vec!["*".to_owned()]);
+        assert_eq!(
+            store.get_task("A-OVERLAP").unwrap().unwrap().status,
+            "Ready"
+        );
+        assert_eq!(store.get_task("B-EMPTY").unwrap().unwrap().status, "Ready");
+    }
+
+    #[test]
+    fn resumed_task_returns_to_ready_and_redispatches_without_stranding_path_locks() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        store.set_max_parallel_tasks(1).unwrap();
+
+        let mut task = make_test_task("RESUME-1", "zach", "S", "Ready", vec![], vec![]);
+        task.memory.governance_started = true;
+        store.upsert_task(&task).unwrap();
+
+        let first = schedule_scoped_dispatches(&mut store, None, None).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].task_id, "RESUME-1");
+
+        // Simulate lifecycle_ack("start") returning an idle task to Ready while keeping path_locks for the same task.
+        let mut acked = store.get_task("RESUME-1").unwrap().unwrap();
+        acked.status = "Ready".into();
+        store.upsert_task(&acked).unwrap();
+
+        let second = schedule_scoped_dispatches(&mut store, None, None).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].task_id, "RESUME-1");
+        assert_eq!(
+            store.get_task("RESUME-1").unwrap().unwrap().status,
+            "In Progress"
+        );
+    }
+
+    #[test]
+    fn cooldown_routes_primary_to_fallback_when_available_and_defers_when_unavailable() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        store.set_max_parallel_tasks(2).unwrap();
+        let future = crate::v2::now_epoch() + 1800;
+
+        // S/impl primary is OpenAiSol, fallback is GeminiAgy.
+        let mut impl_task = make_test_task("CD-IMPL", "repo-a", "S", "Ready", vec![], vec![]);
+        impl_task.memory.governance_started = true;
+        store.upsert_task(&impl_task).unwrap();
+
+        // Cooldown OpenAiSol only -> S/impl should route to GeminiAgy fallback.
+        store
+            .upsert_provider_cooldown("openai-sol", future, "usage limit")
+            .unwrap();
+        let dispatches = schedule_scoped_dispatches(&mut store, Some("CD-IMPL"), None).unwrap();
+        assert_eq!(dispatches.len(), 1);
+        let updated = store.get_task("CD-IMPL").unwrap().unwrap();
+        assert_eq!(updated.status, "In Progress");
+        assert!(updated.memory.fallback_stages.contains(&"impl".to_owned()));
+
+        // Now cooldown GeminiAgy too -> a second S/impl task must wait in Ready without path locks.
+        store
+            .upsert_provider_cooldown("gemini-agy", future, "429 resource exhausted")
+            .unwrap();
+        let mut blocked_task = make_test_task("CD-BOTH", "repo-b", "S", "Ready", vec![], vec![]);
+        blocked_task.memory.governance_started = true;
+        store.upsert_task(&blocked_task).unwrap();
+
+        let dispatches2 = schedule_scoped_dispatches(&mut store, Some("CD-BOTH"), None).unwrap();
+        assert!(dispatches2.is_empty());
+        let still_ready = store.get_task("CD-BOTH").unwrap().unwrap();
+        assert_eq!(still_ready.status, "Ready");
+        assert!(
+            store
+                .list_path_locks(None)
+                .unwrap()
+                .into_iter()
+                .all(|l| l.task_id != "CD-BOTH")
+        );
+
+        // Review stage cannot fall back: if reviewer family (OpenAiSol when author was GeminiAgy) is cooled down, it waits.
+        store.clear_provider_cooldown(Some("gemini-agy")).unwrap();
+        let mut review_task =
+            make_test_task("CD-REV", "repo-c", "S", "Ready", vec![], vec!["impl"]);
+        review_task.memory.governance_started = true;
+        store.upsert_task(&review_task).unwrap();
+        let mut impl_attempt = crate::v2::store::StageAttemptRecord {
+            attempt_id: "att-impl-1".into(),
+            task_id: "CD-REV".into(),
+            stage: "impl".into(),
+            model: "gemini-4-hydrogen-medium".into(),
+            effort: "medium".into(),
+            systemd_unit: None,
+            invocation_id: None,
+            started_epoch: 100,
+            ended_epoch: Some(200),
+            status: "PASSED".into(),
+            failure_class: None,
+            summary: Some("ok".into()),
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            sha_before: None,
+            sha_after: None,
+            phase: "COMPLETE".into(),
+            last_liveness_epoch: 200,
+            last_output_bytes: 0,
+            last_cpu_usage_usec: None,
+            control_group: None,
+            exit_code: Some(0),
+            exit_code_kind: None,
+            retry_generation: 0,
+        };
+        store.record_stage_attempt(&impl_attempt).unwrap();
+        impl_attempt.attempt_id = "att-impl-1".into();
+
+        let rev_dispatches = schedule_scoped_dispatches(&mut store, Some("CD-REV"), None).unwrap();
+        assert!(rev_dispatches.is_empty());
+        assert_eq!(store.get_task("CD-REV").unwrap().unwrap().status, "Ready");
     }
 }

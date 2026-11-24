@@ -2,7 +2,7 @@ use crate::v2::default_ws_task_bin;
 use crate::v2::intake::default_required_stages;
 use crate::v2::now_epoch;
 use crate::v2::router::{
-    ModelFamily, ReasoningEffort, StageRoute, infer_model_family,
+    ModelFamily, StageRoute, active_router_config, infer_model_family,
     is_no_cross_family_reviewer_error, resolve_stage_route,
 };
 use crate::v2::runner::{
@@ -590,10 +590,14 @@ pub fn plan_task_execution(task: &TaskRecord) -> Result<DryRunTaskPlan, String> 
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AgyCliError {
     pub failure_class: String,
     pub message: String,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub duration_seconds: Option<f64>,
 }
 
 impl std::fmt::Display for AgyCliError {
@@ -690,7 +694,134 @@ fn classify_agy_infra_failure(res: &Result<StageExecutionResult, String>) -> Opt
     }
 }
 
-/// Builds a structured JSON payload for `agent-tooling/plugins/gemini-worker/scripts/worker.mjs --cli`.
+/// Applies durable per-stage fallback routing while never switching family on review stages.
+pub fn apply_stage_fallback_route(task: &TaskRecord, mut route: StageRoute) -> StageRoute {
+    if matches!(route.stage.as_str(), "plan-review" | "pr-review") {
+        return route;
+    }
+    if task
+        .memory
+        .fallback_stages
+        .iter()
+        .any(|s| s == &route.stage)
+        && let (Some(fb_family), Some(fb_model)) =
+            (route.fallback_family, route.fallback_model.clone())
+    {
+        route.family = fb_family;
+        route.model = fb_model;
+        if let Some(fb_effort) = route.fallback_effort {
+            route.effort = fb_effort;
+        }
+        route.fallback_family = None;
+        route.fallback_model = None;
+        route.fallback_effort = None;
+    }
+    route
+}
+
+fn is_openaisol_fallback_eligible(
+    _stage: &str,
+    res: &Result<StageExecutionResult, String>,
+) -> bool {
+    let (status, msg) = match res {
+        Err(err) => ("FAILED", err.as_str()),
+        Ok(r) if r.status != "PASSED" => (r.status.as_str(), r.summary.as_str()),
+        _ => return false,
+    };
+    if is_quota_or_usage_limit_error(msg) {
+        return true;
+    }
+    let lower_status = status.trim().to_ascii_lowercase();
+    let lower_msg = msg.to_ascii_lowercase();
+    matches!(lower_status.as_str(), "stalled" | "lost" | "timeout")
+        || lower_msg.contains("codex_")
+        || lower_msg.contains("timed out")
+        || lower_msg.contains("runtimemaxsec")
+        || lower_msg.contains("failed to spawn")
+        || lower_msg.contains("empty stdout")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_fallback_openaisol_to_geminiagy(
+    store: &mut V2Store,
+    task: &mut TaskRecord,
+    executor: &mut dyn StageExecutor,
+    stage: &str,
+    route: &StageRoute,
+    prompt: &str,
+    attempt_rec: &mut StageAttemptRecord,
+    author_family: &mut Option<ModelFamily>,
+    res: Result<StageExecutionResult, String>,
+) -> Result<Result<StageExecutionResult, String>, String> {
+    if route.family != ModelFamily::OpenAiSol
+        || route.fallback_family != Some(ModelFamily::GeminiAgy)
+        || !is_openaisol_fallback_eligible(stage, &res)
+    {
+        return Ok(res);
+    }
+    let Some(fb_model) = route.fallback_model.clone() else {
+        return Ok(res);
+    };
+
+    let fb_route = StageRoute {
+        family: ModelFamily::GeminiAgy,
+        model: fb_model,
+        effort: route.fallback_effort.unwrap_or(route.effort),
+        fallback_family: None,
+        fallback_model: None,
+        fallback_effort: None,
+        ..route.clone()
+    };
+    let fb_attempt_id = format!(
+        "{}-{}-fb-{}",
+        task.task_id.to_ascii_lowercase(),
+        stage,
+        task.version
+    );
+    let fb_spec = build_systemd_stage_command(task, &fb_attempt_id, &fb_route, prompt)?;
+
+    if let Ok(ref r) = res {
+        apply_stage_result_usage(task, attempt_rec, stage, r);
+    }
+    let primary_err = match &res {
+        Err(e) => e.clone(),
+        Ok(r) => r.summary.clone(),
+    };
+    attempt_rec.status = "FAILED".to_owned();
+    attempt_rec.ended_epoch = Some(now_epoch());
+    attempt_rec.failure_class = Some(FAILURE_CLASS_INFRA.to_owned());
+    attempt_rec.summary = Some(primary_err);
+    store
+        .record_stage_attempt(attempt_rec)
+        .map_err(|e| e.to_string())?;
+
+    attempt_rec.attempt_id = fb_attempt_id.clone();
+    attempt_rec.model = fb_route.model.clone();
+    attempt_rec.effort = fb_route.effort.as_str().to_owned();
+    attempt_rec.systemd_unit = Some(fb_spec.unit_name.clone());
+    attempt_rec.status = "RUNNING".to_owned();
+    attempt_rec.ended_epoch = None;
+    attempt_rec.failure_class = None;
+    attempt_rec.summary = None;
+    store
+        .record_stage_attempt(attempt_rec)
+        .map_err(|e| e.to_string())?;
+
+    task.active_attempt_id = Some(fb_attempt_id.clone());
+    if !task.memory.fallback_stages.iter().any(|s| s == stage) {
+        task.memory.fallback_stages.push(stage.to_owned());
+    }
+    *task = store.upsert_task(task).map_err(|e| e.to_string())?;
+    *author_family = Some(fb_route.family);
+
+    Ok(executor.execute_stage(task, &fb_attempt_id, &fb_route, &fb_spec))
+}
+
+pub const MAX_AGY_CLI_TIMEOUT_SECS: u64 = 3600;
+
+/// Builds a structured JSON payload for `agent-tooling/plugins/gemini-worker/scripts/worker.mjs --cli`
+/// using ADR-014 clean stage mode (`stage_mode: true`, `stream_json: true`) and canonical
+/// `ReviewVerdict` `--json-schema` for review stages (`plan-review` and `pr-review`).
 pub fn build_agy_cli_payload(
     task: &TaskRecord,
     route: &StageRoute,
@@ -703,11 +834,18 @@ pub fn build_agy_cli_payload(
     };
     let worktree = task.worktree_path.clone().unwrap_or_default();
     let allowed_files = filter_existing_allowed_files(&worktree, &task.context_pack.target_files);
-    let timeout_seconds = route.timeout_secs.clamp(30, 1800);
+    let timeout_seconds = route.timeout_secs.clamp(30, MAX_AGY_CLI_TIMEOUT_SECS);
     let orchestration_id = task.task_id.to_ascii_lowercase();
 
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "action": "run",
+        "harness": "agy",
+        "stage_mode": true,
+        "stream_json": true,
+        "task_id": task.task_id,
+        "stage": route.stage,
+        "executor": "zach",
+        "effort": route.effort.as_str(),
         "kind": kind,
         "task": prompt,
         "model": route.model,
@@ -716,7 +854,15 @@ pub fn build_agy_cli_payload(
         "confirmed": true,
         "timeout_seconds": timeout_seconds,
         "orchestration_id": orchestration_id,
-    })
+    });
+    if matches!(route.stage.as_str(), "plan-review" | "pr-review")
+        && let Ok(schema_val) =
+            serde_json::from_str::<serde_json::Value>(&review_verdict_json_schema_string())
+        && let Some(obj) = payload.as_object_mut()
+    {
+        obj.insert("json_schema".to_owned(), schema_val);
+    }
+    payload
 }
 
 /// Locate the same Context Pack-shaped YAML block Governance consumes, skipping
@@ -1148,7 +1294,7 @@ fn truncate_prompt_section(text: &str, max_chars: usize) -> String {
     out
 }
 
-fn bounded_prompt(header: String, sections: Vec<(&str, String)>) -> String {
+fn bounded_prompt(header: String, sections: Vec<(String, String)>) -> String {
     let mut out = truncate_prompt_section(&header, 1000);
     let headings: usize = sections
         .iter()
@@ -1158,7 +1304,7 @@ fn bounded_prompt(header: String, sections: Vec<(&str, String)>) -> String {
     // Share spare capacity among sections; short schemas/findings remain complete.
     let mut caps = vec![0; sections.len()];
     for (i, (name, body)) in sections.iter().enumerate() {
-        if *name == "Required Output Format (Strict JSON Only)" {
+        if name == "Required Output Format (Strict JSON Only)" {
             caps[i] = body.encode_utf16().count();
             budget = budget.saturating_sub(caps[i]);
         }
@@ -1191,22 +1337,188 @@ fn bounded_prompt(header: String, sections: Vec<(&str, String)>) -> String {
     out
 }
 
-fn governance_skill(name: &str) -> String {
-    let root = std::env::var_os("ZACH_GOVERNANCE_ROOT")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| "/home/ubuntu/workspace/governance".into());
-    format!(
-        "{}\nDaemon mode: return output to zachd. Do not publish stages or call ws-task/gh; zachd owns publication.",
-        governance_skill_from_root(&root, name)
-    )
+pub const LEARNINGS_MAX_CHARS: usize = 1500;
+const REPO_INSTRUCTIONS_MAX_CHARS: usize = 3000;
+
+/// Bounded ADR-004 content-safe bootstrap provenance metadata recorded per stage attempt.
+/// Never stores raw prompt text, transcripts, or credentials.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BootstrapMetadata {
+    pub role: String,
+    pub cwd: String,
+    pub repository: String,
+    pub branch: String,
+    pub writable: bool,
+    pub repo_instructions_loaded: bool,
+    pub repo_instruction_paths: Vec<String>,
+    pub role_skill_loaded: bool,
+    pub role_skill_path: Option<String>,
+    pub learnings_loaded: bool,
+    pub learnings_chars: usize,
+    pub missing_required_instructions: Vec<String>,
 }
 
+pub fn role_skill_name(stage: &str) -> &'static str {
+    match stage {
+        "plan" => "governance-planner",
+        "plan-review" => "governance-plan-reviewer",
+        "impl" => "governance-implementer",
+        "pr-review" => "governance-pr-reviewer",
+        _ => "governance-planner",
+    }
+}
+
+fn governance_root_path() -> std::path::PathBuf {
+    std::env::var_os("ZACH_GOVERNANCE_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| "/home/ubuntu/workspace/governance".into())
+}
+
+fn governance_skill_fallback(name: &str) -> String {
+    match name {
+        "governance-planner" => "governance-planner: Explore canonical owners read-only; propose architecture, risks, tests and a ## [PLAN] with a fenced yaml Context Pack containing weight, target_files, forbidden_paths, verification_commands and acceptance_criteria. Escalate weight for critical scope; preserve existing boundaries and criteria.".to_owned(),
+        "governance-plan-reviewer" => "governance-plan-reviewer: Independently audit ownership and path existence, weight accuracy, testability of every acceptance criterion, safety and forbidden paths. Return APPROVED or CHANGES_REQUESTED using the required ReviewVerdict schema.".to_owned(),
+        "governance-implementer" => "governance-implementer: Inspect exact struct/field/symbol definitions before editing inside the governed worktree; never touch forbidden_paths; verify every AC-i and run all worker_checks before finishing.".to_owned(),
+        _ => "governance-pr-reviewer: Independently audit the real git diff against merge-base and verify every AC-i with exact file:line citations inside diff hunks. Return APPROVED or CHANGES_REQUESTED using the required ReviewVerdict JSON schema.".to_owned(),
+    }
+}
+
+fn governance_skill_from_root_with_meta(root: &Path, name: &str) -> (String, bool, Option<String>) {
+    let path = root.join(".agents/skills").join(name).join("SKILL.md");
+    match std::fs::read_to_string(&path) {
+        Ok(text) if !text.trim().is_empty() => (text, true, Some(path.display().to_string())),
+        _ => (governance_skill_fallback(name), false, None),
+    }
+}
+
+#[cfg(test)]
 fn governance_skill_from_root(root: &Path, name: &str) -> String {
-    std::fs::read_to_string(root.join(".agents/skills").join(name).join("SKILL.md"))
-        .unwrap_or_else(|_| match name {
-            "governance-planner" => "governance-planner: Explore canonical owners read-only; propose architecture, risks, tests and a ## [PLAN] with a fenced yaml Context Pack containing weight, target_files, forbidden_paths, verification_commands and acceptance_criteria. Escalate weight for critical scope; preserve existing boundaries and criteria.".to_owned(),
-            _ => "governance-plan-reviewer: Independently audit ownership and path existence, weight accuracy, testability of every acceptance criterion, safety and forbidden paths. Return APPROVED or CHANGES_REQUESTED using the required ReviewVerdict schema.".to_owned(),
-        })
+    governance_skill_from_root_with_meta(root, name).0
+}
+
+fn load_repo_instructions(worktree_path: &Path) -> (String, Vec<String>) {
+    let mut parts = Vec::new();
+    let mut loaded_paths = Vec::new();
+    for filename in ["AGENTS.md", "INSTRUCTIONS.md"] {
+        let candidate = worktree_path.join(filename);
+        if let Ok(content) = std::fs::read_to_string(&candidate)
+            && !content.trim().is_empty()
+        {
+            loaded_paths.push(filename.to_owned());
+            parts.push(format!(
+                "### {filename}\n{}",
+                truncate_prompt_section(content.trim(), REPO_INSTRUCTIONS_MAX_CHARS)
+            ));
+        }
+    }
+    (parts.join("\n\n"), loaded_paths)
+}
+
+fn load_bounded_learnings(governance_root: &Path, repo: &str) -> (String, bool) {
+    if std::env::var("ZACH_DISABLE_PREFLIGHT_LEARNINGS")
+        .ok()
+        .as_deref()
+        == Some("1")
+        || repo.trim().is_empty()
+    {
+        return (String::new(), false);
+    }
+    let preflight = governance_root.join("bin/ws-preflight");
+    if !preflight.is_file() {
+        return (String::new(), false);
+    }
+    let Ok(output) = std::process::Command::new(&preflight)
+        .args([
+            "--learnings",
+            "--repo",
+            repo,
+            "--max-chars",
+            &LEARNINGS_MAX_CHARS.to_string(),
+        ])
+        .output()
+    else {
+        return (String::new(), false);
+    };
+    if !output.status.success() {
+        return (String::new(), false);
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if text.is_empty() {
+        return (String::new(), false);
+    }
+    (truncate_prompt_section(&text, LEARNINGS_MAX_CHARS), true)
+}
+
+/// Resolves role skill, applicable repo instructions (`AGENTS.md`/`INSTRUCTIONS.md`),
+/// and bounded operational learnings for any of the 4 Governance v2 stages, returning
+/// both the prompt sections and ADR-004 content-safe `BootstrapMetadata`.
+pub fn resolve_stage_bootstrap_from_roots(
+    task: &TaskRecord,
+    stage: &str,
+    worktree_path: &str,
+    governance_root: &Path,
+    learnings_override: Option<String>,
+) -> (Vec<(String, String)>, BootstrapMetadata) {
+    let skill_name = role_skill_name(stage);
+    let (skill_body, role_skill_loaded, role_skill_path) =
+        governance_skill_from_root_with_meta(governance_root, skill_name);
+    let skill_text = format!(
+        "{skill_body}\nDaemon mode: return output to zachd. Do not publish stages or call ws-task/gh; zachd owns publication."
+    );
+    let (repo_body, repo_instruction_paths) = load_repo_instructions(Path::new(worktree_path));
+    let repo_instructions_loaded = !repo_instruction_paths.is_empty();
+    let (learnings_body, learnings_loaded) = match learnings_override {
+        Some(text) => {
+            let trimmed = text.trim().to_owned();
+            if trimmed.is_empty() {
+                (String::new(), false)
+            } else {
+                (truncate_prompt_section(&trimmed, LEARNINGS_MAX_CHARS), true)
+            }
+        }
+        None => load_bounded_learnings(governance_root, &task.repository),
+    };
+
+    let mut missing_required_instructions = Vec::new();
+    if !role_skill_loaded {
+        missing_required_instructions.push(format!("role_skill:{skill_name}"));
+    }
+    if !repo_instructions_loaded {
+        missing_required_instructions
+            .push("repo_instructions:AGENTS.md|INSTRUCTIONS.md".to_owned());
+    }
+
+    let mut sections = vec![(skill_name.to_owned(), skill_text)];
+    if repo_instructions_loaded {
+        sections.push(("Repository Instructions".to_owned(), repo_body));
+    }
+    if learnings_loaded {
+        sections.push(("Operational Learnings".to_owned(), learnings_body.clone()));
+    }
+
+    let meta = BootstrapMetadata {
+        role: stage.to_owned(),
+        cwd: worktree_path.to_owned(),
+        repository: task.repository.clone(),
+        branch: task.branch.clone().unwrap_or_default(),
+        writable: stage == "impl",
+        repo_instructions_loaded,
+        repo_instruction_paths,
+        role_skill_loaded,
+        role_skill_path,
+        learnings_loaded,
+        learnings_chars: learnings_body.chars().count(),
+        missing_required_instructions,
+    };
+    (sections, meta)
+}
+
+pub fn resolve_stage_bootstrap(
+    task: &TaskRecord,
+    stage: &str,
+    worktree_path: &str,
+) -> (Vec<(String, String)>, BootstrapMetadata) {
+    resolve_stage_bootstrap_from_roots(task, stage, worktree_path, &governance_root_path(), None)
 }
 
 fn prompt_context(task: &TaskRecord) -> String {
@@ -1227,46 +1539,45 @@ fn prompt_diagnostic(text: &Option<String>) -> String {
 }
 
 pub fn build_plan_prompt(task: &TaskRecord, worktree_path: &str) -> String {
+    let (mut sections, _) = resolve_stage_bootstrap(task, "plan", worktree_path);
+    sections.extend([
+        ("Context Pack".to_owned(), prompt_context(task)),
+        ("Acceptance Criteria".to_owned(), prompt_acs(task)),
+        (
+            "Prior Plan Review Findings".to_owned(),
+            prompt_diagnostic(&task.memory.last_plan_review_findings),
+        ),
+    ]);
     bounded_prompt(
         format!(
             "Plan task {} ({}) inside governed worktree {}.\nDaemon mode: read-only. Return the full plan; do not publish stages or call ws-task, git, or gh. Use only the supported YAML subset: scalars, block lists/maps, and inline []. Preserve forbidden_paths and acceptance criteria.\n",
             task.task_id, task.title, worktree_path
         ),
-        vec![
-            ("governance-planner", governance_skill("governance-planner")),
-            ("Context Pack", prompt_context(task)),
-            ("Acceptance Criteria", prompt_acs(task)),
-            (
-                "Prior Plan Review Findings",
-                prompt_diagnostic(&task.memory.last_plan_review_findings),
-            ),
-        ],
+        sections,
     )
 }
 
 pub fn build_plan_review_prompt(task: &TaskRecord, worktree_path: &str, plan: &str) -> String {
+    let (mut sections, _) = resolve_stage_bootstrap(task, "plan-review", worktree_path);
+    sections.extend([
+        (
+            "Required Output Format (Strict JSON Only)".to_owned(),
+            review_verdict_json_schema_string(),
+        ),
+        ("Context Pack".to_owned(), prompt_context(task)),
+        ("Acceptance Criteria".to_owned(), prompt_acs(task)),
+        ("Candidate Plan".to_owned(), plan.to_owned()),
+        (
+            "Prior Plan Review Findings".to_owned(),
+            prompt_diagnostic(&task.memory.last_plan_review_findings),
+        ),
+    ]);
     bounded_prompt(
         format!(
             "Review architectural plan for {} ({}) inside {}.\nDaemon mode: read-only; return JSON only; do not publish or call ws-task, git, or gh. Citations must use line >= 1 in plan, the candidate artifact, or existing/proposed repository files. APPROVED requires every AC PASS and no blocking findings.\n",
             task.task_id, task.title, worktree_path
         ),
-        vec![
-            (
-                "governance-plan-reviewer",
-                governance_skill("governance-plan-reviewer"),
-            ),
-            (
-                "Required Output Format (Strict JSON Only)",
-                review_verdict_json_schema_string(),
-            ),
-            ("Context Pack", prompt_context(task)),
-            ("Acceptance Criteria", prompt_acs(task)),
-            ("Candidate Plan", plan.to_owned()),
-            (
-                "Prior Plan Review Findings",
-                prompt_diagnostic(&task.memory.last_plan_review_findings),
-            ),
-        ],
+        sections,
     )
 }
 
@@ -1282,27 +1593,29 @@ pub(crate) fn task_with_full_approved_plan(
 }
 
 pub fn build_impl_prompt(task: &TaskRecord, worktree_path: &str) -> String {
+    let (mut sections, _) = resolve_stage_bootstrap(task, "impl", worktree_path);
+    sections.extend([
+        ("Context Pack".to_owned(), prompt_context(task)),
+        ("Acceptance Criteria".to_owned(), prompt_acs(task)),
+        (
+            "Approved Plan".to_owned(),
+            task.memory.approved_plan.clone().unwrap_or_default(),
+        ),
+        (
+            "Prior Review Findings (Address All Blocking Items)".to_owned(),
+            prompt_diagnostic(&task.memory.last_review_findings),
+        ),
+        (
+            "Prior Check Failure".to_owned(),
+            prompt_diagnostic(&task.memory.last_check_failure),
+        ),
+    ]);
     bounded_prompt(
         format!(
             "Implement task {} ({}) inside governed worktree {}.\n",
             task.task_id, task.title, worktree_path
         ),
-        vec![
-            ("Context Pack", prompt_context(task)),
-            ("Acceptance Criteria", prompt_acs(task)),
-            (
-                "Approved Plan",
-                task.memory.approved_plan.clone().unwrap_or_default(),
-            ),
-            (
-                "Prior Review Findings (Address All Blocking Items)",
-                prompt_diagnostic(&task.memory.last_review_findings),
-            ),
-            (
-                "Prior Check Failure",
-                prompt_diagnostic(&task.memory.last_check_failure),
-            ),
-        ],
+        sections,
     )
 }
 
@@ -1311,6 +1624,46 @@ pub fn build_pr_review_prompt(
     worktree_path: &str,
     diff_ctx: &ReviewedDiffContext,
 ) -> String {
+    let (mut sections, _) = resolve_stage_bootstrap(task, "pr-review", worktree_path);
+    sections.extend([
+        (
+            "Required Output Format (Strict JSON Only)".to_owned(),
+            review_verdict_json_schema_string(),
+        ),
+        ("Context Pack".to_owned(), prompt_context(task)),
+        ("Acceptance Criteria".to_owned(), prompt_acs(task)),
+        (
+            "Approved Plan".to_owned(),
+            task.memory.approved_plan.clone().unwrap_or_else(|| {
+                "No approved plan recorded (XS/S task or pre-plan resume).".to_owned()
+            }),
+        ),
+        (
+            "Prior Review Findings".to_owned(),
+            prompt_diagnostic(&task.memory.last_review_findings),
+        ),
+        (
+            "Changed Files & Valid Line Ranges".to_owned(),
+            diff_ctx
+                .files
+                .iter()
+                .map(|(p, r)| {
+                    format!(
+                        "{p}: lines [{}]",
+                        r.iter()
+                            .map(|r| format!("{}-{}", r.start, r.end))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        (
+            "Diff Excerpt (--unified=0)".to_owned(),
+            diff_ctx.diff_excerpt.clone(),
+        ),
+    ]);
     bounded_prompt(
         format!(
             "Review implementation of task {} ({}) inside governed worktree {}.\nYou MUST inspect the real git diff and verify every acceptance criterion.\nReviewed Commit Range: {}\nMerge Base SHA: {}\nReviewed SHA: {}\nInspect with: git diff {}\nEvery cited file and line MUST exist in the reviewed commit range.\n",
@@ -1322,42 +1675,7 @@ pub fn build_pr_review_prompt(
             diff_ctx.reviewed_sha,
             diff_ctx.commit_range
         ),
-        vec![
-            (
-                "Required Output Format (Strict JSON Only)",
-                review_verdict_json_schema_string(),
-            ),
-            ("Context Pack", prompt_context(task)),
-            ("Acceptance Criteria", prompt_acs(task)),
-            (
-                "Approved Plan",
-                task.memory.approved_plan.clone().unwrap_or_else(|| {
-                    "No approved plan recorded (XS/S task or pre-plan resume).".to_owned()
-                }),
-            ),
-            (
-                "Prior Review Findings",
-                prompt_diagnostic(&task.memory.last_review_findings),
-            ),
-            (
-                "Changed Files & Valid Line Ranges",
-                diff_ctx
-                    .files
-                    .iter()
-                    .map(|(p, r)| {
-                        format!(
-                            "{p}: lines [{}]",
-                            r.iter()
-                                .map(|r| format!("{}-{}", r.start, r.end))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ),
-            ("Diff Excerpt (--unified=0)", diff_ctx.diff_excerpt.clone()),
-        ],
+        sections,
     )
 }
 
@@ -1376,45 +1694,88 @@ pub fn parse_agy_cli_response(
             } else {
                 stderr.trim().to_owned()
             },
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            duration_seconds: None,
         });
     };
 
-    if stderr.contains("timed out")
+    let has_stderr_timeout = stderr.contains("timed out")
         || stderr.contains("TIMEOUT")
-        || stderr.contains("RuntimeMaxSec")
-        || stdout.contains("TIMEOUT")
-    {
-        return Err(AgyCliError {
-            failure_class: "AGY_TIMEOUT".to_owned(),
-            message: format!(
-                "worker execution timed out (code={code}): {}",
-                stderr.trim()
-            ),
-        });
-    }
+        || stderr.contains("RuntimeMaxSec");
 
     let trimmed_out = stdout.trim();
     if trimmed_out.is_empty() {
+        if has_stderr_timeout {
+            return Err(AgyCliError {
+                failure_class: "AGY_TIMEOUT".to_owned(),
+                message: format!(
+                    "worker execution timed out (code={code}): {}",
+                    stderr.trim()
+                ),
+                input_tokens: None,
+                output_tokens: None,
+                total_tokens: None,
+                duration_seconds: None,
+            });
+        }
         return Err(AgyCliError {
             failure_class: "AGY_EXIT".to_owned(),
             message: format!(
                 "worker exited with code {code} and empty stdout: {}",
                 stderr.trim()
             ),
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            duration_seconds: None,
         });
     }
 
     let json: serde_json::Value = match serde_json::from_str(trimmed_out) {
         Ok(v) => v,
         Err(_) => {
-            return Err(AgyCliError {
-                failure_class: "AGY_EXIT".to_owned(),
-                message: format!(
-                    "worker exited with code {code} with non-JSON output: {trimmed_out}"
-                ),
-            });
+            // ADR-014 stream-json emits sanitized JSONL liveness events followed by one terminal JSON envelope.
+            let terminal_line = trimmed_out
+                .lines()
+                .rev()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok());
+            match terminal_line {
+                Some(v) => v,
+                None => {
+                    if has_stderr_timeout || stdout.contains("TIMEOUT") {
+                        return Err(AgyCliError {
+                            failure_class: "AGY_TIMEOUT".to_owned(),
+                            message: format!(
+                                "worker execution timed out (code={code}): {}",
+                                stderr.trim()
+                            ),
+                            input_tokens: None,
+                            output_tokens: None,
+                            total_tokens: None,
+                            duration_seconds: None,
+                        });
+                    }
+                    return Err(AgyCliError {
+                        failure_class: "AGY_EXIT".to_owned(),
+                        message: format!(
+                            "worker exited with code {code} with non-JSON output: {trimmed_out}"
+                        ),
+                        input_tokens: None,
+                        output_tokens: None,
+                        total_tokens: None,
+                        duration_seconds: None,
+                    });
+                }
+            }
         }
     };
+
+    let (input_tokens, output_tokens, total_tokens) = parse_agy_usage(&json);
+    let duration_seconds = parse_agy_duration_seconds(&json);
 
     let status_str = json.get("status").and_then(|v| v.as_str()).unwrap_or("");
     let exec_succeeded = json
@@ -1423,18 +1784,45 @@ pub fn parse_agy_cli_response(
         .unwrap_or(true);
 
     if status_str.eq_ignore_ascii_case("error") || !exec_succeeded {
-        let err_code = json
-            .get("error_code")
+        let diagnostic = json.get("diagnostic");
+        let err_code = diagnostic
+            .and_then(|d| d.get("code"))
             .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                json.get("error_code")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+            })
             .unwrap_or("AGY_STATUS_ERROR");
-        let summary = json
-            .get("summary")
-            .or_else(|| json.get("message"))
+        let summary = diagnostic
+            .and_then(|d| d.get("summary"))
             .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                json.get("summary")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .or_else(|| {
+                json.get("message")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+            })
             .unwrap_or(trimmed_out);
+        let is_canonical_timeout = err_code == "AGY_TIMEOUT"
+            || json.get("process_status").and_then(|v| v.as_str()) == Some("timeout");
         return Err(AgyCliError {
-            failure_class: "AGY_STATUS".to_owned(),
+            failure_class: if is_canonical_timeout {
+                "AGY_TIMEOUT".to_owned()
+            } else {
+                "AGY_STATUS".to_owned()
+            },
             message: format!("{err_code}: {summary}"),
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            duration_seconds,
         });
     }
 
@@ -1477,8 +1865,6 @@ pub fn parse_agy_cli_response(
         .and_then(|v| v.as_str())
         .map(str::to_owned);
 
-    let (input_tokens, output_tokens, total_tokens) = parse_agy_usage(&json);
-
     Ok(StageExecutionResult {
         status: "PASSED".to_owned(),
         summary,
@@ -1489,10 +1875,17 @@ pub fn parse_agy_cli_response(
         input_tokens,
         output_tokens,
         total_tokens,
+        duration_seconds,
         sha_before: None,
         sha_after: None,
         diff_files: Vec::new(),
     })
+}
+
+fn parse_agy_duration_seconds(json: &serde_json::Value) -> Option<f64> {
+    json.get("duration_seconds")
+        .and_then(|v| v.as_f64())
+        .filter(|d| d.is_finite() && *d >= 0.0)
 }
 
 fn parse_agy_usage(json: &serde_json::Value) -> (Option<u64>, Option<u64>, Option<u64>) {
@@ -1534,6 +1927,345 @@ fn parse_agy_usage(json: &serde_json::Value) -> (Option<u64>, Option<u64>, Optio
 pub const FAILURE_CLASS_INFRA: &str = "infra";
 pub const FAILURE_CLASS_SEMANTIC: &str = "semantic";
 pub const FAILURE_CLASS_POLICY: &str = "policy";
+pub const DEFAULT_QUOTA_COOLDOWN_SECS: i64 = 1800;
+pub const QUOTA_COOLDOWN_SAFETY_MARGIN_SECS: i64 = 60;
+
+/// Parses a quota/rate-limit reset timestamp or relative duration from `message`,
+/// returning `reset_epoch + QUOTA_COOLDOWN_SAFETY_MARGIN_SECS`, or falling back to
+/// `now + DEFAULT_QUOTA_COOLDOWN_SECS` when unparseable or already in the past.
+pub fn parse_quota_reset_epoch(message: &str, now: i64) -> i64 {
+    let parsed = parse_explicit_timestamp_epoch(message)
+        .or_else(|| parse_relative_duration_secs(message).map(|secs| now.saturating_add(secs)));
+    match parsed {
+        Some(epoch) if epoch > now => epoch.saturating_add(QUOTA_COOLDOWN_SAFETY_MARGIN_SECS),
+        _ => now.saturating_add(DEFAULT_QUOTA_COOLDOWN_SECS),
+    }
+}
+
+fn parse_relative_duration_secs(message: &str) -> Option<i64> {
+    let bytes = message.as_bytes();
+    let mut total_secs: i64 = 0;
+    let mut matched_any = false;
+    let mut just_matched_unit = false;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            just_matched_unit = false;
+            i += 1;
+            continue;
+        }
+        // Require a non-alphanumeric boundary before the number unless continuing a compound duration like "1h30m".
+        if !just_matched_unit
+            && i > 0
+            && (bytes[i - 1].is_ascii_alphanumeric()
+                || bytes[i - 1] == b'-'
+                || bytes[i - 1] == b':')
+        {
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            just_matched_unit = false;
+            continue;
+        }
+        just_matched_unit = false;
+        let num_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        let Ok(value) = message[num_start..i].parse::<i64>() else {
+            continue;
+        };
+        let mut unit_start = i;
+        while unit_start < bytes.len() && bytes[unit_start] == b' ' {
+            unit_start += 1;
+        }
+        let mut unit_end = unit_start;
+        while unit_end < bytes.len() && bytes[unit_end].is_ascii_alphabetic() {
+            unit_end += 1;
+        }
+        if unit_start == unit_end {
+            continue;
+        }
+        let unit = message[unit_start..unit_end].to_ascii_lowercase();
+        let multiplier = match unit.as_str() {
+            "d" | "day" | "days" => 86_400,
+            "h" | "hr" | "hrs" | "hour" | "hours" => 3_600,
+            "m" | "min" | "mins" | "minute" | "minutes" => 60,
+            "s" | "sec" | "secs" | "second" | "seconds" => 1,
+            _ => continue,
+        };
+        if value > 0 {
+            total_secs = total_secs.saturating_add(value.saturating_mul(multiplier));
+            matched_any = true;
+            just_matched_unit = true;
+        }
+        i = unit_end;
+    }
+
+    matched_any.then_some(total_secs)
+}
+
+fn parse_explicit_timestamp_epoch(message: &str) -> Option<i64> {
+    parse_iso_timestamp_epoch(message).or_else(|| parse_named_month_timestamp_epoch(message))
+}
+
+fn parse_iso_timestamp_epoch(message: &str) -> Option<i64> {
+    let bytes = message.as_bytes();
+    for i in 0..bytes.len() {
+        if i + 16 > bytes.len() || !bytes[i].is_ascii_digit() {
+            continue;
+        }
+        // Look for YYYY-MM-DD[T ]HH:MM(:SS)?
+        if bytes.get(i + 4) != Some(&b'-') || bytes.get(i + 7) != Some(&b'-') {
+            continue;
+        }
+        let sep = bytes.get(i + 10).copied()?;
+        if sep != b'T' && sep != b't' && sep != b' ' {
+            continue;
+        }
+        let year: i64 = message.get(i..i + 4)?.parse().ok()?;
+        let month: u32 = message.get(i + 5..i + 7)?.parse().ok()?;
+        let day: u32 = message.get(i + 8..i + 10)?.parse().ok()?;
+        if bytes.get(i + 13) != Some(&b':') {
+            continue;
+        }
+        let hour: i64 = message.get(i + 11..i + 13)?.parse().ok()?;
+        let minute: i64 = message.get(i + 14..i + 16)?.parse().ok()?;
+        let mut cursor = i + 16;
+        let second: i64 = if bytes.get(cursor) == Some(&b':') && cursor + 3 <= bytes.len() {
+            let s = message.get(cursor + 1..cursor + 3)?.parse().ok()?;
+            cursor += 3;
+            s
+        } else {
+            0
+        };
+        // Skip optional fractional seconds
+        if bytes.get(cursor) == Some(&b'.') {
+            cursor += 1;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+                cursor += 1;
+            }
+        }
+        let tz_offset_secs = parse_tz_offset_secs(&message[cursor..]);
+        if let Some(base) = civil_datetime_to_epoch(year, month, day, hour, minute, second) {
+            return Some(base - tz_offset_secs);
+        }
+    }
+    None
+}
+
+fn parse_tz_offset_secs(tail: &str) -> i64 {
+    let trimmed = tail.trim_start();
+    if trimmed.starts_with('Z') || trimmed.starts_with('z') {
+        return 0;
+    }
+    let bytes = trimmed.as_bytes();
+    if bytes.len() >= 5 && (bytes[0] == b'+' || bytes[0] == b'-') {
+        let sign = if bytes[0] == b'-' { -1 } else { 1 };
+        if let Ok(hh) = trimmed[1..3].parse::<i64>() {
+            let mm = if bytes.get(3) == Some(&b':') && bytes.len() >= 6 {
+                trimmed[4..6].parse::<i64>().unwrap_or(0)
+            } else {
+                trimmed[3..5].parse::<i64>().unwrap_or(0)
+            };
+            return sign * (hh * 3600 + mm * 60);
+        }
+    }
+    0
+}
+
+fn parse_named_month_timestamp_epoch(message: &str) -> Option<i64> {
+    let tokens: Vec<&str> = message
+        .split(|c: char| c.is_ascii_whitespace() || c == ',')
+        .filter(|s| !s.is_empty())
+        .collect();
+    for idx in 0..tokens.len() {
+        let Some(month) = parse_month_name(tokens[idx]) else {
+            continue;
+        };
+        let Some(day_tok) = tokens.get(idx + 1) else {
+            continue;
+        };
+        let Some(day) = parse_ordinal_day(day_tok) else {
+            continue;
+        };
+        let Some(year_tok) = tokens.get(idx + 2) else {
+            continue;
+        };
+        let Ok(year) = year_tok.parse::<i64>() else {
+            continue;
+        };
+        if !(1970..=9999).contains(&year) {
+            continue;
+        }
+        let mut time_idx = idx + 3;
+        if tokens
+            .get(time_idx)
+            .is_some_and(|t| t.eq_ignore_ascii_case("at"))
+        {
+            time_idx += 1;
+        }
+        let Some(time_tok) = tokens.get(time_idx) else {
+            continue;
+        };
+        let am_pm = tokens.get(time_idx + 1).copied();
+        if let Some((hour, minute, second)) = parse_time_of_day(time_tok, am_pm)
+            && let Some(epoch) = civil_datetime_to_epoch(year, month, day, hour, minute, second)
+        {
+            return Some(epoch);
+        }
+    }
+    None
+}
+
+fn parse_month_name(token: &str) -> Option<u32> {
+    match token.trim_end_matches('.').to_ascii_lowercase().as_str() {
+        "jan" | "january" => Some(1),
+        "feb" | "february" => Some(2),
+        "mar" | "march" => Some(3),
+        "apr" | "april" => Some(4),
+        "may" => Some(5),
+        "jun" | "june" => Some(6),
+        "jul" | "july" => Some(7),
+        "aug" | "august" => Some(8),
+        "sep" | "sept" | "september" => Some(9),
+        "oct" | "october" => Some(10),
+        "nov" | "november" => Some(11),
+        "dec" | "december" => Some(12),
+        _ => None,
+    }
+}
+
+fn parse_ordinal_day(token: &str) -> Option<u32> {
+    let lower = token.to_ascii_lowercase();
+    let stripped = lower
+        .strip_suffix("st")
+        .or_else(|| lower.strip_suffix("nd"))
+        .or_else(|| lower.strip_suffix("rd"))
+        .or_else(|| lower.strip_suffix("th"))
+        .unwrap_or(&lower);
+    let day = stripped.parse::<u32>().ok()?;
+    (1..=31).contains(&day).then_some(day)
+}
+
+fn parse_time_of_day(token: &str, next_token: Option<&str>) -> Option<(i64, i64, i64)> {
+    let lower = token.to_ascii_lowercase();
+    let (core, inline_ampm) = if let Some(rest) = lower.strip_suffix("am") {
+        (rest, Some("am"))
+    } else if let Some(rest) = lower.strip_suffix("pm") {
+        (rest, Some("pm"))
+    } else {
+        (lower.as_str(), None)
+    };
+    let mut parts = core.split(':');
+    let mut hour: i64 = parts.next()?.parse().ok()?;
+    let minute: i64 = parts.next()?.parse().ok()?;
+    let second: i64 = match parts.next() {
+        Some(sec) => sec
+            .trim_end_matches(|c: char| !c.is_ascii_digit())
+            .parse()
+            .ok()?,
+        None => 0,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    let ampm = inline_ampm.or_else(|| {
+        let next = next_token?
+            .trim_end_matches(|c: char| !c.is_ascii_alphabetic())
+            .to_ascii_lowercase();
+        match next.as_str() {
+            "am" => Some("am"),
+            "pm" => Some("pm"),
+            _ => None,
+        }
+    });
+    match ampm {
+        Some("am") => {
+            if !(1..=12).contains(&hour) {
+                return None;
+            }
+            if hour == 12 {
+                hour = 0;
+            }
+        }
+        Some("pm") => {
+            if !(1..=12).contains(&hour) {
+                return None;
+            }
+            if hour != 12 {
+                hour += 12;
+            }
+        }
+        _ => {}
+    }
+    if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) || !(0..=59).contains(&second) {
+        return None;
+    }
+    Some((hour, minute, second))
+}
+
+fn civil_datetime_to_epoch(
+    year: i64,
+    month: u32,
+    day: u32,
+    hour: i64,
+    minute: i64,
+    second: i64,
+) -> Option<i64> {
+    if !(1..=12).contains(&month)
+        || !(1..=days_in_month(year, month)).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=59).contains(&second)
+    {
+        return None;
+    }
+    Some(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+            if is_leap { 29 } else { 28 }
+        }
+        _ => 0,
+    }
+}
+
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let m = month as i64;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Returns true when an error or summary indicates a provider quota, usage-limit, or rate-limit failure.
+pub fn is_quota_or_usage_limit_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("usage limit")
+        || lower.contains("usage_limit")
+        || lower.contains("hit your limit")
+        || lower.contains("exceeded your current quota")
+        || lower.contains("insufficient_quota")
+        || lower.contains("quota")
+        || lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("ratelimit")
+        || lower.contains("resource_exhausted")
+        || lower.contains("resource exhausted")
+        || lower.contains("too many requests")
+        || lower.contains("http 429")
+        || lower.contains("status 429")
+        || lower.contains("status: 429")
+}
 
 /// Maps a failed stage, execution error, or gate violation to `"infra"`, `"semantic"`, or `"policy"`.
 pub fn classify_failure_class(stage: &str, status: &str, message: &str) -> &'static str {
@@ -1547,6 +2279,12 @@ pub fn classify_failure_class(stage: &str, status: &str, message: &str) -> &'sta
     if lower_status == "stalled" || lower_status == "lost" || lower_status == "timeout" {
         return FAILURE_CLASS_INFRA;
     }
+    if is_quota_or_usage_limit_error(message) {
+        return FAILURE_CLASS_INFRA;
+    }
+    if lower_msg.trim_start().starts_with("agy_") {
+        return FAILURE_CLASS_INFRA;
+    }
     if matches!(lower_stage.as_str(), "plan-review" | "pr-review")
         && (lower_msg.contains("schema")
             || lower_msg.contains("review verdict")
@@ -1554,14 +2292,15 @@ pub fn classify_failure_class(stage: &str, status: &str, message: &str) -> &'sta
     {
         return FAILURE_CLASS_SEMANTIC;
     }
-    if lower_msg.contains("forbidden")
+    if lower_msg.contains("forbidden path")
+        || lower_msg.contains("plan target is forbidden")
         || lower_msg.contains("out-of-scope")
         || lower_msg.contains("scope_violation")
         || lower_msg.contains("outside target_files")
         || lower_msg.contains("token budget")
         || lower_msg.contains("budget exhausted")
         || lower_msg.contains("size policy")
-        || lower_msg.contains("policy")
+        || lower_msg.contains("policy violation")
         || lower_msg.contains("exceeds xs ceiling")
         || lower_msg.contains("exceeds s ceiling")
         || lower_msg.contains("verdict gate")
@@ -2239,8 +2978,11 @@ pub fn execute_xs_s_pipeline_with_executor_and_ws_task(
         if !task.stages_completed.iter().any(|s| s == "impl")
             && (task.required_stages.is_empty() || task.required_stages.iter().any(|s| s == "impl"))
         {
-            let impl_route = resolve_stage_route(&task.weight, "impl", task.retry_count, None)?
-                .ok_or_else(|| "missing impl route".to_owned())?;
+            let impl_route = apply_stage_fallback_route(
+                &task,
+                resolve_stage_route(&task.weight, "impl", task.retry_count, None)?
+                    .ok_or_else(|| "missing impl route".to_owned())?,
+            );
             impl_author_family = Some(impl_route.family);
             check_token_budget(&task, &impl_route)?;
 
@@ -2292,22 +3034,33 @@ pub fn execute_xs_s_pipeline_with_executor_and_ws_task(
                 .record_stage_attempt(&attempt_rec)
                 .map_err(|e| e.to_string())?;
 
-            let impl_result =
-                match executor.execute_stage(&task, &impl_attempt_id, &impl_route, &impl_spec) {
-                    Ok(res) => res,
-                    Err(err) => {
-                        let class = classify_failure_class("impl", "FAILED", &err);
-                        fail_stage_attempt(
-                            store,
-                            &mut task,
-                            &mut attempt_rec,
-                            class,
-                            err.clone(),
-                            true,
-                        )?;
-                        return Err(format!("impl stage failed for {}: {}", task.task_id, err));
-                    }
-                };
+            let impl_res = executor.execute_stage(&task, &impl_attempt_id, &impl_route, &impl_spec);
+            let impl_res = maybe_fallback_openaisol_to_geminiagy(
+                store,
+                &mut task,
+                executor,
+                "impl",
+                &impl_route,
+                &impl_prompt,
+                &mut attempt_rec,
+                &mut impl_author_family,
+                impl_res,
+            )?;
+            let impl_result = match impl_res {
+                Ok(res) => res,
+                Err(err) => {
+                    let class = classify_failure_class("impl", "FAILED", &err);
+                    fail_stage_attempt(
+                        store,
+                        &mut task,
+                        &mut attempt_rec,
+                        class,
+                        err.clone(),
+                        true,
+                    )?;
+                    return Err(format!("impl stage failed for {}: {}", task.task_id, err));
+                }
+            };
             apply_stage_result_usage(&mut task, &mut attempt_rec, "impl", &impl_result);
             attempt_rec.sha_before = impl_result.sha_before.clone();
             attempt_rec.sha_after = impl_result.sha_after.clone();
@@ -2519,7 +3272,29 @@ pub fn execute_m_l_pipeline(store: &mut V2Store, task_id: &str) -> Result<TaskRe
 /// - [For L]: `human-merge-approval` gate (opens `DECISION_REQUIRED`, pauses in `Blocked` until resolved)
 /// - Final: Enqueues pull request into per-repo FIFO `merge_queue` (retaining `path_locks`)
 ///
-/// Automatically falls back to `gpt-6.1-sol` after 2 AGY infrastructure failures.
+/// Automatically falls back to the configured `agy_infra_fallback` route after 2 AGY infrastructure failures.
+fn agy_infra_fallback_route(base: &StageRoute, prefer_stage_fallback: bool) -> StageRoute {
+    let cfg = active_router_config();
+    if prefer_stage_fallback && let Some(fb_model) = base.fallback_model.clone() {
+        let mut route = base.clone();
+        route.family = infer_model_family(&fb_model);
+        route.model = fb_model;
+        if let Some(effort) = base.fallback_effort {
+            route.effort = effort;
+        }
+        return route;
+    }
+    let fb = cfg.agy_infra_fallback;
+    StageRoute {
+        family: infer_model_family(&fb.model),
+        model: fb.model,
+        effort: fb.effort,
+        fallback_family: None,
+        fallback_model: None,
+        fallback_effort: None,
+        ..base.clone()
+    }
+}
 pub fn execute_m_l_pipeline_with_executor(
     store: &mut V2Store,
     task_id: &str,
@@ -2595,16 +3370,9 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                 resolve_stage_route(&task.weight, "plan", task.retry_count, None)?
                     .ok_or_else(|| "missing plan route".to_owned())?;
 
-            let mut plan_route = plan_route_initial;
+            let mut plan_route = apply_stage_fallback_route(&task, plan_route_initial);
             if plan_route.family == ModelFamily::GeminiAgy && count_agy_infra_failures(&task) >= 2 {
-                plan_route.family = ModelFamily::OpenAiSol;
-                plan_route.model = plan_route
-                    .fallback_model
-                    .clone()
-                    .unwrap_or_else(|| "gpt-6.1-sol".to_owned());
-                if let Some(effort) = plan_route.fallback_effort {
-                    plan_route.effort = effort;
-                }
+                plan_route = agy_infra_fallback_route(&plan_route, true);
             }
             plan_author_family = Some(plan_route.family);
 
@@ -2670,15 +3438,7 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                     ),
                 );
                 if count_agy_infra_failures(&task) >= 2 {
-                    let fb_route = StageRoute {
-                        family: ModelFamily::OpenAiSol,
-                        model: "gpt-6.1-sol".to_owned(),
-                        effort: ReasoningEffort::High,
-                        fallback_family: None,
-                        fallback_model: None,
-                        fallback_effort: None,
-                        ..plan_route.clone()
-                    };
+                    let fb_route = agy_infra_fallback_route(&plan_route, false);
                     let fb_attempt_id = format!(
                         "{}-plan-fb-{}",
                         task.task_id.to_ascii_lowercase(),
@@ -2712,6 +3472,17 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                     plan_res = executor.execute_stage(&task, &fb_attempt_id, &fb_route, &fb_spec);
                 }
             }
+            plan_res = maybe_fallback_openaisol_to_geminiagy(
+                store,
+                &mut task,
+                executor,
+                "plan",
+                &plan_route,
+                &plan_prompt,
+                &mut plan_rec,
+                &mut plan_author_family,
+                plan_res,
+            )?;
 
             let plan_result = match plan_res {
                 Ok(res) => res,
@@ -3146,16 +3917,9 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                 resolve_stage_route(&task.weight, "impl", task.retry_count, None)?
                     .ok_or_else(|| "missing impl route".to_owned())?;
 
-            let mut impl_route = impl_route_initial;
+            let mut impl_route = apply_stage_fallback_route(&task, impl_route_initial);
             if impl_route.family == ModelFamily::GeminiAgy && count_agy_infra_failures(&task) >= 2 {
-                impl_route.family = ModelFamily::OpenAiSol;
-                impl_route.model = impl_route
-                    .fallback_model
-                    .clone()
-                    .unwrap_or_else(|| "gpt-6.1-sol".to_owned());
-                if let Some(effort) = impl_route.fallback_effort {
-                    impl_route.effort = effort;
-                }
+                impl_route = agy_infra_fallback_route(&impl_route, true);
             }
             impl_author_family = Some(impl_route.family);
 
@@ -3222,15 +3986,7 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                     ),
                 );
                 if count_agy_infra_failures(&task) >= 2 {
-                    let fb_route = StageRoute {
-                        family: ModelFamily::OpenAiSol,
-                        model: "gpt-6.1-sol".to_owned(),
-                        effort: ReasoningEffort::High,
-                        fallback_family: None,
-                        fallback_model: None,
-                        fallback_effort: None,
-                        ..impl_route.clone()
-                    };
+                    let fb_route = agy_infra_fallback_route(&impl_route, false);
                     let fb_attempt_id = format!(
                         "{}-impl-fb-{}",
                         task.task_id.to_ascii_lowercase(),
@@ -3246,6 +4002,17 @@ pub fn execute_m_l_pipeline_with_executor_and_ws_task(
                     impl_res = executor.execute_stage(&task, &fb_attempt_id, &fb_route, &fb_spec);
                 }
             }
+            impl_res = maybe_fallback_openaisol_to_geminiagy(
+                store,
+                &mut task,
+                executor,
+                "impl",
+                &impl_route,
+                &impl_prompt,
+                &mut attempt_rec,
+                &mut impl_author_family,
+                impl_res,
+            )?;
 
             let impl_result = match impl_res {
                 Ok(res) => res,
@@ -3533,8 +4300,11 @@ pub fn prepare_supervised_stage(
     attempt_id: &str,
     author: Option<ModelFamily>,
 ) -> Result<crate::v2::runner::PreparedLaunch, String> {
-    let route = resolve_stage_route(&task.weight, stage, task.retry_count, author)?
-        .ok_or("missing stage route")?;
+    let route = apply_stage_fallback_route(
+        task,
+        resolve_stage_route(&task.weight, stage, task.retry_count, author)?
+            .ok_or("missing stage route")?,
+    );
     check_token_budget(task, &route)?;
     let mut executor = SystemdStageExecutor::with_state_dir(state_dir);
     let worktree = task
@@ -3859,6 +4629,7 @@ pub fn run_supervised_pipeline_step(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::v2::router::ReasoningEffort;
     use crate::v2::runner::{MockStageExecutor, StageExecutionResult};
     use crate::v2::store::{AcceptanceCriterionSpec, TargetFileSpec, TaskMemory};
 
@@ -3873,6 +4644,7 @@ mod tests {
             input_tokens: None,
             output_tokens: None,
             total_tokens: None,
+            duration_seconds: None,
             sha_before: None,
             sha_after: None,
             diff_files: Vec::new(),
@@ -4825,6 +5597,7 @@ print(json.dumps({
                     input_tokens: Some(12_000),
                     output_tokens: Some(3_000),
                     total_tokens: Some(15_000),
+                    duration_seconds: None,
                     sha_before: Some("abc1234".to_owned()),
                     sha_after: Some("abc1234".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -4844,6 +5617,7 @@ print(json.dumps({
                     input_tokens: Some(8_000),
                     output_tokens: Some(1_500),
                     total_tokens: Some(9_500),
+                    duration_seconds: None,
                     sha_before: Some("def5678".to_owned()),
                     sha_after: Some("def5678".to_owned()),
                     diff_files: Vec::new(),
@@ -4945,6 +5719,7 @@ print(json.dumps({
                 input_tokens: Some(4_000),
                 output_tokens: Some(800),
                 total_tokens: Some(4_800),
+                duration_seconds: None,
                 sha_before: Some("abc1234".to_owned()),
                 sha_after: Some("xs-sha-1".to_owned()),
                 diff_files: vec![DiffFileEntry {
@@ -5038,6 +5813,7 @@ print(json.dumps({
                     input_tokens: Some(10_000),
                     output_tokens: Some(2_000),
                     total_tokens: Some(12_000),
+                    duration_seconds: None,
                     sha_before: None,
                     sha_after: None,
                     diff_files: Vec::new(),
@@ -5053,6 +5829,7 @@ print(json.dumps({
                     input_tokens: Some(8_000),
                     output_tokens: Some(1_000),
                     total_tokens: Some(9_000),
+                    duration_seconds: None,
                     sha_before: None,
                     sha_after: None,
                     diff_files: Vec::new(),
@@ -5068,6 +5845,7 @@ print(json.dumps({
                     input_tokens: Some(15_000),
                     output_tokens: Some(3_000),
                     total_tokens: Some(18_000),
+                    duration_seconds: None,
                     sha_before: Some("base123".to_owned()),
                     sha_after: Some("base123".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -5088,6 +5866,7 @@ print(json.dumps({
                     input_tokens: Some(12_000),
                     output_tokens: Some(2_000),
                     total_tokens: Some(14_000),
+                    duration_seconds: None,
                     sha_before: Some("sha-m-impl".to_owned()),
                     sha_after: Some("sha-m-impl".to_owned()),
                     diff_files: Vec::new(),
@@ -5185,6 +5964,7 @@ print(json.dumps({
                     input_tokens: Some(1_000),
                     output_tokens: Some(500),
                     total_tokens: Some(1_500),
+                    duration_seconds: None,
                     sha_before: None,
                     sha_after: None,
                     diff_files: Vec::new(),
@@ -5200,6 +5980,7 @@ print(json.dumps({
                     input_tokens: Some(1_000),
                     output_tokens: Some(500),
                     total_tokens: Some(1_500),
+                    duration_seconds: None,
                     sha_before: None,
                     sha_after: None,
                     diff_files: Vec::new(),
@@ -5247,6 +6028,7 @@ print(json.dumps({
             input_tokens: Some(5_000),
             output_tokens: Some(1_000),
             total_tokens: Some(6_000),
+            duration_seconds: None,
             sha_before: Some("base-l".to_owned()),
             sha_after: Some("sha-l-impl".to_owned()),
             diff_files: vec![DiffFileEntry {
@@ -5266,6 +6048,7 @@ print(json.dumps({
             input_tokens: Some(5_000),
             output_tokens: Some(1_000),
             total_tokens: Some(6_000),
+            duration_seconds: None,
             sha_before: Some("sha-l-impl".to_owned()),
             sha_after: Some("sha-l-impl".to_owned()),
             diff_files: Vec::new(),
@@ -5407,7 +6190,7 @@ print(json.dumps({
         let status_err = parse_agy_cli_response(status_json, "", Some(1)).unwrap_err();
         assert_eq!(status_err.failure_class, "AGY_STATUS");
 
-        // 4. Test automatic fallback to gpt-6.1-sol after 2 AGY infrastructure failures
+        // 4. Test automatic fallback to gpt-6.2-sol after 2 AGY infrastructure failures
         let mut store = V2Store::open_in_memory().expect("open store");
         let mut agy_task = task.clone();
         agy_task.reviewed_sha = Some("plan-sha-008".to_owned());
@@ -5433,6 +6216,7 @@ print(json.dumps({
                 input_tokens: Some(1_000),
                 output_tokens: Some(500),
                 total_tokens: Some(1_500),
+                duration_seconds: None,
                 sha_before: None,
                 sha_after: None,
                 diff_files: Vec::new(),
@@ -5450,10 +6234,10 @@ print(json.dumps({
         .unwrap();
         assert!(completed.stages_completed.contains(&"plan".to_owned()));
 
-        // Verify that route was automatically switched to OpenAiSol (gpt-6.1-sol) instead of GeminiAgy
+        // Verify that route was automatically switched to OpenAiSol (gpt-6.2-sol) instead of GeminiAgy
         assert_eq!(mock.executed_routes.len(), 1);
         assert_eq!(mock.executed_routes[0].family, ModelFamily::OpenAiSol);
-        assert_eq!(mock.executed_routes[0].model, "gpt-6.1-sol");
+        assert_eq!(mock.executed_routes[0].model, "gpt-6.2-sol");
     }
 
     #[test]
@@ -5724,6 +6508,7 @@ print(json.dumps({
                     input_tokens: Some(1_000),
                     output_tokens: Some(200),
                     total_tokens: Some(1_200),
+                    duration_seconds: None,
                     sha_before: Some("abc1234".to_owned()),
                     sha_after: Some("sha-impl-1".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -5743,6 +6528,7 @@ print(json.dumps({
                     input_tokens: Some(500),
                     output_tokens: Some(100),
                     total_tokens: Some(600),
+                    duration_seconds: None,
                     sha_before: Some("mock-committed-sha".to_owned()),
                     sha_after: Some("mock-committed-sha".to_owned()),
                     diff_files: Vec::new(),
@@ -5757,6 +6543,7 @@ print(json.dumps({
                     input_tokens: Some(1_000),
                     output_tokens: Some(200),
                     total_tokens: Some(1_200),
+                    duration_seconds: None,
                     sha_before: Some("mock-committed-sha".to_owned()),
                     sha_after: Some("sha-impl-2".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -5776,6 +6563,7 @@ print(json.dumps({
                     input_tokens: Some(500),
                     output_tokens: Some(100),
                     total_tokens: Some(600),
+                    duration_seconds: None,
                     sha_before: Some("mock-committed-sha".to_owned()),
                     sha_after: Some("mock-committed-sha".to_owned()),
                     diff_files: Vec::new(),
@@ -5830,6 +6618,7 @@ print(json.dumps({
                     input_tokens: Some(500),
                     output_tokens: Some(100),
                     total_tokens: Some(600),
+                    duration_seconds: None,
                     sha_before: None,
                     sha_after: None,
                     diff_files: Vec::new(),
@@ -5844,6 +6633,7 @@ print(json.dumps({
                     input_tokens: Some(500),
                     output_tokens: Some(100),
                     total_tokens: Some(600),
+                    duration_seconds: None,
                     sha_before: None,
                     sha_after: None,
                     diff_files: Vec::new(),
@@ -5858,6 +6648,7 @@ print(json.dumps({
                     input_tokens: Some(500),
                     output_tokens: Some(100),
                     total_tokens: Some(600),
+                    duration_seconds: None,
                     sha_before: Some("abc".to_owned()),
                     sha_after: Some("sha-1".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -5877,6 +6668,7 @@ print(json.dumps({
                     input_tokens: Some(500),
                     output_tokens: Some(100),
                     total_tokens: Some(600),
+                    duration_seconds: None,
                     sha_before: Some("sha-m-1".to_owned()),
                     sha_after: Some("sha-m-1".to_owned()),
                     diff_files: Vec::new(),
@@ -5891,6 +6683,7 @@ print(json.dumps({
                     input_tokens: Some(500),
                     output_tokens: Some(100),
                     total_tokens: Some(600),
+                    duration_seconds: None,
                     sha_before: Some("sha-m-1".to_owned()),
                     sha_after: Some("sha-2".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -5910,6 +6703,7 @@ print(json.dumps({
                     input_tokens: Some(500),
                     output_tokens: Some(100),
                     total_tokens: Some(600),
+                    duration_seconds: None,
                     sha_before: Some("sha-m-2".to_owned()),
                     sha_after: Some("sha-m-2".to_owned()),
                     diff_files: Vec::new(),
@@ -5959,6 +6753,7 @@ print(json.dumps({
                     input_tokens: Some(500),
                     output_tokens: Some(100),
                     total_tokens: Some(600),
+                    duration_seconds: None,
                     sha_before: Some("abc".to_owned()),
                     sha_after: Some("sha-limit".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -5978,6 +6773,7 @@ print(json.dumps({
                     input_tokens: Some(500),
                     output_tokens: Some(100),
                     total_tokens: Some(600),
+                    duration_seconds: None,
                     sha_before: Some("sha-limit".to_owned()),
                     sha_after: Some("sha-limit".to_owned()),
                     diff_files: Vec::new(),
@@ -6042,6 +6838,7 @@ print(json.dumps({
                     input_tokens: Some(1_000),
                     output_tokens: Some(200),
                     total_tokens: Some(1_200),
+                    duration_seconds: None,
                     sha_before: Some("abc".to_owned()),
                     sha_after: Some("sha-ac5".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -6061,6 +6858,7 @@ print(json.dumps({
                     input_tokens: None,
                     output_tokens: None,
                     total_tokens: None,
+                    duration_seconds: None,
                     sha_before: None,
                     sha_after: None,
                     diff_files: Vec::new(),
@@ -6172,6 +6970,7 @@ print(json.dumps({
                 input_tokens: Some(100),
                 output_tokens: Some(50),
                 total_tokens: Some(150),
+                duration_seconds: None,
                 sha_before: None,
                 sha_after: None,
                 diff_files: Vec::new(),
@@ -6255,6 +7054,7 @@ print(json.dumps({
                     input_tokens: Some(1_000),
                     output_tokens: Some(200),
                     total_tokens: Some(1_200),
+                    duration_seconds: None,
                     sha_before: None,
                     sha_after: None,
                     diff_files: Vec::new(),
@@ -6269,6 +7069,7 @@ print(json.dumps({
                     input_tokens: Some(800),
                     output_tokens: Some(100),
                     total_tokens: Some(900),
+                    duration_seconds: None,
                     sha_before: None,
                     sha_after: None,
                     diff_files: Vec::new(),
@@ -6283,6 +7084,7 @@ print(json.dumps({
                     input_tokens: Some(1_500),
                     output_tokens: Some(300),
                     total_tokens: Some(1_800),
+                    duration_seconds: None,
                     sha_before: Some("base123".to_owned()),
                     sha_after: Some("sha-m-impl".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -6302,6 +7104,7 @@ print(json.dumps({
                     input_tokens: Some(900),
                     output_tokens: Some(150),
                     total_tokens: Some(1_050),
+                    duration_seconds: None,
                     sha_before: Some("sha-m-impl".to_owned()),
                     sha_after: Some("sha-m-impl".to_owned()),
                     diff_files: Vec::new(),
@@ -6392,6 +7195,7 @@ print(json.dumps({
                 input_tokens: Some(500),
                 output_tokens: Some(100),
                 total_tokens: Some(600),
+                duration_seconds: None,
                 sha_before: Some("stale-reviewed-sha".to_owned()),
                 sha_after: Some("new-merged-reviewed-sha".to_owned()),
                 diff_files: Vec::new(),
@@ -6552,6 +7356,82 @@ print(json.dumps({
     }
 
     #[test]
+    fn zach062_agy_status_error_and_raw_bodies_are_not_misclassified_as_policy() {
+        let diag_json = r#"{
+            "status": "error",
+            "execution_succeeded": false,
+            "error_code": "FALLBACK_CODE",
+            "summary": "raw body mentioning forbidden_paths and Scope boundary",
+            "diagnostic": {
+                "code": "AGY_DIAG_TIMEOUT",
+                "summary": "worker stalled before completing"
+            }
+        }"#;
+        let diag_err = parse_agy_cli_response(diag_json, "", Some(1)).unwrap_err();
+        assert_eq!(diag_err.failure_class, "AGY_STATUS");
+        assert_eq!(
+            diag_err.message,
+            "AGY_DIAG_TIMEOUT: worker stalled before completing"
+        );
+
+        let fallback_json = r#"{
+            "execution_succeeded": false,
+            "message": "Scope boundary check failed in worker"
+        }"#;
+        let fallback_err = parse_agy_cli_response(fallback_json, "", Some(1)).unwrap_err();
+        assert_eq!(fallback_err.failure_class, "AGY_STATUS");
+        assert_eq!(
+            fallback_err.message,
+            "AGY_STATUS_ERROR: Scope boundary check failed in worker"
+        );
+
+        assert_eq!(
+            classify_failure_class(
+                "impl",
+                "FAILED",
+                "AGY_STATUS_ERROR: worker body echoed forbidden_paths and policy"
+            ),
+            FAILURE_CLASS_INFRA
+        );
+        assert_eq!(
+            classify_failure_class(
+                "pr-review",
+                "FAILED",
+                "AGY_STATUS_ERROR: Scope boundary and review verdict schema mentioned"
+            ),
+            FAILURE_CLASS_INFRA
+        );
+        assert_eq!(
+            classify_failure_class(
+                "impl",
+                "FAILED",
+                "raw worker body referenced forbidden_paths and retry policy"
+            ),
+            FAILURE_CLASS_INFRA
+        );
+        assert_ne!(
+            classify_failure_class(
+                "impl",
+                "FAILED",
+                "AGY_STATUS_ERROR: {\"forbidden_paths\":[\"Cargo.toml\"],\"scope\":\"Scope boundary\"}"
+            ),
+            FAILURE_CLASS_POLICY
+        );
+        assert_eq!(
+            classify_failure_class(
+                "impl",
+                "FAILED",
+                "forbidden path violation on ZACH-062: Cargo.toml matches Cargo.toml"
+            ),
+            FAILURE_CLASS_POLICY
+        );
+        assert_eq!(
+            classify_failure_class("impl", "FAILED", "exceeds size policy for XS"),
+            FAILURE_CLASS_POLICY
+        );
+    }
+
+    #[test]
     fn real_sqlite_store_persists_retry_count_and_failure_class_for_failed_and_passed_stages() {
         let ws_stub = StubWsTask::passthrough_clean("zach-015");
         // 1. Infra failure in XS/S impl (execute_stage returns Err) -> retry_count == 1, failure_class == "infra"
@@ -6601,6 +7481,7 @@ print(json.dumps({
                         input_tokens: Some(1_000),
                         output_tokens: Some(200),
                         total_tokens: Some(1_200),
+                        duration_seconds: None,
                         sha_before: Some("abc1234".to_owned()),
                         sha_after: Some("def5678".to_owned()),
                         diff_files: vec![DiffFileEntry {
@@ -6620,6 +7501,7 @@ print(json.dumps({
                         input_tokens: Some(500),
                         output_tokens: Some(100),
                         total_tokens: Some(600),
+                        duration_seconds: None,
                         sha_before: Some("def5678".to_owned()),
                         sha_after: Some("def5678".to_owned()),
                         diff_files: Vec::new(),
@@ -6671,6 +7553,7 @@ print(json.dumps({
                         input_tokens: Some(100),
                         output_tokens: Some(50),
                         total_tokens: Some(150),
+                        duration_seconds: None,
                         sha_before: Some("abc".to_owned()),
                         sha_after: Some("def".to_owned()),
                         diff_files: vec![DiffFileEntry {
@@ -6723,6 +7606,7 @@ print(json.dumps({
                     input_tokens: Some(100),
                     output_tokens: Some(50),
                     total_tokens: Some(150),
+                    duration_seconds: None,
                     sha_before: Some("abc".to_owned()),
                     sha_after: Some("def".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -6784,6 +7668,7 @@ print(json.dumps({
                         input_tokens: Some(100),
                         output_tokens: Some(50),
                         total_tokens: Some(150),
+                        duration_seconds: None,
                         sha_before: None,
                         sha_after: None,
                         diff_files: Vec::new(),
@@ -6798,6 +7683,7 @@ print(json.dumps({
                         input_tokens: Some(100),
                         output_tokens: Some(50),
                         total_tokens: Some(150),
+                        duration_seconds: None,
                         sha_before: None,
                         sha_after: None,
                         diff_files: Vec::new(),
@@ -6847,6 +7733,7 @@ print(json.dumps({
             input_tokens: Some(1_000),
             output_tokens: Some(200),
             total_tokens: Some(1_200),
+            duration_seconds: None,
             sha_before: Some("abc1234".to_owned()),
             sha_after: Some("abc1234".to_owned()),
             diff_files: vec![DiffFileEntry {
@@ -6866,6 +7753,7 @@ print(json.dumps({
             input_tokens: Some(500),
             output_tokens: Some(100),
             total_tokens: Some(600),
+            duration_seconds: None,
             sha_before: Some("real-sha".to_owned()),
             sha_after: Some("real-sha".to_owned()),
             diff_files: Vec::new(),
@@ -7013,6 +7901,7 @@ print(json.dumps({
                         input_tokens: Some(1_000),
                         output_tokens: Some(200),
                         total_tokens: Some(1_200),
+                        duration_seconds: None,
                         sha_before: Some(sha_before),
                         sha_after: Some(sha_after),
                         diff_files,
@@ -7036,6 +7925,7 @@ print(json.dumps({
                     input_tokens: Some(600),
                     output_tokens: Some(100),
                     total_tokens: Some(700),
+                    duration_seconds: None,
                     sha_before: Some(head_sha.clone()),
                     sha_after: Some(head_sha),
                     diff_files: Vec::new(),
@@ -7250,7 +8140,7 @@ print(json.dumps({
 
         let payload = build_agy_cli_payload(&task, &route, "Plan work");
         assert_eq!(payload["orchestration_id"], "zach-019-agy");
-        assert_eq!(payload["timeout_seconds"], 1800);
+        assert_eq!(payload["timeout_seconds"], 3600);
         let allowed = payload["allowed_files"].as_array().expect("array");
         assert_eq!(allowed.len(), 50);
         assert!(allowed.iter().all(|v| {
@@ -7287,6 +8177,7 @@ print(json.dumps({
                 input_tokens: Some(100),
                 output_tokens: Some(50),
                 total_tokens: Some(150),
+                duration_seconds: None,
                 sha_before: None,
                 sha_after: None,
                 diff_files: Vec::new(),
@@ -7332,6 +8223,7 @@ print(json.dumps({
                 input_tokens: Some(10),
                 output_tokens: Some(5),
                 total_tokens: Some(15),
+                duration_seconds: None,
                 sha_before: None,
                 sha_after: None,
                 diff_files: vec![DiffFileEntry {
@@ -7373,6 +8265,7 @@ print(json.dumps({
                     input_tokens: Some(10),
                     output_tokens: Some(5),
                     total_tokens: Some(15),
+                    duration_seconds: None,
                     sha_before: Some("abc".to_owned()),
                     sha_after: Some("def".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -7517,6 +8410,7 @@ print(json.dumps({
                 input_tokens: Some(200_000),
                 output_tokens: Some(50_000),
                 total_tokens: Some(250_000),
+                duration_seconds: None,
                 sha_before: None,
                 sha_after: None,
                 diff_files: Vec::new(),
@@ -7552,6 +8446,7 @@ print(json.dumps({
                     input_tokens: Some(80_000),
                     output_tokens: Some(20_000),
                     total_tokens: Some(100_000),
+                    duration_seconds: None,
                     sha_before: Some("abc".to_owned()),
                     sha_after: Some("def".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -7571,6 +8466,7 @@ print(json.dumps({
                     input_tokens: Some(50_000),
                     output_tokens: Some(10_000),
                     total_tokens: Some(60_000),
+                    duration_seconds: None,
                     sha_before: Some("def".to_owned()),
                     sha_after: Some("def".to_owned()),
                     diff_files: Vec::new(),
@@ -7625,6 +8521,7 @@ print(json.dumps({
                 input_tokens: failed_codex.input_tokens,
                 output_tokens: failed_codex.output_tokens,
                 total_tokens: failed_codex.total_tokens,
+                duration_seconds: None,
                 sha_before: None,
                 sha_after: None,
                 diff_files: Vec::new(),
@@ -7644,7 +8541,9 @@ print(json.dumps({
         assert!(null_task.memory.token_usage_by_stage.is_empty());
 
         let attempts = store.list_stage_attempts("ZACH-020-NULL").unwrap();
-        assert_eq!(attempts.len(), 1);
+        // codex_exec_failed.jsonl is a usage-limit failure, so OpenAiSol->GeminiAgy fallback
+        // records a second attempt while attempts[0] preserves NULL token counts.
+        assert_eq!(attempts.len(), 2);
         assert_eq!(attempts[0].input_tokens, None);
         assert_eq!(attempts[0].output_tokens, None);
         assert_eq!(attempts[0].total_tokens, None);
@@ -7872,6 +8771,7 @@ raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={
                 input_tokens: Some(100),
                 output_tokens: Some(50),
                 total_tokens: Some(150),
+                duration_seconds: None,
                 sha_before: Some("abc".to_owned()),
                 sha_after: Some("def".to_owned()),
                 diff_files: diff.clone(),
@@ -7910,6 +8810,7 @@ raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={
                 input_tokens: Some(100),
                 output_tokens: Some(50),
                 total_tokens: Some(150),
+                duration_seconds: None,
                 sha_before: Some("abc".to_owned()),
                 sha_after: Some("def".to_owned()),
                 diff_files: diff,
@@ -7963,6 +8864,7 @@ raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={
                     input_tokens: Some(1_000),
                     output_tokens: Some(200),
                     total_tokens: Some(1_200),
+                    duration_seconds: None,
                     sha_before: Some("abc1234".to_owned()),
                     sha_after: Some("abc1234".to_owned()),
                     diff_files: vec![DiffFileEntry {
@@ -7982,6 +8884,7 @@ raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={
                     input_tokens: Some(500),
                     output_tokens: Some(100),
                     total_tokens: Some(600),
+                    duration_seconds: None,
                     sha_before: Some("mock-committed-sha".to_owned()),
                     sha_after: Some("mock-committed-sha".to_owned()),
                     diff_files: Vec::new(),
@@ -8054,6 +8957,355 @@ raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={
             classify_failure_class("impl", "STALLED", "no output or CPU"),
             "infra"
         );
+    }
+
+    #[test]
+    fn quota_and_usage_limit_errors_classify_as_infra() {
+        assert!(is_quota_or_usage_limit_error(
+            "You've hit your usage limit for gpt-6.1-sol"
+        ));
+        assert!(is_quota_or_usage_limit_error("HTTP 429 Too Many Requests"));
+        assert!(is_quota_or_usage_limit_error(
+            "insufficient_quota: exceeded your current quota"
+        ));
+        assert!(!is_quota_or_usage_limit_error(
+            "token budget exhausted for task ZACH-015"
+        ));
+        assert_eq!(
+            classify_failure_class(
+                "pr-review",
+                "FAILED",
+                "review verdict failed due to usage limit exceeded"
+            ),
+            FAILURE_CLASS_INFRA
+        );
+    }
+
+    #[test]
+    fn apply_stage_fallback_route_switches_author_stages_but_preserves_review_family() {
+        let mut task = sample_s_task("ZACH-050-FB-ROUTE");
+        task.memory.fallback_stages = vec!["impl".into(), "pr-review".into()];
+
+        let impl_route = resolve_stage_route("S", "impl", 0, None).unwrap().unwrap();
+        let switched_impl = apply_stage_fallback_route(&task, impl_route);
+        assert_eq!(switched_impl.family, ModelFamily::GeminiAgy);
+        assert_eq!(switched_impl.model, "gemini-4-hydrogen-medium");
+        assert!(switched_impl.fallback_model.is_none());
+
+        let rev_route = resolve_stage_route("S", "pr-review", 0, Some(ModelFamily::OpenAiSol))
+            .unwrap()
+            .unwrap();
+        let preserved_rev = apply_stage_fallback_route(&task, rev_route.clone());
+        assert_eq!(preserved_rev.family, rev_route.family);
+        assert_eq!(preserved_rev.model, rev_route.model);
+    }
+
+    #[test]
+    fn openaisol_impl_falls_back_to_geminiagy_and_keeps_pr_review_cross_family() {
+        struct QuotaFallbackExecutor {
+            seen_stages: Vec<(String, ModelFamily, String)>,
+            inner: MockStageExecutor,
+        }
+        impl StageExecutor for QuotaFallbackExecutor {
+            fn execute_stage(
+                &mut self,
+                task: &TaskRecord,
+                attempt_id: &str,
+                route: &StageRoute,
+                spec: &crate::v2::runner::StageCommandSpec,
+            ) -> Result<StageExecutionResult, String> {
+                self.seen_stages
+                    .push((route.stage.clone(), route.family, route.model.clone()));
+                if route.stage == "impl" && route.family == ModelFamily::OpenAiSol {
+                    return Err("You've hit your usage limit for gpt-6.1-sol".into());
+                }
+                self.inner.execute_stage(task, attempt_id, route, spec)
+            }
+            fn run_checks(
+                &mut self,
+                worktree_path: &str,
+                commands: &[String],
+            ) -> Result<(), String> {
+                self.inner.run_checks(worktree_path, commands)
+            }
+            fn commit_worktree(
+                &mut self,
+                task: &TaskRecord,
+                worktree_path: &str,
+            ) -> Result<String, String> {
+                self.inner.commit_worktree(task, worktree_path)
+            }
+            fn collect_reviewed_diff(
+                &mut self,
+                task: &TaskRecord,
+                worktree_path: &str,
+                reviewed_sha: &str,
+            ) -> Result<crate::v2::runner::ReviewedDiffContext, String> {
+                self.inner
+                    .collect_reviewed_diff(task, worktree_path, reviewed_sha)
+            }
+            fn push_and_ensure_pr(
+                &mut self,
+                task: &TaskRecord,
+                worktree_path: &str,
+                reviewed_sha: &str,
+            ) -> Result<i64, String> {
+                self.inner
+                    .push_and_ensure_pr(task, worktree_path, reviewed_sha)
+            }
+        }
+
+        let mut store = V2Store::open_in_memory().unwrap();
+        let mut task = sample_s_task("ZACH-050-XS-FB");
+        task.context_pack.target_files = vec![crate::v2::store::TargetFileSpec {
+            path: "src/v2/router.rs".into(),
+            action: "modify".into(),
+            summary: "update".into(),
+        }];
+        task.context_pack.acceptance_criteria = vec![crate::v2::store::AcceptanceCriterionSpec {
+            id: "AC-1".into(),
+            description: "criterion".into(),
+        }];
+        store.upsert_task(&task).unwrap();
+
+        let mock = MockStageExecutor {
+            staged_results: vec![
+                StageExecutionResult {
+                    status: "PASSED".into(),
+                    summary: "implemented on fallback".into(),
+                    review_markdown: None,
+                    stage_output: None,
+                    review_output: None,
+                    invocation_id: Some("inv-1".into()),
+                    input_tokens: Some(1_000),
+                    output_tokens: Some(200),
+                    total_tokens: Some(1_200),
+                    duration_seconds: None,
+                    sha_before: Some("abc1234".into()),
+                    sha_after: Some("abc1234".into()),
+                    diff_files: vec![DiffFileEntry {
+                        path: "src/v2/router.rs".into(),
+                        status: "M".into(),
+                        added_lines: 5,
+                        deleted_lines: 1,
+                    }],
+                },
+                StageExecutionResult {
+                    status: "PASSED".into(),
+                    summary: "approved".into(),
+                    review_markdown: None,
+                    stage_output: None,
+                    review_output: Some(approved_verdict_json("AC-1", "src/v2/router.rs:10")),
+                    invocation_id: Some("inv-2".into()),
+                    input_tokens: Some(1_000),
+                    output_tokens: Some(200),
+                    total_tokens: Some(1_200),
+                    duration_seconds: None,
+                    sha_before: Some("def5678".into()),
+                    sha_after: Some("def5678".into()),
+                    diff_files: Vec::new(),
+                },
+            ],
+            committed_sha_to_return: Some("def5678".into()),
+            ..MockStageExecutor::default()
+        };
+        let mut exec = QuotaFallbackExecutor {
+            seen_stages: Vec::new(),
+            inner: mock,
+        };
+
+        let ws_stub = StubWsTask::passthrough_clean("zach-050");
+        let result = execute_xs_s_pipeline_with_executor_and_ws_task(
+            &mut store,
+            &task.task_id,
+            &mut exec,
+            ws_stub.path(),
+        )
+        .unwrap();
+        assert_eq!(result.status, "Queued for Merge");
+        assert_eq!(
+            exec.seen_stages,
+            vec![
+                ("impl".into(), ModelFamily::OpenAiSol, "gpt-6.2-sol".into()),
+                (
+                    "impl".into(),
+                    ModelFamily::GeminiAgy,
+                    "gemini-4-hydrogen-medium".into()
+                ),
+                (
+                    "pr-review".into(),
+                    ModelFamily::OpenAiSol,
+                    "gpt-6.2-sol".into()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_quota_reset_epoch_handles_relative_explicit_and_fallback() {
+        let nov21_1138 = civil_datetime_to_epoch(2026, 11, 21, 11, 38, 0).unwrap();
+        let nov21_2338 = civil_datetime_to_epoch(2026, 11, 21, 23, 38, 0).unwrap();
+        let now = civil_datetime_to_epoch(2026, 11, 21, 10, 0, 0).unwrap();
+
+        // Explicit named month with ordinal + AM/PM
+        assert_eq!(
+            parse_quota_reset_epoch(
+                "You've hit your usage limit. Try again at Nov 21st, 2026 11:38 AM.",
+                now
+            ),
+            nov21_1138 + QUOTA_COOLDOWN_SAFETY_MARGIN_SECS
+        );
+        // Explicit full month 24h
+        assert_eq!(
+            parse_quota_reset_epoch("Usage limit resets November 21, 2026 23:38", now),
+            nov21_2338 + QUOTA_COOLDOWN_SAFETY_MARGIN_SECS
+        );
+        // ISO 8601 UTC and space-separated
+        assert_eq!(
+            parse_quota_reset_epoch("Quota resets at 2026-11-21T11:38:00Z", now),
+            nov21_1138 + QUOTA_COOLDOWN_SAFETY_MARGIN_SECS
+        );
+        assert_eq!(
+            parse_quota_reset_epoch("Retry after 2026-11-21 11:38:00", now),
+            nov21_1138 + QUOTA_COOLDOWN_SAFETY_MARGIN_SECS
+        );
+        // Relative durations (case-insensitive)
+        assert_eq!(
+            parse_quota_reset_epoch("Rate limit exceeded, try again IN 4 HOURS", now),
+            now + 4 * 3600 + QUOTA_COOLDOWN_SAFETY_MARGIN_SECS
+        );
+        assert_eq!(
+            parse_quota_reset_epoch("Quota resets in 45m", now),
+            now + 45 * 60 + QUOTA_COOLDOWN_SAFETY_MARGIN_SECS
+        );
+        assert_eq!(
+            parse_quota_reset_epoch("Try again in 1h30m", now),
+            now + 5400 + QUOTA_COOLDOWN_SAFETY_MARGIN_SECS
+        );
+        assert_eq!(
+            parse_quota_reset_epoch("Resets in 2 days", now),
+            now + 2 * 86_400 + QUOTA_COOLDOWN_SAFETY_MARGIN_SECS
+        );
+        assert_eq!(
+            parse_quota_reset_epoch("Please retry after 30 minutes", now),
+            now + 30 * 60 + QUOTA_COOLDOWN_SAFETY_MARGIN_SECS
+        );
+        assert_eq!(
+            parse_quota_reset_epoch("Try again in 90s", now),
+            now + 90 + QUOTA_COOLDOWN_SAFETY_MARGIN_SECS
+        );
+        // Unparseable or past timestamps fall back to now + DEFAULT_QUOTA_COOLDOWN_SECS
+        assert_eq!(
+            parse_quota_reset_epoch("HTTP 429 Too Many Requests", now),
+            now + DEFAULT_QUOTA_COOLDOWN_SECS
+        );
+        assert_eq!(
+            parse_quota_reset_epoch("Try again at 2026-11-21T09:00:00Z", now),
+            now + DEFAULT_QUOTA_COOLDOWN_SECS
+        );
+    }
+
+    #[test]
+    fn build_agy_cli_payload_clamps_timeout_to_30_3600() {
+        let task = sample_s_task("ZACH-071-TIMEOUT");
+        let mut route = StageRoute {
+            weight: "M".to_owned(),
+            stage: "impl".to_owned(),
+            family: ModelFamily::GeminiAgy,
+            model: "gemini-4-hydrogen-high".to_owned(),
+            effort: ReasoningEffort::High,
+            fallback_family: None,
+            fallback_model: None,
+            fallback_effort: None,
+            max_task_tokens: 1_200_000,
+            timeout_secs: 3600,
+            stall_timeout_secs: 600,
+        };
+        assert_eq!(
+            build_agy_cli_payload(&task, &route, "p")["timeout_seconds"],
+            3600
+        );
+        route.timeout_secs = 5000;
+        assert_eq!(
+            build_agy_cli_payload(&task, &route, "p")["timeout_seconds"],
+            3600
+        );
+        route.timeout_secs = 5;
+        assert_eq!(
+            build_agy_cli_payload(&task, &route, "p")["timeout_seconds"],
+            30
+        );
+    }
+
+    #[test]
+    fn parse_agy_cli_response_preserves_usage_and_duration_on_failed_and_passed_runs() {
+        let err_status_json = serde_json::json!({
+            "status": "ERROR",
+            "execution_succeeded": false,
+            "error_code": "AGY_STATUS_ERROR",
+            "summary": "tool call failed",
+            "duration_seconds": 412.75,
+            "usage": {
+                "input_tokens": 12000,
+                "output_tokens": 345,
+                "total_tokens": 12345
+            }
+        })
+        .to_string();
+        let err = parse_agy_cli_response(&err_status_json, "", Some(1)).unwrap_err();
+        assert_eq!(err.failure_class, "AGY_STATUS");
+        assert!(err.message.contains("AGY_STATUS_ERROR"));
+        assert_eq!(err.input_tokens, Some(12_000));
+        assert_eq!(err.output_tokens, Some(345));
+        assert_eq!(err.total_tokens, Some(12_345));
+        assert_eq!(err.duration_seconds, Some(412.75));
+
+        let timeout_json = serde_json::json!({
+            "status": "ok",
+            "execution_succeeded": false,
+            "process_status": "timeout",
+            "diagnostic": {
+                "code": "AGY_TIMEOUT",
+                "summary": "worker hit deadline"
+            },
+            "duration_seconds": 1800.5,
+            "usage": {
+                "input_tokens": 90000,
+                "output_tokens": 1500
+            }
+        })
+        .to_string();
+        let err = parse_agy_cli_response(&timeout_json, "", Some(124)).unwrap_err();
+        assert_eq!(err.failure_class, "AGY_TIMEOUT");
+        assert_eq!(err.input_tokens, Some(90_000));
+        assert_eq!(err.output_tokens, Some(1_500));
+        assert_eq!(err.total_tokens, Some(91_500));
+        assert_eq!(err.duration_seconds, Some(1800.5));
+
+        let ok_json = serde_json::json!({
+            "status": "ok",
+            "execution_succeeded": true,
+            "summary": "done",
+            "duration_seconds": 87.25,
+            "usage": {
+                "input_tokens": 500,
+                "output_tokens": 100,
+                "total_tokens": 600
+            }
+        })
+        .to_string();
+        let ok = parse_agy_cli_response(&ok_json, "", Some(0)).unwrap();
+        assert_eq!(ok.duration_seconds, Some(87.25));
+        assert_eq!(ok.total_tokens, Some(600));
+
+        // Negative duration_seconds is ignored.
+        let neg_json = serde_json::json!({
+            "status": "error",
+            "duration_seconds": -5.0
+        })
+        .to_string();
+        let neg_err = parse_agy_cli_response(&neg_json, "", Some(1)).unwrap_err();
+        assert_eq!(neg_err.duration_seconds, None);
     }
 
     #[test]

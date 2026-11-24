@@ -77,6 +77,20 @@ pub enum SyncMode {
     ReconcileFinishedLegacy,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StageRunGrant {
+    pub stage: String,
+    pub granted_epoch: i64,
+    #[serde(default)]
+    pub consumed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_attempt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_summary: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct TaskMemory {
     /// An authoritative Governance export observed a terminal task. Local
@@ -105,6 +119,8 @@ pub struct TaskMemory {
     pub retry_generation: u64,
     #[serde(default)]
     pub pipeline_checkpoint: Option<PipelineCheckpoint>,
+    #[serde(default)]
+    pub stage_run_grant: Option<StageRunGrant>,
     #[serde(default)]
     pub merge_checkpoint: Option<MergeCheckpoint>,
     #[serde(default)]
@@ -137,6 +153,8 @@ pub struct TaskMemory {
     pub last_review_findings: Option<String>,
     #[serde(default)]
     pub review_rework_count: u32,
+    #[serde(default)]
+    pub fallback_stages: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -355,6 +373,29 @@ pub struct TaskRecord {
     pub updated_epoch: i64,
 }
 
+impl TaskRecord {
+    pub fn has_active_stage_grant(&self) -> bool {
+        self.memory
+            .stage_run_grant
+            .as_ref()
+            .is_some_and(|g| !g.consumed)
+    }
+
+    pub fn has_any_execution_grant(&self) -> bool {
+        self.autonomous_consent || self.has_active_stage_grant()
+    }
+
+    pub fn has_execution_grant_for(&self, stage: Option<&str>) -> bool {
+        if self.autonomous_consent {
+            return true;
+        }
+        self.memory
+            .stage_run_grant
+            .as_ref()
+            .is_some_and(|g| !g.consumed && stage.is_none_or(|s| s == g.stage))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StageAttemptRecord {
     pub attempt_id: String,
@@ -397,6 +438,23 @@ fn default_attempt_phase() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttemptAuditRecord {
+    pub attempt_id: String,
+    pub task_id: String,
+    pub stage: String,
+    pub turn_count: u64,
+    pub tool_call_count: u64,
+    pub tool_error_count: u64,
+    pub edit_compile_fail_loops: u64,
+    pub redundant_read_count: u64,
+    pub cached_input_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub check_divergence: bool,
+    pub error_code: Option<String>,
+    pub created_epoch: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskEventRecord {
     pub seq_id: i64,
     pub task_id: String,
@@ -423,6 +481,10 @@ pub struct PendingDecisionRecord {
     pub resolved_epoch: Option<i64>,
     pub choice: Option<String>,
     pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retirement_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub linked_unverified_delivery: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -441,6 +503,14 @@ pub struct MergeQueueRecord {
     pub reviewed_sha: String,
     pub enqueued_epoch: i64,
     pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderCooldownRecord {
+    pub family: String,
+    pub until_epoch: i64,
+    pub reason: String,
+    pub updated_epoch: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -476,6 +546,170 @@ pub struct DaemonStatusSummary {
     pub reconciliation_errors: u64,
     #[serde(default)]
     pub last_sync_epoch: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveTaskDetail {
+    pub task_id: String,
+    pub task_group: String,
+    pub repository: String,
+    pub weight: String,
+    pub status: String,
+    #[serde(default)]
+    pub board_status: Option<String>,
+    #[serde(default)]
+    pub open_decision_id: Option<String>,
+    pub title: String,
+    pub executor: Option<String>,
+    pub current_stage: Option<String>,
+    pub attempt_id: Option<String>,
+    pub attempt_phase: Option<String>,
+    pub model: Option<String>,
+    pub occupies_slot: bool,
+    pub target_files: Vec<String>,
+    pub reservation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WaitingTaskDetail {
+    pub task_id: String,
+    pub task_group: String,
+    pub repository: String,
+    pub weight: String,
+    pub status: String,
+    #[serde(default)]
+    pub board_status: Option<String>,
+    #[serde(default)]
+    pub open_decision_id: Option<String>,
+    pub title: String,
+    pub wait_reason: String,
+    pub target_files: Vec<String>,
+    pub next_retry_epoch: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DetailedStatusReport {
+    pub summary: DaemonStatusSummary,
+    pub active_tasks: Vec<ActiveTaskDetail>,
+    pub waiting_tasks: Vec<WaitingTaskDetail>,
+    pub path_locks: Vec<PathLockRecord>,
+    pub merge_queue: Vec<MergeQueueRecord>,
+    pub open_decisions: Vec<PendingDecisionRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoReservation {
+    WholeRepo { task_id: String },
+    ScopedPaths { task_id: String, paths: Vec<String> },
+}
+
+impl RepoReservation {
+    pub fn task_id(&self) -> &str {
+        match self {
+            Self::WholeRepo { task_id } | Self::ScopedPaths { task_id, .. } => task_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoConflict {
+    RepoLocked { owner: String },
+    PathConflict { owner: String, path: String },
+}
+
+pub fn normalize_repo_path(raw: &str) -> String {
+    let mut s = raw.trim().to_owned();
+    while s.contains("//") {
+        s = s.replace("//", "/");
+    }
+    while let Some(rest) = s.strip_prefix("./") {
+        s = rest.to_owned();
+    }
+    let trimmed = s.trim_end_matches('/');
+    if trimmed.is_empty() || trimmed == "." || trimmed == "*" {
+        "*".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+fn extract_attempt_id_from_path(raw: &str) -> Option<String> {
+    let components: Vec<_> = Path::new(raw).components().collect();
+    let mut found = None;
+    for window in components.windows(2) {
+        if window[0].as_os_str() == "attempts"
+            && let std::path::Component::Normal(id) = window[1]
+            && let Some(id_str) = id.to_str()
+            && !id_str.trim().is_empty()
+        {
+            found = Some(id_str.to_owned());
+        }
+    }
+    found
+}
+
+pub fn paths_overlap(a: &str, b: &str) -> bool {
+    let a = normalize_repo_path(a);
+    let b = normalize_repo_path(b);
+    if a == "*" || b == "*" {
+        return true;
+    }
+    a == b || b.starts_with(&format!("{a}/")) || a.starts_with(&format!("{b}/"))
+}
+
+pub fn repo_conflict_for_task(
+    reservations: &[RepoReservation],
+    task: &TaskRecord,
+) -> Option<RepoConflict> {
+    let others: Vec<&RepoReservation> = reservations
+        .iter()
+        .filter(|res| res.task_id() != task.task_id)
+        .collect();
+    if others.is_empty() {
+        return None;
+    }
+
+    for res in &others {
+        if let RepoReservation::WholeRepo { task_id } = res {
+            return Some(RepoConflict::RepoLocked {
+                owner: task_id.clone(),
+            });
+        }
+    }
+
+    let task_paths: Vec<String> = task
+        .context_pack
+        .target_files
+        .iter()
+        .map(|f| normalize_repo_path(&f.path))
+        .collect();
+    if task_paths.is_empty() || task_paths.iter().any(|p| p == "*") {
+        return others.first().map(|res| RepoConflict::RepoLocked {
+            owner: res.task_id().to_owned(),
+        });
+    }
+
+    for res in others {
+        if let RepoReservation::ScopedPaths { task_id, paths } = res {
+            for tp in &task_paths {
+                for rp in paths {
+                    if rp == "*" {
+                        return Some(RepoConflict::RepoLocked {
+                            owner: task_id.clone(),
+                        });
+                    }
+                    if paths_overlap(tp, rp) {
+                        return Some(RepoConflict::PathConflict {
+                            owner: task_id.clone(),
+                            path: tp.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Durable post-merge work. `rule_json` is the immutable contract rule captured
@@ -692,7 +926,30 @@ impl V2Store {
                  attempt INTEGER NOT NULL DEFAULT 0,
                  updated_epoch INTEGER NOT NULL
              );
-             CREATE INDEX IF NOT EXISTS idx_deliveries_task ON post_merge_deliveries(task_id);",
+             CREATE INDEX IF NOT EXISTS idx_deliveries_task ON post_merge_deliveries(task_id);
+
+             CREATE TABLE IF NOT EXISTS provider_cooldowns (
+                 family TEXT PRIMARY KEY,
+                 until_epoch INTEGER NOT NULL,
+                 reason TEXT NOT NULL,
+                 updated_epoch INTEGER NOT NULL
+             );
+
+             CREATE TABLE IF NOT EXISTS attempt_audits (
+                 attempt_id TEXT PRIMARY KEY,
+                 task_id TEXT NOT NULL,
+                 stage TEXT NOT NULL,
+                 turn_count INTEGER NOT NULL DEFAULT 0,
+                 tool_call_count INTEGER NOT NULL DEFAULT 0,
+                 tool_error_count INTEGER NOT NULL DEFAULT 0,
+                 edit_compile_fail_loops INTEGER NOT NULL DEFAULT 0,
+                 redundant_read_count INTEGER NOT NULL DEFAULT 0,
+                 cached_input_tokens INTEGER,
+                 reasoning_tokens INTEGER,
+                 check_divergence INTEGER NOT NULL DEFAULT 0,
+                 error_code TEXT,
+                 created_epoch INTEGER NOT NULL
+             );",
         )?;
 
         if self
@@ -706,6 +963,7 @@ impl V2Store {
         }
         self.migrate_supervision()?;
         self.migrate_stage_attempts_nullable_tokens()?;
+        self.migrate_attempt_audits()?;
         // These additive fields also tolerate an interrupted pre-release upgrade.
         let delivery_columns: BTreeSet<String> = {
             let mut stmt = self
@@ -826,6 +1084,42 @@ impl V2Store {
         Ok(())
     }
 
+    fn migrate_attempt_audits(&mut self) -> Result<(), V2StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: BTreeSet<String> = {
+            let mut stmt = tx.prepare("PRAGMA table_info('attempt_audits')")?;
+            stmt.query_map([], |row| row.get(1))?
+                .collect::<Result<_, _>>()?
+        };
+        for (name, definition) in [
+            ("task_id", "TEXT NOT NULL DEFAULT ''"),
+            ("stage", "TEXT NOT NULL DEFAULT ''"),
+            ("turn_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("tool_call_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("tool_error_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("edit_compile_fail_loops", "INTEGER NOT NULL DEFAULT 0"),
+            ("redundant_read_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("cached_input_tokens", "INTEGER"),
+            ("reasoning_tokens", "INTEGER"),
+            ("check_divergence", "INTEGER NOT NULL DEFAULT 0"),
+            ("error_code", "TEXT"),
+            ("created_epoch", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            if !existing.contains(name) {
+                tx.execute_batch(&format!(
+                    "ALTER TABLE attempt_audits ADD COLUMN {name} {definition};"
+                ))?;
+            }
+        }
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_attempt_audits_task ON attempt_audits(task_id);",
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     fn migrate_supervision(&mut self) -> Result<(), V2StoreError> {
         // Column introduction and compatibility classification are indivisible:
         // a reopen must never mistake a partially classified legacy DB for current state.
@@ -940,17 +1234,147 @@ impl V2Store {
     }
 
     pub fn lifecycle_ops(&self) -> Result<Vec<LifecycleOperation>, V2StoreError> {
-        Ok(self.conn.prepare("SELECT operation_id,task_id,kind,args_json,body_path,depends_on,state,retry_epoch,attempts,last_error,attempt_id,decision_id FROM lifecycle_ops ORDER BY rowid")?.query_map([], |r| {
+        self.read_lifecycle_ops(false)
+    }
+
+    pub(crate) fn replayable_lifecycle_ops(&self) -> Result<Vec<LifecycleOperation>, V2StoreError> {
+        self.read_lifecycle_ops(true)
+    }
+
+    fn read_lifecycle_ops(
+        &self,
+        replay_only: bool,
+    ) -> Result<Vec<LifecycleOperation>, V2StoreError> {
+        Ok(self.conn.prepare("SELECT operation_id,task_id,kind,args_json,body_path,depends_on,state,retry_epoch,attempts,last_error,attempt_id,decision_id FROM lifecycle_ops l
+            WHERE NOT ?1 OR l.state='ACKNOWLEDGED' OR l.decision_id IS NULL OR NOT EXISTS(
+                SELECT 1 FROM task_events e WHERE e.task_id=l.task_id AND e.event_type='DECISION_RETIRED'
+                AND json_extract(e.payload_json,'$.decision_id')=l.decision_id)
+            ORDER BY rowid")?.query_map([replay_only], |r| {
             let args: String = r.get(3)?;
             Ok(LifecycleOperation { attempt_id:r.get(10)?,decision_id:r.get(11)?,operation_id:r.get(0)?,task_id:r.get(1)?,kind:r.get(2)?,args:serde_json::from_str(&args).unwrap_or_default(),body_path:r.get(4)?,depends_on:r.get(5)?,state:r.get(6)?,retry_epoch:r.get(7)?,attempts:r.get(8)?,last_error:r.get(9)? })
         })?.collect::<Result<_,_>>()?)
     }
 
     pub fn has_pending_lifecycle(&self, task_id: &str) -> Result<bool, V2StoreError> {
-        Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM lifecycle_ops WHERE task_id=?1 AND state!='ACKNOWLEDGED')",
+        Self::has_pending_lifecycle_on(&self.conn, task_id)
+    }
+
+    fn has_pending_lifecycle_on(conn: &Connection, task_id: &str) -> Result<bool, V2StoreError> {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM lifecycle_ops l WHERE task_id=?1 AND state!='ACKNOWLEDGED'
+                AND (l.decision_id IS NULL OR NOT EXISTS(SELECT 1 FROM task_events e
+                     WHERE e.task_id=l.task_id AND e.event_type='DECISION_RETIRED'
+                     AND json_extract(e.payload_json,'$.decision_id')=l.decision_id)))",
             [task_id],
             |r| r.get(0),
+        )?)
+    }
+
+    pub(crate) fn lifecycle_in_flight(&self, id: &str) -> Result<bool, V2StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM lifecycle_ops WHERE operation_id=?1 AND state IN ('IN_FLIGHT','QUEUED'))",
+            [id],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub(crate) fn grant_decision_publication(&mut self, id: &str) -> Result<bool, V2StoreError> {
+        Ok(self.conn.execute(
+            "UPDATE lifecycle_ops SET state='DISPATCHED', updated_epoch=?2
+             WHERE operation_id=?1 AND state='QUEUED'
+             AND EXISTS (SELECT 1 FROM tasks t WHERE t.task_id=lifecycle_ops.task_id
+                 AND lower(t.status) NOT IN ('done','cancelled') AND t.autonomous_consent)
+             AND EXISTS (SELECT 1 FROM pending_decisions d WHERE d.decision_id=lifecycle_ops.decision_id
+                 AND d.task_id=lifecycle_ops.task_id AND d.status='RESOLVED')
+             AND NOT EXISTS (SELECT 1 FROM task_events e WHERE e.task_id=lifecycle_ops.task_id
+                 AND e.event_type='DECISION_RETIRED'
+                 AND json_extract(e.payload_json,'$.decision_id')=lifecycle_ops.decision_id)
+             AND NOT EXISTS (SELECT 1 FROM lifecycle_ops other
+                 WHERE other.task_id=lifecycle_ops.task_id AND other.state='DISPATCHED')",
+            params![id, now_epoch()],
+        )? == 1)
+    }
+
+    pub(crate) fn deferred_terminal(
+        &self,
+        operation_id: &str,
+        task: &TaskRecord,
+    ) -> Result<Option<(String, bool)>, V2StoreError> {
+        Self::effective_deferred_terminal_on(&self.conn, operation_id, task)
+    }
+
+    fn effective_deferred_terminal_on(
+        conn: &Connection,
+        operation_id: &str,
+        task: &TaskRecord,
+    ) -> Result<Option<(String, bool)>, V2StoreError> {
+        let deferred = Self::deferred_terminal_on(conn, operation_id)?;
+        if deferred.as_ref().is_some_and(|(_, board)| *board)
+            && Self::delivery_holds_terminal(conn, task)?
+        {
+            return Ok(None);
+        }
+        Ok(deferred)
+    }
+
+    fn deferred_terminal_on(
+        conn: &Connection,
+        operation_id: &str,
+    ) -> Result<Option<(String, bool)>, V2StoreError> {
+        Ok(conn
+            .query_row(
+                "SELECT json_extract(payload_json,'$.status'),json_extract(payload_json,'$.board')
+             FROM task_events WHERE event_type='TASK_TERMINAL_DEFERRED'
+             AND json_extract(payload_json,'$.operation_id')=?1 ORDER BY seq_id DESC LIMIT 1",
+                [operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    fn defer_terminal_tx(
+        tx: &rusqlite::Transaction<'_>,
+        task: &TaskRecord,
+        status: &str,
+        board: bool,
+        now: i64,
+    ) -> Result<bool, V2StoreError> {
+        if !is_terminal_task_status(status) || is_terminal_task_status(&task.status) {
+            return Ok(false);
+        }
+        let Some(id) = tx
+            .query_row(
+                "SELECT operation_id FROM lifecycle_ops WHERE task_id=?1 AND state='DISPATCHED'",
+                [&task.task_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        else {
+            return Ok(false);
+        };
+        if Self::deferred_terminal_on(tx, &id)?
+            .as_ref()
+            .is_none_or(|(previous, from_board)| previous != status || *from_board != board)
+        {
+            Self::insert_event_tx(
+                tx,
+                &task.task_id,
+                &task.task_group,
+                now,
+                "TASK_TERMINAL_DEFERRED",
+                &serde_json::json!({"operation_id":id,"status":status,"board":board}),
+            )?;
+        }
+        Ok(true)
+    }
+
+    fn delivery_holds_terminal(conn: &Connection, task: &TaskRecord) -> Result<bool, V2StoreError> {
+        Ok(!is_terminal_task_status(&task.status) && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM post_merge_deliveries p
+             WHERE p.task_id=?1 AND p.decision_id IS NOT NULL AND p.state NOT IN ('verified','aborted')
+             AND NOT EXISTS(SELECT 1 FROM task_events e WHERE e.task_id=p.task_id
+               AND e.event_type='DECISION_RETIRED' AND json_extract(e.payload_json,'$.decision_id')=p.decision_id))",
+            [&task.task_id], |row| row.get(0),
         )?)
     }
 
@@ -962,7 +1386,7 @@ impl V2Store {
         retry_epoch: i64,
     ) -> Result<(), V2StoreError> {
         let error = error.map(|s| crate::v2::runner::truncate_utf8_bytes(s, 1024));
-        self.conn.execute("UPDATE lifecycle_ops SET state=?2,last_error=?3,retry_epoch=?4,updated_epoch=?5,attempts=attempts+CASE WHEN ?2='IN_FLIGHT' THEN 1 ELSE 0 END WHERE operation_id=?1",params![id,state,error,retry_epoch,now_epoch()])?;
+        self.conn.execute("UPDATE lifecycle_ops SET state=?2,last_error=?3,retry_epoch=?4,updated_epoch=?5,attempts=attempts+CASE WHEN ?2 IN ('IN_FLIGHT','QUEUED') THEN 1 ELSE 0 END WHERE operation_id=?1",params![id,state,error,retry_epoch,now_epoch()])?;
         Ok(())
     }
 
@@ -972,12 +1396,92 @@ impl V2Store {
         op: &LifecycleOperation,
         attempt_id: Option<&str>,
     ) -> Result<(), V2StoreError> {
+        self.finish_lifecycle(task, op, attempt_id, None)
+    }
+
+    pub(crate) fn settle_decision_publication(
+        &mut self,
+        task: &TaskRecord,
+        op: &LifecycleOperation,
+        settlement_id: &str,
+    ) -> Result<(), V2StoreError> {
+        self.finish_lifecycle(task, op, None, Some(settlement_id))
+    }
+
+    fn finish_lifecycle(
+        &mut self,
+        task: &TaskRecord,
+        op: &LifecycleOperation,
+        attempt_id: Option<&str>,
+        settlement_id: Option<&str>,
+    ) -> Result<(), V2StoreError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let old = Self::get_task_tx(&tx, &task.task_id)?
             .ok_or_else(|| V2StoreError("missing lifecycle task".into()))?;
-        Self::update_task_tx(&tx, &old, task, now_epoch())?;
+        if let Some(id) = &op.decision_id
+            && (is_terminal_task_status(&old.status)
+                || Self::get_decision_on(&tx, id)?
+                    .is_some_and(|decision| decision.status == "RETIRED"))
+        {
+            return Ok(());
+        }
+        let mut next = task.clone();
+        if op.state == "DISPATCHED"
+            && let Some((status, board)) =
+                Self::effective_deferred_terminal_on(&tx, &op.operation_id, &old)?
+        {
+            next = old.clone();
+            next.status = status;
+            next.memory.governance_terminal_observed |= board;
+            // Clear the fence only inside the acknowledgment transaction. Keep the
+            // publication pending for retirement until the terminal transition is recorded.
+            tx.execute(
+                "UPDATE lifecycle_ops SET state='SETTLING' WHERE operation_id=?1",
+                [&op.operation_id],
+            )?;
+        }
+        let now = now_epoch();
+        let retirement = if let Some(settlement_id) = settlement_id {
+            if op.state != "DISPATCHED" {
+                return Err(V2StoreError("publication is no longer dispatched".into()));
+            }
+            let id = op
+                .decision_id
+                .clone()
+                .ok_or_else(|| V2StoreError("publication has no decision".into()))?;
+            next.memory.applied_decisions.push(settlement_id.into());
+            if !is_terminal_task_status(&next.status) && !is_post_merge_status(&next.status) {
+                next.memory.halt_requested = true;
+            }
+            Some((id, "publication_settled"))
+        } else if op.state == "DISPATCHED" {
+            let id = format!("settle-{}", op.operation_id);
+            Self::get_decision_on(&tx, &id)?
+                .filter(|decision| decision.status != "RETIRED")
+                .map(|_| (id, "publication_confirmed"))
+        } else {
+            None
+        };
+        let saved = Self::update_task_tx(&tx, &old, &next, now)?;
+        if let Some((id, reason)) = retirement
+            && Self::get_decision_on(&tx, &id)?.is_some_and(|decision| decision.status != "RETIRED")
+        {
+            let reason = if is_terminal_task_status(&saved.status) {
+                saved.status.as_str()
+            } else {
+                reason
+            };
+            Self::insert_event_tx(
+                &tx,
+                &task.task_id,
+                &task.task_group,
+                now,
+                "DECISION_RETIRED",
+                &serde_json::json!({"task_id":task.task_id,"decision_id":id,"reason":reason,"settlement_id":settlement_id}),
+            )?;
+        }
         if let Some(id) = attempt_id {
             tx.execute(
                 "UPDATE stage_attempts SET phase='COMPLETE' WHERE attempt_id=?1",
@@ -1002,7 +1506,11 @@ impl V2Store {
                 &serde_json::json!({"receipt":task.memory.merge_checkpoint}),
             )?;
         }
-        tx.execute("UPDATE lifecycle_ops SET state='ACKNOWLEDGED',last_error=NULL,updated_epoch=?2 WHERE operation_id=?1",params![op.operation_id,now_epoch()])?;
+        tx.execute(
+            "UPDATE lifecycle_ops SET state=?2,last_error=CASE WHEN ?2='ACKNOWLEDGED' THEN NULL ELSE last_error END,
+             updated_epoch=?3 WHERE operation_id=?1",
+            params![op.operation_id, if settlement_id.is_some() { "SETTLED" } else { "ACKNOWLEDGED" }, now],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -1161,10 +1669,115 @@ impl V2Store {
                 task.lease_expires_epoch,
             ],
         )?;
+        if is_terminal_task_status(&task.status) {
+            Self::retire_decisions_tx(tx, task, now)?;
+        }
         let mut inserted = task.clone();
         inserted.version = 1;
         inserted.updated_epoch = now;
         Ok(inserted)
+    }
+
+    fn board_status_on(conn: &Connection, task_id: &str) -> Result<Option<String>, V2StoreError> {
+        Ok(conn
+            .query_row(
+                "SELECT json_extract(payload_json,'$.board_status') FROM task_events
+             WHERE task_id=?1 AND event_type='BOARD_STATUS_OBSERVED' ORDER BY seq_id DESC LIMIT 1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn board_statuses(
+        &self,
+        group: Option<&str>,
+    ) -> Result<BTreeMap<String, String>, V2StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.task_id,json_extract(e.payload_json,'$.board_status')
+             FROM (
+                SELECT task_id,MAX(seq_id) AS seq_id FROM task_events
+                WHERE event_type='BOARD_STATUS_OBSERVED' GROUP BY task_id
+             ) latest JOIN task_events e ON e.seq_id=latest.seq_id
+             JOIN tasks t ON t.task_id=latest.task_id
+             WHERE ?1 IS NULL OR t.task_group=?1 COLLATE NOCASE",
+        )?;
+        Ok(stmt
+            .query_map([group], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?)
+    }
+
+    fn retire_decisions_tx(
+        tx: &rusqlite::Transaction<'_>,
+        task: &TaskRecord,
+        now: i64,
+    ) -> Result<(), V2StoreError> {
+        let decisions = tx.prepare(
+            "SELECT decision_id,status,EXISTS(
+                 SELECT 1 FROM lifecycle_ops l WHERE l.task_id=d.task_id
+                   AND l.decision_id=d.decision_id AND l.state!='ACKNOWLEDGED'
+             ) FROM pending_decisions d WHERE task_id=?1
+             AND NOT EXISTS(SELECT 1 FROM task_events e WHERE e.task_id=d.task_id
+               AND e.event_type='DECISION_RETIRED' AND json_extract(e.payload_json,'$.decision_id')=d.decision_id)
+             ORDER BY created_seq",
+        )?.query_map([&task.task_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (id, status, pending_publication) in decisions {
+            if status == "OPEN"
+                || (status == "RESOLVED"
+                    && (pending_publication || !task.memory.applied_decisions.contains(&id)))
+            {
+                Self::insert_event_tx(
+                    tx,
+                    &task.task_id,
+                    &task.task_group,
+                    now,
+                    "DECISION_RETIRED",
+                    &serde_json::json!({"task_id":task.task_id,"decision_id":id,"reason":task.status}),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retire_terminal_decisions(&mut self) -> Result<(), V2StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ids = tx.prepare(
+            "SELECT DISTINCT t.task_id FROM tasks t JOIN pending_decisions d ON t.task_id=d.task_id
+             WHERE lower(t.status) IN ('done','cancelled')",
+        )?.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+        for id in ids {
+            if let Some(task) = Self::get_task_tx(&tx, &id)? {
+                Self::retire_decisions_tx(&tx, &task, now_epoch())?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn publish_status_tx(
+        tx: &rusqlite::Transaction<'_>,
+        task: &TaskRecord,
+        now: i64,
+        metadata_only: bool,
+    ) -> Result<(), V2StoreError> {
+        let event = if task.status.eq_ignore_ascii_case("Done") {
+            "TASK_DONE"
+        } else {
+            "TASK_STATUS_CHANGED"
+        };
+        Self::insert_event_tx(
+            tx,
+            &task.task_id,
+            &task.task_group,
+            now,
+            event,
+            &serde_json::json!({"task_id":task.task_id,"status":task.status,
+                "board_status":Self::board_status_on(tx, &task.task_id)?, "metadata_only":metadata_only}),
+        )?;
+        Ok(())
     }
 
     fn update_task_tx(
@@ -1173,6 +1786,9 @@ impl V2Store {
         next: &TaskRecord,
         now: i64,
     ) -> Result<TaskRecord, V2StoreError> {
+        if Self::defer_terminal_tx(tx, old, &next.status, false, now)? {
+            return Ok(old.clone());
+        }
         let context_pack_json = serde_json::to_string(&next.context_pack)?;
         let depends_on_json = serde_json::to_string(&next.depends_on)?;
         let required_stages_json = serde_json::to_string(&next.required_stages)?;
@@ -1250,15 +1866,13 @@ impl V2Store {
                 }),
             )?;
         }
-        if old.status != next.status && next.status.eq_ignore_ascii_case("Done") {
-            Self::insert_event_tx(
-                tx,
-                &next.task_id,
-                &next.task_group,
-                now,
-                "TASK_DONE",
-                &serde_json::json!({ "status": next.status }),
-            )?;
+        if old.status != next.status {
+            Self::publish_status_tx(tx, next, now, false)?;
+        }
+        if is_terminal_task_status(&next.status) {
+            Self::retire_decisions_tx(tx, next, now)?;
+        } else if is_terminal_task_status(&old.status) {
+            Self::retire_decisions_tx(tx, old, now)?;
         }
 
         let mut updated = next.clone();
@@ -1308,15 +1922,112 @@ impl V2Store {
         } else {
             now_epoch()
         };
-        let result = match Self::get_task_tx(&tx, &incoming.task_id)? {
+        let existing = Self::get_task_tx(&tx, &incoming.task_id)?;
+        if mode == SyncMode::ReconcileFinishedLegacy
+            && let Some(old) = existing.as_ref()
+            && Self::offline_identity_conflicts(old, incoming)
+        {
+            return Ok(old.clone());
+        }
+        let group = match (&existing, mode) {
+            (Some(old), SyncMode::ReconcileFinishedLegacy)
+                if is_terminal_task_status(&incoming.status) =>
+            {
+                &old.task_group
+            }
+            _ => &incoming.task_group,
+        };
+        let observed = crate::v2::runner::truncate_utf8_bytes(&incoming.status, 128);
+        if Self::board_status_on(&tx, &incoming.task_id)?.as_deref() != Some(observed.as_str()) {
+            Self::insert_event_tx(
+                &tx,
+                &incoming.task_id,
+                group,
+                now,
+                "BOARD_STATUS_OBSERVED",
+                &serde_json::json!({"task_id":incoming.task_id,"board_status":observed}),
+            )?;
+        }
+        let result = match existing {
             Some(mut old) => {
                 if mode == SyncMode::ReconcileFinishedLegacy
-                    && matches!(incoming.status.as_str(), "Done" | "Cancelled")
+                    && is_terminal_task_status(&incoming.status)
                 {
+                    if !matches!(incoming.status.as_str(), "Done" | "Cancelled") {
+                        tx.commit()?;
+                        return Ok(old);
+                    }
                     let raw = strict_task_json(&tx, &mut old)?;
                     let saved = Self::reconcile_offline_tx(&tx, &old, incoming, raw, now)?;
                     tx.commit()?;
                     return Ok(saved);
+                }
+                let delivery_hold = is_terminal_task_status(&incoming.status)
+                    && Self::delivery_holds_terminal(&tx, &old)?;
+                if !delivery_hold
+                    && Self::defer_terminal_tx(&tx, &old, &incoming.status, true, now)?
+                {
+                    tx.commit()?;
+                    return Ok(old);
+                }
+                if !is_terminal_task_status(&incoming.status) && tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM lifecycle_ops WHERE task_id=?1 AND state='DISPATCHED')",
+                    [&old.task_id], |row| row.get::<_, bool>(0),
+                )? {
+                    let foreign_executor = incoming.executor.as_deref().filter(|executor| {
+                        !executor.trim().is_empty() && !executor.eq_ignore_ascii_case("zach")
+                    });
+                    let mut next = old.clone();
+                    next.autonomous_consent &= incoming.autonomous_consent && foreign_executor.is_none();
+                    if let Some(foreign) = foreign_executor {
+                        if old.autonomous_consent
+                            || old.active_attempt_id.is_some()
+                            || old
+                                .executor
+                                .as_deref()
+                                .is_some_and(|e| e.eq_ignore_ascii_case("zach"))
+                        {
+                            let payload = serde_json::json!({
+                                "task_id": old.task_id,
+                                "previous_executor": old.executor,
+                                "incoming_executor": foreign,
+                                "active_attempt_id": old.active_attempt_id,
+                            });
+                            Self::insert_event_tx(
+                                &tx,
+                                &old.task_id,
+                                &old.task_group,
+                                now,
+                                "CLAIM_CONFLICT_OBSERVED",
+                                &payload,
+                            )?;
+                            Self::insert_event_tx(
+                                &tx,
+                                &old.task_id,
+                                crate::v2::socket::SESSION_GROUP_NAME,
+                                now,
+                                "CLAIM_CHANGED",
+                                &payload,
+                            )?;
+                        }
+                    } else if old.autonomous_consent && !incoming.autonomous_consent {
+                        Self::insert_event_tx(
+                            &tx,
+                            &old.task_id,
+                            &old.task_group,
+                            now,
+                            "CONSENT_REVOKED_EXTERNALLY",
+                            &serde_json::json!({
+                                "task_id": old.task_id,
+                                "active_attempt_id": old.active_attempt_id,
+                            }),
+                        )?;
+                    }
+                    if next.autonomous_consent != old.autonomous_consent {
+                        old = Self::update_task_tx(&tx, &old, &next, now)?;
+                    }
+                    tx.commit()?;
+                    return Ok(old);
                 }
                 let mut next = incoming.clone();
                 let verified_delivery: bool = old.status == "Done" && tx.query_row(
@@ -1324,8 +2035,33 @@ impl V2Store {
                         AND NOT EXISTS(SELECT 1 FROM post_merge_deliveries WHERE task_id=?1 AND state!='verified')",
                     [&old.task_id], |row| row.get(0),
                 )?;
-                if should_preserve_zach_state(&old, incoming)
-                    || (verified_delivery && !is_terminal_task_status(&incoming.status))
+                let is_blocked_to_ready = old.status == "Blocked" && incoming.status == "Ready";
+                let has_pending_lifecycle_ops = Self::has_pending_lifecycle_on(&tx, &old.task_id)?;
+                let has_open_decision: bool = !is_terminal_task_status(&old.status) && tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pending_decisions WHERE task_id=?1 AND status='OPEN'
+                     AND NOT EXISTS(SELECT 1 FROM task_events e WHERE e.task_id=pending_decisions.task_id
+                       AND e.event_type='DECISION_RETIRED' AND json_extract(e.payload_json,'$.decision_id')=pending_decisions.decision_id))",
+                    [&old.task_id],
+                    |row| row.get(0),
+                )?;
+                let idle_reset_eligible = matches!(incoming.status.as_str(), "Backlog" | "Ready")
+                    && !is_blocked_to_ready
+                    && old.active_attempt_id.is_none()
+                    && old.memory.pipeline_checkpoint.is_none()
+                    && old.memory.merge_checkpoint.is_none()
+                    && !is_post_merge_status(&old.status)
+                    && !verified_delivery
+                    && !has_pending_lifecycle_ops
+                    && !has_open_decision;
+                let idle_reset = idle_reset_eligible
+                    && (old.status != incoming.status || incoming.status == "Backlog");
+                if !idle_reset
+                    && (delivery_hold
+                        || (has_open_decision
+                            && old.status == "Blocked"
+                            && incoming.status == "Backlog")
+                        || should_preserve_zach_state(&old, incoming)
+                        || (verified_delivery && !is_terminal_task_status(&incoming.status)))
                 {
                     next.status = old.status.clone();
                     next.stages_completed = old.stages_completed.clone();
@@ -1335,10 +2071,50 @@ impl V2Store {
                     next.reviewed_sha = old.reviewed_sha.clone();
                     next.pr_number = old.pr_number;
                     next.executor = old.executor.clone();
-                    if incoming.executor.as_deref().is_some_and(|executor| {
+                    let foreign_executor = incoming.executor.as_deref().filter(|executor| {
                         !executor.trim().is_empty() && !executor.eq_ignore_ascii_case("zach")
-                    }) {
+                    });
+                    if let Some(foreign) = foreign_executor {
                         next.autonomous_consent = false;
+                        if old.active_attempt_id.is_some() {
+                            let payload = serde_json::json!({
+                                "task_id": old.task_id,
+                                "previous_executor": old.executor,
+                                "incoming_executor": foreign,
+                                "active_attempt_id": old.active_attempt_id,
+                            });
+                            Self::insert_event_tx(
+                                &tx,
+                                &old.task_id,
+                                &old.task_group,
+                                now,
+                                "CLAIM_CONFLICT_OBSERVED",
+                                &payload,
+                            )?;
+                            Self::insert_event_tx(
+                                &tx,
+                                &old.task_id,
+                                crate::v2::socket::SESSION_GROUP_NAME,
+                                now,
+                                "CLAIM_CHANGED",
+                                &payload,
+                            )?;
+                        }
+                    } else if old.active_attempt_id.is_some()
+                        && old.autonomous_consent
+                        && !incoming.autonomous_consent
+                    {
+                        Self::insert_event_tx(
+                            &tx,
+                            &old.task_id,
+                            &old.task_group,
+                            now,
+                            "CONSENT_REVOKED_EXTERNALLY",
+                            &serde_json::json!({
+                                "task_id": old.task_id,
+                                "active_attempt_id": old.active_attempt_id,
+                            }),
+                        )?;
                     }
                     next.retry_count = old.retry_count;
                     next.memory = old.memory.clone();
@@ -1366,18 +2142,63 @@ impl V2Store {
                     next.next_retry_epoch = old.next_retry_epoch;
                     next.lease_owner = old.lease_owner.clone();
                     next.lease_expires_epoch = old.lease_expires_epoch;
+                    if old.status == "Blocked" && incoming.status == "Ready" {
+                        next.status = "Ready".into();
+                        next.retry_count = 0;
+                        next.next_retry_epoch = 0;
+                        next.memory.halt_requested = false;
+                        if old.retry_count > 0 || old.memory.halt_requested {
+                            next.memory.retry_generation += 1;
+                            next.memory.retry_reset_epoch = now_epoch();
+                        }
+                    }
                 } else {
                     coalesce_runtime_fields(&old, &mut next);
-                    next.retry_count = old.retry_count.max(next.retry_count);
+                    if is_terminal_task_status(&next.status) {
+                        next.lease_owner = old.lease_owner.clone();
+                        next.lease_expires_epoch = old.lease_expires_epoch;
+                        next.next_retry_epoch = old.next_retry_epoch;
+                        next.memory = old.memory.clone();
+                        next.memory.governance_started |= incoming.memory.governance_started;
+                    }
+                    if idle_reset {
+                        next.status = incoming.status.clone();
+                        next.current_stage = None;
+                        next.memory.governance_started = incoming.memory.governance_started;
+                        tx.execute(
+                            "DELETE FROM lifecycle_ops WHERE task_id=?1 AND kind='start' AND state='ACKNOWLEDGED'",
+                            [&old.task_id],
+                        )?;
+                        if incoming.status == "Backlog" {
+                            tx.execute("DELETE FROM path_locks WHERE task_id=?1", [&old.task_id])?;
+                        }
+                    }
+                    if old.status == "Blocked" && incoming.status == "Ready" {
+                        next.status = "Ready".into();
+                        next.retry_count = 0;
+                        next.next_retry_epoch = 0;
+                        next.memory.halt_requested = false;
+                        if old.retry_count > 0 || old.memory.halt_requested {
+                            next.memory.retry_generation = old
+                                .memory
+                                .retry_generation
+                                .max(next.memory.retry_generation)
+                                + 1;
+                            next.memory.retry_reset_epoch = now_epoch();
+                        }
+                    } else {
+                        next.retry_count = old.retry_count.max(next.retry_count);
+                    }
                 }
                 next.memory.governance_terminal_observed |= old.memory.governance_terminal_observed
-                    || is_terminal_task_status(&incoming.status);
+                    || (!delivery_hold && is_terminal_task_status(&incoming.status));
                 Self::update_task_tx(&tx, &old, &next, now)?
             }
             None => {
                 let mut next = incoming.clone();
                 next.memory.governance_terminal_observed |=
                     is_terminal_task_status(&incoming.status);
+                Self::publish_status_tx(&tx, &next, now, true)?;
                 Self::insert_task_tx(&tx, &next, now)?
             }
         };
@@ -1385,14 +2206,8 @@ impl V2Store {
         Ok(result)
     }
 
-    fn reconcile_offline_tx(
-        tx: &rusqlite::Transaction<'_>,
-        old: &TaskRecord,
-        incoming: &TaskRecord,
-        mut raw: RawTask,
-        now: i64,
-    ) -> Result<TaskRecord, V2StoreError> {
-        let conflicting = old.repository != incoming.repository
+    fn offline_identity_conflicts(old: &TaskRecord, incoming: &TaskRecord) -> bool {
+        old.repository != incoming.repository
             || old
                 .github_repo
                 .as_ref()
@@ -1402,6 +2217,16 @@ impl V2Store {
                 .issue_number
                 .zip(incoming.issue_number)
                 .is_some_and(|(a, b)| a != b)
+    }
+
+    fn reconcile_offline_tx(
+        tx: &rusqlite::Transaction<'_>,
+        old: &TaskRecord,
+        incoming: &TaskRecord,
+        mut raw: RawTask,
+        now: i64,
+    ) -> Result<TaskRecord, V2StoreError> {
+        let conflicting = Self::offline_identity_conflicts(old, incoming)
             || incoming.current_stage.is_some()
             || incoming.lease_owner.is_some()
             || incoming.lease_expires_epoch.is_some()
@@ -1486,8 +2311,13 @@ impl V2Store {
         if raw_task(tx, &old.task_id)? != raw {
             return Err(V2StoreError("offline task changed during cleanup".into()));
         }
-        Self::get_task_tx(tx, &old.task_id)?
-            .ok_or_else(|| V2StoreError("offline task disappeared".into()))
+        let saved = Self::get_task_tx(tx, &old.task_id)?
+            .ok_or_else(|| V2StoreError("offline task disappeared".into()))?;
+        if old.status != saved.status {
+            Self::publish_status_tx(tx, &saved, now, empty)?;
+        }
+        Self::retire_decisions_tx(tx, &saved, now)?;
+        Ok(saved)
     }
 
     fn can_classify_empty_tx(
@@ -1521,7 +2351,6 @@ impl V2Store {
             "pending_decisions",
             "merge_queue",
             "path_locks",
-            "task_events",
         ] {
             let exists: bool = tx.query_row(
                 &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE task_id=?1)"),
@@ -1532,7 +2361,15 @@ impl V2Store {
                 return Ok(false);
             }
         }
-        Ok(true)
+        let native_events: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM task_events WHERE task_id=?1
+             AND event_type!='BOARD_STATUS_OBSERVED'
+             AND NOT(event_type IN ('TASK_DONE','TASK_STATUS_CHANGED') AND
+                     coalesce(json_extract(payload_json,'$.metadata_only'),0)=1))",
+            [&old.task_id],
+            |row| row.get(0),
+        )?;
+        Ok(!native_events)
     }
 
     /// Status/consent alone never proves that Zach owns startup recovery. Validate
@@ -1563,16 +2400,14 @@ impl V2Store {
         {
             return Ok(true);
         }
-        for table in [
-            "lifecycle_ops",
-            "post_merge_deliveries",
-            "merge_queue",
-            "path_locks",
-        ] {
-            let filter = match table {
-                "lifecycle_ops" => " AND state!='ACKNOWLEDGED'",
-                "post_merge_deliveries" => " AND state NOT IN ('verified','aborted')",
-                _ => "",
+        if self.has_pending_lifecycle(&task.task_id)? {
+            return Ok(true);
+        }
+        for table in ["post_merge_deliveries", "merge_queue", "path_locks"] {
+            let filter = if table == "post_merge_deliveries" {
+                " AND state NOT IN ('verified','aborted')"
+            } else {
+                ""
             };
             let exists: bool = self.conn.query_row(
                 &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE task_id=?1{filter})"),
@@ -1590,20 +2425,32 @@ impl V2Store {
         {
             return Ok(true);
         }
+        let confirmed_terminal_history = task.memory.governance_terminal_observed
+            && matches!(task.status.as_str(), "Done" | "Cancelled");
         if attempts.iter().any(|a| {
-            !matches!(a.status.as_str(), "PASSED" | "FAILED")
+            !(matches!(a.status.as_str(), "PASSED" | "FAILED")
+                || (confirmed_terminal_history && a.status == "LOST"))
                 || (a.status == "PASSED"
                     && !task.memory.governance_terminal_observed
                     && !task.stages_completed.contains(&a.stage))
         }) {
             return Err(V2StoreError("ambiguous native startup history".into()));
         }
-        if self.list_decisions(false, None)?.iter().any(|d| {
-            d.task_id == task.task_id
-                && (d.status != "RESOLVED"
-                    || !task.memory.applied_decisions.contains(&d.decision_id))
-        }) {
-            return Ok(true);
+        let mut decisions = self.conn.prepare(&format!(
+            "{} WHERE d.task_id=?1",
+            Self::DECISION_HISTORY_SELECT,
+        ))?;
+        for row in decisions.query_map([&task.task_id], Self::map_decision_row)? {
+            let decision = row?;
+            if decision.status != "RETIRED"
+                && (decision.status != "RESOLVED"
+                    || !task
+                        .memory
+                        .applied_decisions
+                        .contains(&decision.decision_id))
+            {
+                return Ok(true);
+            }
         }
         // A terminal observation can outlive a later human reopen. With every
         // current native reference/effect excluded above, completed worker stages
@@ -1647,12 +2494,19 @@ impl V2Store {
         {
             return Ok(false);
         }
-        let effects: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_ops WHERE task_id=?1 AND state!='ACKNOWLEDGED') OR EXISTS(SELECT 1 FROM post_merge_deliveries WHERE task_id=?1 AND state!='verified') OR EXISTS(SELECT 1 FROM merge_queue WHERE task_id=?1 AND (state!='FAILED' OR repo!=?2))", params![old.task_id,old.repository], |r| r.get(0))?;
+        let effects: bool = Self::has_pending_lifecycle_on(tx, &old.task_id)?
+            || tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM post_merge_deliveries WHERE task_id=?1 AND state!='verified')
+                 OR EXISTS(SELECT 1 FROM merge_queue WHERE task_id=?1 AND (state!='FAILED' OR repo!=?2))",
+                params![old.task_id, old.repository], |r| r.get(0),
+            )?;
         if effects {
             return Ok(false);
         }
         let decisions = tx
-            .prepare("SELECT decision_id,status FROM pending_decisions WHERE task_id=?1")?
+            .prepare("SELECT decision_id,status FROM pending_decisions d WHERE task_id=?1
+                AND NOT EXISTS(SELECT 1 FROM task_events e WHERE e.task_id=d.task_id
+                    AND e.event_type='DECISION_RETIRED' AND json_extract(e.payload_json,'$.decision_id')=d.decision_id)")?
             .query_map([&old.task_id], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             })?
@@ -1884,6 +2738,7 @@ impl V2Store {
         if !matches_receipt {
             return Ok(None);
         }
+        Self::retire_decisions_tx(&tx, &old, now_epoch())?;
         let mut next = old.clone();
         next.status = "Delivery Pending".into();
         next.memory.merge_lane_released = true;
@@ -2046,8 +2901,17 @@ impl V2Store {
             {
                 continue;
             }
-            if task.status != "Ready"
-                || !task.autonomous_consent
+            let has_active_grant = task.has_active_stage_grant();
+            let status_eligible = task.status == "Ready"
+                || (has_active_grant
+                    && matches!(
+                        task.status.as_str(),
+                        "Planning" | "Plan Review" | "In Progress" | "PR Review"
+                    )
+                    && task.active_attempt_id.is_none()
+                    && task.memory.pipeline_checkpoint.is_none());
+            if !status_eligible
+                || !task.has_any_execution_grant()
                 || task.next_retry_epoch > now_epoch()
                 || self.has_pending_lifecycle(&task.task_id)?
             {
@@ -2103,6 +2967,70 @@ impl V2Store {
         Ok(tx.last_insert_rowid())
     }
 
+    pub fn record_session_announcement(
+        &mut self,
+        announcement: &crate::v2::socket::SessionAnnouncementRecord,
+    ) -> Result<TaskEventRecord, V2StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let task_id = announcement
+            .task_id
+            .as_deref()
+            .unwrap_or(crate::v2::socket::SESSION_GROUP_NAME);
+        let payload = serde_json::to_value(announcement)?;
+        let seq_id = Self::insert_event_tx(
+            &tx,
+            task_id,
+            crate::v2::socket::SESSION_GROUP_NAME,
+            announcement.announced_at_epoch,
+            "SESSION_ANNOUNCEMENT",
+            &payload,
+        )?;
+        tx.commit()?;
+        Ok(TaskEventRecord {
+            seq_id,
+            task_id: task_id.to_owned(),
+            task_group: crate::v2::socket::SESSION_GROUP_NAME.to_owned(),
+            ts_epoch: announcement.announced_at_epoch,
+            event_type: "SESSION_ANNOUNCEMENT".to_owned(),
+            payload,
+        })
+    }
+
+    pub fn list_session_announcements(
+        &self,
+        include_stale: bool,
+        now: i64,
+    ) -> Result<Vec<crate::v2::socket::SessionAnnouncementRecord>, V2StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT payload_json FROM task_events
+             WHERE task_group = ?1 AND event_type = 'SESSION_ANNOUNCEMENT'
+             ORDER BY seq_id ASC",
+        )?;
+        let mut by_holder = std::collections::BTreeMap::<
+            String,
+            crate::v2::socket::SessionAnnouncementRecord,
+        >::new();
+        let rows = stmt.query_map(params![crate::v2::socket::SESSION_GROUP_NAME], |row| {
+            row.get::<_, String>(0)
+        })?;
+        for row in rows {
+            let raw = row?;
+            if let Ok(rec) =
+                serde_json::from_str::<crate::v2::socket::SessionAnnouncementRecord>(&raw)
+            {
+                by_holder.insert(rec.holder.clone(), rec);
+            }
+        }
+        let mut out: Vec<_> = by_holder
+            .into_values()
+            .filter(|rec| include_stale || rec.expires_at_epoch >= now)
+            .collect();
+        out.sort_by(|a, b| a.holder.cmp(&b.holder));
+        Ok(out)
+    }
+
     pub fn list_events_since(
         &self,
         group_filter: Option<&str>,
@@ -2150,9 +3078,6 @@ impl V2Store {
         context_summary: &str,
         sha: Option<&str>,
     ) -> Result<PendingDecisionRecord, V2StoreError> {
-        if let Some(existing) = self.get_decision(decision_id)? {
-            return Ok(existing);
-        }
         let now = now_epoch();
         let bounded_context = crate::v2::runner::truncate_utf8_bytes(
             context_summary,
@@ -2161,6 +3086,24 @@ impl V2Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = Self::get_decision_on(&tx, decision_id)? {
+            return Ok(existing);
+        }
+        let old = Self::get_task_tx(&tx, task_id)?;
+        if old
+            .as_ref()
+            .is_some_and(|task| is_terminal_task_status(&task.status))
+        {
+            return Err(V2StoreError(
+                "cannot open a decision for a terminal task".into(),
+            ));
+        }
+        let linked_unverified_delivery: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM post_merge_deliveries
+                           WHERE task_id=?1 AND decision_id=?2 AND state NOT IN ('verified','aborted'))",
+            params![task_id, decision_id],
+            |row| row.get(0),
+        )?;
         let seq_id = Self::insert_event_tx(
             &tx,
             task_id,
@@ -2173,6 +3116,7 @@ impl V2Store {
                 "question": question,
                 "options": options,
                 "recommended_option": recommended_option,
+                "linked_unverified_delivery": linked_unverified_delivery,
                 "sha": sha,
             }),
         )?;
@@ -2204,6 +3148,11 @@ impl V2Store {
                  version = version + 1, updated_epoch = ?2 WHERE task_id = ?1",
             params![task_id, now, kind],
         )?;
+        if let (Some(old), Some(next)) = (old, Self::get_task_tx(&tx, task_id)?)
+            && old.status != next.status
+        {
+            Self::publish_status_tx(&tx, &next, now, false)?;
+        }
         tx.commit()?;
         self.get_decision(decision_id)?
             .ok_or_else(|| V2StoreError("Failed to read created decision".into()))
@@ -2216,17 +3165,29 @@ impl V2Store {
         resolved_by: &str,
         note: Option<&str>,
     ) -> Result<DecisionResolution, V2StoreError> {
-        let choice = if let Some(existing) = self.get_decision(decision_id)? {
+        let now = now_epoch();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let choice = if let Some(existing) = Self::get_decision_on(&tx, decision_id)? {
+            if existing.status == "RETIRED" {
+                return Ok(DecisionResolution::NotFound);
+            }
             if existing.status == "RESOLVED" {
                 return Ok(DecisionResolution::AlreadyResolved(existing));
             }
-            let task = self
-                .get_task(&existing.task_id)?
+            let task = Self::get_task_tx(&tx, &existing.task_id)?
                 .ok_or_else(|| V2StoreError("decision task missing".into()))?;
-            let delivery = existing.kind != "governance_close_failed"
-                && (is_post_merge_decision(&existing.kind)
-                    || is_post_merge_status(&task.status)
-                    || !self.list_deliveries(Some(&existing.task_id))?.is_empty());
+            let delivery = !matches!(
+                existing.kind.as_str(),
+                "governance_close_failed" | "governance_publication_uncertain"
+            ) && (is_post_merge_decision(&existing.kind)
+                || is_post_merge_status(&task.status)
+                || tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM post_merge_deliveries WHERE task_id=?1)",
+                    [&existing.task_id],
+                    |row| row.get(0),
+                )?);
             let selected = if delivery {
                 choice
                     .parse::<usize>()
@@ -2252,14 +3213,14 @@ impl V2Store {
             return Ok(DecisionResolution::NotFound);
         };
         let choice = choice.as_str();
-        let now = now_epoch();
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = tx.execute(
             "UPDATE pending_decisions
              SET status = 'RESOLVED', choice = ?2, resolved_by = ?3, resolved_epoch = ?4, note = ?5
-             WHERE decision_id = ?1 AND status = 'OPEN'",
+             WHERE decision_id = ?1 AND status = 'OPEN'
+               AND EXISTS(SELECT 1 FROM tasks t WHERE t.task_id=pending_decisions.task_id
+                          AND lower(t.status) NOT IN ('done','cancelled'))
+               AND NOT EXISTS(SELECT 1 FROM task_events e WHERE e.task_id=pending_decisions.task_id
+                   AND e.event_type='DECISION_RETIRED' AND json_extract(e.payload_json,'$.decision_id')=?1)",
             params![decision_id, choice, resolved_by, now, note],
         )?;
         if changed == 0 {
@@ -2285,8 +3246,11 @@ impl V2Store {
             params![task_id],
             |row| row.get(0),
         )?;
-        let post_merge = kind != "governance_close_failed"
-            && (is_post_merge_decision(&kind) || is_post_merge_status(&task_status) || linked);
+        let post_merge =
+            !matches!(
+                kind.as_str(),
+                "governance_close_failed" | "governance_publication_uncertain"
+            ) && (is_post_merge_decision(&kind) || is_post_merge_status(&task_status) || linked);
         let mut next_status = task_status.as_str();
         if post_merge {
             let options_raw: String = tx.query_row(
@@ -2387,6 +3351,11 @@ impl V2Store {
                 "note": note,
             }),
         )?;
+        if next_status != task_status
+            && let Some(task) = Self::get_task_tx(&tx, &task_id)?
+        {
+            Self::publish_status_tx(&tx, &task, now, false)?;
+        }
         tx.commit()?;
         let rec = self
             .get_decision(decision_id)?
@@ -2398,15 +3367,37 @@ impl V2Store {
         &self,
         decision_id: &str,
     ) -> Result<Option<PendingDecisionRecord>, V2StoreError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT decision_id, task_id, task_group, kind, question, options_json,
-                    recommended_option, context_summary, sha, status, created_seq,
-                    resolved_by, resolved_epoch, choice, note
-             FROM pending_decisions WHERE decision_id = ?1",
-        )?;
-        stmt.query_row(params![decision_id], Self::map_decision_row)
-            .optional()
-            .map_err(V2StoreError::from)
+        Self::get_decision_on(&self.conn, decision_id)
+    }
+
+    const DECISION_HISTORY_SELECT: &str = "
+        SELECT d.decision_id,d.task_id,d.task_group,d.kind,d.question,d.options_json,
+               d.recommended_option,d.context_summary,d.sha,d.status,d.created_seq,
+               d.resolved_by,d.resolved_epoch,d.choice,d.note,
+               coalesce(
+                   (SELECT json_extract(e.payload_json,'$.reason') FROM task_events e
+                    WHERE e.task_id=d.task_id AND e.event_type='DECISION_RETIRED'
+                    AND json_extract(e.payload_json,'$.decision_id')=d.decision_id
+                    ORDER BY seq_id DESC LIMIT 1),
+                   (SELECT t.status FROM tasks t WHERE t.task_id=d.task_id
+                    AND d.status='OPEN' AND lower(t.status) IN ('done','cancelled'))
+               ) AS retirement_reason,
+               EXISTS(SELECT 1 FROM post_merge_deliveries p
+                      WHERE p.task_id=d.task_id AND p.decision_id=d.decision_id
+                      AND p.state NOT IN ('verified','aborted'))
+        FROM pending_decisions d";
+
+    fn get_decision_on(
+        conn: &Connection,
+        decision_id: &str,
+    ) -> Result<Option<PendingDecisionRecord>, V2StoreError> {
+        Ok(conn
+            .prepare(&format!(
+                "{} WHERE d.decision_id=?1",
+                Self::DECISION_HISTORY_SELECT
+            ))?
+            .query_row([decision_id], Self::map_decision_row)
+            .optional()?)
     }
 
     pub fn list_decisions(
@@ -2414,27 +3405,19 @@ impl V2Store {
         open_only: bool,
         group_filter: Option<&str>,
     ) -> Result<Vec<PendingDecisionRecord>, V2StoreError> {
-        let mut all = Vec::new();
-        let mut stmt = self.conn.prepare(
-            "SELECT decision_id, task_id, task_group, kind, question, options_json,
-                    recommended_option, context_summary, sha, status, created_seq,
-                    resolved_by, resolved_epoch, choice, note
-             FROM pending_decisions ORDER BY created_seq ASC",
-        )?;
-        let rows = stmt.query_map([], Self::map_decision_row)?;
-        for r in rows {
-            let item = r?;
-            if open_only && item.status != "OPEN" {
-                continue;
+        let mut stmt = self.conn.prepare(&format!(
+            "{} WHERE (?1 IS NULL OR d.task_group=?1 COLLATE NOCASE) ORDER BY d.created_seq",
+            Self::DECISION_HISTORY_SELECT,
+        ))?;
+        let rows = stmt.query_map([group_filter], Self::map_decision_row)?;
+        let mut decisions = Vec::new();
+        for row in rows {
+            let decision = row?;
+            if !open_only || decision.status == "OPEN" {
+                decisions.push(decision);
             }
-            if let Some(group) = group_filter
-                && !item.task_group.eq_ignore_ascii_case(group)
-            {
-                continue;
-            }
-            all.push(item);
         }
-        Ok(all)
+        Ok(decisions)
     }
 
     pub fn record_stage_attempt(
@@ -2582,6 +3565,14 @@ impl V2Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let old = Self::get_task_tx(&tx, &task.task_id)?
             .ok_or_else(|| V2StoreError("transition task missing".into()))?;
+        if decision.is_some()
+            && is_terminal_task_status(&old.status)
+            && !is_terminal_task_status(&task.status)
+        {
+            return Err(V2StoreError(
+                "decision cannot reopen a terminal task".into(),
+            ));
+        }
         Self::update_task_tx(&tx, &old, task, now_epoch())?;
         if let Some(attempt) = attempt {
             Self::record_stage_attempt_tx(&tx, attempt)?;
@@ -2590,7 +3581,10 @@ impl V2Store {
             tx.execute("DELETE FROM path_locks WHERE task_id=?1", [&task.task_id])?;
             tx.execute("DELETE FROM merge_queue WHERE task_id=?1", [&task.task_id])?;
         }
-        if let Some(decision) = decision {
+        if let Some(decision) = decision
+            && !is_terminal_task_status(&task.status)
+            && !is_terminal_task_status(&old.status)
+        {
             let exists: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pending_decisions WHERE decision_id=?1)",
                 [&decision.decision_id],
@@ -2645,6 +3639,247 @@ impl V2Store {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    pub fn record_attempt_audit(&mut self, audit: &AttemptAuditRecord) -> Result<(), V2StoreError> {
+        let sanitized_error_code = audit
+            .error_code
+            .as_deref()
+            .map(|c| {
+                crate::v2::audit::redact_adr004_text(
+                    c,
+                    crate::v2::audit::MAX_AUDIT_DIGEST_ERROR_SIGNATURE_LEN,
+                )
+            })
+            .filter(|c| !c.is_empty());
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO attempt_audits (
+                attempt_id, task_id, stage, turn_count, tool_call_count, tool_error_count,
+                edit_compile_fail_loops, redundant_read_count, cached_input_tokens,
+                reasoning_tokens, check_divergence, error_code, created_epoch
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT(attempt_id) DO UPDATE SET
+                task_id = excluded.task_id,
+                stage = excluded.stage,
+                turn_count = excluded.turn_count,
+                tool_call_count = excluded.tool_call_count,
+                tool_error_count = excluded.tool_error_count,
+                edit_compile_fail_loops = excluded.edit_compile_fail_loops,
+                redundant_read_count = excluded.redundant_read_count,
+                cached_input_tokens = COALESCE(excluded.cached_input_tokens, attempt_audits.cached_input_tokens),
+                reasoning_tokens = COALESCE(excluded.reasoning_tokens, attempt_audits.reasoning_tokens),
+                check_divergence = MAX(attempt_audits.check_divergence, excluded.check_divergence),
+                error_code = COALESCE(excluded.error_code, attempt_audits.error_code),
+                created_epoch = excluded.created_epoch",
+            params![
+                audit.attempt_id,
+                audit.task_id,
+                audit.stage,
+                audit.turn_count as i64,
+                audit.tool_call_count as i64,
+                audit.tool_error_count as i64,
+                audit.edit_compile_fail_loops as i64,
+                audit.redundant_read_count as i64,
+                audit.cached_input_tokens.map(|v| v as i64),
+                audit.reasoning_tokens.map(|v| v as i64),
+                i64::from(audit.check_divergence),
+                sanitized_error_code,
+                audit.created_epoch,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_attempt_audit(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Option<AttemptAuditRecord>, V2StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT attempt_id, task_id, stage, turn_count, tool_call_count, tool_error_count,
+                    edit_compile_fail_loops, redundant_read_count, cached_input_tokens,
+                    reasoning_tokens, check_divergence, error_code, created_epoch
+             FROM attempt_audits WHERE attempt_id = ?1",
+        )?;
+        stmt.query_row(params![attempt_id], Self::map_attempt_audit_row)
+            .optional()
+            .map_err(V2StoreError::from)
+    }
+
+    pub fn list_attempt_audits(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<AttemptAuditRecord>, V2StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT attempt_id, task_id, stage, turn_count, tool_call_count, tool_error_count,
+                    edit_compile_fail_loops, redundant_read_count, cached_input_tokens,
+                    reasoning_tokens, check_divergence, error_code, created_epoch
+             FROM attempt_audits WHERE task_id = ?1 ORDER BY created_epoch ASC, rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![task_id], Self::map_attempt_audit_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn mark_attempt_check_divergence(
+        &mut self,
+        attempt_id: &str,
+        task_id: &str,
+        stage: &str,
+        error_code: Option<&str>,
+    ) -> Result<(), V2StoreError> {
+        let sanitized_error_code = error_code
+            .map(|c| {
+                crate::v2::audit::redact_adr004_text(
+                    c,
+                    crate::v2::audit::MAX_AUDIT_DIGEST_ERROR_SIGNATURE_LEN,
+                )
+            })
+            .filter(|c| !c.is_empty());
+        let now = now_epoch();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO attempt_audits (
+                attempt_id, task_id, stage, turn_count, tool_call_count, tool_error_count,
+                edit_compile_fail_loops, redundant_read_count, cached_input_tokens,
+                reasoning_tokens, check_divergence, error_code, created_epoch
+             ) VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, NULL, NULL, 1, ?4, ?5)
+             ON CONFLICT(attempt_id) DO UPDATE SET
+                check_divergence = 1,
+                error_code = COALESCE(excluded.error_code, attempt_audits.error_code)",
+            params![attempt_id, task_id, stage, sanitized_error_code, now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_task_events(&self, task_id: &str) -> Result<Vec<TaskEventRecord>, V2StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq_id, task_id, task_group, ts_epoch, event_type, payload_json
+             FROM task_events WHERE task_id = ?1 ORDER BY seq_id ASC",
+        )?;
+        let rows = stmt.query_map(params![task_id], Self::map_event_row)?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
+    }
+
+    fn map_attempt_audit_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptAuditRecord> {
+        Ok(AttemptAuditRecord {
+            attempt_id: row.get(0)?,
+            task_id: row.get(1)?,
+            stage: row.get(2)?,
+            turn_count: row.get::<_, i64>(3)?.max(0) as u64,
+            tool_call_count: row.get::<_, i64>(4)?.max(0) as u64,
+            tool_error_count: row.get::<_, i64>(5)?.max(0) as u64,
+            edit_compile_fail_loops: row.get::<_, i64>(6)?.max(0) as u64,
+            redundant_read_count: row.get::<_, i64>(7)?.max(0) as u64,
+            cached_input_tokens: row.get::<_, Option<i64>>(8)?.map(|v| v.max(0) as u64),
+            reasoning_tokens: row.get::<_, Option<i64>>(9)?.map(|v| v.max(0) as u64),
+            check_divergence: row.get::<_, i64>(10)? != 0,
+            error_code: row.get(11)?,
+            created_epoch: row.get(12)?,
+        })
+    }
+
+    /// Returns the set of `attempt_id`s that are non-terminal or referenced by
+    /// active tasks, in-flight lifecycle operations, or non-terminal task checkpoints.
+    pub fn active_attempt_ids(&self) -> Result<BTreeSet<String>, V2StoreError> {
+        let mut active = BTreeSet::new();
+
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT attempt_id FROM stage_attempts
+                 WHERE phase != 'COMPLETE' OR ended_epoch IS NULL OR status = 'RUNNING'",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                let id = row?;
+                if !id.trim().is_empty() {
+                    active.insert(id);
+                }
+            }
+        }
+
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT active_attempt_id, status, memory_json FROM tasks")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (active_attempt_id, status, memory_json) = row?;
+                if let Some(id) = active_attempt_id
+                    && !id.trim().is_empty()
+                {
+                    active.insert(id);
+                }
+                if !matches!(status.trim(), "Done" | "Cancelled") {
+                    let memory: TaskMemory = serde_json::from_str(&memory_json).map_err(|e| {
+                        V2StoreError(format!(
+                            "decode task memory_json in active_attempt_ids: {e}"
+                        ))
+                    })?;
+                    if let Some(cp) = memory.pipeline_checkpoint.as_ref()
+                        && !cp.attempt_id.trim().is_empty()
+                    {
+                        active.insert(cp.attempt_id.clone());
+                    }
+                    if let Some(id) = memory.suspended_impl_attempt_id.as_deref()
+                        && !id.trim().is_empty()
+                    {
+                        active.insert(id.to_owned());
+                    }
+                    if let Some(path) = memory.last_pr_review_evidence_path.as_deref()
+                        && let Some(id) = extract_attempt_id_from_path(path)
+                    {
+                        active.insert(id);
+                    }
+                }
+            }
+        }
+
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT attempt_id, body_path FROM lifecycle_ops WHERE state NOT IN ('ACKNOWLEDGED','SETTLED')",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })?;
+            for row in rows {
+                let (attempt_id, body_path) = row?;
+                if let Some(id) = attempt_id
+                    && !id.trim().is_empty()
+                {
+                    active.insert(id);
+                }
+                if let Some(path) = body_path
+                    && let Some(id) = extract_attempt_id_from_path(&path)
+                {
+                    active.insert(id);
+                }
+            }
+        }
+
+        Ok(active)
     }
 
     pub fn acquire_path_locks(
@@ -2969,7 +4204,7 @@ impl V2Store {
             pending_write_backs: self
                 .lifecycle_ops()?
                 .iter()
-                .filter(|o| o.state != "ACKNOWLEDGED")
+                .filter(|o| !matches!(o.state.as_str(), "ACKNOWLEDGED" | "SETTLED"))
                 .count(),
             reconciliation_errors: self
                 .meta("reconciliation_errors")?
@@ -2979,6 +4214,239 @@ impl V2Store {
                 .meta("last_sync_epoch")?
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0),
+        })
+    }
+
+    pub fn repo_reservations(
+        &self,
+        all_tasks: &[TaskRecord],
+    ) -> Result<BTreeMap<String, Vec<RepoReservation>>, V2StoreError> {
+        let mut by_repo: BTreeMap<String, Vec<RepoReservation>> = BTreeMap::new();
+        for lock in self.list_path_locks(None)? {
+            by_repo
+                .entry(lock.repo)
+                .or_default()
+                .push(RepoReservation::WholeRepo {
+                    task_id: lock.task_id,
+                });
+        }
+        for t in all_tasks {
+            if t.status == "Queued for Merge" {
+                by_repo
+                    .entry(t.repository.clone())
+                    .or_default()
+                    .push(RepoReservation::WholeRepo {
+                        task_id: t.task_id.clone(),
+                    });
+            } else if matches!(
+                t.status.as_str(),
+                "Planning" | "Plan Review" | "In Progress" | "PR Review"
+            ) {
+                if t.executor.as_deref() == Some("session") {
+                    let paths: Vec<String> = t
+                        .context_pack
+                        .target_files
+                        .iter()
+                        .map(|f| normalize_repo_path(&f.path))
+                        .collect();
+                    if paths.is_empty() || paths.iter().any(|p| p == "*") {
+                        by_repo.entry(t.repository.clone()).or_default().push(
+                            RepoReservation::WholeRepo {
+                                task_id: t.task_id.clone(),
+                            },
+                        );
+                    } else {
+                        by_repo.entry(t.repository.clone()).or_default().push(
+                            RepoReservation::ScopedPaths {
+                                task_id: t.task_id.clone(),
+                                paths,
+                            },
+                        );
+                    }
+                } else {
+                    by_repo.entry(t.repository.clone()).or_default().push(
+                        RepoReservation::WholeRepo {
+                            task_id: t.task_id.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        for entry in self.list_merge_queue(None)? {
+            by_repo
+                .entry(entry.repo)
+                .or_default()
+                .push(RepoReservation::WholeRepo {
+                    task_id: entry.task_id,
+                });
+        }
+        Ok(by_repo)
+    }
+
+    pub fn detailed_status(
+        &self,
+        group_filter: Option<&str>,
+    ) -> Result<DetailedStatusReport, V2StoreError> {
+        let summary = self.status_summary()?;
+        let all_tasks = self.list_tasks(None)?;
+        let done_ids: BTreeSet<String> = all_tasks
+            .iter()
+            .filter(|t| t.status == "Done")
+            .map(|t| t.task_id.clone())
+            .collect();
+        let all_open_decisions = self.list_decisions(true, None)?;
+        let blocked_by_decision: BTreeSet<String> = all_open_decisions
+            .iter()
+            .map(|d| d.task_id.clone())
+            .collect();
+        let reservations = self.repo_reservations(&all_tasks)?;
+        let max_parallel = self.max_parallel_tasks()?;
+        let active_slot_count = all_tasks
+            .iter()
+            .map(|task| self.occupies_task_slot(task))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|occupied| *occupied)
+            .count();
+        let available_slots = max_parallel.saturating_sub(active_slot_count);
+        let now = now_epoch();
+
+        let board_statuses = self.board_statuses(group_filter)?;
+        let open_decisions = self.list_decisions(true, group_filter)?;
+        let mut active_tasks = Vec::new();
+        let mut waiting_tasks = Vec::new();
+        let mut group_task_ids = BTreeSet::new();
+
+        for task in &all_tasks {
+            if let Some(group) = group_filter
+                && !task.task_group.eq_ignore_ascii_case(group)
+            {
+                continue;
+            }
+            group_task_ids.insert(task.task_id.clone());
+            let board_status = board_statuses.get(&task.task_id).cloned();
+            let open_decision_id = open_decisions
+                .iter()
+                .filter(|decision| decision.task_id == task.task_id)
+                .max_by_key(|decision| (decision.linked_unverified_delivery, decision.created_seq))
+                .map(|decision| decision.decision_id.clone());
+
+            let target_files: Vec<String> = task
+                .context_pack
+                .target_files
+                .iter()
+                .map(|f| normalize_repo_path(&f.path))
+                .collect();
+
+            if matches!(
+                task.status.as_str(),
+                "Planning" | "Plan Review" | "In Progress" | "PR Review" | "Queued for Merge"
+            ) {
+                let attempt = if let Some(id) = task.active_attempt_id.as_deref() {
+                    self.get_stage_attempt(id)?
+                } else {
+                    None
+                };
+                let occupies_slot = self.occupies_task_slot(task)?;
+                let reservation = if task.status != "Queued for Merge"
+                    && task.executor.as_deref() == Some("session")
+                    && !target_files.is_empty()
+                    && !target_files.iter().any(|p| p == "*")
+                {
+                    "scoped_paths".to_owned()
+                } else {
+                    "whole_repo".to_owned()
+                };
+                active_tasks.push(ActiveTaskDetail {
+                    task_id: task.task_id.clone(),
+                    task_group: task.task_group.clone(),
+                    repository: task.repository.clone(),
+                    weight: task.weight.clone(),
+                    status: task.status.clone(),
+                    board_status,
+                    open_decision_id,
+                    title: task.title.clone(),
+                    executor: task.executor.clone(),
+                    current_stage: task.current_stage.clone(),
+                    attempt_id: task.active_attempt_id.clone(),
+                    attempt_phase: attempt.as_ref().map(|a| a.phase.clone()),
+                    model: attempt.map(|a| a.model),
+                    occupies_slot,
+                    target_files,
+                    reservation,
+                });
+            } else if matches!(task.status.as_str(), "Ready" | "Blocked")
+                || is_post_merge_status(&task.status)
+                || open_decision_id.is_some()
+            {
+                let wait_reason = if !task.autonomous_consent {
+                    "awaiting_consent".to_owned()
+                } else if blocked_by_decision.contains(&task.task_id) {
+                    "open_decision".to_owned()
+                } else if self.has_pending_lifecycle(&task.task_id)? {
+                    "pending_lifecycle".to_owned()
+                } else if task.next_retry_epoch > now {
+                    "retry_backoff".to_owned()
+                } else if let Some(dep) =
+                    task.depends_on.iter().find(|dep| !done_ids.contains(*dep))
+                {
+                    format!("dependency:{dep}")
+                } else if task.status == "Blocked" {
+                    "blocked".to_owned()
+                } else if let Some(conflict) = repo_conflict_for_task(
+                    reservations
+                        .get(&task.repository)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                    task,
+                ) {
+                    match conflict {
+                        RepoConflict::RepoLocked { owner } => format!("repo_locked:{owner}"),
+                        RepoConflict::PathConflict { owner, path } => {
+                            format!("path_conflict:{owner}:{path}")
+                        }
+                    }
+                } else if is_post_merge_status(&task.status) {
+                    "post_merge_delivery".to_owned()
+                } else if available_slots == 0 {
+                    "no_free_slots".to_owned()
+                } else {
+                    "eligible".to_owned()
+                };
+
+                waiting_tasks.push(WaitingTaskDetail {
+                    task_id: task.task_id.clone(),
+                    task_group: task.task_group.clone(),
+                    repository: task.repository.clone(),
+                    weight: task.weight.clone(),
+                    status: task.status.clone(),
+                    board_status,
+                    open_decision_id,
+                    title: task.title.clone(),
+                    wait_reason,
+                    target_files,
+                    next_retry_epoch: task.next_retry_epoch,
+                });
+            }
+        }
+
+        let path_locks = self
+            .list_path_locks(None)?
+            .into_iter()
+            .filter(|lock| group_filter.is_none() || group_task_ids.contains(&lock.task_id))
+            .collect();
+        let merge_queue = self
+            .list_merge_queue(None)?
+            .into_iter()
+            .filter(|entry| group_filter.is_none() || group_task_ids.contains(&entry.task_id))
+            .collect();
+        Ok(DetailedStatusReport {
+            summary,
+            active_tasks,
+            waiting_tasks,
+            path_locks,
+            merge_queue,
+            open_decisions,
         })
     }
 
@@ -3037,6 +4505,7 @@ impl V2Store {
     fn map_decision_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingDecisionRecord> {
         let options_str: String = row.get(5)?;
         let rec_opt: Option<i64> = row.get(6)?;
+        let retirement_reason = row.get::<_, Option<String>>(15)?;
         Ok(PendingDecisionRecord {
             decision_id: row.get(0)?,
             task_id: row.get(1)?,
@@ -3047,12 +4516,18 @@ impl V2Store {
             recommended_option: rec_opt.and_then(|v| usize::try_from(v).ok()),
             context_summary: row.get(7)?,
             sha: row.get(8)?,
-            status: row.get(9)?,
+            status: if retirement_reason.is_some() {
+                "RETIRED".into()
+            } else {
+                row.get(9)?
+            },
             created_seq: row.get(10)?,
             resolved_by: row.get(11)?,
             resolved_epoch: row.get(12)?,
             choice: row.get(13)?,
             note: row.get(14)?,
+            retirement_reason,
+            linked_unverified_delivery: row.get(16)?,
         })
     }
 
@@ -3088,6 +4563,95 @@ impl V2Store {
             retry_generation: row.get(24)?,
         })
     }
+
+    pub fn upsert_provider_cooldown(
+        &mut self,
+        family: &str,
+        until_epoch: i64,
+        reason: &str,
+    ) -> Result<(), V2StoreError> {
+        let updated_epoch = now_epoch();
+        self.conn.execute(
+            "INSERT INTO provider_cooldowns(family, until_epoch, reason, updated_epoch)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(family) DO UPDATE SET
+                 until_epoch = MAX(provider_cooldowns.until_epoch, excluded.until_epoch),
+                 reason = excluded.reason,
+                 updated_epoch = excluded.updated_epoch",
+            params![family, until_epoch, reason, updated_epoch],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_active_provider_cooldown(
+        &self,
+        family: &str,
+        now: i64,
+    ) -> Result<Option<ProviderCooldownRecord>, V2StoreError> {
+        self.conn
+            .query_row(
+                "SELECT family, until_epoch, reason, updated_epoch
+                 FROM provider_cooldowns
+                 WHERE family = ?1 AND until_epoch > ?2",
+                params![family, now],
+                Self::row_to_provider_cooldown,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_provider_cooldowns(
+        &self,
+        now: Option<i64>,
+    ) -> Result<Vec<ProviderCooldownRecord>, V2StoreError> {
+        match now {
+            Some(ts) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT family, until_epoch, reason, updated_epoch
+                     FROM provider_cooldowns
+                     WHERE until_epoch > ?1
+                     ORDER BY until_epoch ASC, family ASC",
+                )?;
+                let rows = stmt
+                    .query_map(params![ts], Self::row_to_provider_cooldown)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            }
+            None => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT family, until_epoch, reason, updated_epoch
+                     FROM provider_cooldowns
+                     ORDER BY until_epoch ASC, family ASC",
+                )?;
+                let rows = stmt
+                    .query_map([], Self::row_to_provider_cooldown)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            }
+        }
+    }
+
+    pub fn clear_provider_cooldown(&mut self, family: Option<&str>) -> Result<usize, V2StoreError> {
+        let count = match family {
+            Some(fam) => self.conn.execute(
+                "DELETE FROM provider_cooldowns WHERE family = ?1",
+                params![fam],
+            )?,
+            None => self.conn.execute("DELETE FROM provider_cooldowns", [])?,
+        };
+        Ok(count)
+    }
+
+    fn row_to_provider_cooldown(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<ProviderCooldownRecord> {
+        Ok(ProviderCooldownRecord {
+            family: row.get(0)?,
+            until_epoch: row.get(1)?,
+            reason: row.get(2)?,
+            updated_epoch: row.get(3)?,
+        })
+    }
 }
 
 fn is_terminal_task_status(status: &str) -> bool {
@@ -3110,12 +4674,19 @@ fn coalesce_runtime_fields(old: &TaskRecord, next: &mut TaskRecord) {
     if next.pr_number.is_none() {
         next.pr_number = old.pr_number;
     }
+    let incoming_governance_started = next.memory.governance_started;
     if next.memory == TaskMemory::default() {
         next.memory = old.memory.clone();
     } else if next.memory.merge_checkpoint.is_none() {
         // Board exports cannot replace a durable merge/delivery receipt.
         next.memory.merge_checkpoint = old.memory.merge_checkpoint.clone();
         next.memory.merge_lane_released = old.memory.merge_lane_released;
+    }
+    if matches!(next.status.as_str(), "Backlog" | "Ready")
+        && !incoming_governance_started
+        && !(old.status == "Blocked" && next.status == "Ready")
+    {
+        next.memory.governance_started = false;
     }
 }
 
@@ -3196,6 +4767,162 @@ mod tests {
     }
 
     #[test]
+    fn terminalization_preserves_decision_history_and_runtime_across_replay_and_restart() {
+        for terminal in ["Done", "Cancelled"] {
+            for from_board in [true, false] {
+                let db = LegacyTestDb::new();
+                let mut store = V2Store::open(&db.0).unwrap();
+                let mut task = sample_task("SYNTHETIC-1", "Backlog", vec![]);
+                task.autonomous_consent = false;
+                store.sync_task(&task).unwrap();
+                store
+                    .open_decision(
+                        "stale",
+                        &task.task_id,
+                        &task.task_group,
+                        "failure",
+                        "Retry?",
+                        &["Retry stage".into()],
+                        Some(0),
+                        "original failure",
+                        None,
+                    )
+                    .unwrap();
+                let mut saved = store.get_task(&task.task_id).unwrap().unwrap();
+                saved.active_attempt_id = Some("running".into());
+                saved.lease_owner = Some("owner".into());
+                saved.lease_expires_epoch = Some(55);
+                saved.memory.pipeline_checkpoint = Some(PipelineCheckpoint {
+                    attempt_id: "running".into(),
+                    operation: "VALIDATE".into(),
+                });
+                store.upsert_task(&saved).unwrap();
+                store.conn.execute_batch("INSERT INTO stage_attempts(attempt_id,task_id,stage,model,effort,started_epoch,status,phase,last_liveness_epoch) VALUES('running','SYNTHETIC-1','impl','synthetic','low',1,'RUNNING','RUNNING',1)").unwrap();
+                assert!(
+                    store
+                        .acquire_path_locks(&task.repository, &["*".into()], &task.task_id)
+                        .unwrap()
+                );
+                let raw_decisions = table_rows(&store, "pending_decisions");
+                let raw_attempts = table_rows(&store, "stage_attempts");
+                let raw_locks = table_rows(&store, "path_locks");
+                assert_eq!(store.sync_task(&task).unwrap().status, "Blocked");
+                assert_eq!(store.status_summary().unwrap().open_decisions_count, 1);
+                let cursor = store.max_seq_id().unwrap();
+                task.status = terminal.into();
+                if from_board {
+                    store.sync_task(&task).unwrap();
+                } else {
+                    saved.status = terminal.into();
+                    store.transition_task(&saved, None, false, None).unwrap();
+                }
+                let events = store.list_events_since(None, cursor, 10).unwrap();
+                let mut expected = vec![];
+                if from_board {
+                    expected.push("BOARD_STATUS_OBSERVED");
+                }
+                expected.extend([
+                    if terminal == "Done" {
+                        "TASK_DONE"
+                    } else {
+                        "TASK_STATUS_CHANGED"
+                    },
+                    "DECISION_RETIRED",
+                ]);
+                assert_eq!(
+                    events
+                        .iter()
+                        .map(|event| event.event_type.as_str())
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+                assert_eq!(
+                    events[events.len() - 2].payload["board_status"],
+                    if from_board { terminal } else { "Backlog" }
+                );
+                assert_eq!(store.status_summary().unwrap().open_decisions_count, 0);
+                assert!(store.list_decisions(true, None).unwrap().is_empty());
+                let history = store.list_decisions(false, None).unwrap().remove(0);
+                assert_eq!(history.status, "RETIRED");
+                assert_eq!(history.retirement_reason.as_deref(), Some(terminal));
+                assert_eq!(history.context_summary, "original failure");
+                assert_eq!(history.choice, None);
+                assert!(
+                    store
+                        .open_decision(
+                            "late",
+                            &task.task_id,
+                            &task.task_group,
+                            "failure",
+                            "Late?",
+                            &["Retry stage".into()],
+                            None,
+                            "",
+                            None
+                        )
+                        .is_err()
+                );
+                if from_board {
+                    store.sync_task(&task).unwrap();
+                }
+                drop(store);
+                let mut store = V2Store::open(&db.0).unwrap();
+                store.retire_terminal_decisions().unwrap();
+                assert_eq!(store.list_events_since(None, cursor, 10).unwrap(), events);
+                let mut reopened = store.get_task(&task.task_id).unwrap().unwrap();
+                assert_eq!(reopened.active_attempt_id, saved.active_attempt_id);
+                assert_eq!(reopened.lease_owner, saved.lease_owner);
+                assert_eq!(reopened.lease_expires_epoch, saved.lease_expires_epoch);
+                assert_eq!(
+                    reopened.memory.pipeline_checkpoint,
+                    saved.memory.pipeline_checkpoint
+                );
+                reopened.status = "Ready".into();
+                store.upsert_task(&reopened).unwrap();
+                assert!(matches!(
+                    store
+                        .resolve_decision("stale", "Retry stage", "actor", None)
+                        .unwrap(),
+                    DecisionResolution::NotFound
+                ));
+                assert!(store.list_decisions(true, None).unwrap().is_empty());
+                assert_eq!(table_rows(&store, "pending_decisions"), raw_decisions);
+                assert_eq!(table_rows(&store, "stage_attempts"), raw_attempts);
+                assert_eq!(table_rows(&store, "path_locks"), raw_locks);
+                assert_eq!(store.get_decision("stale").unwrap().unwrap(), history);
+            }
+        }
+    }
+
+    #[test]
+    fn declined_offline_observation_is_idempotent_and_leaves_empty_row_eligible() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        let mut input = terminal_input();
+        let original = sample_task(&input.task_id, "Backlog", vec![]);
+        store.upsert_task(&original).unwrap();
+        let raw = raw_task(&store.conn, &input.task_id).unwrap();
+        input.current_stage = Some("conflicting".into());
+        for _ in 0..2 {
+            store
+                .sync_task_with_mode(&input, SyncMode::ReconcileFinishedLegacy)
+                .unwrap();
+            assert_eq!(raw_task(&store.conn, &input.task_id).unwrap(), raw);
+            assert_eq!(store.max_seq_id().unwrap(), 1);
+        }
+        input.current_stage = None;
+        let accepted = store
+            .sync_task_with_mode(&input, SyncMode::ReconcileFinishedLegacy)
+            .unwrap();
+        assert_eq!(accepted.status, "Done");
+        assert_eq!(store.max_seq_id().unwrap(), 2);
+        let mut expected = raw;
+        expected.insert("status".into(), "Done".to_owned().into());
+        expected.insert("version".into(), accepted.version.into());
+        expected.insert("updated_epoch".into(), accepted.updated_epoch.into());
+        assert_eq!(raw_task(&store.conn, &input.task_id).unwrap(), expected);
+    }
+
+    #[test]
     fn offline_empty_metadata_preserves_raw_rows_events_and_repeats_after_reopen() {
         for terminal in ["Done", "Cancelled"] {
             for status in ["Backlog", "Ready", "In Progress", terminal] {
@@ -3211,7 +4938,6 @@ mod tests {
                     // Native upsert emits Done only on UPDATE, not this initial INSERT.
                     store.conn.execute("UPDATE tasks SET memory_json=?1, context_pack_json=' { } ', stages_completed_json=' [ ] ', depends_on_json=' [ ] '",[memory]).unwrap();
                     let before = raw_task(&store.conn, &t.task_id).unwrap();
-                    let events = table_rows(&store, "task_events");
                     let export = serde_json::json!({"schema_version":2,"tasks":[{"id":t.task_id,"repository":t.repository,"status":terminal,"executor":"external","reviewed_sha":"canonical-review","context_pack":{"base_sha":"canonical-base"},"stages_completed":["manual-complete"],"branch":"task/planned","worktree":"/predeclared","autonomous_consent":!t.autonomous_consent}]});
                     let incoming = crate::v2::intake::decode_export_records(&export.to_string())
                         .unwrap()
@@ -3226,7 +4952,22 @@ mod tests {
                         expected.insert("updated_epoch".into(), out.updated_epoch.into());
                     }
                     assert_eq!(raw_task(&store.conn, &t.task_id).unwrap(), expected);
-                    assert_eq!(table_rows(&store, "task_events"), events);
+                    let events = store.list_task_events(&t.task_id).unwrap();
+                    let mut expected_types = vec!["BOARD_STATUS_OBSERVED"];
+                    if status != terminal {
+                        expected_types.push(if terminal == "Done" {
+                            "TASK_DONE"
+                        } else {
+                            "TASK_STATUS_CHANGED"
+                        });
+                    }
+                    assert_eq!(
+                        events
+                            .iter()
+                            .map(|e| e.event_type.as_str())
+                            .collect::<Vec<_>>(),
+                        expected_types
+                    );
                     for table in [
                         "stage_attempts",
                         "lifecycle_ops",
@@ -3243,6 +4984,7 @@ mod tests {
                         .sync_task_with_mode(&incoming, SyncMode::ReconcileFinishedLegacy)
                         .unwrap();
                     assert_eq!(raw_task(&reopened.conn, &t.task_id).unwrap(), expected);
+                    assert_eq!(reopened.list_task_events(&t.task_id).unwrap(), events);
                 }
             }
         }
@@ -3388,7 +5130,22 @@ mod tests {
         expected.insert("memory_json".into(), after_memory.clone().into());
         assert_eq!(after, expected);
         for (table, rows) in history {
-            assert_eq!(table_rows(&store, table), rows, "{table}");
+            let after = table_rows(&store, table);
+            if table == "task_events" {
+                assert_eq!(after[..rows.len()], rows);
+                assert_eq!(
+                    after[rows.len()..]
+                        .iter()
+                        .map(|row| row[4].clone())
+                        .collect::<Vec<_>>(),
+                    vec![
+                        "BOARD_STATUS_OBSERVED".to_owned().into(),
+                        "TASK_DONE".to_owned().into()
+                    ]
+                );
+            } else {
+                assert_eq!(after, rows, "{table}");
+            }
         }
         store
             .sync_task_with_mode(&terminal_input(), SyncMode::ReconcileFinishedLegacy)
@@ -3429,7 +5186,17 @@ mod tests {
                 .unwrap();
             assert_eq!(raw_task(&store.conn, "SYNTHETIC-1").unwrap(), before);
             for (t, rows) in tables {
-                assert_eq!(table_rows(&store, t), rows);
+                let after = table_rows(&store, t);
+                if t == "task_events" {
+                    assert_eq!(after.len(), rows.len() + 1);
+                    assert_eq!(after[..rows.len()], rows);
+                    assert_eq!(
+                        after[rows.len()][4],
+                        "BOARD_STATUS_OBSERVED".to_owned().into()
+                    );
+                } else {
+                    assert_eq!(after, rows);
+                }
             }
         }
         for finished in [false, true] {
@@ -4769,6 +6536,89 @@ mod tests {
     }
 
     #[test]
+    fn terminal_exports_do_not_retire_an_unverified_linked_delivery_gate() {
+        for terminal in ["Done", "Cancelled"] {
+            let db = LegacyTestDb::new();
+            let mut store = V2Store::open(&db.0).unwrap();
+            let task = delivery_task("Pending Prod Promotion");
+            let mut row = sample_delivery(&task);
+            let id = row.decision_id.clone().unwrap();
+            store
+                .save_deliveries_and_task(&task, std::slice::from_ref(&row))
+                .unwrap();
+            let mut incoming = task.clone();
+            incoming.status = terminal.into();
+            // The persisted link protects the checkpoint before the gate is published.
+            assert_eq!(store.sync_task(&incoming).unwrap().status, task.status);
+            let original = store
+                .open_decision(
+                    &id,
+                    &task.task_id,
+                    &task.task_group,
+                    "prod_promotion_approval",
+                    "Promote?",
+                    &["Approve".into(), "Reject".into()],
+                    None,
+                    "hold",
+                    None,
+                )
+                .unwrap();
+            let unrelated = store
+                .open_decision(
+                    "newer",
+                    &task.task_id,
+                    &task.task_group,
+                    "failure",
+                    "Retry?",
+                    &["Retry stage".into()],
+                    None,
+                    "unrelated",
+                    None,
+                )
+                .unwrap();
+            assert!(original.linked_unverified_delivery);
+            assert!(!unrelated.linked_unverified_delivery);
+            assert!(unrelated.created_seq > original.created_seq);
+            let cursor = store.max_seq_id().unwrap();
+            drop(store);
+            let mut store = V2Store::open(&db.0).unwrap();
+            store.retire_terminal_decisions().unwrap();
+            for mode in [
+                SyncMode::Standard,
+                SyncMode::ReconcileFinishedLegacy,
+                SyncMode::Standard,
+            ] {
+                let saved = store.sync_task_with_mode(&incoming, mode).unwrap();
+                assert_eq!(saved.status, task.status);
+                assert!(!saved.memory.governance_terminal_observed);
+                assert_eq!(store.list_deliveries(None).unwrap(), vec![row.clone()]);
+                assert_eq!(
+                    store.list_decisions(true, None).unwrap(),
+                    vec![original.clone(), unrelated.clone()]
+                );
+                assert_eq!(store.board_statuses(None).unwrap()[&task.task_id], terminal);
+                let detail = store.detailed_status(None).unwrap();
+                assert_eq!(
+                    detail.waiting_tasks[0].open_decision_id.as_deref(),
+                    Some(id.as_str())
+                );
+                assert_eq!(store.max_seq_id().unwrap(), cursor);
+            }
+            row.state = "verified".into();
+            store.upsert_delivery(&row).unwrap();
+            assert_eq!(store.sync_task(&incoming).unwrap().status, terminal);
+            assert_eq!(store.get_decision(&id).unwrap().unwrap().status, "RETIRED");
+            assert!(matches!(
+                store
+                    .resolve_decision(&id, "Approve", "actor", None)
+                    .unwrap(),
+                DecisionResolution::NotFound
+            ));
+            assert_eq!(store.list_deliveries(None).unwrap(), vec![row]);
+        }
+    }
+
+    #[test]
     fn delivery_decision_resolution_is_atomic_and_retries_do_not_reopen_implementation() {
         let mut store = V2Store::open_in_memory().unwrap();
         let task = delivery_task("Pending Prod Promotion");
@@ -5068,19 +6918,21 @@ mod tests {
                     .save_deliveries_and_task(&stale_task, std::slice::from_ref(&stale_row))
                     .is_err()
             );
-            terminal_store
-                .open_decision(
-                    "late-delivery-gate",
-                    &stale_task.task_id,
-                    &stale_task.task_group,
-                    "delivery_contract_error",
-                    "Retry delivery?",
-                    &["Retry".into(), "Abort".into()],
-                    None,
-                    "late observation",
-                    Some(&stale_row.merge_sha),
-                )
-                .unwrap();
+            assert!(
+                terminal_store
+                    .open_decision(
+                        "late-delivery-gate",
+                        &stale_task.task_id,
+                        &stale_task.task_group,
+                        "delivery_contract_error",
+                        "Retry delivery?",
+                        &["Retry".into(), "Abort".into()],
+                        None,
+                        "late observation",
+                        Some(&stale_row.merge_sha),
+                    )
+                    .is_err()
+            );
             assert_eq!(
                 terminal_store
                     .get_task(&stale_task.task_id)
@@ -5234,6 +7086,804 @@ mod tests {
                 .filter(|e| e.event_type == "POST_MERGE_DELIVERY_VERIFIED")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn sync_task_blocked_to_ready_resets_retry_count_and_preserves_runtime_memory() {
+        let mut store = V2Store::open_in_memory().unwrap();
+
+        // Case 1: zach-owned task in Blocked state re-readied via board sync
+        let mut zach_task = sample_task("ZACH-901", "Blocked", vec![]);
+        zach_task.executor = Some("zach".into());
+        zach_task.retry_count = 3;
+        zach_task.next_retry_epoch = 9999;
+        zach_task.stages_completed = vec!["plan".into(), "plan-review".into()];
+        zach_task.current_stage = Some("impl".into());
+        zach_task.reviewed_sha = Some("deadbeef".into());
+        zach_task.memory.halt_requested = true;
+        zach_task.memory.retry_generation = 2;
+        zach_task.memory.fallback_stages = vec!["impl".into()];
+        store.upsert_task(&zach_task).unwrap();
+
+        let mut incoming_zach = sample_task("ZACH-901", "Ready", vec![]);
+        incoming_zach.executor = Some("zach".into());
+        let synced_zach = store
+            .sync_task_with_mode(&incoming_zach, SyncMode::Standard)
+            .unwrap();
+        assert_eq!(synced_zach.status, "Ready");
+        assert_eq!(synced_zach.retry_count, 0);
+        assert_eq!(synced_zach.next_retry_epoch, 0);
+        assert!(!synced_zach.memory.halt_requested);
+        assert_eq!(synced_zach.memory.retry_generation, 3);
+        assert!(synced_zach.memory.retry_reset_epoch > 0);
+        assert_eq!(
+            synced_zach.stages_completed,
+            vec!["plan".to_owned(), "plan-review".to_owned()]
+        );
+        assert_eq!(synced_zach.reviewed_sha.as_deref(), Some("deadbeef"));
+        assert_eq!(synced_zach.memory.fallback_stages, vec!["impl".to_owned()]);
+
+        // Case 2: non-zach task in Blocked state re-readied via board sync
+        let mut ext_task = sample_task("ZACH-902", "Blocked", vec![]);
+        ext_task.executor = None;
+        ext_task.retry_count = 4;
+        ext_task.next_retry_epoch = 8888;
+        ext_task.reviewed_sha = Some("cafebabe".into());
+        ext_task.memory.halt_requested = true;
+        ext_task.memory.retry_generation = 1;
+        ext_task.memory.fallback_stages = vec!["plan".into()];
+        store.upsert_task(&ext_task).unwrap();
+
+        let mut incoming_ext = sample_task("ZACH-902", "Ready", vec![]);
+        incoming_ext.executor = None;
+        let synced_ext = store
+            .sync_task_with_mode(&incoming_ext, SyncMode::Standard)
+            .unwrap();
+        assert_eq!(synced_ext.status, "Ready");
+        assert_eq!(synced_ext.retry_count, 0);
+        assert_eq!(synced_ext.next_retry_epoch, 0);
+        assert!(!synced_ext.memory.halt_requested);
+        assert_eq!(synced_ext.memory.retry_generation, 2);
+        assert!(synced_ext.memory.retry_reset_epoch > 0);
+        assert_eq!(synced_ext.reviewed_sha.as_deref(), Some("cafebabe"));
+        assert_eq!(synced_ext.memory.fallback_stages, vec!["plan".to_owned()]);
+    }
+
+    #[test]
+    fn normalize_repo_path_and_paths_overlap_are_segment_aware() {
+        assert_eq!(normalize_repo_path(""), "*");
+        assert_eq!(normalize_repo_path("."), "*");
+        assert_eq!(normalize_repo_path("./"), "*");
+        assert_eq!(normalize_repo_path("*"), "*");
+        assert_eq!(normalize_repo_path("./src//v2/"), "src/v2");
+        assert_eq!(
+            normalize_repo_path("././src/v2/store.rs"),
+            "src/v2/store.rs"
+        );
+
+        assert!(paths_overlap("./src/v2/", "src//v2/store.rs"));
+        assert!(paths_overlap("src/v2/store.rs", "src"));
+        assert!(paths_overlap("*", "src/v2/store.rs"));
+        assert!(paths_overlap(".", "src/v2/store.rs"));
+        assert!(!paths_overlap("src", "src2"));
+        assert!(!paths_overlap("src/v2/store.rs", "src/v2/scheduler.rs"));
+    }
+
+    #[test]
+    fn detailed_status_reports_wait_reasons_active_details_and_group_filter() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        store.set_max_parallel_tasks(3).unwrap();
+
+        let mut active_session = sample_task("ZACH-1", "In Progress", vec![]);
+        active_session.repository = "zach".to_owned();
+        active_session.task_group = "ZACH".to_owned();
+        active_session.executor = Some("session".to_owned());
+        active_session.autonomous_consent = false;
+        active_session.current_stage = None;
+        active_session.context_pack.target_files = vec![TargetFileSpec {
+            path: "./src/v2/store.rs".to_owned(),
+            ..Default::default()
+        }];
+        store.upsert_task(&active_session).unwrap();
+
+        let mut done_dep = sample_task("ZACH-0", "Done", vec![]);
+        done_dep.task_group = "ZACH".to_owned();
+        store.upsert_task(&done_dep).unwrap();
+
+        let mut pending_dep = sample_task("ZACH-DEP", "Backlog", vec![]);
+        pending_dep.task_group = "ZACH".to_owned();
+        store.upsert_task(&pending_dep).unwrap();
+
+        let mut w_consent = sample_task("ZACH-2", "Ready", vec![]);
+        w_consent.task_group = "ZACH".to_owned();
+        w_consent.autonomous_consent = false;
+        store.upsert_task(&w_consent).unwrap();
+
+        let mut w_decision = sample_task("ZACH-3", "Ready", vec![]);
+        w_decision.task_group = "ZACH".to_owned();
+        store.upsert_task(&w_decision).unwrap();
+        store
+            .open_decision(
+                "DEC-3",
+                "ZACH-3",
+                "ZACH",
+                "clarification",
+                "Need answer",
+                &["ok".into()],
+                Some(0),
+                "context",
+                None,
+            )
+            .unwrap();
+
+        let mut w_lifecycle = sample_task("ZACH-4", "Ready", vec![]);
+        w_lifecycle.task_group = "ZACH".to_owned();
+        store.upsert_task(&w_lifecycle).unwrap();
+        store
+            .enqueue_lifecycle(&LifecycleOperation {
+                attempt_id: None,
+                decision_id: None,
+                operation_id: "op-4".to_owned(),
+                task_id: "ZACH-4".to_owned(),
+                kind: "label_sync".to_owned(),
+                args: vec![],
+                body_path: None,
+                depends_on: None,
+                state: "PENDING".to_owned(),
+                retry_epoch: 0,
+                attempts: 0,
+                last_error: None,
+            })
+            .unwrap();
+
+        let mut w_backoff = sample_task("ZACH-5", "Ready", vec![]);
+        w_backoff.task_group = "ZACH".to_owned();
+        w_backoff.next_retry_epoch = now_epoch() + 300;
+        store.upsert_task(&w_backoff).unwrap();
+
+        let mut w_dep = sample_task("ZACH-6", "Ready", vec!["ZACH-DEP".to_owned()]);
+        w_dep.task_group = "ZACH".to_owned();
+        store.upsert_task(&w_dep).unwrap();
+
+        let mut w_path_conflict = sample_task("ZACH-7", "Ready", vec!["ZACH-0".to_owned()]);
+        w_path_conflict.repository = "zach".to_owned();
+        w_path_conflict.task_group = "ZACH".to_owned();
+        w_path_conflict.context_pack.target_files = vec![TargetFileSpec {
+            path: "src/v2".to_owned(),
+            ..Default::default()
+        }];
+        store.upsert_task(&w_path_conflict).unwrap();
+
+        let mut w_repo_locked = sample_task("ZACH-8", "Ready", vec![]);
+        w_repo_locked.repository = "zach".to_owned();
+        w_repo_locked.task_group = "ZACH".to_owned();
+        store.upsert_task(&w_repo_locked).unwrap();
+
+        let mut w_eligible = sample_task("OTHER-1", "Ready", vec![]);
+        w_eligible.repository = "other-repo".to_owned();
+        w_eligible.task_group = "OTHER".to_owned();
+        store.upsert_task(&w_eligible).unwrap();
+
+        let report = store.detailed_status(None).unwrap();
+        assert_eq!(report.active_tasks.len(), 1);
+        assert_eq!(report.active_tasks[0].task_id, "ZACH-1");
+        assert_eq!(report.active_tasks[0].reservation, "scoped_paths");
+        assert!(!report.active_tasks[0].occupies_slot);
+
+        let reasons: BTreeMap<String, String> = report
+            .waiting_tasks
+            .iter()
+            .map(|w| (w.task_id.clone(), w.wait_reason.clone()))
+            .collect();
+        assert_eq!(reasons["ZACH-2"], "awaiting_consent");
+        assert_eq!(reasons["ZACH-3"], "open_decision");
+        assert_eq!(reasons["ZACH-4"], "pending_lifecycle");
+        assert_eq!(reasons["ZACH-5"], "retry_backoff");
+        assert_eq!(reasons["ZACH-6"], "dependency:ZACH-DEP");
+        assert_eq!(reasons["ZACH-7"], "path_conflict:ZACH-1:src/v2");
+        assert_eq!(reasons["ZACH-8"], "repo_locked:ZACH-1");
+        assert_eq!(reasons["OTHER-1"], "eligible");
+
+        let filtered = store.detailed_status(Some("OTHER")).unwrap();
+        assert!(filtered.active_tasks.is_empty());
+        assert_eq!(filtered.waiting_tasks.len(), 1);
+        assert_eq!(filtered.waiting_tasks[0].task_id, "OTHER-1");
+        assert!(filtered.open_decisions.is_empty());
+
+        store.set_max_parallel_tasks(1).unwrap();
+        let mut native_active = sample_task("NATIVE-1", "In Progress", vec![]);
+        native_active.repository = "native-repo".to_owned();
+        native_active.task_group = "NATIVE".to_owned();
+        native_active.current_stage = Some("impl".to_owned());
+        store.upsert_task(&native_active).unwrap();
+        assert!(
+            store
+                .acquire_path_locks("native-repo", &["*".to_owned()], "NATIVE-1")
+                .unwrap()
+        );
+        let no_slots = store.detailed_status(Some("OTHER")).unwrap();
+        assert_eq!(no_slots.waiting_tasks[0].wait_reason, "no_free_slots");
+        assert!(no_slots.path_locks.is_empty());
+        let native_report = store.detailed_status(Some("NATIVE")).unwrap();
+        assert_eq!(native_report.path_locks.len(), 1);
+        assert_eq!(native_report.path_locks[0].task_id, "NATIVE-1");
+    }
+
+    #[test]
+    fn sync_task_idle_reset_resets_backlog_ready_and_preserves_blocked_ready_and_active_guards() {
+        let mut store = V2Store::open_in_memory().unwrap();
+
+        let make_started = |id: &str, status: &str| {
+            let mut t = sample_task(id, status, vec![]);
+            t.executor = Some("zach".into());
+            t.weight = "M".into();
+            t.current_stage = Some("impl".into());
+            t.stages_completed = vec!["plan".into(), "plan-review".into()];
+            t.memory.governance_started = true;
+            t
+        };
+
+        let insert_ack_start = |store: &mut V2Store, id: &str| {
+            let op_id = format!("start-{id}-v1");
+            let op = LifecycleOperation {
+                attempt_id: None,
+                decision_id: None,
+                operation_id: op_id.clone(),
+                task_id: id.into(),
+                kind: "start".into(),
+                args: vec!["start".into(), id.into()],
+                body_path: None,
+                depends_on: None,
+                state: "ACKNOWLEDGED".into(),
+                retry_epoch: 0,
+                attempts: 1,
+                last_error: None,
+            };
+            store.enqueue_lifecycle(&op).unwrap();
+            store
+                .connection_mut()
+                .execute(
+                    "UPDATE lifecycle_ops SET state='ACKNOWLEDGED' WHERE operation_id=?1",
+                    [&op_id],
+                )
+                .unwrap();
+        };
+
+        // 1. Idle In Progress -> Backlog: resets status, current_stage, governance_started, releases path_locks, retires start op.
+        let t1 = make_started("IDLE-BACKLOG", "In Progress");
+        store.upsert_task(&t1).unwrap();
+        assert!(
+            store
+                .acquire_path_locks("zach", &["*".into()], "IDLE-BACKLOG")
+                .unwrap()
+        );
+        insert_ack_start(&mut store, "IDLE-BACKLOG");
+        let mut incoming1 = sample_task("IDLE-BACKLOG", "Backlog", vec![]);
+        incoming1.executor = Some("zach".into());
+        let synced1 = store.sync_task(&incoming1).unwrap();
+        assert_eq!(synced1.status, "Backlog");
+        assert!(synced1.current_stage.is_none());
+        assert!(!synced1.memory.governance_started);
+        assert!(
+            store
+                .lifecycle_ops()
+                .unwrap()
+                .into_iter()
+                .all(|op| op.task_id != "IDLE-BACKLOG")
+        );
+        assert!(
+            store
+                .acquire_path_locks("zach", &["*".into()], "OTHER-TASK")
+                .unwrap()
+        );
+        assert_eq!(store.release_path_locks("OTHER-TASK").unwrap(), 1);
+
+        // 2. Idle In Progress -> Ready: resets status, current_stage, governance_started, retires start op.
+        let t2 = make_started("IDLE-READY", "In Progress");
+        store.upsert_task(&t2).unwrap();
+        insert_ack_start(&mut store, "IDLE-READY");
+        let mut incoming2 = sample_task("IDLE-READY", "Ready", vec![]);
+        incoming2.executor = Some("zach".into());
+        let synced2 = store.sync_task(&incoming2).unwrap();
+        assert_eq!(synced2.status, "Ready");
+        assert!(synced2.current_stage.is_none());
+        assert!(!synced2.memory.governance_started);
+        assert!(
+            store
+                .lifecycle_ops()
+                .unwrap()
+                .into_iter()
+                .all(|op| op.task_id != "IDLE-READY")
+        );
+
+        // 3. Idle Done -> Ready (without verified delivery): resets governance_started.
+        let t3 = make_started("DONE-READY", "Done");
+        store.upsert_task(&t3).unwrap();
+        let mut incoming3 = sample_task("DONE-READY", "Ready", vec![]);
+        incoming3.executor = Some("zach".into());
+        let synced3 = store.sync_task(&incoming3).unwrap();
+        assert_eq!(synced3.status, "Ready");
+        assert!(synced3.current_stage.is_none());
+        assert!(!synced3.memory.governance_started);
+
+        // 4. Idle Blocked -> Backlog: resets governance_started and releases path_locks.
+        let t4 = make_started("BLOCKED-BACKLOG", "Blocked");
+        store.upsert_task(&t4).unwrap();
+        assert!(
+            store
+                .acquire_path_locks("zach", &["*".into()], "BLOCKED-BACKLOG")
+                .unwrap()
+        );
+        let mut incoming4 = sample_task("BLOCKED-BACKLOG", "Backlog", vec![]);
+        incoming4.executor = Some("zach".into());
+        let synced4 = store.sync_task(&incoming4).unwrap();
+        assert_eq!(synced4.status, "Backlog");
+        assert!(synced4.current_stage.is_none());
+        assert!(!synced4.memory.governance_started);
+        assert!(
+            store
+                .acquire_path_locks("zach", &["*".into()], "OTHER-TASK-2")
+                .unwrap()
+        );
+        assert_eq!(store.release_path_locks("OTHER-TASK-2").unwrap(), 1);
+
+        // 5. Blocked -> Ready recovery: preserves stages_completed, weight, context_pack, and governance_started.
+        let mut t5 = make_started("BLOCKED-READY", "Blocked");
+        t5.context_pack.weight = "M".into();
+        store.upsert_task(&t5).unwrap();
+        let mut incoming5 = sample_task("BLOCKED-READY", "Ready", vec![]);
+        incoming5.executor = Some("zach".into());
+        incoming5.weight = "XS".into();
+        let synced5 = store.sync_task(&incoming5).unwrap();
+        assert_eq!(synced5.status, "Ready");
+        assert_eq!(synced5.weight, "M");
+        assert_eq!(synced5.context_pack.weight, "M");
+        assert_eq!(synced5.stages_completed, vec!["plan", "plan-review"]);
+        assert!(synced5.memory.governance_started);
+
+        // 6. Verified delivery Done -> Ready: preserved.
+        let t6 = make_started("VERIFIED-DONE", "Done");
+        store.upsert_task(&t6).unwrap();
+        store
+            .connection_mut()
+            .execute(
+                "INSERT INTO post_merge_deliveries(delivery_id,task_id,repository,github_repo,merge_sha,kind,name,state,workflow,updated_epoch) VALUES('del-1','VERIFIED-DONE','zach','owner/repo','sha','test','test','verified','test',100)",
+                [],
+            )
+            .unwrap();
+        let mut incoming6 = sample_task("VERIFIED-DONE", "Ready", vec![]);
+        incoming6.executor = Some("zach".into());
+        let synced6 = store.sync_task(&incoming6).unwrap();
+        assert_eq!(synced6.status, "Done");
+        assert!(synced6.memory.governance_started);
+
+        // 7. OPEN decision task Blocked -> Backlog: preserved.
+        let t7 = make_started("OPEN-DEC", "In Progress");
+        store.upsert_task(&t7).unwrap();
+        store
+            .open_decision(
+                "DEC-OPEN",
+                "OPEN-DEC",
+                "zach",
+                "plan_approval",
+                "Approve?",
+                &["approve".into()],
+                None,
+                "ctx",
+                None,
+            )
+            .unwrap();
+        let mut incoming7 = sample_task("OPEN-DEC", "Backlog", vec![]);
+        incoming7.executor = Some("zach".into());
+        let synced7 = store.sync_task(&incoming7).unwrap();
+        assert_eq!(synced7.status, "Blocked");
+        assert!(synced7.memory.governance_started);
+
+        // 8. Active attempt In Progress -> Ready: preserved.
+        let mut t8 = make_started("ACTIVE-ATT", "In Progress");
+        t8.active_attempt_id = Some("att-1".into());
+        store.upsert_task(&t8).unwrap();
+        let mut incoming8 = sample_task("ACTIVE-ATT", "Ready", vec![]);
+        incoming8.executor = Some("zach".into());
+        let synced8 = store.sync_task(&incoming8).unwrap();
+        assert_eq!(synced8.status, "In Progress");
+        assert!(synced8.memory.governance_started);
+    }
+
+    #[test]
+    fn provider_cooldowns_persist_across_store_reopen_and_clear() {
+        let dir = std::env::temp_dir().join(format!(
+            "zach-store-cooldown-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("zach.db");
+        let future = now_epoch() + 3600;
+
+        {
+            let mut store = V2Store::open(&db_path).unwrap();
+            store
+                .upsert_provider_cooldown("openai-sol", future, "usage limit reached")
+                .unwrap();
+            store
+                .upsert_provider_cooldown("gemini-agy", future + 120, "429 resource exhausted")
+                .unwrap();
+        }
+
+        {
+            let mut reopened = V2Store::open(&db_path).unwrap();
+            let now = now_epoch();
+            let active = reopened
+                .get_active_provider_cooldown("openai-sol", now)
+                .unwrap();
+            assert!(active.is_some());
+            let rec = active.unwrap();
+            assert_eq!(rec.family, "openai-sol");
+            assert_eq!(rec.until_epoch, future);
+            assert_eq!(rec.reason, "usage limit reached");
+
+            let listed = reopened.list_provider_cooldowns(Some(now)).unwrap();
+            assert_eq!(listed.len(), 2);
+            assert!(
+                reopened
+                    .get_active_provider_cooldown("openai-sol", future + 1)
+                    .unwrap()
+                    .is_none()
+            );
+
+            assert_eq!(
+                reopened
+                    .clear_provider_cooldown(Some("openai-sol"))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                reopened.list_provider_cooldowns(Some(now)).unwrap().len(),
+                1
+            );
+            assert_eq!(reopened.clear_provider_cooldown(None).unwrap(), 1);
+            assert!(reopened.list_provider_cooldowns(None).unwrap().is_empty());
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn active_attempt_ids_tracks_in_flight_references_excludes_terminal_and_fails_closed() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        let now = now_epoch();
+
+        // 1. Active/non-terminal task referencing active_attempt_id, pipeline_checkpoint,
+        //    suspended_impl_attempt_id, and last_pr_review_evidence_path.
+        let mut active_task = sample_task("ZACH-071-ACTIVE", "In Progress", vec![]);
+        active_task.active_attempt_id = Some("att-task-active".into());
+        active_task.memory.pipeline_checkpoint = Some(PipelineCheckpoint {
+            attempt_id: "att-checkpoint".into(),
+            operation: "VALIDATE".into(),
+        });
+        active_task.memory.suspended_impl_attempt_id = Some("att-suspended".into());
+        active_task.memory.last_pr_review_evidence_path =
+            Some("/var/lib/zach/attempts/att-evidence/stage-evidence.md".into());
+        store.upsert_task(&active_task).unwrap();
+
+        // 2. Terminal ("Done") task whose memory still holds old checkpoint/evidence paths:
+        //    its historical memory references must NOT protect expired attempt dirs.
+        let mut done_task = sample_task("ZACH-071-DONE", "Done", vec![]);
+        done_task.memory.pipeline_checkpoint = Some(PipelineCheckpoint {
+            attempt_id: "att-done-checkpoint".into(),
+            operation: "VALIDATE".into(),
+        });
+        done_task.memory.last_pr_review_evidence_path =
+            Some("/var/lib/zach/attempts/att-done-evidence/stage-evidence.md".into());
+        store.upsert_task(&done_task).unwrap();
+
+        // 3. Stage attempts: one non-COMPLETE, one ended_epoch=None, one RUNNING, one COMPLETE.
+        let make_attempt =
+            |id: &str, task_id: &str, phase: &str, status: &str, ended: Option<i64>| {
+                StageAttemptRecord {
+                    attempt_id: id.into(),
+                    task_id: task_id.into(),
+                    stage: "impl".into(),
+                    model: "gemini-4-hydrogen-high".into(),
+                    effort: "high".into(),
+                    systemd_unit: None,
+                    invocation_id: None,
+                    started_epoch: now - 100,
+                    ended_epoch: ended,
+                    status: status.into(),
+                    failure_class: None,
+                    summary: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    total_tokens: None,
+                    sha_before: None,
+                    sha_after: None,
+                    phase: phase.into(),
+                    last_liveness_epoch: now,
+                    last_output_bytes: 0,
+                    last_cpu_usage_usec: None,
+                    control_group: None,
+                    exit_code: None,
+                    exit_code_kind: None,
+                    retry_generation: 0,
+                }
+            };
+        store
+            .record_stage_attempt(&make_attempt(
+                "att-harvested",
+                "ZACH-071-ACTIVE",
+                "HARVESTED",
+                "PASSED",
+                Some(now),
+            ))
+            .unwrap();
+        store
+            .record_stage_attempt(&make_attempt(
+                "att-no-end",
+                "ZACH-071-ACTIVE",
+                "COMPLETE",
+                "PASSED",
+                None,
+            ))
+            .unwrap();
+        store
+            .record_stage_attempt(&make_attempt(
+                "att-running",
+                "ZACH-071-ACTIVE",
+                "COMPLETE",
+                "RUNNING",
+                Some(now),
+            ))
+            .unwrap();
+        store
+            .record_stage_attempt(&make_attempt(
+                "att-finished",
+                "ZACH-071-DONE",
+                "COMPLETE",
+                "PASSED",
+                Some(now - 50),
+            ))
+            .unwrap();
+
+        // 4. Lifecycle ops: one PENDING (with attempt_id and body_path), one ACKNOWLEDGED.
+        store
+            .conn
+            .execute(
+                "INSERT INTO lifecycle_ops(operation_id,task_id,kind,args_json,body_path,state,created_epoch,updated_epoch,attempt_id)
+                 VALUES('op-pending','ZACH-071-ACTIVE','stage','[]','/state/attempts/att-op-body/body.md','PENDING',1,1,'att-op-id')",
+                [],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO lifecycle_ops(operation_id,task_id,kind,args_json,body_path,state,created_epoch,updated_epoch,attempt_id)
+                 VALUES('op-acked','ZACH-071-DONE','stage','[]','/state/attempts/att-acked-body/body.md','ACKNOWLEDGED',1,1,'att-acked-id')",
+                [],
+            )
+            .unwrap();
+
+        let ids = store.active_attempt_ids().unwrap();
+        for expected in [
+            "att-task-active",
+            "att-checkpoint",
+            "att-suspended",
+            "att-evidence",
+            "att-harvested",
+            "att-no-end",
+            "att-running",
+            "att-op-id",
+            "att-op-body",
+        ] {
+            assert!(
+                ids.contains(expected),
+                "missing expected active id {expected} in {ids:?}"
+            );
+        }
+        for excluded in [
+            "att-finished",
+            "att-done-checkpoint",
+            "att-done-evidence",
+            "att-acked-id",
+            "att-acked-body",
+        ] {
+            assert!(
+                !ids.contains(excluded),
+                "unexpected terminal id {excluded} in {ids:?}"
+            );
+        }
+
+        // 5. Fail closed when a non-terminal task has corrupt memory_json.
+        store
+            .conn
+            .execute(
+                "UPDATE tasks SET memory_json = '{not-valid-json' WHERE task_id = 'ZACH-071-ACTIVE'",
+                [],
+            )
+            .unwrap();
+        let err = store.active_attempt_ids().unwrap_err();
+        assert!(
+            err.0
+                .contains("decode task memory_json in active_attempt_ids"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn attempt_audits_migration_and_round_trip_persistence() {
+        let db = LegacyTestDb::new();
+        let db_path = &db.0;
+
+        // Pre-seed a partial attempt_audits table with an existing row to verify
+        // additive migration with SQLite DEFAULT clauses works on non-empty tables.
+        {
+            let conn = Connection::open(db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE attempt_audits (
+                     attempt_id TEXT PRIMARY KEY
+                 );
+                 INSERT INTO attempt_audits(attempt_id) VALUES('att-legacy-1');",
+            )
+            .unwrap();
+        }
+
+        let mut store = V2Store::open(db_path).expect("migrate partial attempt_audits table");
+        let legacy = store
+            .get_attempt_audit("att-legacy-1")
+            .unwrap()
+            .expect("legacy row preserved");
+        assert_eq!(legacy.attempt_id, "att-legacy-1");
+        assert_eq!(legacy.task_id, "");
+        assert_eq!(legacy.stage, "");
+        assert_eq!(legacy.turn_count, 0);
+        assert!(!legacy.check_divergence);
+
+        let rec = AttemptAuditRecord {
+            attempt_id: "att-1".to_owned(),
+            task_id: "ZACH-072".to_owned(),
+            stage: "impl".to_owned(),
+            turn_count: 4,
+            tool_call_count: 11,
+            tool_error_count: 2,
+            edit_compile_fail_loops: 1,
+            redundant_read_count: 3,
+            cached_input_tokens: Some(420),
+            reasoning_tokens: Some(95),
+            check_divergence: false,
+            error_code: Some("api_key=secret123456 failure".to_owned()),
+            created_epoch: 1_700_000_001,
+        };
+        store.record_attempt_audit(&rec).unwrap();
+
+        let loaded = store.get_attempt_audit("att-1").unwrap().unwrap();
+        assert_eq!(loaded.turn_count, 4);
+        assert_eq!(loaded.tool_call_count, 11);
+        assert_eq!(loaded.tool_error_count, 2);
+        assert_eq!(loaded.edit_compile_fail_loops, 1);
+        assert_eq!(loaded.redundant_read_count, 3);
+        assert_eq!(loaded.cached_input_tokens, Some(420));
+        assert_eq!(loaded.reasoning_tokens, Some(95));
+        assert!(!loaded.check_divergence);
+        assert_eq!(
+            loaded.error_code.as_deref(),
+            Some("[REDACTED_CREDENTIAL] failure")
+        );
+
+        // Marking check_divergence persists even if record_attempt_audit is called again with false.
+        store
+            .mark_attempt_check_divergence("att-1", "ZACH-072", "impl", Some("semantic"))
+            .unwrap();
+        store.record_attempt_audit(&rec).unwrap();
+        let after_div = store.get_attempt_audit("att-1").unwrap().unwrap();
+        assert!(after_div.check_divergence);
+
+        let list = store.list_attempt_audits("ZACH-072").unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].attempt_id, "att-1");
+    }
+
+    #[test]
+    fn zach_080_startup_guard_accepts_lost_complete_only_for_confirmed_terminal_rows() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        let mut task = sample_task("GOV-066", "Done", vec![]);
+        task.executor = None;
+        task.active_attempt_id = None;
+        task.memory.governance_terminal_observed = true;
+        store.upsert_task(&task).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO stage_attempts(attempt_id,task_id,stage,model,effort,started_epoch,ended_epoch,status,phase) \
+                 VALUES('gov-066-plan-lost','GOV-066','plan','gemini-4-hydrogen-high','high',100,200,'LOST','COMPLETE')",
+            )
+            .unwrap();
+
+        // 1. Confirmed Done with LOST/COMPLETE historical attempt passes as closed history (not native-owned).
+        assert_eq!(store.native_startup_owned(&task).unwrap(), false);
+
+        // 2. Confirmed Cancelled with LOST/COMPLETE also passes as closed history.
+        task.status = "Cancelled".to_owned();
+        store.upsert_task(&task).unwrap();
+        assert_eq!(store.native_startup_owned(&task).unwrap(), false);
+
+        // 3. Same row without governance_terminal_observed still fails closed.
+        task.status = "Done".to_owned();
+        task.memory.governance_terminal_observed = false;
+        store.upsert_task(&task).unwrap();
+        let err = store.native_startup_owned(&task).unwrap_err();
+        assert!(
+            err.to_string().contains("ambiguous native startup history"),
+            "unexpected error: {err}"
+        );
+
+        // 4. Same row in Planning (even with governance_terminal_observed=true) still fails closed.
+        task.status = "Planning".to_owned();
+        task.memory.governance_terminal_observed = true;
+        store.upsert_task(&task).unwrap();
+        let err = store.native_startup_owned(&task).unwrap_err();
+        assert!(
+            err.to_string().contains("ambiguous native startup history"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn sync_task_emits_claim_conflict_and_consent_revocation_events() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        let mut task = sample_task("ZACH-790", "In Progress", vec![]);
+        task.status = "In Progress".to_owned();
+        task.executor = Some("zach".to_owned());
+        task.autonomous_consent = true;
+        task.active_attempt_id = Some("att-live-790".to_owned());
+        store.upsert_task(&task).unwrap();
+
+        // 1. Foreign executor takeover during active zach attempt emits CLAIM_CONFLICT_OBSERVED + CLAIM_CHANGED
+        let mut incoming_conflict = task.clone();
+        incoming_conflict.executor = Some("session".to_owned());
+        incoming_conflict.active_attempt_id = None;
+        let synced = store
+            .sync_task_with_mode(&incoming_conflict, SyncMode::Standard)
+            .unwrap();
+        assert!(!synced.autonomous_consent);
+        let events = store.list_events_since(None, 0, 100).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_type == "CLAIM_CONFLICT_OBSERVED" && e.task_id == "ZACH-790"),
+            "expected CLAIM_CONFLICT_OBSERVED event, got: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| {
+                e.event_type == "CLAIM_CHANGED"
+                    && e.task_group == crate::v2::socket::SESSION_GROUP_NAME
+            }),
+            "expected CLAIM_CHANGED event on _sessions group, got: {events:?}"
+        );
+
+        // 2. External consent revocation (without foreign executor) emits CONSENT_REVOKED_EXTERNALLY
+        let mut task2 = sample_task("ZACH-791", "In Progress", vec![]);
+        task2.status = "In Progress".to_owned();
+        task2.executor = Some("zach".to_owned());
+        task2.autonomous_consent = true;
+        task2.active_attempt_id = Some("att-live-791".to_owned());
+        store.upsert_task(&task2).unwrap();
+
+        let mut incoming_revoke = task2.clone();
+        incoming_revoke.autonomous_consent = false;
+        incoming_revoke.active_attempt_id = None;
+        store
+            .sync_task_with_mode(&incoming_revoke, SyncMode::Standard)
+            .unwrap();
+        let events2 = store.list_events_since(None, 0, 100).unwrap();
+        assert!(
+            events2
+                .iter()
+                .any(|e| e.event_type == "CONSENT_REVOKED_EXTERNALLY" && e.task_id == "ZACH-791"),
+            "expected CONSENT_REVOKED_EXTERNALLY event, got: {events2:?}"
         );
     }
 }

@@ -61,6 +61,7 @@ async function fixture(
     post?: number;
     unknown?: boolean;
     replay?: boolean;
+    access?: boolean;
   } = {},
 ) {
   let snapshots = 0,
@@ -70,9 +71,14 @@ async function fixture(
   const base = opts.empty ? { ...data, tasks: [], open_decisions: [] } : data;
   await page.route("**/api/**", async (route) => {
     const req = route.request();
+    const auth = req.headers().authorization;
+    if (!opts.access && !auth) {
+      await route.fulfill({ status: 401, json: { error: "unauthorized" } });
+      return;
+    }
     requests.push({
       url: req.url(),
-      authorization: req.headers().authorization,
+      authorization: auth,
     });
     if (req.url().endsWith("/snapshot")) {
       snapshots++;
@@ -130,7 +136,9 @@ test("one bootstrap, reconnect cursor, no storage or URL credentials; disconnect
     },
   ]);
   const f = await fixture(page);
-  const request = page.waitForRequest((r) => r.url().endsWith("/snapshot"));
+  const request = page.waitForRequest(
+    (r) => r.url().endsWith("/snapshot") && Boolean(r.headers().authorization),
+  );
   await connect(page);
   expect((await request).headers().cookie).toContain(
     "CF_Authorization=synthetic-access-cookie",
@@ -319,6 +327,8 @@ test("a Ready task moves into En curso on observed start and stops running after
   };
   let subscriptions = 0;
   await page.route("**/api/**", async (route) => {
+    if (!route.request().headers().authorization)
+      return route.fulfill({ status: 401, json: { error: "unauthorized" } });
     if (route.request().url().endsWith("/snapshot"))
       return route.fulfill({
         json: { ...data, tasks: [ready], open_decisions: [] },
@@ -375,4 +385,16 @@ test("a Ready task moves into En curso on observed start and stops running after
     path: `${process.env.ZACH_SCREENSHOT_DIR ?? "test-results"}/panel-observed-completed.png`,
     fullPage: true,
   });
+});
+
+test("Access JWT mode connects automatically to snapshot and SSE without token prompt", async ({
+  page,
+}) => {
+  const f = await fixture(page, { access: true });
+  await page.goto("/");
+  await expect(page.getByText("ZACH-030", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("FUTURE_EVENT", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("Credencial de sesión")).toHaveCount(0);
+  expect(f.snapshots()).toBe(1);
+  expect(f.requests.every((r) => r.authorization === undefined)).toBe(true);
 });

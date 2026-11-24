@@ -7,8 +7,8 @@ import "@fontsource/space-grotesk/latin-600.css";
 import "@fontsource/space-grotesk/latin-700.css";
 import "@fontsource/jetbrains-mono/latin-400.css";
 import "./style.css";
-import { Connection } from "./connection";
-import { initial, mood, taskLane, observedStage, type State } from "./state";
+import { Connection, type AuthMode } from "./connection";
+import { initial, mood, taskLane, taskDecision, observedStage, type State } from "./state";
 import { github, type Task, type Decision } from "./protocol";
 import { Mascot, moodText } from "./Mascot";
 import { Sound } from "./sound";
@@ -112,6 +112,7 @@ function DecisionCard({
 }
 function TaskCard({ t, s }: { t: Task; s: State }) {
   const pr = github(t, "pull");
+  const openDecision = taskDecision(s, t);
   return (
     <article className="card task">
       <div className="taskhead">
@@ -150,7 +151,10 @@ function TaskCard({ t, s }: { t: Task; s: State }) {
       <div className="taskfoot">
         <p className={t.memory.last_check_failure ? "failure" : ""}>
           {t.memory.last_check_failure ? "⚠ Fallo registrado · " : ""}
-          {t.status}
+          Estado efectivo: {t.status} · GitHub: {t.board_status ?? "Desconocido"}
+          {openDecision && (
+            <span> · Decisión abierta: {openDecision.question} ({openDecision.decision_id})</span>
+          )}
           {observedStage(s, t) && (
             <span> · Etapa observada: {observedStage(s, t)!.status}</span>
           )}
@@ -176,6 +180,7 @@ function TaskCard({ t, s }: { t: Task; s: State }) {
 function App() {
   const [s, setS] = useState(initial),
     [notice, setNotice] = useState("Desconectado"),
+    [authMode, setAuthMode] = useState<AuthMode>("none"),
     [on, setOn] = useState(false),
     [now, setNow] = useState(Date.now()),
     [epoch, setEpoch] = useState(0);
@@ -197,9 +202,11 @@ function App() {
         }
       },
       (kind) => sound.current.play(kind),
+      setAuthMode,
     );
   const c = connection.current;
   useEffect(() => {
+    void c.connectAuto();
     const timer = setInterval(() => setNow(Date.now()), 1000);
     const hide = () => {
       if (document.hidden) {
@@ -262,52 +269,85 @@ function App() {
           </button>
         </div>
       </header>
-      <form
-        aria-label="Conexión de sesión"
-        className="connection"
-        onSubmit={(e) => {
-          e.preventDefault();
-          const token = input.current?.value ?? "";
-          if (input.current) input.current.value = "";
-          setEpoch((x) => x + 1);
-          sound.current.mute();
-          setOn(false);
-          void c.connect(token);
-        }}
-      >
-        <label>
-          Credencial de sesión
-          <input
-            ref={input}
-            type="password"
-            autoComplete="off"
-            name="session-credential"
-            required
-          />
-        </label>
-        <button className="primary" type="submit">
-          Conectar
-        </button>
-        <button
-          type="button"
-          onClick={() => {
-            c.disconnect();
+      {authMode === "access" ? (
+        <section aria-label="Conexión de sesión" className="connection">
+          <p>Sesión autenticada mediante Cloudflare Access.</p>
+          <button
+            className="primary"
+            type="button"
+            onClick={() => {
+              setEpoch((x) => x + 1);
+              sound.current.mute();
+              setOn(false);
+              void c.connectAuto();
+            }}
+          >
+            Reconectar
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              c.disconnect();
+              sound.current.mute();
+              setOn(false);
+              setEpoch((x) => x + 1);
+            }}
+          >
+            Desconectar
+          </button>
+          <div className="status" role="status">
+            {connected ? "● " : ""}
+            {notice}
+          </div>
+        </section>
+      ) : (
+        <form
+          aria-label="Conexión de sesión"
+          className="connection"
+          onSubmit={(e) => {
+            e.preventDefault();
+            const token = input.current?.value ?? "";
+            if (input.current) input.current.value = "";
+            setEpoch((x) => x + 1);
             sound.current.mute();
             setOn(false);
-            setEpoch((x) => x + 1);
-            if (input.current) input.current.value = "";
+            void c.connect(token);
           }}
         >
-          Desconectar
-        </button>
-        <p>
-          Solo en memoria durante la conexión. El campo se borra al conectar.
-        </p>
-        <div className="status" role="status">
-          {connected ? "● " : ""}
-          {notice}
-        </div>
-      </form>
+          <label>
+            Credencial de sesión
+            <input
+              ref={input}
+              type="password"
+              autoComplete="off"
+              name="session-credential"
+              required
+            />
+          </label>
+          <button className="primary" type="submit">
+            Conectar
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              c.disconnect();
+              sound.current.mute();
+              setOn(false);
+              setEpoch((x) => x + 1);
+              if (input.current) input.current.value = "";
+            }}
+          >
+            Desconectar
+          </button>
+          <p>
+            Solo en memoria durante la conexión. El campo se borra al conectar.
+          </p>
+          <div className="status" role="status">
+            {connected ? "● " : ""}
+            {notice}
+          </div>
+        </form>
+      )}
       <main id="main">
         <section className="column" aria-label="Decisiones pendientes">
           {s.decisions.length ? (

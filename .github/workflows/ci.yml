@@ -4,21 +4,45 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - name: Install native SQLite linker dependency
         run: sudo apt-get update && sudo apt-get install --yes libsqlite3-dev
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
       - run: make test
       - run: cargo build --locked
+      - run: cargo build --release --locked --bin zach
+      - name: Verify ELF64 AArch64 release binary
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          header = Path("target/release/zach").read_bytes()[:20]
+          if len(header) < 20 or header[:6] != b"\x7fELF\x02\x01":
+              raise SystemExit("target/release/zach is not little-endian ELF64")
+          machine = int.from_bytes(header[18:20], "little")
+          if machine != 183:
+              raise SystemExit(f"Expected ELF e_machine=183 (aarch64), got {machine}")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zach-bin-${{ github.event.pull_request.head.sha || github.sha }}
+          path: target/release/zach
+          if-no-files-found: error
+          retention-days: 30
 
   frontend:
     runs-on: ubuntu-latest
@@ -56,5 +80,48 @@ jobs:
         with:
           name: zach-web-${{ github.event.pull_request.head.sha || github.sha }}
           path: web/dist
+          if-no-files-found: error
+          retention-days: 30
+
+  package:
+    needs: [check, frontend]
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: zach-bin-${{ github.event.pull_request.head.sha || github.sha }}
+          path: dist-bin
+      - uses: actions/download-artifact@v4
+        with:
+          name: zach-web-${{ github.event.pull_request.head.sha || github.sha }}
+          path: web/dist
+      - name: Package deterministic release archive
+        env:
+          ZACH_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          ZACH_BUILD_RUN_ID: ${{ github.run_id }}
+        run: |
+          python3 scripts/delivery/package-release.py \
+            --binary dist-bin/zach \
+            --web-dist web/dist \
+            --source-sha "$ZACH_SOURCE_SHA" \
+            --build-run-id "$ZACH_BUILD_RUN_ID" \
+            --output-dir dist-release
+          (cd dist-release && sha256sum --check release.sha256)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zach-release-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            dist-release/zach-release.tar.gz
+            dist-release/release.sha256
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zach-release-digest-${{ github.event.pull_request.head.sha || github.sha }}
+          path: dist-release/release.sha256
           if-no-files-found: error
           retention-days: 30

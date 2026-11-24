@@ -1,0 +1,216 @@
+name: promote-zach
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: 'Successful ci.yml run ID on main'
+        required: true
+        type: string
+      source_sha:
+        description: 'Expected 40-hex source SHA (optional)'
+        required: false
+        type: string
+        default: ''
+      artifact_digest:
+        description: 'Expected 64-hex SHA-256 digest of zach-release.tar.gz (optional)'
+        required: false
+        type: string
+        default: ''
+      expected_current:
+        description: 'Expected currently deployed 40-hex SHA or "none" (required when approve_production=true)'
+        required: false
+        type: string
+        default: ''
+      approve_production:
+        description: 'Set true to execute production deploy after plan validation'
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: zach-runtime-delivery
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Resolve and verify integrated build
+        id: build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          INPUT_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$BUILD_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]; then
+            echo "::error::Invalid build_run_id: $BUILD_RUN_ID"
+            exit 1
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID" > build-run.json
+          jq -e '
+            .conclusion == "success"
+            and .head_branch == "main"
+            and (.event == "push" or .event == "workflow_dispatch")
+            and .path == ".github/workflows/ci.yml"
+          ' build-run.json >/dev/null
+          source=$(jq -r '.head_sha' build-run.json)
+          if [[ ! "$source" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Invalid head_sha in build-run.json: $source"
+            exit 1
+          fi
+          if [[ -n "$INPUT_SOURCE_SHA" && "$INPUT_SOURCE_SHA" != "$source" ]]; then
+            echo "::error::Input source_sha ($INPUT_SOURCE_SHA) does not match build run head_sha ($source)"
+            exit 1
+          fi
+          compare_status=$(gh api "repos/$GITHUB_REPOSITORY/compare/${source}...main" --jq .status)
+          if ! printf '%s\n' "$compare_status" | grep -Ex 'ahead|identical' >/dev/null; then
+            echo "::error::Build source $source is not an ancestor of main (compare status: $compare_status)"
+            exit 1
+          fi
+          printf 'source=%s\n' "$source" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: zach-release-${{ steps.build.outputs.source }}
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify artifact evidence
+        id: artifact
+        env:
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          SOURCE_SHA: ${{ steps.build.outputs.source }}
+          INPUT_ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
+        run: |
+          set -euo pipefail
+          sha256sum --check release.sha256
+          args=(
+            scripts/delivery/promotion_envelope.py
+            artifact
+            --build-run-id "$BUILD_RUN_ID"
+            --expected-source "$SOURCE_SHA"
+          )
+          if [[ -n "$INPUT_ARTIFACT_DIGEST" ]]; then
+            args+=(--expected-digest "$INPUT_ARTIFACT_DIGEST")
+          fi
+          artifact_json=$(python3 "${args[@]}")
+          digest=$(python3 -c 'import json, sys; print(json.loads(sys.argv[1])["artifact_digest"])' "$artifact_json")
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Configure SSH transport
+        env:
+          ZACH_DEPLOY_KEY: ${{ secrets.ZACH_DEPLOY_KEY }}
+          ZACH_KNOWN_HOSTS: ${{ secrets.ZACH_KNOWN_HOSTS }}
+          SERVER_IP: ${{ secrets.SERVER_IP }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$ZACH_DEPLOY_KEY" || -z "$ZACH_KNOWN_HOSTS" || -z "$SERVER_IP" ]]; then
+            echo "::error::Missing required production SSH secrets (ZACH_DEPLOY_KEY, ZACH_KNOWN_HOSTS, SERVER_IP)"
+            exit 1
+          fi
+          if [[ "$SERVER_IP" =~ [[:space:][:cntrl:]@] ]]; then
+            echo "::error::Invalid SERVER_IP format"
+            exit 1
+          fi
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s\n' "$ZACH_DEPLOY_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 0600 "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$ZACH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 0600 "$HOME/.ssh/known_hosts"
+
+      - name: Plan and conditionally deploy Zach runtime
+        env:
+          DEPLOY_HOST: ${{ secrets.SERVER_IP }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          SOURCE_SHA: ${{ steps.build.outputs.source }}
+          ARTIFACT_DIGEST: ${{ steps.artifact.outputs.digest }}
+          EXPECTED_CURRENT: ${{ inputs.expected_current }}
+          APPROVED: ${{ inputs.approve_production }}
+        run: |
+          set -euo pipefail
+          ssh_opts=(
+            -o BatchMode=yes
+            -o StrictHostKeyChecking=yes
+            -o "UserKnownHostsFile=$HOME/.ssh/known_hosts"
+            -o IdentitiesOnly=yes
+            -o ConnectTimeout=15
+            -i "$HOME/.ssh/id_ed25519"
+          )
+
+          ssh "${ssh_opts[@]}" "zach-deploy@$DEPLOY_HOST" \
+            "plan --source-sha $SOURCE_SHA --artifact-sha256 $ARTIFACT_DIGEST --build-run-id $BUILD_RUN_ID" \
+            < zach-release.tar.gz > zach-plan.raw.json
+
+          if [[ "$APPROVED" == "true" ]]; then
+            if [[ ! "$EXPECTED_CURRENT" =~ ^(none|[0-9a-f]{40})$ ]]; then
+              echo "::error::expected_current must be 40-hex SHA or 'none' when approve_production=true"
+              exit 1
+            fi
+            python3 scripts/delivery/promotion_envelope.py plan \
+              --build-run-id "$BUILD_RUN_ID" \
+              --expected-source "$SOURCE_SHA" \
+              --expected-digest "$ARTIFACT_DIGEST" \
+              --expected-current "$EXPECTED_CURRENT" > zach-plan.json
+
+            ssh "${ssh_opts[@]}" "zach-deploy@$DEPLOY_HOST" \
+              "deploy --source-sha $SOURCE_SHA --artifact-sha256 $ARTIFACT_DIGEST --expected-current $EXPECTED_CURRENT --build-run-id $BUILD_RUN_ID" \
+              < zach-release.tar.gz > zach-delivery.raw.json
+
+            python3 scripts/delivery/promotion_envelope.py delivery \
+              --build-run-id "$BUILD_RUN_ID" \
+              --expected-source "$SOURCE_SHA" \
+              --expected-digest "$ARTIFACT_DIGEST" \
+              --expected-current "$EXPECTED_CURRENT" > zach-delivery.json
+          else
+            python3 scripts/delivery/promotion_envelope.py plan \
+              --build-run-id "$BUILD_RUN_ID" \
+              --expected-source "$SOURCE_SHA" \
+              --expected-digest "$ARTIFACT_DIGEST" > zach-plan.json
+          fi
+
+      - name: Cleanup SSH key and summarize evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -f "$HOME/.ssh/id_ed25519" ]]; then
+            shred -u "$HOME/.ssh/id_ed25519" 2>/dev/null || rm -f "$HOME/.ssh/id_ed25519"
+          fi
+          {
+            echo "## Zach Promotion Evidence"
+            if [[ -f zach-plan.json ]]; then
+              echo "### zach-plan.json"
+              echo '```json'
+              cat zach-plan.json
+              echo '```'
+            fi
+            if [[ -f zach-delivery.json ]]; then
+              echo "### zach-delivery.json"
+              echo '```json'
+              cat zach-delivery.json
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zach-delivery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            build-run.json
+            zach-plan.raw.json
+            zach-plan.json
+            zach-delivery.raw.json
+            zach-delivery.json
+          retention-days: 90

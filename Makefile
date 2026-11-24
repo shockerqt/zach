@@ -20,6 +20,7 @@ test:
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-actions-journal-coordinator.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-actions-request-handler.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-actions-phase-cli.py
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/delivery -p 'test_*.py' -v
 
 build:
 	cargo build --locked

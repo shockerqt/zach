@@ -11,6 +11,17 @@ runtime and process-tree limits. Bubblewrap supplies mount, PID, IPC, user and
 network namespaces, a new session and parent-death cleanup. Units retain the
 `zach-stage-*` naming convention for orphan reconciliation.
 
+Codex executes with `--ignore-user-config` and the documented
+`--dangerously-bypass-approvals-and-sandbox` mode for externally sandboxed
+processes. Its inner command sandbox is disabled because nesting its namespace
+setup inside Zach's bubblewrap envelope prevented real shell tools from starting.
+The outer systemd/bubblewrap boundary remains mandatory for every stage; this
+flag must never be used as a host-transport fallback. Read-only review mounts and
+the Git, credential and network restrictions below remain the actual containment.
+Before detached preparation creates attempt files or stages credentials, the
+runner validates the supervisor, route-derived write/network policy and wrapper
+position using the same pure replacement path as actual preparation.
+
 ## Filesystem boundary
 
 The OS is mounted read-only. `/home` and `/root` are masked, and `/tmp`, `/run`
@@ -103,6 +114,20 @@ metadata forms and read-only/read-write stages, schema visibility, credential
 path hiding, write containment, host loopback/external TCP denial, proxy 403s and
 provider CONNECT reachability, plus staged-auth node/Codex/Gemini CLI readiness.
 It never makes an inference request or prints staged credentials.
+
+CLI readiness proves that the executable and staged authentication are available,
+not that a model-generated shell tool can execute. An explicitly approved release
+smoke must use the real stage builder/preparation and outer wrapper, with no
+relaxed Codex invocation on the host. Limit it to two sequential provider calls,
+at most 300 seconds each, without automatic retries or increased token policies.
+Independently verify actual tool events and predetermined harmless implementation
+marker bytes, plus a successful read tool and write denial in a read-only stage;
+exit zero or final prose alone is insufficient. Retain outside/Git/host-auth and
+direct-network negative controls without reading staged or real credentials.
+Keep raw outputs private outside Git and record only bounded proof metadata.
+Ordinary doctor remains inference-free. Preserve existing pilot attempts, native
+state and revoked consent; any release/recovery obstacle requires its existing
+owner procedure, never a history reset or widened idle admission.
 
 Any failed probe returns nonzero. Daemon startup and non-dry-run `zach run` refuse
 to dispatch after `ISOLATION_PREFLIGHT_FAILED`; the executor also checks an

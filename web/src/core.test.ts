@@ -8,6 +8,7 @@ import {
   mood,
   layers,
   taskLane,
+  taskDecision,
   observedStage,
 } from "./state";
 export const sampleTask = {
@@ -93,7 +94,8 @@ describe("authoritative replay projection", () => {
         s = applyEvent(s, ev(12, "STAGE_COMPLETED", {
           attempt_id: "before-disconnect", stage: "impl", status: "PASSED",
         }));
-        expect(s).toBe(reconciled);
+        expect(s.tasks).toBe(reconciled.tasks);
+        expect(s.feed[0].seq_id).toBe(12);
         expect(observedStage(s, s.tasks[0])).toBeUndefined();
         expect(taskLane(s, s.tasks[0])).toBe(status === "Done" ? "terminal" : "queued");
         expect(mood(s)).toBe("idle");
@@ -108,6 +110,9 @@ describe("authoritative replay projection", () => {
       question: "?",
       options: ["Approve", "Reject"],
     };
+    s = applyEvent(s, ev(10, "DECISION_REQUIRED", d));
+    expect(s.decisions).toHaveLength(0);
+    expect(s.feed.map((entry) => entry.seq_id)).toEqual([10]);
     expect(applyEvent(s, ev(10, "DECISION_REQUIRED", d))).toBe(s);
     s = applyEvent(s, ev(11, "DECISION_REQUIRED", d));
     expect(s.decisions).toHaveLength(1);
@@ -117,6 +122,72 @@ describe("authoritative replay projection", () => {
     expect(s.decisions).toHaveLength(0);
     expect(s.feed).toHaveLength(0);
     expect(s.cursor).toBe(2);
+  });
+  it("prefers the linked delivery gate over a newer decision in snapshots and live events", () => {
+    const linked = {
+      decision_id: "delivery",
+      task_id: sampleTask.task_id,
+      kind: "prod_promotion_approval",
+      question: "Promote?",
+      options: ["Approve", "Reject"],
+      linked_unverified_delivery: true,
+    };
+    const newer = {
+      ...linked,
+      decision_id: "newer",
+      question: "Retry?",
+      linked_unverified_delivery: false,
+    };
+    const fromSnapshot = acceptSnapshot(initial, snapshot({
+      ...snap,
+      open_decisions: [linked, newer],
+    }));
+    expect(taskDecision(fromSnapshot, fromSnapshot.tasks[0])?.decision_id).toBe("delivery");
+    let live = acceptSnapshot(initial, snapshot(snap));
+    live = applyEvent(live, ev(11, "DECISION_REQUIRED", linked));
+    live = applyEvent(live, ev(12, "DECISION_REQUIRED", newer));
+    expect(taskDecision(live, live.tasks[0])?.decision_id).toBe("delivery");
+    live = applyEvent(live, ev(13, "DECISION_RESOLVED", {
+      decision_id: linked.decision_id, choice: "Approve",
+    }));
+    expect(taskDecision(live, live.tasks[0])?.decision_id).toBe("newer");
+  });
+  it("keeps board and effective status independent through live retirement and replay", () => {
+    const d = {
+      decision_id: "d",
+      task_id: sampleTask.task_id,
+      kind: "plan_approval",
+      question: "?",
+      options: ["Approve", "Reject"],
+    };
+    expect(snapshot(snap).tasks[0].board_status).toBeUndefined();
+    let s = acceptSnapshot(initial, snapshot({
+      ...snap,
+      tasks: [{ ...sampleTask, status: "Blocked" }],
+      board_statuses: { [sampleTask.task_id]: "Backlog" },
+      open_decisions: [d],
+    }));
+    expect(s.tasks[0]).toMatchObject({ status: "Blocked", board_status: "Backlog" });
+    expect(s.decisions[0].decision_id).toBe("d");
+    const observed = ev(11, "BOARD_STATUS_OBSERVED", { board_status: "Cancelled" });
+    const terminal = ev(12, "TASK_STATUS_CHANGED", { status: "Cancelled", board_status: "Cancelled" });
+    const retired = ev(13, "DECISION_RETIRED", { decision_id: "d", reason: "Cancelled" });
+    s = applyEvent(s, observed);
+    expect(s.tasks[0]).toMatchObject({ status: "Blocked", board_status: "Cancelled" });
+    s = applyEvent(applyEvent(s, terminal), retired);
+    expect(s.tasks[0]).toMatchObject({ status: "Cancelled", board_status: "Cancelled" });
+    expect(s.decisions).toEqual([]);
+    let reconnected = acceptSnapshot(initial, snapshot({
+      ...snap,
+      tasks: [{ ...sampleTask, status: "Cancelled" }],
+      board_statuses: { [sampleTask.task_id]: "Cancelled" },
+      as_of_seq: 13,
+    }));
+    for (const event of [ev(9, "DECISION_REQUIRED", d), observed, terminal, retired, retired])
+      reconnected = applyEvent(reconnected, event);
+    expect(reconnected.decisions).toEqual([]);
+    expect(reconnected.tasks).toEqual(s.tasks);
+    expect(reconnected.feed.map((entry) => entry.seq_id)).toEqual([13, 12, 11, 9]);
   });
   it("unknown event remains bounded without fabricated task fields and validates before cursor", () => {
     let s = acceptSnapshot(initial, snapshot(snap));

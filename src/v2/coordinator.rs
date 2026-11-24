@@ -25,6 +25,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
+pub const ATTEMPT_PRUNE_INTERVAL_SECS: u64 = 3600;
+
 /// Acquire before socket unlink/bind; CLOEXEC prevents subprocesses retaining it.
 pub struct DaemonLock {
     _file: File,
@@ -49,6 +51,184 @@ impl DaemonLock {
         }
         Ok(Self { _file: file })
     }
+}
+
+trait LifecycleWsTaskClient: WsTaskClient {
+    fn execute_fenced(&self, args: &[String], _fence: &File) -> Result<String, String> {
+        self.execute(args)
+    }
+
+    fn issue_comments(&self, _repo: &str, _issue: i64) -> Result<String, String> {
+        Err("Governance marker readback unavailable".into())
+    }
+}
+
+impl LifecycleWsTaskClient for intake::SystemWsTaskClient {
+    fn execute_fenced(&self, args: &[String], fence: &File) -> Result<String, String> {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new(&self.bin);
+        command.args(args);
+        let fd = fence.as_raw_fd();
+        // Keep the lock in the publishing subprocess even if the daemon exits.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = command
+            .output()
+            .map_err(|_| "Governance publication launch failed")?;
+        if !output.status.success() {
+            return Err("Governance publication outcome requires readback".into());
+        }
+        String::from_utf8(output.stdout)
+            .map_err(|_| "invalid Governance publication receipt".into())
+    }
+
+    fn issue_comments(&self, repo: &str, issue: i64) -> Result<String, String> {
+        let Some((owner, name)) = repo.split_once('/') else {
+            return Err("invalid Governance issue repository".into());
+        };
+        if issue <= 0
+            || ![owner, name].iter().all(|part| {
+                !part.is_empty()
+                    && !matches!(*part, "." | "..")
+                    && part
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+            })
+        {
+            return Err("invalid Governance issue identity".into());
+        }
+        let output = std::process::Command::new("gh")
+            .args([
+                "api",
+                &format!("repos/{repo}/issues/{issue}/comments?per_page=100"),
+                "--paginate",
+                "--jq",
+                ".[] | [.user.login, .body] | @json",
+            ])
+            .output()
+            .map_err(|_| "Governance marker readback failed")?;
+        if !output.status.success() {
+            return Err("Governance marker readback failed".into());
+        }
+        String::from_utf8(output.stdout).map_err(|_| "invalid Governance marker response".into())
+    }
+}
+
+fn publication_fence(state_dir: &Path, task_id: &str) -> Result<File, String> {
+    runner::validate_attempt_id(task_id)?;
+    let dir = runner::ensure_secure_dir(&state_dir.join("publication-fences"))?;
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join(task_id))
+        .map_err(|_| "cannot open Governance publication fence")?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err("Governance publication fence unavailable".into());
+    }
+    Ok(file)
+}
+
+fn operation_arg<'a>(op: &'a LifecycleOperation, flag: &str) -> Option<&'a str> {
+    op.args
+        .windows(2)
+        .find(|pair| pair[0] == flag)
+        .map(|pair| pair[1].as_str())
+}
+
+fn recover_decision_publication(
+    ws: &dyn LifecycleWsTaskClient,
+    task: &TaskRecord,
+    op: &LifecycleOperation,
+) -> Result<(String, Box<TaskRecord>), String> {
+    let repo = task
+        .github_repo
+        .as_deref()
+        .ok_or("missing Governance issue repository")?;
+    let issue = task.issue_number.ok_or("missing Governance issue number")?;
+    let key = operation_arg(op, "--idempotency-key").ok_or("missing Governance publication key")?;
+    let sha = operation_arg(op, "--sha").ok_or("missing Governance publication SHA")?;
+    let verdict = operation_arg(op, "--verdict").ok_or("missing Governance publication verdict")?;
+    let actor = operation_arg(op, "--actor").ok_or("missing Governance publication actor")?;
+    let mut weight = None;
+    for line in ws.issue_comments(repo, issue)?.lines() {
+        let (author, body): (String, String) =
+            serde_json::from_str(line).map_err(|_| "invalid Governance marker response")?;
+        // Match the Governance trusted authors and the generated comment header.
+        if !matches!(author.as_str(), "shockerqt" | "github-actions[bot]") {
+            continue;
+        }
+        let Some(header) = body.lines().next().and_then(|line| {
+            line.strip_prefix("<!-- governance-v2: ")?
+                .strip_suffix(" -->")
+        }) else {
+            continue;
+        };
+        if !header
+            .split_whitespace()
+            .any(|field| field.split_once('=') == Some(("idempotency_key", key)))
+        {
+            continue;
+        }
+        let mut fields = BTreeMap::new();
+        for field in header.split_whitespace() {
+            let (name, value) = field
+                .split_once('=')
+                .ok_or("invalid Governance marker field")?;
+            if fields.insert(name, value).is_some() {
+                return Err("ambiguous Governance publication marker".into());
+            }
+        }
+        if fields.get("task_id") != Some(&op.task_id.as_str())
+            || fields.get("stage") != Some(&op.kind.as_str())
+            || fields.get("sha") != Some(&sha)
+            || fields.get("verdict") != Some(&verdict)
+            || fields.get("actor") != Some(&actor)
+            || weight.is_some()
+        {
+            return Err("conflicting Governance publication marker".into());
+        }
+        weight = Some(match fields.get("weight").copied() {
+            Some(value @ ("XS" | "S" | "M" | "L")) => value.to_owned(),
+            _ => return Err("invalid Governance marker weight".into()),
+        });
+    }
+    let weight = weight.ok_or("Governance publication marker has not been confirmed")?;
+    // ws-task posts the marker before updating labels and board status. Require
+    // the board postcondition, or an authoritative terminal observation, as well.
+    let expected_status = match (op.kind.as_str(), verdict) {
+        ("human-plan-approval", "APPROVED") | ("human-merge-approval", "CHANGES_REQUESTED") => {
+            "In Progress"
+        }
+        ("human-plan-approval", "CHANGES_REQUESTED") => "Planning",
+        ("human-merge-approval", "APPROVED") => "PR Review",
+        _ => return Err("unsupported Governance decision publication".into()),
+    };
+    let export = ws.execute(&["export".into(), "--sync".into(), "--json".into()])?;
+    let observed = intake::decode_export_records(&export)
+        .map_err(|_| "invalid Governance readback export")?
+        .into_iter()
+        .find(|item| {
+            item.task_id == op.task_id
+                && item.github_repo.as_deref() == Some(repo)
+                && item.issue_number == Some(issue)
+        })
+        .ok_or("missing Governance issue in readback export")?;
+    if observed.status != expected_status
+        && !matches!(observed.status.as_str(), "Done" | "Cancelled")
+    {
+        return Err("Governance publication board status is unconfirmed".into());
+    }
+    Ok((serde_json::json!({"task_id":op.task_id,"stage":op.kind,"sha":sha,"verdict":verdict,"weight":weight}).to_string(),
+        Box::new(observed)))
 }
 
 type Job = Box<dyn FnOnce() -> Result<WorkerResult, String> + Send>;
@@ -128,6 +308,11 @@ pub enum WorkerResult {
         attempt_id: String,
         step: PipelineStepResult,
     },
+    LifecycleRecovered {
+        operation_id: String,
+        output: String,
+        observation: Box<TaskRecord>,
+    },
     Lifecycle {
         operation_id: String,
         output: String,
@@ -142,6 +327,8 @@ pub enum WorkerResult {
     },
     Reconciled,
     DeliveryPolled,
+    LifecycleSkipped,
+    AttemptsPruned(usize),
 }
 
 type DeliveryStoreOperation = Box<dyn FnOnce(&mut V2Store) + Send>;
@@ -169,6 +356,10 @@ impl DeliveryStore for CoordinatorDeliveryStore {
 
 pub enum CoordinatorEvent {
     DeliveryStore(DeliveryStoreOperation),
+    AuthorizeLifecycle {
+        operation: Box<LifecycleOperation>,
+        reply: mpsc::SyncSender<Result<bool, String>>,
+    },
     Socket {
         client_id: usize,
         command: ClientCommand,
@@ -219,7 +410,7 @@ pub struct Coordinator {
     monitors: WorkerPool,
     governance: WorkerPool,
     controller: Arc<dyn UnitController>,
-    ws: Arc<dyn WsTaskClient>,
+    ws: Arc<dyn LifecycleWsTaskClient>,
     semaphore: HeavyCheckSemaphore,
     jobs: BTreeSet<String>,
     manifests: BTreeMap<String, AttemptManifest>,
@@ -234,9 +425,15 @@ pub struct Coordinator {
     synced: bool,
     last_export: Instant,
     last_delivery_poll: Instant,
+    last_prune: Option<Instant>,
     last_heartbeat: Instant,
+    next_tick_deadline: Option<Instant>,
+    in_tick: bool,
+    tick_tasks_cache: Option<Vec<TaskRecord>>,
     last_seq: i64,
     scope: Option<(Option<String>, Option<String>)>,
+    #[cfg(test)]
+    task_list_reads: usize,
     #[cfg(test)]
     submission_probe: Option<BTreeMap<&'static str, usize>>,
     #[cfg(test)]
@@ -293,9 +490,15 @@ impl Coordinator {
             synced: false,
             last_export: Instant::now() - Duration::from_secs(3600),
             last_delivery_poll: Instant::now() - Duration::from_secs(10),
+            last_prune: None,
             last_heartbeat: Instant::now() - Duration::from_secs(10),
+            next_tick_deadline: None,
+            in_tick: false,
+            tick_tasks_cache: None,
             last_seq: 0,
             scope: None,
+            #[cfg(test)]
+            task_list_reads: 0,
             #[cfg(test)]
             submission_probe: None,
             #[cfg(test)]
@@ -328,7 +531,7 @@ impl Coordinator {
                 "post-merge-deliveries" => "delivery-poll",
                 "identity" | "observe" => "inspection",
                 "stop" | "cleanup" => "unit-mutation",
-                "reconcile" | "preflight" | "export" => "control",
+                "reconcile" | "preflight" | "export" | "prune-attempts" => "control",
                 _ => "other",
             };
             *probe.entry(class).or_default() += 1;
@@ -356,17 +559,80 @@ impl Coordinator {
         self.store
             .set_meta("daemon_instance_id", &self.instance)
             .map_err(|e| e.to_string())?;
+        self.recover_lifecycle_journal()?;
+        let mut dirty = true;
+        loop {
+            self.flush_deliveries()?;
+            if dirty {
+                dirty = false;
+                self.tick()?;
+                self.flush_deliveries()?;
+            }
+            for _ in 0..64 {
+                if self.pending_deliveries.len() >= 128 {
+                    break;
+                }
+                match self.rx.try_recv() {
+                    Ok(CoordinatorEvent::Shutdown) => return self.shutdown(),
+                    Ok(event) => {
+                        if self.handle_event_dirty(event)? {
+                            dirty = true;
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+                }
+            }
+            if dirty {
+                continue;
+            }
+            self.maybe_heartbeat()?;
+            let now = Instant::now();
+            if self.next_tick_deadline.is_some_and(|d| now >= d) {
+                dirty = true;
+                continue;
+            }
+            let heartbeat_deadline = self.last_heartbeat + Duration::from_secs(1);
+            let mut wake_at = match self.next_tick_deadline {
+                Some(d) => heartbeat_deadline.min(d),
+                None => heartbeat_deadline,
+            };
+            if !self.pending_deliveries.is_empty() {
+                wake_at = wake_at.min(now + Duration::from_millis(20));
+            }
+            let wait = wake_at.saturating_duration_since(now);
+            if self.pending_deliveries.len() >= 128 {
+                std::thread::sleep(wait);
+                continue;
+            }
+            match self.rx.recv_timeout(wait) {
+                Ok(CoordinatorEvent::Shutdown) => return self.shutdown(),
+                Ok(event) => {
+                    if self.handle_event_dirty(event)? {
+                        dirty = true;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+            self.maybe_heartbeat()?;
+        }
+    }
+
+    fn recover_lifecycle_journal(&mut self) -> Result<(), String> {
         for op in self.store.lifecycle_ops().map_err(|e| e.to_string())? {
             if op.kind == "start" && op.state == "ACKNOWLEDGED" {
                 let mut task = self.task(&op.task_id)?;
-                if !task.memory.governance_started {
+                if !task.memory.governance_started
+                    && !matches!(task.status.as_str(), "Backlog" | "Ready")
+                {
                     task.memory.governance_started = true;
                     self.save(&task)?;
                 }
             }
             if op.state == "FAILED" {
                 let task = self.task(&op.task_id)?;
-                if task.autonomous_consent
+                if task.has_any_execution_grant()
                     && !task.memory.halt_requested
                     && !matches!(task.status.as_str(), "Done" | "Cancelled")
                 {
@@ -378,35 +644,57 @@ impl Coordinator {
                     )?;
                 }
             }
-            if op.state == "IN_FLIGHT" {
+            if matches!(op.state.as_str(), "QUEUED" | "IN_FLIGHT") {
+                let state = if op.state == "IN_FLIGHT"
+                    && let Some(id) = &op.decision_id
+                    && self
+                        .store
+                        .get_decision(id)
+                        .map_err(|e| e.to_string())?
+                        .is_some_and(|decision| decision.status == "RESOLVED")
+                    && !matches!(
+                        self.task(&op.task_id)?.status.as_str(),
+                        "Done" | "Cancelled"
+                    ) {
+                    // An older daemon could have granted a decision publication
+                    // without recording that grant separately from queueing.
+                    "DISPATCHED"
+                } else {
+                    "PENDING"
+                };
                 self.store
-                    .update_lifecycle(&op.operation_id, "PENDING", None, 0)
+                    .update_lifecycle(&op.operation_id, state, None, 0)
                     .map_err(|e| e.to_string())?;
             }
         }
-        loop {
-            self.flush_deliveries()?;
-            for _ in 0..64 {
-                if self.pending_deliveries.len() >= 128 {
-                    break;
-                }
-                match self.rx.try_recv() {
-                    Ok(CoordinatorEvent::Shutdown) => {
-                        self.ready = false;
-                        self.store
-                            .set_meta("daemon_lease_expires_epoch", "0")
-                            .map_err(|e| e.to_string())?;
-                        let _stopped = self.socket_tx.try_send(SocketDelivery::Stopped);
-                        return Ok(());
-                    }
-                    Ok(event) => self.handle_event(event)?,
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
-                }
-            }
-            self.tick()?;
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> Result<(), String> {
+        self.ready = false;
+        self.store
+            .set_meta("daemon_lease_expires_epoch", "0")
+            .map_err(|e| e.to_string())?;
+        let _stopped = self.socket_tx.try_send(SocketDelivery::Stopped);
+        Ok(())
+    }
+
+    fn handle_event_dirty(&mut self, event: CoordinatorEvent) -> Result<bool, String> {
+        let dirty = match &event {
+            CoordinatorEvent::Completed { key, .. } => key != "prune-attempts",
+            CoordinatorEvent::DeliveryStore(_) => true,
+            CoordinatorEvent::Socket { command, .. } => matches!(
+                command,
+                ClientCommand::Decide { .. }
+                    | ClientCommand::Run { .. }
+                    | ClientCommand::StageRun { .. }
+            ),
+            CoordinatorEvent::Replay { .. }
+            | CoordinatorEvent::AuthorizeLifecycle { .. }
+            | CoordinatorEvent::Shutdown => false,
+        };
+        self.handle_event(event)?;
+        Ok(dirty)
     }
 
     fn send_delivery(&mut self, delivery: SocketDelivery) -> Result<(), String> {
@@ -442,12 +730,58 @@ impl Coordinator {
         Ok(())
     }
 
-    fn error_event(&mut self, task_id: Option<&str>, message: &str) -> Result<(), String> {
+    fn derive_attempt_id(job_key: Option<&str>, task: Option<&TaskRecord>) -> Option<String> {
+        let key = job_key?;
+        for prefix in ["launch:", "observe:", "pipeline:", "stop:", "cleanup:"] {
+            if let Some(id) = key.strip_prefix(prefix) {
+                return (!id.is_empty()).then(|| id.to_owned());
+            }
+        }
+        if key.starts_with("prepare:") {
+            return task.and_then(|t| {
+                t.memory
+                    .pipeline_checkpoint
+                    .as_ref()
+                    .map(|cp| cp.attempt_id.clone())
+            });
+        }
+        None
+    }
+
+    fn error_event(
+        &mut self,
+        task_id: Option<&str>,
+        job_key: Option<&str>,
+        message: &str,
+    ) -> Result<(), String> {
         let task = task_id
             .map(|id| self.store.get_task(id))
             .transpose()
             .map_err(|e| e.to_string())?
             .flatten();
+        let attempt_id = Self::derive_attempt_id(job_key, task.as_ref());
+        if let Some(key) = job_key
+            && (key.starts_with("prepare:") || key.starts_with("launch:"))
+            && let Some(ref id) = attempt_id
+            && runner::validate_attempt_id(id).is_ok()
+        {
+            let attempt_dir = self.state_dir.join("attempts").join(id);
+            if attempt_dir.is_dir() {
+                let stage = task.as_ref().and_then(|t| t.current_stage.as_deref());
+                runner::write_supervisor_error_log(&attempt_dir, stage, Some(key), message);
+            }
+        }
+        let mut payload = serde_json::Map::new();
+        payload.insert(
+            "error".into(),
+            serde_json::Value::String(runner::truncate_utf8_bytes(message, 1024)),
+        );
+        if let Some(key) = job_key {
+            payload.insert("job_key".into(), serde_json::Value::String(key.to_owned()));
+        }
+        if let Some(id) = attempt_id {
+            payload.insert("attempt_id".into(), serde_json::Value::String(id));
+        }
         self.store
             .append_event(
                 task_id.unwrap_or("daemon"),
@@ -455,7 +789,7 @@ impl Coordinator {
                     .map(|t| t.task_group.as_str())
                     .unwrap_or("daemon"),
                 "SUPERVISOR_ERROR",
-                &serde_json::json!({"error":runner::truncate_utf8_bytes(message,1024)}),
+                &serde_json::Value::Object(payload),
             )
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -500,7 +834,7 @@ impl Coordinator {
                 match handled {
                     Ok(()) => {}
                     Err(error) => {
-                        self.error_event(task_id.as_deref(), &error)?;
+                        self.error_event(task_id.as_deref(), Some(&key), &error)?;
                         if key == "preflight" {
                             return Err(error);
                         }
@@ -554,6 +888,7 @@ impl Coordinator {
                                 if self.delivery_verified(&task)?
                                     && task.autonomous_consent
                                     && !task.memory.halt_requested
+                                    && !matches!(task.status.as_str(), "Done" | "Cancelled")
                                 {
                                     self.store
                                         .open_decision(
@@ -574,6 +909,7 @@ impl Coordinator {
                                                 .and_then(|cp| cp.merge_sha.as_deref()),
                                         )
                                         .map_err(|e| e.to_string())?;
+                                    self.emit_task_audit_digest(&task.task_id)?;
                                 }
                             } else if key.starts_with("merge:") {
                                 self.merge_failed(&task_id, &error)?;
@@ -584,7 +920,13 @@ impl Coordinator {
                     }
                 }
             }
-            CoordinatorEvent::DeliveryStore(operation) => operation(&mut self.store),
+            CoordinatorEvent::AuthorizeLifecycle { operation, reply } => {
+                let _ = reply.send(self.authorize_lifecycle(&operation));
+            }
+            CoordinatorEvent::DeliveryStore(operation) => {
+                operation(&mut self.store);
+                self.invalidate_tasks_cache();
+            }
             CoordinatorEvent::Shutdown => {}
         }
         Ok(())
@@ -602,6 +944,10 @@ impl Coordinator {
                     tasks: self
                         .store
                         .list_tasks(group.as_deref())
+                        .map_err(|e| e.to_string())?,
+                    board_statuses: self
+                        .store
+                        .board_statuses(group.as_deref())
                         .map_err(|e| e.to_string())?,
                     open_decisions: self
                         .store
@@ -631,6 +977,7 @@ impl Coordinator {
                         note.as_deref(),
                     )
                     .map_err(|e| e.to_string())?;
+                self.invalidate_tasks_cache();
                 match resolution {
                     DecisionResolution::Resolved(decision) => {
                         self.apply_decision(&decision)?;
@@ -661,22 +1008,431 @@ impl Coordinator {
                 self.last_delivery_poll = Instant::now() - Duration::from_secs(10);
                 vec![ServerMessage::RunAccepted { ready: self.ready }]
             }
+            ClientCommand::StageRun {
+                task,
+                stage,
+                wait: _,
+            } => {
+                if !matches!(
+                    stage.as_str(),
+                    "plan" | "plan-review" | "impl" | "pr-review"
+                ) {
+                    return Ok(vec![ServerMessage::StageRunResult {
+                        ok: false,
+                        task_id: task,
+                        stage: stage.clone(),
+                        status: "REJECTED".to_owned(),
+                        attempt_id: None,
+                        summary: None,
+                        stage_receipt: None,
+                        error: Some(format!(
+                            "unsupported stage '{stage}'; expected plan, plan-review, impl, or pr-review"
+                        )),
+                    }]);
+                }
+                let Some(mut record) = self.store.get_task(&task).map_err(|e| e.to_string())?
+                else {
+                    return Ok(vec![ServerMessage::StageRunResult {
+                        ok: false,
+                        task_id: task.clone(),
+                        stage,
+                        status: "NOT_FOUND".to_owned(),
+                        attempt_id: None,
+                        summary: None,
+                        stage_receipt: None,
+                        error: Some(format!("task not found: {task}")),
+                    }]);
+                };
+                if matches!(record.status.as_str(), "Done" | "Cancelled") {
+                    return Ok(vec![ServerMessage::StageRunResult {
+                        ok: false,
+                        task_id: task.clone(),
+                        stage,
+                        status: "REJECTED".to_owned(),
+                        attempt_id: record.active_attempt_id.clone(),
+                        summary: None,
+                        stage_receipt: None,
+                        error: Some(format!(
+                            "task {task} is already terminal ({})",
+                            record.status
+                        )),
+                    }]);
+                }
+                let state_dir = self.state_dir.clone();
+                let load_receipt = |aid: Option<&str>| {
+                    aid.and_then(|id| {
+                        let p = state_dir
+                            .join("attempts")
+                            .join(id)
+                            .join("stage-receipt.json");
+                        std::fs::read_to_string(p)
+                            .ok()
+                            .and_then(|s| serde_json::from_str::<runner::StageReceiptV1>(&s).ok())
+                    })
+                };
+                // Re-attach to an already-consumed (terminal) or in-flight grant for this stage.
+                if let Some(existing) = record.memory.stage_run_grant.as_ref()
+                    && existing.stage == stage
+                {
+                    if existing.consumed {
+                        let term_status = existing
+                            .terminal_status
+                            .clone()
+                            .unwrap_or_else(|| "COMPLETED".to_owned());
+                        let ok = term_status == "PASSED";
+                        let receipt = load_receipt(existing.terminal_attempt_id.as_deref());
+                        return Ok(vec![ServerMessage::StageRunResult {
+                            ok,
+                            task_id: task,
+                            stage,
+                            status: term_status,
+                            attempt_id: existing.terminal_attempt_id.clone(),
+                            summary: existing.terminal_summary.clone(),
+                            stage_receipt: receipt,
+                            error: if ok {
+                                None
+                            } else {
+                                existing.terminal_summary.clone()
+                            },
+                        }]);
+                    }
+                    let receipt = load_receipt(record.active_attempt_id.as_deref());
+                    return Ok(vec![ServerMessage::StageRunResult {
+                        ok: true,
+                        task_id: task,
+                        stage,
+                        status: "ACCEPTED".to_owned(),
+                        attempt_id: record.active_attempt_id.clone(),
+                        summary: Some("delegated stage grant already active".to_owned()),
+                        stage_receipt: receipt,
+                        error: None,
+                    }]);
+                }
+                let next_expected = scheduler::determine_next_stage(&record);
+                if next_expected.as_deref() != Some(stage.as_str()) {
+                    return Ok(vec![ServerMessage::StageRunResult {
+                        ok: false,
+                        task_id: task.clone(),
+                        stage: stage.clone(),
+                        status: "REJECTED".to_owned(),
+                        attempt_id: record.active_attempt_id.clone(),
+                        summary: None,
+                        stage_receipt: None,
+                        error: Some(format!(
+                            "stage '{stage}' is not the next eligible stage for {task} (next={})",
+                            next_expected.as_deref().unwrap_or("none")
+                        )),
+                    }]);
+                }
+                record.memory.stage_run_grant = Some(crate::v2::store::StageRunGrant {
+                    stage: stage.clone(),
+                    granted_epoch: now_epoch(),
+                    consumed: false,
+                    terminal_status: None,
+                    terminal_attempt_id: None,
+                    terminal_summary: None,
+                });
+                self.store.upsert_task(&record).map_err(|e| e.to_string())?;
+                self.invalidate_tasks_cache();
+                let _ = self.store.append_event(
+                    &record.task_id,
+                    &record.task_group,
+                    "STAGE_RUN_GRANTED",
+                    &serde_json::json!({
+                        "task_id": record.task_id,
+                        "stage": stage,
+                        "autonomous_consent": record.autonomous_consent,
+                    }),
+                );
+                let receipt = load_receipt(record.active_attempt_id.as_deref());
+                vec![ServerMessage::StageRunResult {
+                    ok: true,
+                    task_id: task,
+                    stage,
+                    status: "ACCEPTED".to_owned(),
+                    attempt_id: record.active_attempt_id,
+                    summary: Some("single-stage grant persisted".to_owned()),
+                    stage_receipt: receipt,
+                    error: None,
+                }]
+            }
+            ClientCommand::ReloadConfig { path } => {
+                match crate::v2::router::reload_router_config(
+                    path.as_deref().map(std::path::Path::new),
+                ) {
+                    Ok((loaded_path, warnings)) => vec![ServerMessage::ConfigReloaded {
+                        ok: true,
+                        path: loaded_path.display().to_string(),
+                        warnings,
+                        error: None,
+                    }],
+                    Err(err) => vec![ServerMessage::ConfigReloaded {
+                        ok: false,
+                        path: path.unwrap_or_else(|| {
+                            crate::v2::router::default_router_config_path()
+                                .display()
+                                .to_string()
+                        }),
+                        warnings: Vec::new(),
+                        error: Some(err),
+                    }],
+                }
+            }
+            ClientCommand::CooldownList => vec![ServerMessage::Cooldowns {
+                cooldowns: self
+                    .store
+                    .list_provider_cooldowns(Some(now_epoch()))
+                    .map_err(|e| e.to_string())?,
+            }],
+            ClientCommand::CooldownClear { family } => {
+                let cleared = self
+                    .store
+                    .clear_provider_cooldown(family.as_deref())
+                    .map_err(|e| e.to_string())?;
+                vec![ServerMessage::CooldownCleared { cleared }]
+            }
+            ClientCommand::Announce {
+                holder,
+                executor,
+                actor,
+                intent,
+                task_id,
+                repo,
+                stage,
+                note,
+                ttl_secs,
+            } => {
+                let now = now_epoch();
+                match crate::v2::socket::validate_session_announcement(
+                    holder.as_deref(),
+                    executor.as_deref(),
+                    actor.as_deref(),
+                    &intent,
+                    task_id.as_deref(),
+                    repo.as_deref(),
+                    stage.as_deref(),
+                    note.as_deref(),
+                    ttl_secs,
+                    now,
+                ) {
+                    Ok(announcement) => {
+                        let event = self
+                            .store
+                            .record_session_announcement(&announcement)
+                            .map_err(|e| e.to_string())?;
+                        vec![ServerMessage::SessionAnnouncement {
+                            ok: true,
+                            announcement,
+                            seq_id: event.seq_id,
+                        }]
+                    }
+                    Err(error) => vec![ServerMessage::Error { error }],
+                }
+            }
+            ClientCommand::Sessions { include_stale } => {
+                let as_of_seq = self.store.max_seq_id().map_err(|e| e.to_string())?;
+                let sessions = self
+                    .store
+                    .list_session_announcements(include_stale, now_epoch())
+                    .map_err(|e| e.to_string())?;
+                vec![ServerMessage::SessionsList {
+                    sessions,
+                    as_of_seq,
+                }]
+            }
         })
     }
 
-    fn tick(&mut self) -> Result<(), String> {
+    fn invalidate_tasks_cache(&mut self) {
+        self.tick_tasks_cache = None;
+    }
+
+    fn list_all_tasks_cached(&mut self) -> Result<Vec<TaskRecord>, String> {
+        if self.in_tick
+            && let Some(cached) = self.tick_tasks_cache.as_ref()
+        {
+            return Ok(cached.clone());
+        }
+        #[cfg(test)]
+        {
+            self.task_list_reads += 1;
+        }
+        let tasks = self.store.list_tasks(None).map_err(|e| e.to_string())?;
+        if self.in_tick {
+            self.tick_tasks_cache = Some(tasks.clone());
+        }
+        Ok(tasks)
+    }
+
+    fn maybe_heartbeat(&mut self) -> Result<(), String> {
         if self.last_heartbeat.elapsed() >= Duration::from_secs(1) {
+            let now = now_epoch();
             self.store
-                .record_heartbeat(now_epoch())
+                .record_heartbeat(now)
                 .map_err(|e| e.to_string())?;
             self.store
-                .set_meta(
-                    "daemon_lease_expires_epoch",
-                    &(now_epoch() + 15).to_string(),
-                )
+                .set_meta("daemon_lease_expires_epoch", &(now + 15).to_string())
                 .map_err(|e| e.to_string())?;
+            self.write_presence_heartbeat_file(now);
             self.last_heartbeat = Instant::now();
         }
+        Ok(())
+    }
+
+    fn write_presence_heartbeat_file(&self, now: i64) {
+        let path = std::env::var_os("ZACH_HEARTBEAT_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.state_dir.join("heartbeat.json"));
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "executor": "zach",
+            "pid": std::process::id(),
+            "ts_epoch": now,
+        });
+        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+        if let Ok(bytes) = serde_json::to_vec(&payload)
+            && std::fs::write(&tmp, bytes).is_ok()
+        {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+            }
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    fn sync_interval_secs() -> u64 {
+        std::env::var("ZACH_SYNC_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(30)
+            .max(1)
+    }
+
+    fn compute_next_tick_deadline(&mut self) -> Result<Option<Instant>, String> {
+        let mut deadline: Option<Instant> = None;
+        let mut min_deadline = |candidate: Instant| {
+            deadline = Some(match deadline {
+                Some(current) => current.min(candidate),
+                None => candidate,
+            });
+        };
+
+        if !self.preflight {
+            return Ok(None);
+        }
+        if !self.reconciled {
+            if !self.jobs.contains("reconcile") {
+                min_deadline(self.last_export + Duration::from_secs(2));
+            }
+            return Ok(deadline);
+        }
+        if !self.jobs.contains("export") {
+            min_deadline(self.last_export + Duration::from_secs(Self::sync_interval_secs()));
+        }
+        if !self.synced {
+            return Ok(deadline);
+        }
+
+        let now_instant = Instant::now();
+        let now = now_epoch();
+
+        let tasks = self.list_all_tasks_cached()?;
+        for task in &tasks {
+            if let Some(attempt_id) = &task.active_attempt_id
+                && !self
+                    .jobs
+                    .iter()
+                    .any(|k| k.ends_with(&format!(":{attempt_id}")))
+                && let Some(polled_at) = self.last_poll.get(attempt_id)
+                && polled_at.elapsed() < Duration::from_secs(1)
+            {
+                min_deadline(*polled_at + Duration::from_secs(1));
+            }
+            if !matches!(task.status.as_str(), "Done" | "Cancelled")
+                && task.autonomous_consent
+                && !task.memory.halt_requested
+                && task.next_retry_epoch > now
+            {
+                let secs = (task.next_retry_epoch - now) as u64;
+                min_deadline(now_instant + Duration::from_secs(secs));
+            }
+            if let Some(cp) = &task.memory.merge_checkpoint
+                && matches!(cp.phase.as_str(), "DELIVERY_PENDING" | "CLOSE_PENDING")
+                && let Some(polled_at) = self.merge_poll.get(&task.task_id)
+                && polled_at.elapsed() < Duration::from_secs(2)
+            {
+                min_deadline(*polled_at + Duration::from_secs(2));
+            }
+        }
+
+        for op in self.store.lifecycle_ops().map_err(|e| e.to_string())? {
+            if matches!(op.state.as_str(), "PENDING" | "DISPATCHED") && op.retry_epoch > now {
+                let secs = (op.retry_epoch - now) as u64;
+                min_deadline(now_instant + Duration::from_secs(secs));
+            }
+        }
+
+        for cooldown in self
+            .store
+            .list_provider_cooldowns(Some(now))
+            .map_err(|e| e.to_string())?
+        {
+            if cooldown.until_epoch > now {
+                let secs = (cooldown.until_epoch - now) as u64;
+                min_deadline(now_instant + Duration::from_secs(secs));
+            }
+        }
+
+        if !self.jobs.iter().any(|k| k.starts_with("merge:")) {
+            for entry in self
+                .store
+                .list_merge_queue(None)
+                .map_err(|e| e.to_string())?
+            {
+                if let Some(polled_at) = self.merge_poll.get(&entry.task_id)
+                    && polled_at.elapsed() < Duration::from_secs(2)
+                {
+                    min_deadline(*polled_at + Duration::from_secs(2));
+                }
+            }
+        }
+
+        if !self.jobs.contains("post-merge-deliveries")
+            && !self
+                .store
+                .list_deliveries(None)
+                .map_err(|e| e.to_string())?
+                .is_empty()
+        {
+            min_deadline(self.last_delivery_poll + Duration::from_secs(2));
+        }
+
+        Ok(deadline)
+    }
+
+    fn tick(&mut self) -> Result<(), String> {
+        self.in_tick = true;
+        self.tick_tasks_cache = None;
+        let result = (|| {
+            self.tick_inner()?;
+            self.next_tick_deadline = self.compute_next_tick_deadline()?;
+            Ok(())
+        })();
+        self.in_tick = false;
+        self.tick_tasks_cache = None;
+        result
+    }
+
+    fn tick_inner(&mut self) -> Result<(), String> {
+        self.maybe_heartbeat()?;
         if !self.preflight {
             self.submit(
                 "preflight".into(),
@@ -693,11 +1449,7 @@ impl Coordinator {
             self.reconcile_startup()?;
             return self.deliver_events();
         }
-        let sync_secs = std::env::var("ZACH_SYNC_INTERVAL_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(30)
-            .max(1);
+        let sync_secs = Self::sync_interval_secs();
         if self.last_export.elapsed() >= Duration::from_secs(sync_secs)
             && !self.jobs.contains("export")
         {
@@ -722,12 +1474,12 @@ impl Coordinator {
             return self.deliver_events();
         }
         self.reconcile_terminal_tasks()?;
+        self.resume_decisions()?;
         self.replay_lifecycle()?;
         self.resume_pipeline_steps()?;
-        self.resume_decisions()?;
         self.reconcile_terminal_tasks()?;
         let mut recovery_ready = true;
-        for task in self.store.list_tasks(None).map_err(|e| e.to_string())? {
+        for task in self.list_all_tasks_cached()? {
             if let Some(id) = &task.active_attempt_id {
                 let attempt = self
                     .store
@@ -751,21 +1503,58 @@ impl Coordinator {
             self.dispatch()?;
             self.drive_merges()?;
             self.poll_deliveries()?;
+            if let Err(err) = self.maybe_submit_attempt_prune() {
+                self.error_event(None, Some("prune-attempts"), &err)?;
+            }
         }
         self.deliver_events()
     }
 
+    fn maybe_submit_attempt_prune(&mut self) -> Result<bool, String> {
+        if self.jobs.contains("prune-attempts")
+            || self
+                .last_prune
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(ATTEMPT_PRUNE_INTERVAL_SECS))
+        {
+            return Ok(false);
+        }
+        let now = Instant::now();
+        if !self.state_dir.join("attempts").is_dir() {
+            self.last_prune = Some(now);
+            return Ok(false);
+        }
+        // Advance `last_prune` before querying/submitting so errors cannot cause a per-tick retry storm.
+        self.last_prune = Some(now);
+        let mut active_ids = self.store.active_attempt_ids().map_err(|e| e.to_string())?;
+        active_ids.extend(self.manifests.keys().cloned());
+        active_ids.extend(self.attached.iter().cloned());
+        active_ids.extend(self.resources.keys().cloned());
+        let state_dir = self.state_dir.clone();
+        let retention = runner::attempt_retention_from_env();
+        let submitted = self.submit(
+            "prune-attempts".into(),
+            None,
+            0,
+            Box::new(move || {
+                let pruned = runner::prune_old_attempts(&state_dir, retention, &active_ids)?;
+                Ok(WorkerResult::AttemptsPruned(pruned))
+            }),
+        );
+        Ok(submitted)
+    }
+
     fn reconcile_terminal_tasks(&mut self) -> Result<(), String> {
-        for mut task in self.store.list_tasks(None).map_err(|e| e.to_string())? {
+        for mut task in self.list_all_tasks_cached()? {
             if let Some(recovered) = self
                 .store
                 .recover_unclosed_delivery(&task.task_id)
                 .map_err(|e| e.to_string())?
             {
+                self.invalidate_tasks_cache();
                 task = recovered;
             }
             if !matches!(task.status.as_str(), "Done" | "Cancelled")
-                && task.autonomous_consent
+                && task.has_any_execution_grant()
                 && !task.memory.halt_requested
             {
                 continue;
@@ -884,11 +1673,12 @@ impl Coordinator {
         }
         // Enumerate as well as inspect exact persisted identities. Dispatch stays disabled.
         self.startup_ownership()?;
+        self.store
+            .retire_terminal_decisions()
+            .map_err(|e| e.to_string())?;
         let controller = self.controller.clone();
         let snapshots = self
-            .store
-            .list_tasks(None)
-            .map_err(|e| e.to_string())?
+            .list_all_tasks_cached()?
             .into_iter()
             .map(|task| {
                 let attempts = self.store.list_stage_attempts(&task.task_id)?;
@@ -914,6 +1704,7 @@ impl Coordinator {
     }
     fn save(&mut self, task: &TaskRecord) -> Result<(), String> {
         self.store.upsert_task(task).map_err(|e| e.to_string())?;
+        self.invalidate_tasks_cache();
         Ok(())
     }
 
@@ -924,23 +1715,43 @@ impl Coordinator {
             scope.0.as_deref(),
             scope.1.as_deref(),
         )?;
+        if !dispatches.is_empty() {
+            self.invalidate_tasks_cache();
+        }
         for dispatch in dispatches {
             let mut task = self.task(&dispatch.task_id)?;
-            if !task.memory.governance_started {
+            if task.status == "Backlog" {
+                continue;
+            }
+            let missing_worktree = task.repository != "none"
+                && task
+                    .worktree_path
+                    .as_deref()
+                    .is_none_or(|p| !std::path::Path::new(p).is_dir());
+            if !task.memory.governance_started || missing_worktree {
+                let was_started = task.memory.governance_started;
+                let resume = was_started;
                 task.executor = Some("zach".into());
-                task.status = "Ready".into();
+                if !was_started {
+                    task.status = "Ready".into();
+                }
+                let operation_id = format!("start-{}-v{}", task.task_id, task.version);
+                let mut args = vec![
+                    "start".into(),
+                    task.task_id.clone(),
+                    "--executor".into(),
+                    "zach".into(),
+                ];
+                if resume {
+                    args.push("--resume".into());
+                }
                 let op = LifecycleOperation {
                     attempt_id: None,
                     decision_id: None,
-                    operation_id: format!("start-{}", task.task_id),
+                    operation_id,
                     task_id: task.task_id.clone(),
                     kind: "start".into(),
-                    args: vec![
-                        "start".into(),
-                        task.task_id.clone(),
-                        "--executor".into(),
-                        "zach".into(),
-                    ],
+                    args,
                     body_path: None,
                     depends_on: None,
                     state: "PENDING".into(),
@@ -951,6 +1762,7 @@ impl Coordinator {
                 self.store
                     .checkpoint_with_lifecycle(&task, &op)
                     .map_err(|e| e.to_string())?;
+                self.invalidate_tasks_cache();
                 continue;
             }
             if dispatch.stage == "impl"
@@ -985,8 +1797,8 @@ impl Coordinator {
     }
 
     fn resume_pipeline_steps(&mut self) -> Result<(), String> {
-        for task in self.store.list_tasks(None).map_err(|e| e.to_string())? {
-            if !task.autonomous_consent
+        for task in self.list_all_tasks_cached()? {
+            if !task.has_execution_grant_for(task.current_stage.as_deref())
                 || matches!(task.status.as_str(), "Done" | "Cancelled" | "Blocked")
             {
                 continue;
@@ -1056,7 +1868,15 @@ impl Coordinator {
                 };
                 let verdict = matches!(stage, "plan-review" | "pr-review")
                     .then(|| cp.operation.trim_start_matches("PUBLISH_"));
-                let op = intake::stage_operation(
+                let receipt_candidate = self
+                    .state_dir
+                    .join("attempts")
+                    .join(&cp.attempt_id)
+                    .join("stage-receipt.json");
+                let receipt_opt = receipt_candidate
+                    .is_file()
+                    .then_some(receipt_candidate.as_path());
+                let op = intake::stage_operation_with_receipt(
                     &task,
                     &format!("zach-stage-{}", cp.attempt_id),
                     stage,
@@ -1064,6 +1884,7 @@ impl Coordinator {
                     verdict,
                     sha,
                     "zach",
+                    receipt_opt,
                 );
                 self.store
                     .enqueue_lifecycle(&op)
@@ -1125,7 +1946,7 @@ impl Coordinator {
     }
 
     fn monitor_attempts(&mut self) -> Result<(), String> {
-        for task in self.store.list_tasks(None).map_err(|e| e.to_string())? {
+        for task in self.list_all_tasks_cached()? {
             let Some(id) = task.active_attempt_id.clone() else {
                 continue;
             };
@@ -1303,6 +2124,7 @@ impl Coordinator {
             WorkerResult::StartupReconciled { adopted, retired } => {
                 self.startup_ownership()?;
                 for attempt in retired {
+                    self.persist_attempt_audit(&attempt);
                     self.store
                         .record_stage_attempt(&attempt)
                         .map_err(|e| e.to_string())?;
@@ -1364,7 +2186,8 @@ impl Coordinator {
                 }
                 self.worker_result(WorkerResult::Reconciled)?;
             }
-            WorkerResult::DeliveryPolled => {}
+            WorkerResult::DeliveryPolled | WorkerResult::LifecycleSkipped => {}
+            WorkerResult::AttemptsPruned(_) => {}
             WorkerResult::Reconciled => {
                 // Prove every exclusion before the first cleanup/lock/failure write.
                 let native = self.startup_ownership()?;
@@ -1458,6 +2281,7 @@ impl Coordinator {
                 // External terminal changes and consent revocations are observed
                 // before any dispatch. Live attempts keep ownership until stopped.
                 intake::ingest_task_records(&mut self.store, output).map_err(|e| e.to_string())?;
+                self.invalidate_tasks_cache();
                 self.synced = true;
             }
             WorkerResult::Prepared(prepared) => {
@@ -1471,7 +2295,7 @@ impl Coordinator {
                     .pipeline_checkpoint
                     .as_ref()
                     .is_none_or(|c| c.attempt_id != manifest.attempt_id)
-                    || !task.autonomous_consent
+                    || !task.has_execution_grant_for(Some(&manifest.route.stage))
                     || matches!(task.status.as_str(), "Done" | "Cancelled" | "Blocked")
                 {
                     resources.cleanup_after_stop()?;
@@ -1561,14 +2385,29 @@ impl Coordinator {
                     return Ok(());
                 };
                 let mut task = self.task(&attempt.task_id)?;
+                let mut duration_ended_epoch: Option<i64> = None;
                 match result {
                     Ok(result) => {
                         attempt.status = result.status.clone();
+                        if result.status != "PASSED" && attempt.failure_class.is_none() {
+                            attempt.failure_class = Some(
+                                pipeline::classify_failure_class(
+                                    &attempt.stage,
+                                    &result.status,
+                                    &result.summary,
+                                )
+                                .into(),
+                            );
+                        }
                         attempt.summary = Some(result.summary.clone());
                         attempt.input_tokens = result.input_tokens;
                         attempt.output_tokens = result.output_tokens;
                         attempt.total_tokens = result.total_tokens;
                         attempt.sha_after = result.sha_after;
+                        if let Some(dur) = result.duration_seconds {
+                            duration_ended_epoch =
+                                Some(attempt.started_epoch.saturating_add(dur.round() as i64));
+                        }
                         if let Some(tokens) = result.total_tokens {
                             let previous = self
                                 .store
@@ -1598,7 +2437,8 @@ impl Coordinator {
                     }
                 }
                 attempt.phase = "HARVESTED".into();
-                attempt.ended_epoch = Some(now_epoch());
+                let now = now_epoch();
+                attempt.ended_epoch = Some(duration_ended_epoch.map_or(now, |d| d.max(now)));
                 self.store
                     .record_stage_attempt(&attempt)
                     .map_err(|e| e.to_string())?;
@@ -1645,6 +2485,7 @@ impl Coordinator {
                     self.store
                         .transition_attempt(&task, &attempt, false, None)
                         .map_err(|e| e.to_string())?;
+                    self.invalidate_tasks_cache();
                 }
             }
             WorkerResult::Stopped(id) => {
@@ -1655,10 +2496,11 @@ impl Coordinator {
                 else {
                     return Ok(());
                 };
+                self.persist_attempt_audit(&attempt);
                 self.attached.remove(&id);
                 self.manifests.remove(&id);
                 let mut task = self.task(&attempt.task_id)?;
-                if !task.autonomous_consent
+                if !task.has_execution_grant_for(Some(&attempt.stage))
                     || task.memory.halt_requested
                     || matches!(task.status.as_str(), "Done" | "Cancelled")
                 {
@@ -1671,6 +2513,10 @@ impl Coordinator {
                     self.store
                         .transition_attempt(&task, &attempt, true, None)
                         .map_err(|e| e.to_string())?;
+                    self.invalidate_tasks_cache();
+                    if task.status == "Blocked" {
+                        self.emit_task_audit_digest(&task.task_id)?;
+                    }
                 } else if attempt.status != "PASSED" {
                     self.fail_task(
                         &attempt.task_id,
@@ -1686,6 +2532,7 @@ impl Coordinator {
                     self.store
                         .transition_attempt(&task, &attempt, false, None)
                         .map_err(|e| e.to_string())?;
+                    self.invalidate_tasks_cache();
                 }
             }
             WorkerResult::Pipeline { attempt_id, step } => {
@@ -1696,7 +2543,7 @@ impl Coordinator {
                 {
                     return Ok(());
                 }
-                if !current.autonomous_consent
+                if !current.has_execution_grant_for(current.current_stage.as_deref())
                     || current.memory.halt_requested
                     || matches!(current.status.as_str(), "Done" | "Cancelled")
                 {
@@ -1728,6 +2575,17 @@ impl Coordinator {
                 } else {
                     self.save(&task)?;
                 }
+            }
+            WorkerResult::LifecycleRecovered {
+                operation_id,
+                output,
+                observation,
+            } => {
+                self.store
+                    .sync_task(&observation)
+                    .map_err(|e| e.to_string())?;
+                self.invalidate_tasks_cache();
+                self.lifecycle_ack(&operation_id, &output)?;
             }
             WorkerResult::Lifecycle {
                 operation_id,
@@ -1804,7 +2662,7 @@ impl Coordinator {
         }
         let force_reason = if identity_conflict {
             Some("InvocationID identity conflict".to_owned())
-        } else if !task.autonomous_consent
+        } else if !task.has_execution_grant_for(Some(&attempt.stage))
             || task.memory.halt_requested
             || matches!(task.status.as_str(), "Done" | "Cancelled")
         {
@@ -1938,7 +2796,31 @@ impl Coordinator {
     }
 
     fn quarantine_task(&mut self, id: &str, error: &str) -> Result<(), String> {
-        let task = self.task(id)?;
+        let mut task = self.task(id)?;
+        if let Some(grant) = task.memory.stage_run_grant.as_mut()
+            && !grant.consumed
+        {
+            grant.consumed = true;
+            grant.terminal_status = Some("BLOCKED".to_owned());
+            grant.terminal_attempt_id = task.active_attempt_id.clone();
+            grant.terminal_summary = Some(error.to_owned());
+            let stage = grant.stage.clone();
+            let attempt_id = grant.terminal_attempt_id.clone();
+            self.store.upsert_task(&task).map_err(|e| e.to_string())?;
+            self.invalidate_tasks_cache();
+            let _ = self.store.append_event(
+                &task.task_id,
+                &task.task_group,
+                "STAGE_RUN_FINISHED",
+                &serde_json::json!({
+                    "task_id": task.task_id,
+                    "stage": stage,
+                    "status": "BLOCKED",
+                    "attempt_id": attempt_id,
+                    "summary": error,
+                }),
+            );
+        }
         self.store
             .open_decision(
                 &format!(
@@ -1963,12 +2845,64 @@ impl Coordinator {
                 .remove_merge_queue_entry(&task.repository, id)
                 .map_err(|e| e.to_string())?;
         }
+        self.emit_task_audit_digest(id)?;
         Ok(())
+    }
+
+    fn persist_attempt_audit(&mut self, attempt: &StageAttemptRecord) {
+        let attempt_dir = self.state_dir.join("attempts").join(&attempt.attempt_id);
+        let mut record =
+            crate::v2::audit::read_or_extract_attempt_audit_record(&attempt_dir, attempt);
+        if record.error_code.is_none() && attempt.status != "PASSED" {
+            record.error_code = attempt
+                .failure_class
+                .as_deref()
+                .or(attempt.summary.as_deref())
+                .map(|s| {
+                    crate::v2::audit::redact_adr004_text(
+                        s,
+                        crate::v2::audit::MAX_AUDIT_DIGEST_ERROR_SIGNATURE_LEN,
+                    )
+                })
+                .filter(|s| !s.is_empty());
+        }
+        let _ = self.store.record_attempt_audit(&record);
+    }
+
+    fn emit_task_audit_digest(&mut self, task_id: &str) -> Result<(), String> {
+        let task = self.task(task_id)?;
+        match crate::v2::audit::build_task_audit_digest(&self.store, task_id) {
+            Ok(digest) => match crate::v2::audit::validate_task_audit_digest(&digest) {
+                Ok(payload) => {
+                    self.store
+                        .append_event(
+                            &task.task_id,
+                            &task.task_group,
+                            "TASK_AUDIT_DIGEST",
+                            &payload,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    Ok(())
+                }
+                Err(probs) => {
+                    let err = format!("TASK_AUDIT_DIGEST validation failed: {}", probs.join("; "));
+                    self.error_event(Some(task_id), Some("audit-digest"), &err)
+                }
+            },
+            Err(err) => self.error_event(Some(task_id), Some("audit-digest"), &err),
+        }
     }
 
     fn fail_task(&mut self, task_id: &str, error: &str, class: Option<&str>) -> Result<(), String> {
         let mut task = self.task(task_id)?;
         let stage = task.current_stage.clone().unwrap_or_else(|| "impl".into());
+        let is_check_divergence = task
+            .memory
+            .pipeline_checkpoint
+            .as_ref()
+            .is_some_and(|cp| cp.operation == "CHECKS")
+            || error.starts_with("check '")
+            || error.starts_with("failed to run check '");
         let class =
             class.unwrap_or_else(|| pipeline::classify_failure_class(&stage, "FAILED", error));
         let attempts = self
@@ -2017,32 +2951,126 @@ impl Coordinator {
         }
         attempt.failure_class = Some(class.into());
         attempt.summary = Some(error.into());
-        attempt.ended_epoch = Some(now_epoch());
+        let now = now_epoch();
+        attempt.ended_epoch = Some(attempt.ended_epoch.unwrap_or(now).max(now));
         attempt.phase = "COMPLETE".into();
-        let failures = attempts
+        self.persist_attempt_audit(&attempt);
+        if is_check_divergence {
+            let _ = self.store.mark_attempt_check_divergence(
+                &attempt.attempt_id,
+                &task.task_id,
+                &stage,
+                Some(class),
+            );
+        }
+        let is_quota = pipeline::is_quota_or_usage_limit_error(error);
+        let prior_failures = attempts
             .iter()
             .filter(|a| {
                 a.attempt_id != attempt.attempt_id
                     && a.stage == stage
                     && a.retry_generation == task.memory.retry_generation
                     && a.failure_class.as_deref() == Some(class)
+                    && !a
+                        .summary
+                        .as_deref()
+                        .is_some_and(pipeline::is_quota_or_usage_limit_error)
             })
-            .count()
-            + 1;
+            .count();
+        let failures = prior_failures + usize::from(!is_quota);
         let limit = match class {
             "infra" => pipeline::MAX_INFRA_RETRIES,
             "semantic" => pipeline::MAX_SEMANTIC_RETRIES,
             _ => pipeline::MAX_POLICY_RETRIES,
         };
-        task.retry_count += 1;
+        if !is_quota {
+            task.retry_count += 1;
+        }
+        let author_stage = match stage.as_str() {
+            "plan-review" => Some("plan"),
+            "pr-review" => Some("impl"),
+            _ => None,
+        };
+        let author_family = author_stage.and_then(|src_stage| {
+            attempts
+                .iter()
+                .rev()
+                .find(|a| a.stage == src_stage && a.status == "PASSED")
+                .map(|a| infer_model_family(&a.model))
+        });
+        let quota_until_epoch = if is_quota {
+            let exhausted_family = if attempt.model != "unknown" && !attempt.model.trim().is_empty()
+            {
+                infer_model_family(&attempt.model)
+            } else {
+                crate::v2::router::resolve_stage_route(
+                    &task.weight,
+                    &stage,
+                    task.retry_count,
+                    author_family,
+                )
+                .ok()
+                .flatten()
+                .map(|r| pipeline::apply_stage_fallback_route(&task, r).family)
+                .unwrap_or(crate::v2::router::ModelFamily::OpenAiSol)
+            };
+            let until_epoch = pipeline::parse_quota_reset_epoch(error, now);
+            self.store
+                .upsert_provider_cooldown(exhausted_family.as_str(), until_epoch, error)
+                .map_err(|e| e.to_string())?;
+            Some(until_epoch)
+        } else {
+            None
+        };
         task.active_attempt_id = None;
         task.memory.pipeline_checkpoint = None;
         task.lease_owner = None;
         task.lease_expires_epoch = None;
         task.memory.last_check_failure = Some(runner::truncate_utf8_bytes(error, 1024));
-        let decision = if failures <= limit {
+        let route_for_fallback = if !matches!(stage.as_str(), "plan-review" | "pr-review")
+            && !task.memory.fallback_stages.iter().any(|s| s == &stage)
+        {
+            crate::v2::router::resolve_stage_route(
+                &task.weight,
+                &stage,
+                task.retry_count,
+                author_family,
+            )
+            .ok()
+            .flatten()
+            .map(|r| pipeline::apply_stage_fallback_route(&task, r))
+        } else {
+            None
+        };
+        let has_fallback = route_for_fallback
+            .as_ref()
+            .is_some_and(|r| r.fallback_family.is_some() && r.fallback_model.is_some());
+        let has_usable_fallback = match route_for_fallback.and_then(|r| {
+            if r.fallback_model.is_some() {
+                r.fallback_family
+            } else {
+                None
+            }
+        }) {
+            Some(fb_family) => self
+                .store
+                .get_active_provider_cooldown(fb_family.as_str(), now)
+                .map_err(|e| e.to_string())?
+                .is_none(),
+            None => false,
+        };
+        let decision = if is_quota && has_usable_fallback {
+            task.memory.fallback_stages.push(stage.clone());
             task.status = "Ready".into();
-            task.next_retry_epoch = now_epoch() + pipeline::retry_backoff(failures);
+            task.next_retry_epoch = now;
+            None
+        } else if let Some(until_epoch) = quota_until_epoch {
+            task.status = "Ready".into();
+            task.next_retry_epoch = until_epoch;
+            None
+        } else if failures <= limit {
+            task.status = "Ready".into();
+            task.next_retry_epoch = now + pipeline::retry_backoff(failures);
             None
         } else {
             task.status = "Blocked".into();
@@ -2051,6 +3079,11 @@ impl Coordinator {
             } else {
                 "retries_exhausted"
             };
+            let mut options = vec!["Retry stage".into()];
+            if kind == "retries_exhausted" && has_fallback {
+                options.push("Retry with fallback model".into());
+            }
+            options.push("Abort task".into());
             Some(crate::v2::store::FailureDecision {
                 decision_id: format!(
                     "{kind}-{}-{}-{}",
@@ -2058,7 +3091,7 @@ impl Coordinator {
                 ),
                 kind: kind.into(),
                 question: format!("{} failed; choose how to proceed", task.task_id),
-                options: vec!["Retry stage".into(), "Abort task".into()],
+                options,
                 context: error.into(),
                 sha: task.reviewed_sha.clone(),
             })
@@ -2066,12 +3099,121 @@ impl Coordinator {
         self.store
             .transition_attempt(&task, &attempt, true, decision.as_ref())
             .map_err(|e| e.to_string())?;
+        self.invalidate_tasks_cache();
+        if task.status == "Blocked" {
+            self.emit_task_audit_digest(&task.task_id)?;
+        }
         Ok(())
     }
 
+    fn lifecycle_delivery_allowed(
+        &self,
+        op: &LifecycleOperation,
+        task: &TaskRecord,
+    ) -> Result<bool, String> {
+        Ok(op.kind != "close"
+            || self
+                .store
+                .list_deliveries(Some(&task.task_id))
+                .map_err(|e| e.to_string())?
+                .is_empty()
+            || self.delivery_verified(task)?)
+    }
+
+    fn lifecycle_task_allowed(
+        &self,
+        op: &LifecycleOperation,
+        task: &TaskRecord,
+    ) -> Result<bool, String> {
+        let negative_human = op.kind.starts_with("human-")
+            && op
+                .args
+                .windows(2)
+                .any(|args| args[0] == "--verdict" && args[1] == "CHANGES_REQUESTED");
+        let has_grant = task.autonomous_consent
+            || (op.kind == "start" && task.has_active_stage_grant())
+            || task.has_execution_grant_for(Some(&op.kind));
+        Ok(has_grant
+            && (!task.memory.halt_requested || negative_human)
+            && task.status != "Cancelled"
+            && (task.status != "Done" || (op.kind == "close" && self.delivery_verified(task)?)))
+    }
+
+    fn authorize_lifecycle(&mut self, op: &LifecycleOperation) -> Result<bool, String> {
+        if !self
+            .store
+            .lifecycle_in_flight(&op.operation_id)
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(false);
+        }
+        let task = self.task(&op.task_id)?;
+        if let Some(id) = &op.decision_id
+            && (matches!(task.status.as_str(), "Done" | "Cancelled")
+                || self
+                    .store
+                    .get_decision(id)
+                    .map_err(|e| e.to_string())?
+                    .is_none_or(|d| d.status != "RESOLVED"))
+        {
+            return Ok(false);
+        }
+        if !self.lifecycle_task_allowed(op, &task)? {
+            self.store
+                .update_lifecycle(
+                    &op.operation_id,
+                    "FAILED",
+                    Some("publication intent superseded by task stop/terminal state"),
+                    0,
+                )
+                .map_err(|e| e.to_string())?;
+            return Ok(false);
+        }
+        if !self.lifecycle_delivery_allowed(op, &task)? {
+            self.store
+                .update_lifecycle(&op.operation_id, "PENDING", None, 0)
+                .map_err(|e| e.to_string())?;
+            return Ok(false);
+        }
+        if op.decision_id.is_some() {
+            return self
+                .store
+                .grant_decision_publication(&op.operation_id)
+                .map_err(|e| e.to_string());
+        }
+        Ok(true)
+    }
+
     fn replay_lifecycle(&mut self) -> Result<(), String> {
-        let ops = self.store.lifecycle_ops().map_err(|e| e.to_string())?;
+        let ops = self
+            .store
+            .replayable_lifecycle_ops()
+            .map_err(|e| e.to_string())?;
         for op in &ops {
+            if op.state == "DISPATCHED" {
+                if op.retry_epoch <= now_epoch() {
+                    let task = self.task(&op.task_id)?;
+                    let operation = op.clone();
+                    let state = self.state_dir.clone();
+                    let ws = self.ws.clone();
+                    self.submit(
+                        format!("ws:{}", op.operation_id),
+                        Some(op.task_id.clone()),
+                        2,
+                        Box::new(move || {
+                            let _fence = publication_fence(&state, &operation.task_id)?;
+                            let (output, observation) =
+                                recover_decision_publication(ws.as_ref(), &task, &operation)?;
+                            Ok(WorkerResult::LifecycleRecovered {
+                                operation_id: operation.operation_id,
+                                output,
+                                observation,
+                            })
+                        }),
+                    );
+                }
+                continue;
+            }
             if op.state != "PENDING" || op.retry_epoch > now_epoch() {
                 continue;
             }
@@ -2089,28 +3231,13 @@ impl Coordinator {
                 continue;
             }
             let task = self.task(&op.task_id)?;
-            if op.kind == "close"
-                && !self
-                    .store
-                    .list_deliveries(Some(&task.task_id))
-                    .map_err(|e| e.to_string())?
-                    .is_empty()
-                && !self.delivery_verified(&task)?
-            {
+            if op.decision_id.is_some() && matches!(task.status.as_str(), "Done" | "Cancelled") {
                 continue;
             }
-
-            let negative_human = op.kind.starts_with("human-")
-                && op
-                    .args
-                    .windows(2)
-                    .any(|args| args[0] == "--verdict" && args[1] == "CHANGES_REQUESTED");
-            if !task.autonomous_consent
-                || (task.memory.halt_requested && !negative_human)
-                || task.status == "Cancelled"
-                || (task.status == "Done"
-                    && !(op.kind == "close" && self.delivery_verified(&task)?))
-            {
+            if !self.lifecycle_delivery_allowed(op, &task)? {
+                continue;
+            }
+            if !self.lifecycle_task_allowed(op, &task)? {
                 self.store
                     .update_lifecycle(
                         &op.operation_id,
@@ -2128,9 +3255,14 @@ impl Coordinator {
                 .transpose()
                 .map_err(|e| e.to_string())?
                 .flatten();
+            if op.decision_id.is_some() && decision.as_ref().is_none_or(|d| d.status != "RESOLVED")
+            {
+                continue;
+            }
             let state = self.state_dir.clone();
             let ws = self.ws.clone();
             let operation = op.clone();
+            let commands = self.commands.clone();
             let key = format!("ws:{}", op.operation_id);
             if self.submit(
                 key,
@@ -2143,9 +3275,30 @@ impl Coordinator {
                             return Err("human evidence path does not match durable intent".into());
                         }
                     }
-                    let mut args = operation.args;
+                    let fence = decision
+                        .as_ref()
+                        .map(|_| publication_fence(&state, &operation.task_id))
+                        .transpose()?;
+                    // The coordinator commits the per-task fence before replying.
+                    // A terminal update after this grant must await the receipt.
+                    let authorize = || -> Result<bool, String> {
+                        let (reply, verdict) = mpsc::sync_channel(1);
+                        commands
+                            .send(CoordinatorEvent::AuthorizeLifecycle {
+                                operation: Box::new(operation.clone()),
+                                reply,
+                            })
+                            .map_err(|_| "lifecycle coordinator stopped".to_string())?;
+                        verdict
+                            .recv()
+                            .map_err(|_| "lifecycle coordinator stopped".to_string())?
+                    };
+                    let mut args = operation.args.clone();
                     // Recover a successful remote start whose local receipt was lost.
                     if operation.kind == "start" && operation.attempts > 0 {
+                        if !authorize()? {
+                            return Ok(WorkerResult::LifecycleSkipped);
+                        }
                         let export =
                             ws.execute(&["export".into(), "--sync".into(), "--json".into()])?;
                         let export: intake::ExportContract =
@@ -2164,15 +3317,34 @@ impl Coordinator {
                             args.push("--resume".into());
                         }
                     }
-                    let output = ws.execute(&args)?;
+                    if !authorize()? {
+                        return Ok(WorkerResult::LifecycleSkipped);
+                    }
+                    let output = if let Some(fence) = &fence {
+                        ws.execute_fenced(&args, fence)?
+                    } else {
+                        ws.execute(&args)?
+                    };
                     let output = if operation.kind == "close" {
                         String::new()
                     } else {
-                        serde_json::to_string(&intake::parse_start_receipt(
-                            &output,
-                            &operation.task_id,
-                        )?)
-                        .map_err(|e| e.to_string())?
+                        let receipt = intake::parse_start_receipt(&output, &operation.task_id)?;
+                        if operation.decision_id.is_some()
+                            && (receipt["stage"].as_str() != Some(operation.kind.as_str())
+                                || receipt["verdict"].as_str()
+                                    != operation_arg(&operation, "--verdict")
+                                || operation_arg(&operation, "--sha")
+                                    .is_some_and(|sha| receipt["sha"].as_str() != Some(sha))
+                                || !matches!(
+                                    receipt["weight"].as_str(),
+                                    Some("XS" | "S" | "M" | "L")
+                                ))
+                        {
+                            return Err(
+                                "Governance decision publication receipt identity mismatch".into(),
+                            );
+                        }
+                        serde_json::to_string(&receipt).map_err(|e| e.to_string())?
                     };
                     Ok(WorkerResult::Lifecycle {
                         operation_id: operation.operation_id,
@@ -2181,7 +3353,16 @@ impl Coordinator {
                 }),
             ) {
                 self.store
-                    .update_lifecycle(&op.operation_id, "IN_FLIGHT", None, 0)
+                    .update_lifecycle(
+                        &op.operation_id,
+                        if op.decision_id.is_some() {
+                            "QUEUED"
+                        } else {
+                            "IN_FLIGHT"
+                        },
+                        None,
+                        0,
+                    )
                     .map_err(|e| e.to_string())?;
             }
         }
@@ -2198,16 +3379,47 @@ impl Coordinator {
         else {
             return Ok(());
         };
-        if op.state == "ACKNOWLEDGED" {
+        if matches!(op.state.as_str(), "ACKNOWLEDGED" | "SETTLED") {
+            return Ok(());
+        }
+        if op.state == "DISPATCHED" {
+            self.store
+                .update_lifecycle(id, "DISPATCHED", Some(error), now_epoch() + 30)
+                .map_err(|e| e.to_string())?;
+            let task = self.task(&op.task_id)?;
+            if op.decision_id.is_some()
+                && !matches!(task.status.as_str(), "Done" | "Cancelled")
+                && let Ok(_fence) = publication_fence(&self.state_dir, &op.task_id)
+            {
+                self.store
+                    .open_decision(
+                        &format!("settle-{}", op.operation_id),
+                        &task.task_id,
+                        &task.task_group,
+                        "governance_publication_uncertain",
+                        "Close this publication after manually checking Governance?",
+                        &["Close without replay".into()],
+                        None,
+                        "The write may have landed. Verify and reconcile the issue and board before closing. Closing permanently retires this publication and applies any deferred terminal transition.",
+                        operation_arg(&op, "--sha"),
+                    )
+                    .map_err(|e| e.to_string())?;
+                self.invalidate_tasks_cache();
+            }
             return Ok(());
         }
         let current = self.task(&op.task_id)?;
-        if !current.autonomous_consent
-            || current.memory.halt_requested
-            || current.status == "Cancelled"
-            || (current.status == "Done"
-                && !(op.kind == "close" && self.delivery_verified(&current)?))
+        if let Some(id) = &op.decision_id
+            && (matches!(current.status.as_str(), "Done" | "Cancelled")
+                || self
+                    .store
+                    .get_decision(id)
+                    .map_err(|e| e.to_string())?
+                    .is_some_and(|decision| decision.status == "RETIRED"))
         {
+            return Ok(());
+        }
+        if !self.lifecycle_task_allowed(&op, &current)? {
             self.store
                 .update_lifecycle(id, "FAILED", Some(error), 0)
                 .map_err(|e| e.to_string())?;
@@ -2222,7 +3434,7 @@ impl Coordinator {
                 now_epoch() + pipeline::retry_backoff(op.attempts as usize),
             )
             .map_err(|e| e.to_string())?;
-        if failed {
+        if failed && !matches!(current.status.as_str(), "Done" | "Cancelled") {
             let task = self.task(&op.task_id)?;
             let (kind, option) = if op.kind == "close" {
                 ("governance_close_failed", "Retry close")
@@ -2242,6 +3454,7 @@ impl Coordinator {
                     task.reviewed_sha.as_deref(),
                 )
                 .map_err(|e| e.to_string())?;
+            self.emit_task_audit_digest(&op.task_id)?;
         }
         Ok(())
     }
@@ -2254,13 +3467,39 @@ impl Coordinator {
             .into_iter()
             .find(|o| o.operation_id == id)
             .ok_or("unknown lifecycle operation")?;
-        if op.state == "ACKNOWLEDGED" {
+        if matches!(op.state.as_str(), "ACKNOWLEDGED" | "SETTLED") {
             return Ok(());
         }
         // Receipt and local transition commit atomically after external acknowledgment.
         let mut task = self.task(&op.task_id)?;
+        if let Some(decision_id) = &op.decision_id
+            && (matches!(task.status.as_str(), "Done" | "Cancelled")
+                || self
+                    .store
+                    .get_decision(decision_id)
+                    .map_err(|e| e.to_string())?
+                    .is_none_or(|decision| decision.status != "RESOLVED"))
+        {
+            return Ok(());
+        }
+        if op.state == "DISPATCHED"
+            && self
+                .store
+                .deferred_terminal(id, &task)
+                .map_err(|e| e.to_string())?
+                .is_some()
+        {
+            self.store
+                .acknowledge_lifecycle(&task, &op, None)
+                .map_err(|e| e.to_string())?;
+            self.invalidate_tasks_cache();
+            return Ok(());
+        }
+        let has_op_grant = task.autonomous_consent
+            || (op.kind == "start" && task.has_active_stage_grant())
+            || task.has_execution_grant_for(Some(&op.kind));
         if op.kind != "close"
-            && (!task.autonomous_consent
+            && (!has_op_grant
                 || task.memory.halt_requested
                 || matches!(task.status.as_str(), "Done" | "Cancelled"))
         {
@@ -2324,7 +3563,9 @@ impl Coordinator {
                 }
                 task.memory.governance_started = true;
                 task.executor = Some("zach".into());
-                task.status = "Ready".into();
+                if task.active_attempt_id.is_none() && task.memory.pipeline_checkpoint.is_none() {
+                    task.status = "Ready".into();
+                }
             }
             "human-plan-approval" | "human-merge-approval" => {
                 let decision_id = id
@@ -2359,6 +3600,7 @@ impl Coordinator {
                         .map_err(|e| e.to_string())?;
                     return self.error_event(
                         Some(&task.task_id),
+                        None,
                         "stale human approval acknowledgment ignored",
                     );
                 }
@@ -2431,22 +3673,58 @@ impl Coordinator {
                     .pipeline_checkpoint
                     .clone()
                     .ok_or("publication missing pipeline checkpoint")?;
-                if cp.operation == "PUBLISH_CHANGES_REQUESTED" {
+                let outcome_status = if cp.operation == "PUBLISH_CHANGES_REQUESTED" {
                     self.review_rework(&mut task, stage)?;
+                    "CHANGES_REQUESTED"
                 } else {
                     if !task.stages_completed.iter().any(|s| s == stage) {
                         task.stages_completed.push(stage.into());
                     }
                     task.status = "Ready".into();
-                }
-                completed_attempt = Some(cp.attempt_id);
+                    "PASSED"
+                };
+                completed_attempt = Some(cp.attempt_id.clone());
                 task.active_attempt_id = None;
                 task.memory.pipeline_checkpoint = None;
+                if let Some(grant) = task.memory.stage_run_grant.as_mut()
+                    && !grant.consumed
+                    && grant.stage == stage
+                {
+                    grant.consumed = true;
+                    grant.terminal_status = Some(outcome_status.to_owned());
+                    grant.terminal_attempt_id = Some(cp.attempt_id.clone());
+                    grant.terminal_summary = Some(format!(
+                        "stage {stage} finished with status {outcome_status}"
+                    ));
+                }
             }
         }
+        let finished_grant = task
+            .memory
+            .stage_run_grant
+            .as_ref()
+            .filter(|g| g.consumed && g.stage == op.kind)
+            .cloned();
         self.store
             .acknowledge_lifecycle(&task, &op, completed_attempt.as_deref())
             .map_err(|e| e.to_string())?;
+        if let Some(grant) = finished_grant {
+            let _ = self.store.append_event(
+                &task.task_id,
+                &task.task_group,
+                "STAGE_RUN_FINISHED",
+                &serde_json::json!({
+                    "task_id": task.task_id,
+                    "stage": grant.stage,
+                    "status": grant.terminal_status.unwrap_or_else(|| "COMPLETED".to_owned()),
+                    "attempt_id": grant.terminal_attempt_id,
+                    "summary": grant.terminal_summary,
+                }),
+            );
+        }
+        if op.kind == "close" || task.status == "Blocked" {
+            self.emit_task_audit_digest(&task.task_id)?;
+        }
         Ok(())
     }
 
@@ -2525,7 +3803,7 @@ impl Coordinator {
     }
 
     fn evaluate_gates(&mut self) -> Result<(), String> {
-        for mut task in self.store.list_tasks(None).map_err(|e| e.to_string())? {
+        for mut task in self.list_all_tasks_cached()? {
             let stale_gate_wait = task.status == "Blocked"
                 && !task.memory.halt_requested
                 && task
@@ -2658,7 +3936,7 @@ impl Coordinator {
                     .contains(&decision.decision_id)
                 && let Err(error) = self.apply_decision(&decision)
             {
-                self.error_event(Some(&decision.task_id), &error)?;
+                self.error_event(Some(&decision.task_id), None, &error)?;
             }
         }
         Ok(())
@@ -2669,11 +3947,46 @@ impl Coordinator {
         decision: &crate::v2::store::PendingDecisionRecord,
     ) -> Result<(), String> {
         let mut task = self.task(&decision.task_id)?;
+        if decision.status != "RESOLVED" || matches!(task.status.as_str(), "Done" | "Cancelled") {
+            return Ok(());
+        }
+
         if task
             .memory
             .applied_decisions
             .contains(&decision.decision_id)
         {
+            return Ok(());
+        }
+        if decision.kind == "governance_publication_uncertain" {
+            let id = decision
+                .decision_id
+                .strip_prefix("settle-")
+                .ok_or("invalid publication settlement identity")?;
+            let op = self
+                .store
+                .lifecycle_ops()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .find(|op| {
+                    op.operation_id == id
+                        && op.task_id == task.task_id
+                        && op.state == "DISPATCHED"
+                        && op.decision_id.is_some()
+                })
+                .ok_or("missing dispatched publication for settlement")?;
+            // A confirmed readback already in progress gets to finish first.
+            // The durable decision can be applied on a later tick or after restart.
+            if self.jobs.contains(&format!("ws:{id}")) {
+                return Ok(());
+            }
+            let Ok(_fence) = publication_fence(&self.state_dir, &task.task_id) else {
+                return Ok(());
+            };
+            self.store
+                .settle_decision_publication(&task, &op, &decision.decision_id)
+                .map_err(|e| e.to_string())?;
+            self.invalidate_tasks_cache();
             return Ok(());
         }
         if matches!(
@@ -2716,6 +4029,7 @@ impl Coordinator {
                 self.save(&task)?;
                 return self.error_event(
                     Some(&task.task_id),
+                    None,
                     "stale human decision; current SHA differs",
                 );
             }
@@ -2767,6 +4081,22 @@ impl Coordinator {
                 task.memory.retry_generation += 1;
                 task.memory.retry_reset_epoch = now_epoch();
                 task.next_retry_epoch = 0;
+                task.retry_count = 0;
+                task.status = "Ready".into();
+            }
+            "Retry with fallback model" => {
+                task.memory.halt_requested = false;
+                if task.active_attempt_id.is_some() {
+                    return Err("cannot retry while an attempt still needs cleanup".into());
+                }
+                let stage = task.current_stage.clone().unwrap_or_else(|| "impl".into());
+                if !task.memory.fallback_stages.iter().any(|s| s == &stage) {
+                    task.memory.fallback_stages.push(stage);
+                }
+                task.memory.retry_generation += 1;
+                task.memory.retry_reset_epoch = now_epoch();
+                task.next_retry_epoch = 0;
+                task.retry_count = 0;
                 task.status = "Ready".into();
             }
             "Retry merge" => {
@@ -2847,6 +4177,7 @@ impl Coordinator {
                 } else {
                     return Err("decision does not authorize review budget reset".into());
                 }
+                task.retry_count = 0;
                 task.status = "Ready".into();
             }
             "Record merge SHA manually" => {
@@ -2914,7 +4245,11 @@ impl Coordinator {
         task.memory
             .applied_decisions
             .push(decision.decision_id.clone());
-        self.save(&task)
+        self.save(&task)?;
+        if task.status == "Blocked" {
+            self.emit_task_audit_digest(&task.task_id)?;
+        }
+        Ok(())
     }
 
     fn delivery_verified(&self, task: &TaskRecord) -> Result<bool, String> {
@@ -2942,12 +4277,13 @@ impl Coordinator {
 
     fn poll_deliveries(&mut self) -> Result<(), String> {
         // Recover the small gap between the durable handoff and lane release.
-        for mut task in self.store.list_tasks(None).map_err(|e| e.to_string())? {
+        for mut task in self.list_all_tasks_cached()? {
             if let Some(recovered) = self
                 .store
                 .recover_unclosed_delivery(&task.task_id)
                 .map_err(|e| e.to_string())?
             {
+                self.invalidate_tasks_cache();
                 task = recovered;
             }
             let rows = self
@@ -3250,6 +4586,7 @@ impl Coordinator {
                 self.store
                     .update_merge_queue_state(&task.repository, id, "MERGE_QUEUE_BLOCKED")
                     .map_err(|e| e.to_string())?;
+                self.emit_task_audit_digest(id)?;
             }
         }
         Ok(())
@@ -3326,7 +4663,9 @@ impl Coordinator {
         };
         self.store
             .transition_task(&task, None, !uncertain && !close, Some(&decision))
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        self.emit_task_audit_digest(id)?;
+        Ok(())
     }
 }
 
@@ -3701,6 +5040,7 @@ mod tests {
         reads: AtomicUsize,
         mutations: AtomicUsize,
     }
+    impl LifecycleWsTaskClient for RehearsalWs {}
     impl WsTaskClient for RehearsalWs {
         fn execute(&self, args: &[String]) -> Result<String, String> {
             if args == ["export", "--sync", "--json"] {
@@ -3898,6 +5238,9 @@ mod tests {
 
     fn rehearsal_startup(c: &mut Coordinator) -> Result<(), String> {
         c.startup_ownership()?;
+        c.store
+            .retire_terminal_decisions()
+            .map_err(|e| e.to_string())?;
         let snapshots = c
             .store
             .list_tasks(None)
@@ -4608,8 +5951,11 @@ mod tests {
         Ok(bytes)
     }
     fn rehearsal_directory() -> Result<(PathBuf, u32, (u64, u64)), String> {
+        rehearsal_directory_for("ZACH039_REHEARSAL_DIR")
+    }
+    fn rehearsal_directory_for(env_var: &str) -> Result<(PathBuf, u32, (u64, u64)), String> {
         use std::os::unix::fs::MetadataExt;
-        let dir = PathBuf::from(std::env::var_os("ZACH039_REHEARSAL_DIR").ok_or("NO_SELECTOR")?);
+        let dir = PathBuf::from(std::env::var_os(env_var).ok_or("NO_SELECTOR")?);
         // Root means the orchestrating role. The reviewed operator is ubuntu,
         // running with its own UID and real user bus, never sudo/root.
         let uid = unsafe { libc::geteuid() };
@@ -4791,6 +6137,31 @@ mod tests {
         w: &ActualDecodeTimeWitness,
         export: &str,
     ) -> Result<StandardObservation, String> {
+        observe_standard_for_profile(c, w, export, None)
+    }
+    fn profile_status_matches(
+        old: &TaskRecord,
+        incoming: &TaskRecord,
+        retained: Option<&BTreeSet<String>>,
+    ) -> bool {
+        if retained.is_some_and(|ids| ids.contains(&old.task_id)) {
+            matches!(
+                (old.status.as_str(), incoming.status.as_str()),
+                ("Ready", "Ready") | ("Blocked", "Blocked") | ("Ready", "Blocked")
+            ) && !old.autonomous_consent
+                && !incoming.autonomous_consent
+                && old.executor.as_deref() == Some("zach")
+                && incoming.executor.as_deref() == Some("zach")
+        } else {
+            old.status == incoming.status
+        }
+    }
+    fn observe_standard_for_profile(
+        c: &mut Coordinator,
+        w: &ActualDecodeTimeWitness,
+        export: &str,
+        retained: Option<&BTreeSet<String>>,
+    ) -> Result<StandardObservation, String> {
         w.verify(export, now_epoch())?;
         if !c.jobs.is_empty()
             || c.submission_probe.is_none()
@@ -4805,7 +6176,9 @@ mod tests {
         if old.len() != w.records.len()
             || w.records.iter().any(|t| {
                 !old.iter().any(|o| {
-                    o.task_id == t.task_id && o.repository == t.repository && o.status == t.status
+                    o.task_id == t.task_id
+                        && o.repository == t.repository
+                        && profile_status_matches(o, t, retained)
                 })
             })
         {
@@ -4991,6 +6364,14 @@ mod tests {
         w: &ActualDecodeTimeWitness,
         export: &str,
     ) -> Result<usize, String> {
+        validate_standard_for_profile(o, w, export, None)
+    }
+    fn validate_standard_for_profile(
+        o: &StandardObservation,
+        w: &ActualDecodeTimeWitness,
+        export: &str,
+        retained: Option<&BTreeSet<String>>,
+    ) -> Result<usize, String> {
         use rusqlite::types::Value as V;
         w.verify(export, o.epoch)?;
         if !native_event_schema(&o.schema_before) || o.schema_before != o.schema_after {
@@ -5059,13 +6440,32 @@ mod tests {
                 .find(|t| t.task_id == incoming.task_id)
                 .ok_or("STANDARD_INVENTORY")?;
             if old.repository != incoming.repository
-                || old.status != incoming.status
+                || !profile_status_matches(old, incoming, retained)
                 || t.repository != old.repository
                 || t.status != old.status
                 || t.task_group != incoming.task_group
                 || t.updated_epoch != incoming.updated_epoch
             {
                 return Err("STANDARD_OWNER_BINDING".into());
+            }
+            let latest_observation = expected.iter().rev().find(|row| {
+                row[1] == V::Text(t.task_id.clone())
+                    && row[4] == V::Text("BOARD_STATUS_OBSERVED".into())
+            });
+            let observed_payload = serde_json::json!({
+                "task_id": t.task_id, "board_status": incoming.status
+            })
+            .to_string();
+            if latest_observation.is_none_or(|row| row[5] != V::Text(observed_payload.clone())) {
+                next = next.checked_add(1).ok_or("STANDARD_EVENT_OVERFLOW")?;
+                expected.push(vec![
+                    V::Integer(next),
+                    V::Text(t.task_id.clone()),
+                    V::Text(t.task_group.clone()),
+                    V::Integer(t.updated_epoch),
+                    V::Text("BOARD_STATUS_OBSERVED".into()),
+                    V::Text(observed_payload),
+                ]);
             }
             if old.weight == t.weight {
                 continue;
@@ -5098,7 +6498,7 @@ mod tests {
             return Err("STANDARD_EVENTS".into());
         }
         let mut expected_alloc = old_alloc;
-        if count > 0 {
+        if next > high {
             if let Some(row) = expected_alloc.iter_mut().find(|r| r[1] == name) {
                 row[2] = V::Integer(next);
             } else {
@@ -5292,7 +6692,7 @@ mod tests {
         assert_eq!(validate_standard(&o, &w, &raw).unwrap(), 2);
         let events = event_rows(o.after.get("task_events").unwrap()).unwrap();
         assert_eq!(events[14][1], V::Text("z-first".into()));
-        assert_eq!(events[15][1], V::Text("a-second".into()));
+        assert_eq!(events[16][1], V::Text("a-second".into()));
         // Simulate canonical JSON transport sorting, which orders 10 before2.
         for image in [&mut o.before, &mut o.after] {
             image
@@ -5353,7 +6753,7 @@ mod tests {
             c.store.get_task(&returned.task_id).unwrap().unwrap()
         );
         assert_eq!(
-            c.store.list_events_since(None, 0, 100).unwrap()[0].event_type,
+            c.store.list_events_since(None, 0, 100).unwrap()[1].event_type,
             "TASK_DONE"
         );
     }
@@ -5514,8 +6914,8 @@ mod tests {
         assert_eq!(validate_standard(&bad, &w, &raw).unwrap(), 2);
         let rows = bad.after.get_mut("task_events").unwrap();
         let first = rows[0][1].clone();
-        rows[0][1] = rows[1][1].clone();
-        rows[1][1] = first;
+        rows[0][1] = rows[2][1].clone();
+        rows[2][1] = first;
         assert!(validate_standard(&bad, &w, &raw).is_err());
     }
 
@@ -5526,13 +6926,13 @@ mod tests {
         let o = observe_standard(&mut c, &w, &raw).unwrap();
         let mut supported = o.clone();
         supported.allocator_before[0][2] = V::Integer(50);
-        supported.allocator_after[0][2] = V::Integer(51);
-        supported
-            .after
-            .get_mut("task_events")
-            .unwrap()
-            .last_mut()
-            .unwrap()[0] = V::Integer(51);
+        supported.allocator_after[0][2] = V::Integer(52);
+        for (row, seq) in supported.after.get_mut("task_events").unwrap()[2..]
+            .iter_mut()
+            .zip(51..=52)
+        {
+            row[0] = V::Integer(seq);
+        }
         for rows in [
             &mut supported.allocator_before,
             &mut supported.allocator_after,
@@ -5574,13 +6974,13 @@ mod tests {
                 "high-text" => bad.allocator_before[0][2] = V::Text("50".into()),
                 "high-negative" => bad.allocator_before[0][2] = V::Integer(-1),
                 "high-behind" => bad.allocator_before[0][2] = V::Integer(0),
-                "advance" => bad.allocator_after[0][2] = V::Integer(52),
+                "advance" => bad.allocator_after[0][2] = V::Integer(53),
                 "gap" => {
                     bad.after
                         .get_mut("task_events")
                         .unwrap()
                         .last_mut()
-                        .unwrap()[0] = V::Integer(52)
+                        .unwrap()[0] = V::Integer(53)
                 }
                 "overflow" => bad.allocator_before[0][2] = V::Integer(i64::MAX),
                 "unrelated" => bad.allocator_after[1][2] = V::Integer(10),
@@ -5602,11 +7002,7 @@ mod tests {
         let (_dir, mut c, raw, w) = weight_fixture(&[("no-event", "M", "M", "Done")], 0);
         let mut no_event = observe_standard(&mut c, &w, &raw).unwrap();
         assert_eq!(validate_standard(&no_event, &w, &raw).unwrap(), 0);
-        no_event.allocator_after.push(vec![
-            V::Integer(1),
-            V::Text("task_events".into()),
-            V::Integer(1),
-        ]);
+        no_event.allocator_after[0][2] = V::Integer(2);
         refresh_allocator_image(&mut no_event);
         assert!(validate_standard(&no_event, &w, &raw).is_err());
     }
@@ -5622,7 +7018,7 @@ mod tests {
             let (_dir, mut c, raw, w) = weight_fixture(&[("unreviewed", from, to, status)], 0);
             let o = observe_standard(&mut c, &w, &raw).unwrap();
             assert_eq!(
-                c.store.list_events_since(None, 0, 100).unwrap()[0].event_type,
+                c.store.list_events_since(None, 0, 100).unwrap()[1].event_type,
                 "WEIGHT_ESCALATED"
             );
             assert!(validate_standard(&o, &w, &raw).is_err());
@@ -5736,9 +7132,8 @@ mod tests {
             .unwrap();
         let raw=serde_json::json!({"schema_version":2,"tasks":[{"id":old.task_id,"repository":old.repository,"status":"Done","weight":"L","executor":"external","autonomous_consent":false}]}).to_string();
         let w = actual_decode(&raw).unwrap();
-        let events = c.store.list_events_since(None, 0, 100).unwrap();
-        let allocator = standard_allocator(&mut c.store).unwrap();
-        for _ in 0..2 {
+        let mut events = c.store.list_events_since(None, 0, 100).unwrap();
+        for pass in 0..2 {
             c.store
                 .sync_task_with_mode(
                     &w.records[0],
@@ -5746,8 +7141,20 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(c.task(&old.task_id).unwrap().weight, "M");
-            assert_eq!(c.store.list_events_since(None, 0, 100).unwrap(), events);
-            assert_eq!(standard_allocator(&mut c.store).unwrap(), allocator);
+            let after = c.store.list_events_since(None, 0, 100).unwrap();
+            if pass == 0 {
+                assert_eq!(after[..events.len()], events);
+                assert_eq!(
+                    after[events.len()..]
+                        .iter()
+                        .map(|e| e.event_type.as_str())
+                        .collect::<Vec<_>>(),
+                    ["BOARD_STATUS_OBSERVED", "TASK_DONE"]
+                );
+                events = after;
+            } else {
+                assert_eq!(after, events);
+            }
             assert_eq!(
                 c.store.list_stage_attempts(&old.task_id).unwrap(),
                 vec![a.clone()]
@@ -5771,7 +7178,7 @@ mod tests {
         let mut incoming = old.clone();
         incoming.status = "Done".into();
         incoming.weight = "L".into();
-        for _ in 0..2 {
+        for pass in 0..2 {
             let history = c.store.list_events_since(None, 0, 100).unwrap();
             let allocator = standard_allocator(&mut c.store).unwrap();
             c.store
@@ -5781,8 +7188,18 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(c.task(&old.task_id).unwrap().weight, "M");
-            assert_eq!(c.store.list_events_since(None, 0, 100).unwrap(), history);
-            assert_eq!(standard_allocator(&mut c.store).unwrap(), allocator);
+            let after = c.store.list_events_since(None, 0, 100).unwrap();
+            assert_eq!(
+                after
+                    .iter()
+                    .map(|e| e.event_type.as_str())
+                    .collect::<Vec<_>>(),
+                ["BOARD_STATUS_OBSERVED", "TASK_DONE"]
+            );
+            if pass > 0 {
+                assert_eq!(after, history);
+                assert_eq!(standard_allocator(&mut c.store).unwrap(), allocator);
+            }
         }
     }
 
@@ -5869,12 +7286,48 @@ mod tests {
         }
     }
 
+    fn write_rehearsal_result(dir: &Path, uid: u32, bytes: &[u8]) -> Result<(), String> {
+        use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
+        let output = dir.join("result.json");
+        let temporary = dir.join(".result.tmp");
+        if output.exists() || temporary.exists() {
+            return Err("OUTPUT_EXISTS".into());
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&temporary)
+            .map_err(|_| "OUTPUT_WRITE")?;
+        file.write_all(bytes).map_err(|_| "OUTPUT_WRITE")?;
+        file.sync_all().map_err(|_| "OUTPUT_WRITE")?;
+        let from =
+            std::ffi::CString::new(temporary.as_os_str().as_bytes()).map_err(|_| "OUTPUT_WRITE")?;
+        let to =
+            std::ffi::CString::new(output.as_os_str().as_bytes()).map_err(|_| "OUTPUT_WRITE")?;
+        if unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        } != 0
+        {
+            return Err("OUTPUT_WRITE".into());
+        }
+        rehearsal_file(&output, uid)?;
+        Ok(())
+    }
+
     /// ROOT ORCHESTRATOR ONLY. Never invoke from a worker, ordinary cargo test,
     /// production CLI or daemon. Inputs are exclusive operator-owned copies.
     #[test]
     #[ignore = "root orchestrator only: reviewed binary and exclusive private copied inputs required"]
     fn private_copy_activation_rehearsal() -> Result<(), String> {
-        use std::io::Write;
         use std::os::unix::fs::MetadataExt;
         let (dir, uid, dir_identity) = rehearsal_directory()?;
         let (db, db_id) = rehearsal_file(&dir.join("zach-v2.sqlite3"), uid)?;
@@ -6152,39 +7605,8 @@ mod tests {
             }
             Err(class) => result["failure_class"] = class.clone().into(),
         }
-        let output = dir.join("result.json");
-        let temporary = dir.join(".result.tmp");
-        if output.exists() || temporary.exists() {
-            return Err("OUTPUT_EXISTS".into());
-        }
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&temporary)
-            .map_err(|_| "OUTPUT_WRITE")?;
-        file.write_all(&serde_json::to_vec(&result).map_err(|_| "RESULT_SCHEMA")?)
-            .map_err(|_| "OUTPUT_WRITE")?;
-        file.sync_all().map_err(|_| "OUTPUT_WRITE")?;
-        use std::os::unix::ffi::OsStrExt;
-        let from =
-            std::ffi::CString::new(temporary.as_os_str().as_bytes()).map_err(|_| "OUTPUT_WRITE")?;
-        let to =
-            std::ffi::CString::new(output.as_os_str().as_bytes()).map_err(|_| "OUTPUT_WRITE")?;
-        if unsafe {
-            libc::renameat2(
-                libc::AT_FDCWD,
-                from.as_ptr(),
-                libc::AT_FDCWD,
-                to.as_ptr(),
-                libc::RENAME_NOREPLACE,
-            )
-        } != 0
-        {
-            return Err("OUTPUT_WRITE".into());
-        }
-        rehearsal_file(&output, uid)?;
+        let bytes = serde_json::to_vec(&result).map_err(|_| "RESULT_SCHEMA")?;
+        write_rehearsal_result(&dir, uid, &bytes)?;
         outcome
     }
 
@@ -6209,7 +7631,7 @@ mod tests {
     }
 
     #[test]
-    fn offline_empty_terminal_is_visible_in_actual_snapshot_without_event() {
+    fn offline_empty_terminal_is_visible_in_actual_snapshot_and_event_history() {
         let dir = TestDirectory::new();
         let mut c = coordinator(&dir.0);
         let payload = serde_json::json!({"schema_version":2,"tasks":[{"id":"empty-snapshot","repository":"synthetic","status":"In Progress","autonomous_consent":false}]});
@@ -6225,7 +7647,14 @@ mod tests {
                 crate::v2::store::SyncMode::ReconcileFinishedLegacy,
             )
             .unwrap();
-        assert!(c.store.list_events_since(None, 0, 100).unwrap().is_empty());
+        let events = c.store.list_events_since(None, 0, 100).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|e| e.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["BOARD_STATUS_OBSERVED", "TASK_DONE"]
+        );
         let messages = c
             .socket_command(ClientCommand::Subscribe {
                 group: None,
@@ -6234,7 +7663,10 @@ mod tests {
             })
             .unwrap();
         assert!(
-            matches!(&messages[0],ServerMessage::Snapshot{tasks,..} if tasks.len()==1 && tasks[0].status=="Done")
+            matches!(&messages[0],ServerMessage::Snapshot{tasks,board_statuses,as_of_seq,..}
+                if tasks.len()==1 && tasks[0].status=="Done"
+                && board_statuses.get(&tasks[0].task_id).is_some_and(|s| s == "Done")
+                && *as_of_seq == events[1].seq_id)
         );
     }
 
@@ -6367,6 +7799,152 @@ mod tests {
             c.task("decision").unwrap().memory.applied_decisions.len(),
             1
         );
+    }
+
+    #[test]
+    fn fail_task_quota_triggers_immediate_fallback_without_burning_retry_count() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        let mut t = task("quota-fb");
+        t.weight = "S".into();
+        t.current_stage = Some("impl".into());
+        t.retry_count = 1;
+        c.save(&t).unwrap();
+
+        c.fail_task(
+            "quota-fb",
+            "You've hit your usage limit for gpt-6.1-sol",
+            None,
+        )
+        .unwrap();
+
+        let updated = c.task("quota-fb").unwrap();
+        assert_eq!(updated.status, "Ready");
+        assert_eq!(updated.retry_count, 1);
+        assert_eq!(updated.memory.fallback_stages, vec!["impl".to_owned()]);
+        assert!(c.store.list_decisions(true, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fail_task_quota_without_fallback_defers_to_cooldown_without_burning_infra_retries() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        let mut t = task("quota-no-fb");
+        t.weight = "S".into();
+        t.current_stage = Some("pr-review".into());
+        c.save(&t).unwrap();
+
+        // Seed a PASSED impl attempt on GeminiAgy so pr-review routes to OpenAiSol (no fallback on review stages).
+        let impl_attempt = StageAttemptRecord {
+            attempt_id: "att-impl".into(),
+            task_id: "quota-no-fb".into(),
+            stage: "impl".into(),
+            model: "gemini-4-hydrogen-medium".into(),
+            effort: "medium".into(),
+            systemd_unit: None,
+            invocation_id: None,
+            started_epoch: 100,
+            ended_epoch: Some(200),
+            status: "PASSED".into(),
+            failure_class: None,
+            summary: Some("ok".into()),
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            sha_before: None,
+            sha_after: None,
+            phase: "COMPLETE".into(),
+            last_liveness_epoch: 200,
+            last_output_bytes: 0,
+            last_cpu_usage_usec: None,
+            control_group: None,
+            exit_code: Some(0),
+            exit_code_kind: None,
+            retry_generation: 0,
+        };
+        c.store.record_stage_attempt(&impl_attempt).unwrap();
+
+        for i in 0..=(pipeline::MAX_INFRA_RETRIES + 2) {
+            let before = now_epoch();
+            c.fail_task(
+                "quota-no-fb",
+                &format!("Quota exceeded #{i}, resets in 2 hours"),
+                None,
+            )
+            .unwrap();
+            let updated = c.task("quota-no-fb").unwrap();
+            assert_eq!(updated.status, "Ready");
+            assert_eq!(updated.retry_count, 0);
+            assert!(updated.next_retry_epoch >= before + 2 * 3600);
+            assert!(c.store.list_decisions(true, None).unwrap().is_empty());
+            let cd = c
+                .store
+                .get_active_provider_cooldown("openai-sol", before)
+                .unwrap()
+                .expect("cooldown persisted");
+            assert_eq!(cd.until_epoch, updated.next_retry_epoch);
+        }
+    }
+
+    #[test]
+    fn retries_exhausted_offers_fallback_option_and_resets_retry_count_on_decision() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        let mut t = task("exhausted-fb");
+        t.weight = "S".into();
+        t.current_stage = Some("impl".into());
+        c.save(&t).unwrap();
+
+        for i in 0..=pipeline::MAX_INFRA_RETRIES {
+            c.fail_task(
+                "exhausted-fb",
+                &format!("AGY_TIMEOUT: attempt {i}"),
+                Some("infra"),
+            )
+            .unwrap();
+        }
+
+        let blocked = c.task("exhausted-fb").unwrap();
+        assert_eq!(blocked.status, "Blocked");
+        assert!(blocked.retry_count > 0);
+        let decision = c
+            .store
+            .list_decisions(true, None)
+            .unwrap()
+            .into_iter()
+            .find(|d| d.task_id == "exhausted-fb")
+            .unwrap();
+        assert_eq!(decision.kind, "retries_exhausted");
+        assert_eq!(
+            decision.options,
+            vec![
+                "Retry stage".to_owned(),
+                "Retry with fallback model".to_owned(),
+                "Abort task".to_owned(),
+            ]
+        );
+
+        let DecisionResolution::Resolved(resolved) = c
+            .store
+            .resolve_decision(
+                &decision.decision_id,
+                "Retry with fallback model",
+                "alice",
+                None,
+            )
+            .unwrap()
+        else {
+            panic!("expected resolved decision");
+        };
+        c.apply_decision(&resolved).unwrap();
+
+        let retried = c.task("exhausted-fb").unwrap();
+        assert_eq!(retried.status, "Ready");
+        assert_eq!(retried.retry_count, 0);
+        assert_eq!(retried.next_retry_epoch, 0);
+        assert!(!retried.memory.halt_requested);
+        assert_eq!(retried.memory.retry_generation, 1);
+        assert_eq!(retried.memory.fallback_stages, vec!["impl".to_owned()]);
     }
 
     #[test]
@@ -6938,7 +8516,10 @@ mod tests {
     fn escalated_impl_is_suspended_until_prerequisites_and_never_relaunched() {
         let dir = TestDirectory::new();
         let mut c = coordinator(&dir.0);
+        let wt = dir.0.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
         let mut t = task("escalated");
+        t.worktree_path = Some(wt.to_string_lossy().into_owned());
         t.lease_owner = Some(c.instance.clone());
         let mut a = seed_attempt(&mut c, t, "saved-impl");
         a.phase = "POSTPROCESSING".into();
@@ -7119,10 +8700,110 @@ mod tests {
         socket_thread.join().unwrap().unwrap();
         coordinator_thread.join().unwrap().unwrap();
     }
+    #[test]
+    fn coordinated_socket_delivers_live_terminal_events_and_replays_against_snapshot() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixStream;
+
+        let dir = TestDirectory::new();
+        let (mut c, handle) =
+            Coordinator::create(V2Store::open_in_memory().unwrap(), dir.0.clone());
+        let mut t = task("replay-decision");
+        t.status = "Backlog".into();
+        t.autonomous_consent = false;
+        c.store.sync_task(&t).unwrap();
+        c.store
+            .open_decision(
+                "old",
+                &t.task_id,
+                &t.task_group,
+                "failure",
+                "Retry?",
+                &["Retry stage".into()],
+                None,
+                "context",
+                None,
+            )
+            .unwrap();
+        c.preflight = true;
+        c.reconciled = true;
+        c.synced = true;
+        c.last_export = Instant::now();
+        let commands = handle.commands.clone();
+        let coordinator = std::thread::spawn(move || c.run());
+        let path = PathBuf::from(format!("target/z78-live-{}.sock", std::process::id()));
+        let mut server = crate::v2::socket::DaemonServer::bind(&path, 0).unwrap();
+        let shutdown = server.shutdown.clone();
+        let socket = std::thread::spawn(move || server.run_coordinated(handle, false));
+        let subscribe = |since_seq, once| {
+            let mut client = UnixStream::connect(&path).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            crate::v2::socket::write_ndjson(
+                &mut client,
+                &ClientCommand::Subscribe {
+                    group: Some("test".into()),
+                    since_seq: Some(since_seq),
+                    once: Some(once),
+                },
+            )
+            .unwrap();
+            BufReader::new(client)
+        };
+        let read = |reader: &mut BufReader<UnixStream>| {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()
+        };
+        let mut client = subscribe(0, false);
+        let snapshot = read(&mut client);
+        assert_eq!(snapshot["tasks"][0]["status"], "Blocked");
+        assert_eq!(snapshot["board_statuses"]["replay-decision"], "Backlog");
+        assert_eq!(snapshot["open_decisions"][0]["decision_id"], "old");
+        let cursor = snapshot["as_of_seq"].as_i64().unwrap();
+        for expected in 1..=cursor {
+            assert_eq!(read(&mut client)["event"]["seq_id"], expected);
+        }
+        t.status = "Cancelled".into();
+        commands
+            .send(CoordinatorEvent::DeliveryStore(Box::new(move |store| {
+                store.sync_task(&t).unwrap();
+            })))
+            .unwrap();
+        let live = (0..3).map(|_| read(&mut client)).collect::<Vec<_>>();
+        assert_eq!(
+            live.iter()
+                .map(|e| e["event"]["event_type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "BOARD_STATUS_OBSERVED",
+                "TASK_STATUS_CHANGED",
+                "DECISION_RETIRED"
+            ]
+        );
+        assert_eq!(live[2]["event"]["payload"]["decision_id"], "old");
+        let mut reconnect = subscribe(cursor, true);
+        let snapshot = read(&mut reconnect);
+        assert_eq!(snapshot["as_of_seq"], cursor + 3);
+        assert_eq!(snapshot["tasks"][0]["status"], "Cancelled");
+        assert_eq!(snapshot["board_statuses"]["replay-decision"], "Cancelled");
+        assert_eq!(snapshot["open_decisions"], serde_json::json!([]));
+        for event in live {
+            assert_eq!(read(&mut reconnect), event);
+        }
+        let mut trailing = String::new();
+        assert_eq!(reconnect.read_line(&mut trailing).unwrap(), 0);
+        shutdown.store(true, Ordering::Relaxed);
+        socket.join().unwrap().unwrap();
+        coordinator.join().unwrap().unwrap();
+    }
+
     #[derive(Default)]
     struct RecordingWsTaskClient {
         calls: Mutex<Vec<Vec<String>>>,
     }
+    impl LifecycleWsTaskClient for RecordingWsTaskClient {}
     impl WsTaskClient for RecordingWsTaskClient {
         fn execute(&self, args: &[String]) -> Result<String, String> {
             self.calls.lock().unwrap().push(args.to_vec());
@@ -7132,9 +8813,727 @@ mod tests {
                 .find(|pair| pair[0] == "--sha")
                 .map(|pair| pair[1].as_str())
                 .unwrap_or("base");
-            Ok(serde_json::json!({"task_id":id,"stage":args.get(2),"sha":sha,"weight":"M","branch":"task/ordered","worktree":"/governed/ordered"}).to_string())
+            let verdict = args
+                .windows(2)
+                .find(|pair| pair[0] == "--verdict")
+                .map(|pair| &pair[1]);
+            Ok(serde_json::json!({"task_id":id,"stage":args.get(2),"sha":sha,"verdict":verdict,"weight":"M","branch":"task/ordered","worktree":"/governed/ordered"}).to_string())
         }
     }
+    #[test]
+    fn startup_retires_legacy_decisions_and_never_replays_unapplied_publication() {
+        for terminal in ["Done", "Cancelled"] {
+            let dir = TestDirectory::new();
+            let db = dir.0.join("legacy.sqlite3");
+            let mut store = V2Store::open(&db).unwrap();
+            let t = task("legacy-terminal");
+            store.upsert_task(&t).unwrap();
+            for id in ["open", "unapplied"] {
+                store
+                    .open_decision(
+                        id,
+                        &t.task_id,
+                        &t.task_group,
+                        "human-plan-approval",
+                        "Approve?",
+                        &["Approve".into()],
+                        None,
+                        "original context",
+                        None,
+                    )
+                    .unwrap();
+            }
+            store
+                .resolve_decision("unapplied", "Approve", "alice", Some("human note"))
+                .unwrap();
+            let op = LifecycleOperation {
+                operation_id: "approval-intent".into(),
+                task_id: t.task_id.clone(),
+                kind: "human-plan-approval".into(),
+                args: vec![],
+                body_path: None,
+                depends_on: None,
+                state: "PENDING".into(),
+                retry_epoch: 0,
+                attempts: 0,
+                last_error: None,
+                decision_id: Some("unapplied".into()),
+                attempt_id: None,
+            };
+            store.enqueue_lifecycle(&op).unwrap();
+            store
+                .connection_mut()
+                .execute("UPDATE tasks SET status=?1", [terminal])
+                .unwrap();
+            assert!(store.list_decisions(true, None).unwrap().is_empty());
+            drop(store);
+            let (mut c, _handle) = Coordinator::create(V2Store::open(&db).unwrap(), dir.0.clone());
+            c.controller = Arc::new(RehearsalUnits::default());
+            c.submission_probe = Some(BTreeMap::new());
+            rehearsal_startup(&mut c).unwrap();
+            c.replay_lifecycle().unwrap();
+            c.resume_decisions().unwrap();
+            c.lifecycle_ack("approval-intent", "late result").unwrap();
+            c.lifecycle_failed("approval-intent", "late failure")
+                .unwrap();
+            assert_eq!(c.store.lifecycle_ops().unwrap(), vec![op.clone()]);
+            assert_eq!(c.task(&t.task_id).unwrap().status, terminal);
+            assert!(
+                c.task(&t.task_id)
+                    .unwrap()
+                    .memory
+                    .applied_decisions
+                    .is_empty()
+            );
+            let retired = c.store.get_decision("unapplied").unwrap().unwrap();
+            assert_eq!(retired.status, "RETIRED");
+            assert_eq!(retired.choice.as_deref(), Some("Approve"));
+            assert_eq!(retired.note.as_deref(), Some("human note"));
+            let max = c.store.max_seq_id().unwrap();
+            let mut reopened = c.task(&t.task_id).unwrap();
+            reopened.status = "Ready".into();
+            c.save(&reopened).unwrap();
+            c.replay_lifecycle().unwrap();
+            c.resume_decisions().unwrap();
+            c.lifecycle_ack("approval-intent", "replayed result")
+                .unwrap();
+            assert_eq!(c.store.lifecycle_ops().unwrap(), vec![op]);
+            assert_eq!(c.task(&t.task_id).unwrap().status, "Ready");
+            assert_eq!(c.store.max_seq_id().unwrap(), max + 1);
+            let events = c.store.list_task_events(&t.task_id).unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| e.event_type == "DECISION_RETIRED")
+                    .count(),
+                2
+            );
+        }
+    }
+
+    fn apply_human_rejection(c: &mut Coordinator) -> (TaskRecord, LifecycleOperation) {
+        let mut t = task("rejected");
+        t.status = "Blocked".into();
+        let stage = "human-plan-approval";
+        t.current_stage = Some(stage.into());
+        c.save(&t).unwrap();
+        let id = "human-rejected-human-plan-approval-base-0-0-p0-r0";
+        c.store
+            .open_decision(
+                id,
+                &t.task_id,
+                &t.task_group,
+                stage,
+                "Approve?",
+                &["Reject".into()],
+                None,
+                "plan review",
+                t.plan_base_sha.as_deref(),
+            )
+            .unwrap();
+        let DecisionResolution::Resolved(rejection) = c
+            .store
+            .resolve_decision(id, "Reject", "alice", Some("keep this note"))
+            .unwrap()
+        else {
+            panic!("expected resolved rejection");
+        };
+        c.apply_decision(&rejection).unwrap();
+        let t = c.task(&t.task_id).unwrap();
+        assert!(t.memory.halt_requested);
+        assert_eq!(t.memory.applied_decisions, [id]);
+        let op = c.store.lifecycle_ops().unwrap().remove(0);
+        assert_eq!(op.decision_id.as_deref(), Some(id));
+        assert_eq!(op.state, "PENDING");
+        (t, op)
+    }
+
+    #[test]
+    fn terminal_and_reopen_retire_locally_applied_rejection_with_pending_publication() {
+        for terminal in ["Done", "Cancelled"] {
+            let dir = TestDirectory::new();
+            let mut c = coordinator(&dir.0);
+            c.ws = Arc::new(RecordingWsTaskClient::default());
+            let (mut t, op) = apply_human_rejection(&mut c);
+            let id = op.decision_id.as_deref().unwrap();
+            t.status = terminal.into();
+            c.worker_result(WorkerResult::Export(vec![t.clone()]))
+                .unwrap();
+            assert_eq!(c.task(&t.task_id).unwrap().status, terminal);
+            let decision = c.store.get_decision(id).unwrap().unwrap();
+            assert_eq!(decision.status, "RETIRED");
+            assert_eq!(decision.choice.as_deref(), Some("Reject"));
+            assert_eq!(decision.note.as_deref(), Some("keep this note"));
+            t.status = "Ready".into();
+            t.memory.halt_requested = false;
+            c.worker_result(WorkerResult::Export(vec![t.clone()]))
+                .unwrap();
+            assert_eq!(c.task(&t.task_id).unwrap().status, "Ready");
+            assert!(!c.store.has_pending_lifecycle(&t.task_id).unwrap());
+            c.replay_lifecycle().unwrap();
+            assert!(c.jobs.is_empty());
+            c.lifecycle_ack(&op.operation_id, "late receipt").unwrap();
+            c.lifecycle_failed(&op.operation_id, "late error").unwrap();
+            assert_eq!(c.store.get_decision(id).unwrap().unwrap().status, "RETIRED");
+            assert_eq!(c.store.lifecycle_ops().unwrap(), [op]);
+        }
+    }
+
+    #[test]
+    fn queued_rejection_rechecks_eligibility_before_remote_publication() {
+        for (terminal, reopen) in [
+            (None, false),
+            (Some("Done"), false),
+            (Some("Cancelled"), true),
+        ] {
+            let dir = TestDirectory::new();
+            let mut c = coordinator(&dir.0);
+            let ws = Arc::new(RecordingWsTaskClient::default());
+            c.ws = ws.clone();
+            let (mut t, op) = apply_human_rejection(&mut c);
+
+            let (held, holding) = mpsc::sync_channel(0);
+            let (release, released) = mpsc::sync_channel(0);
+            assert!(c.governance.submit(
+                "held".into(),
+                None,
+                Box::new(move || {
+                    held.send(()).unwrap();
+                    released.recv().unwrap();
+                    Ok(WorkerResult::LifecycleSkipped)
+                })
+            ));
+            holding.recv_timeout(Duration::from_secs(2)).unwrap();
+            c.replay_lifecycle().unwrap();
+            assert!(c.store.lifecycle_in_flight(&op.operation_id).unwrap());
+
+            if let Some(terminal) = terminal {
+                t.status = terminal.into();
+                c.worker_result(WorkerResult::Export(vec![t.clone()]))
+                    .unwrap();
+                assert_eq!(c.task(&t.task_id).unwrap().status, terminal);
+                if reopen {
+                    t.status = "Ready".into();
+                    t.memory.halt_requested = false;
+                    c.worker_result(WorkerResult::Export(vec![t.clone()]))
+                        .unwrap();
+                    assert_eq!(c.task(&t.task_id).unwrap().status, "Ready");
+                }
+            }
+            release.send(()).unwrap();
+            for _ in 0..3 {
+                let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                c.handle_event(event).unwrap();
+            }
+            assert!(c.jobs.is_empty());
+            assert_eq!(
+                ws.calls.lock().unwrap().len(),
+                usize::from(terminal.is_none())
+            );
+            assert_eq!(
+                c.store.lifecycle_ops().unwrap()[0].state,
+                if terminal.is_none() {
+                    "ACKNOWLEDGED"
+                } else {
+                    "QUEUED"
+                }
+            );
+        }
+    }
+
+    struct FencedPublicationWs {
+        recording: RecordingWsTaskClient,
+        active: mpsc::SyncSender<()>,
+        finish: Mutex<mpsc::Receiver<bool>>,
+        comments: Mutex<String>,
+        board_status: Mutex<String>,
+    }
+
+    impl WsTaskClient for FencedPublicationWs {
+        fn execute(&self, args: &[String]) -> Result<String, String> {
+            assert_eq!(args, ["export", "--sync", "--json"]);
+            Ok(serde_json::json!({"schema_version":2,"tasks":[{
+                "id":"rejected","repository":"rejected","github_repo":"example/rejected","issue_number":1,
+                "status":*self.board_status.lock().unwrap(),"autonomous_consent":true
+            }]}).to_string())
+        }
+    }
+
+    impl LifecycleWsTaskClient for FencedPublicationWs {
+        fn execute_fenced(&self, args: &[String], _fence: &File) -> Result<String, String> {
+            self.active.send(()).unwrap();
+            let output = self.recording.execute(args)?;
+            if self.finish.lock().unwrap().recv().unwrap() {
+                Ok(output)
+            } else {
+                Err("publication response lost".into())
+            }
+        }
+
+        fn issue_comments(&self, repo: &str, issue: i64) -> Result<String, String> {
+            assert_eq!((repo, issue), ("example/rejected", 1));
+            Ok(self.comments.lock().unwrap().clone())
+        }
+    }
+
+    #[test]
+    fn decision_publication_defers_terminal_after_grant_and_while_call_is_active() {
+        for (terminal, delivery_hold) in [
+            ("Done", false),
+            ("Cancelled", false),
+            ("Done", true),
+            ("Cancelled", true),
+        ] {
+            let dir = TestDirectory::new();
+            let mut c = coordinator(&dir.0);
+            let (active, entered) = mpsc::sync_channel(0);
+            let (finish, outcome) = mpsc::channel();
+            let ws = Arc::new(FencedPublicationWs {
+                recording: RecordingWsTaskClient::default(),
+                active,
+                finish: Mutex::new(outcome),
+                comments: Mutex::new(String::new()),
+                board_status: Mutex::new(terminal.into()),
+            });
+            c.ws = ws.clone();
+            let (mut task, op) = apply_human_rejection(&mut c);
+            c.replay_lifecycle().unwrap();
+            let CoordinatorEvent::AuthorizeLifecycle { operation, reply } =
+                c.rx.recv_timeout(Duration::from_secs(2)).unwrap()
+            else {
+                panic!("expected grant request")
+            };
+            assert!(c.authorize_lifecycle(&operation).unwrap());
+            assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "DISPATCHED");
+
+            let delivery = if delivery_hold {
+                let decision = c
+                    .store
+                    .open_decision(
+                        "delivery-hold",
+                        &task.task_id,
+                        &task.task_group,
+                        "prod_promotion_approval",
+                        "Approve delivery?",
+                        &["Approve".into()],
+                        None,
+                        "receipt pending",
+                        None,
+                    )
+                    .unwrap();
+                let mut row = delivery_rows(&task).remove(0);
+                row.state = "approval_pending".into();
+                row.decision_id = Some(decision.decision_id);
+                c.store.upsert_delivery(&row).unwrap();
+                c.store.list_deliveries(Some(&task.task_id)).unwrap()
+            } else {
+                vec![]
+            };
+            task.status = terminal.into();
+            c.worker_result(WorkerResult::Export(vec![task.clone()]))
+                .unwrap();
+            assert!(ws.recording.calls.lock().unwrap().is_empty());
+            assert_eq!(
+                c.task(&task.task_id).unwrap().status,
+                if delivery_hold {
+                    "Delivery Pending"
+                } else {
+                    "Blocked"
+                }
+            );
+            assert_eq!(
+                c.store.board_statuses(None).unwrap()[&task.task_id],
+                terminal
+            );
+
+            reply.send(Ok(true)).unwrap();
+            entered.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(publication_fence(&dir.0, &task.task_id).is_err());
+            assert!(publication_fence(&dir.0, "another-task").is_ok());
+            assert!(!matches!(
+                c.task(&task.task_id).unwrap().status.as_str(),
+                "Done" | "Cancelled"
+            ));
+
+            if !delivery_hold {
+                // A new board observation can arrive while the call is in progress.
+                task.status = "Ready".into();
+                task.memory.halt_requested = false;
+                c.worker_result(WorkerResult::Export(vec![task.clone()]))
+                    .unwrap();
+                assert_eq!(
+                    c.store.board_statuses(None).unwrap()[&task.task_id],
+                    "Ready"
+                );
+                assert_eq!(c.task(&task.task_id).unwrap().status, "Blocked");
+            }
+            finish.send(true).unwrap();
+            let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            c.handle_event(event).unwrap();
+            assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "ACKNOWLEDGED");
+            assert_eq!(ws.recording.calls.lock().unwrap().len(), 1);
+            if delivery_hold {
+                assert_eq!(c.task(&task.task_id).unwrap().status, "Delivery Pending");
+                assert_eq!(
+                    c.store.list_deliveries(Some(&task.task_id)).unwrap(),
+                    delivery
+                );
+                assert_eq!(
+                    c.store
+                        .get_decision("delivery-hold")
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    "OPEN"
+                );
+            } else {
+                assert_eq!(c.task(&task.task_id).unwrap().status, terminal);
+                c.worker_result(WorkerResult::Export(vec![task])).unwrap();
+                assert_eq!(c.task(&op.task_id).unwrap().status, "Ready");
+                assert_eq!(
+                    c.store
+                        .get_decision(op.decision_id.as_deref().unwrap())
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    "RETIRED"
+                );
+                c.replay_lifecycle().unwrap();
+                assert!(c.jobs.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn queued_decision_publication_retries_after_restart_and_fences_local_terminal_save() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        let (mut task, op) = apply_human_rejection(&mut c);
+        c.store
+            .update_lifecycle(&op.operation_id, "QUEUED", None, 0)
+            .unwrap();
+        c.recover_lifecycle_journal().unwrap();
+        assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "PENDING");
+
+        c.store
+            .update_lifecycle(&op.operation_id, "QUEUED", None, 0)
+            .unwrap();
+        assert!(c.authorize_lifecycle(&op).unwrap());
+        task.status = "Done".into();
+        c.save(&task).unwrap();
+        assert_eq!(c.task(&task.task_id).unwrap().status, "Blocked");
+        c.lifecycle_ack(&op.operation_id, "").unwrap();
+        let saved = c.task(&task.task_id).unwrap();
+        assert_eq!(saved.status, "Done");
+        assert!(!saved.memory.governance_terminal_observed);
+        assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "ACKNOWLEDGED");
+    }
+
+    fn assert_publication_terminal_event_order(
+        store: &V2Store,
+        task_id: &str,
+        terminal: &str,
+        board_status: &str,
+        retired_ids: &[&str],
+    ) {
+        let events = store.list_task_events(task_id).unwrap();
+        let effective = events
+            .iter()
+            .find(|event| {
+                matches!(
+                    event.event_type.as_str(),
+                    "TASK_DONE" | "TASK_STATUS_CHANGED"
+                ) && event.payload["status"] == terminal
+            })
+            .unwrap();
+        assert_eq!(effective.payload["task_id"], task_id);
+        assert_eq!(effective.payload["board_status"], board_status);
+        let observation = events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.seq_id < effective.seq_id && event.event_type == "BOARD_STATUS_OBSERVED"
+            })
+            .unwrap();
+        assert_eq!(observation.payload["board_status"], board_status);
+        let retirements: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == "DECISION_RETIRED")
+            .collect();
+        assert_eq!(retirements.len(), retired_ids.len());
+        for id in retired_ids {
+            let retired = retirements
+                .iter()
+                .find(|event| event.payload["decision_id"] == *id)
+                .unwrap();
+            assert!(effective.seq_id < retired.seq_id);
+            assert_eq!(retired.payload["task_id"], task_id);
+            assert_eq!(retired.payload["reason"], terminal);
+        }
+    }
+
+    #[test]
+    fn grant_before_launch_can_be_settled_after_restart_without_replay() {
+        for terminal in ["Done", "Cancelled"] {
+            let dir = TestDirectory::new();
+            let db = dir.0.join("journal.sqlite");
+            let (mut c, _) = Coordinator::create(V2Store::open(&db).unwrap(), dir.0.clone());
+            let (mut task, op) = apply_human_rejection(&mut c);
+            task.github_repo = Some("example/rejected".into());
+            c.save(&task).unwrap();
+            c.store
+                .update_lifecycle(&op.operation_id, "QUEUED", None, 0)
+                .unwrap();
+            assert!(c.authorize_lifecycle(&op).unwrap());
+            // The grant commits, but no publisher ever launches.
+            drop(c);
+
+            let (active, _entered) = mpsc::sync_channel(0);
+            let (_finish, outcome) = mpsc::channel();
+            let ws = Arc::new(FencedPublicationWs {
+                recording: RecordingWsTaskClient::default(),
+                active,
+                finish: Mutex::new(outcome),
+                comments: Mutex::new(String::new()),
+                board_status: Mutex::new(terminal.into()),
+            });
+            let (mut c, _) = Coordinator::create(V2Store::open(&db).unwrap(), dir.0.clone());
+            c.ws = ws.clone();
+            c.recover_lifecycle_journal().unwrap();
+            task.status = terminal.into();
+            let before = c.task(&task.task_id).unwrap();
+            let cursor = c.store.max_seq_id().unwrap();
+            let export = ws
+                .execute(&["export".into(), "--sync".into(), "--json".into()])
+                .unwrap();
+            let incoming = intake::decode_export_records(&export).unwrap().remove(0);
+            let mut conflicting = incoming.clone();
+            conflicting.repository = "unrelated".into();
+            for (index, incoming) in [&conflicting, &incoming].into_iter().enumerate() {
+                let declined = c
+                    .store
+                    .sync_task_with_mode(
+                        incoming,
+                        crate::v2::store::SyncMode::ReconcileFinishedLegacy,
+                    )
+                    .unwrap();
+                assert_eq!(declined, before);
+                assert!(
+                    c.store
+                        .deferred_terminal(&op.operation_id, &before)
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "DISPATCHED");
+                if index == 0 {
+                    assert!(
+                        c.store
+                            .list_task_events(&task.task_id)
+                            .unwrap()
+                            .iter()
+                            .all(|event| event.seq_id <= cursor),
+                        "a conflicting offline identity must not report board status"
+                    );
+                }
+            }
+            let events = c.store.list_task_events(&task.task_id).unwrap();
+            let observed: Vec<_> = events
+                .iter()
+                .filter(|event| event.seq_id > cursor)
+                .collect();
+            assert_eq!(observed.len(), 1);
+            assert_eq!(observed[0].event_type, "BOARD_STATUS_OBSERVED");
+            assert_eq!(observed[0].payload["board_status"], terminal);
+            c.worker_result(WorkerResult::Export(vec![task.clone()]))
+                .unwrap();
+            let id = format!("settle-{}", op.operation_id);
+
+            // An inherited fence blocks settlement while a publisher could still run.
+            let fence = publication_fence(&dir.0, &task.task_id).unwrap();
+            c.replay_lifecycle().unwrap();
+            let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            c.handle_event(event).unwrap();
+            assert!(c.store.get_decision(&id).unwrap().is_none());
+            drop(fence);
+
+            c.store
+                .update_lifecycle(&op.operation_id, "DISPATCHED", None, 0)
+                .unwrap();
+            c.replay_lifecycle().unwrap();
+            let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            c.handle_event(event).unwrap();
+            assert_eq!(c.task(&task.task_id).unwrap().status, "Blocked");
+            assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "DISPATCHED");
+            assert!(
+                c.store
+                    .resolve_decision(&id, "Retry publication", "alice", None)
+                    .is_err()
+            );
+            assert!(matches!(
+                c.store
+                    .resolve_decision(
+                        &id,
+                        "Close without replay",
+                        "alice",
+                        Some("Checked issue and board")
+                    )
+                    .unwrap(),
+                DecisionResolution::Resolved(_)
+            ));
+            // Resolution and application can also straddle a crash.
+            drop(c);
+            let (mut c, _) = Coordinator::create(V2Store::open(&db).unwrap(), dir.0.clone());
+            c.ws = ws.clone();
+            c.recover_lifecycle_journal().unwrap();
+            let fence = publication_fence(&dir.0, &task.task_id).unwrap();
+            c.resume_decisions().unwrap();
+            assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "DISPATCHED");
+            drop(fence);
+            c.resume_decisions().unwrap();
+            let settled = c.task(&task.task_id).unwrap();
+            assert_eq!(settled.status, terminal);
+            assert!(settled.memory.governance_terminal_observed);
+            assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "SETTLED");
+            assert!(!c.store.has_pending_lifecycle(&task.task_id).unwrap());
+            assert_eq!(
+                c.store
+                    .get_decision(op.decision_id.as_deref().unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "RETIRED"
+            );
+            assert_eq!(
+                c.store.get_decision(&id).unwrap().unwrap().status,
+                "RESOLVED"
+            );
+
+            assert_publication_terminal_event_order(
+                &c.store,
+                &op.task_id,
+                terminal,
+                terminal,
+                &[op.decision_id.as_deref().unwrap()],
+            );
+
+            task.status = "Ready".into();
+            task.memory.halt_requested = false;
+            c.worker_result(WorkerResult::Export(vec![task])).unwrap();
+            c.resume_decisions().unwrap();
+            c.replay_lifecycle().unwrap();
+            assert_eq!(c.task(&op.task_id).unwrap().status, "Ready");
+            assert!(c.jobs.is_empty());
+            assert!(ws.recording.calls.lock().unwrap().is_empty());
+            assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "SETTLED");
+        }
+    }
+
+    #[test]
+    fn lost_decision_publication_result_holds_across_restart_until_exact_readback() {
+        let dir = TestDirectory::new();
+        let db = dir.0.join("journal.sqlite");
+        let (mut c, _) = Coordinator::create(V2Store::open(&db).unwrap(), dir.0.clone());
+        let (active, entered) = mpsc::sync_channel(0);
+        let (finish, outcome) = mpsc::channel();
+        let ws = Arc::new(FencedPublicationWs {
+            recording: RecordingWsTaskClient::default(),
+            active,
+            finish: Mutex::new(outcome),
+            comments: Mutex::new(String::new()),
+            board_status: Mutex::new("Pending".into()),
+        });
+        c.ws = ws.clone();
+        let (mut task, op) = apply_human_rejection(&mut c);
+        task.github_repo = Some("example/rejected".into());
+        c.save(&task).unwrap();
+        c.replay_lifecycle().unwrap();
+        let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        c.handle_event(event).unwrap();
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        task.status = "Cancelled".into();
+        c.worker_result(WorkerResult::Export(vec![task])).unwrap();
+        finish.send(false).unwrap();
+        // Simulate a daemon that loses the worker result before journaling it.
+        assert!(matches!(c.rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            CoordinatorEvent::Completed { result, .. } if result.is_err()));
+        drop(c);
+
+        let (mut c, _) = Coordinator::create(V2Store::open(&db).unwrap(), dir.0.clone());
+        c.ws = ws.clone();
+        c.recover_lifecycle_journal().unwrap();
+        assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "DISPATCHED");
+        let marker = format!(
+            "<!-- governance-v2: task_id={} stage={} verdict=CHANGES_REQUESTED weight=S actor=alice sha=base idempotency_key={} -->",
+            op.task_id, op.kind, op.operation_id
+        );
+        for (author, body) in [
+            ("shockerqt", String::new()),
+            ("external", marker.clone()),
+            ("shockerqt", marker.replace("sha=base", "sha=wrong")),
+            ("shockerqt", marker.clone()), // exact marker but board postcondition still absent
+        ] {
+            *ws.comments.lock().unwrap() = serde_json::json!([author, body]).to_string();
+            c.store
+                .update_lifecycle(&op.operation_id, "DISPATCHED", None, 0)
+                .unwrap();
+            c.replay_lifecycle().unwrap();
+            let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            c.handle_event(event).unwrap();
+            assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "DISPATCHED");
+            assert_eq!(c.task(&op.task_id).unwrap().status, "Blocked");
+            assert_eq!(
+                c.store.board_statuses(None).unwrap()[&op.task_id],
+                "Cancelled"
+            );
+            assert_eq!(ws.recording.calls.lock().unwrap().len(), 1);
+        }
+        let settlement_id = format!("settle-{}", op.operation_id);
+        assert_eq!(
+            c.store
+                .get_decision(&settlement_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "OPEN"
+        );
+        // A previous publisher can still own the per-task process lock after restart.
+        let outstanding = publication_fence(&dir.0, &op.task_id).unwrap();
+        *ws.board_status.lock().unwrap() = "Planning".into();
+        c.store
+            .update_lifecycle(&op.operation_id, "DISPATCHED", None, 0)
+            .unwrap();
+        c.replay_lifecycle().unwrap();
+        let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        c.handle_event(event).unwrap();
+        assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "DISPATCHED");
+        assert_eq!(c.task(&op.task_id).unwrap().status, "Blocked");
+        drop(outstanding);
+        c.store
+            .update_lifecycle(&op.operation_id, "DISPATCHED", None, 0)
+            .unwrap();
+        c.replay_lifecycle().unwrap();
+        let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        c.handle_event(event).unwrap();
+        assert_eq!(c.task(&op.task_id).unwrap().status, "Cancelled");
+        assert_eq!(c.store.lifecycle_ops().unwrap()[0].state, "ACKNOWLEDGED");
+        assert_eq!(
+            c.store
+                .get_decision(&settlement_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "RETIRED"
+        );
+        assert_publication_terminal_event_order(
+            &c.store,
+            &op.task_id,
+            "Cancelled",
+            "Planning",
+            &[op.decision_id.as_deref().unwrap(), &settlement_id],
+        );
+        assert_eq!(ws.recording.calls.lock().unwrap().len(), 1);
+    }
+
     #[test]
     fn ws_task_adapter_replays_start_before_plan_and_acknowledges_each_once() {
         let dir = TestDirectory::new();
@@ -7169,6 +9568,8 @@ mod tests {
         c.store.enqueue_lifecycle(&plan).unwrap();
         for _ in 0..2 {
             c.replay_lifecycle().unwrap();
+            let authorization = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            c.handle_event(authorization).unwrap();
             let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
             c.handle_event(event).unwrap();
         }
@@ -7490,6 +9891,8 @@ mod tests {
         c.apply_decision(&decision).unwrap();
         assert_eq!(c.task(&t.task_id).unwrap().status, "Delivery Pending");
         c.replay_lifecycle().unwrap();
+        let authorization = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        c.handle_event(authorization).unwrap();
         let event = c.rx.recv_timeout(Duration::from_secs(2)).unwrap();
         c.handle_event(event).unwrap();
         c.lifecycle_ack(&close.operation_id, "").unwrap(); // duplicate receipt
@@ -7855,5 +10258,2832 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// ROOT ORCHESTRATOR ONLY. Never invoke from a worker, ordinary cargo test,
+    /// production CLI or daemon. Inputs are exclusive operator-owned copies.
+    #[test]
+    #[ignore = "root orchestrator only: reviewed binary and exclusive private copied inputs required"]
+    fn private_copy_retained_revoked_rehearsal() -> Result<(), String> {
+        retained_rehearsal::run_private()
+    }
+
+    mod retained_rehearsal {
+        use super::*;
+        use serde::{Deserialize, Serialize};
+        use serde_json::{Value, json};
+
+        const PROFILE: &str = "retained-revoked-v1";
+        const PHASES: [&str; 10] = [
+            "startup_1",
+            "pass_1",
+            "standard_1",
+            "pass_2",
+            "startup_2",
+            "pass_3",
+            "standard_2",
+            "pass_4",
+            "startup_3",
+            "pass_5",
+        ];
+        const HISTORY: [&str; 7] = [
+            "stage_attempts",
+            "task_events",
+            "lifecycle_ops",
+            "post_merge_deliveries",
+            "pending_decisions",
+            "merge_queue",
+            "path_locks",
+        ];
+        const FORBIDDEN: [&str; 8] = [
+            "stage_launch",
+            "preparation_apply",
+            "lifecycle_mutation",
+            "publication",
+            "pr_merge",
+            "deploy",
+            "delivery_apply",
+            "other",
+        ];
+        const EFFECTS: [&str; 9] = [
+            "unexpected_task_changes",
+            "attempts",
+            "retries_or_failures",
+            "locks",
+            "decisions",
+            "lifecycle",
+            "queue",
+            "delivery",
+            "other",
+        ];
+        const POLL: [&str; 5] = [
+            "attempted",
+            "executed",
+            "completed",
+            "fake_reads",
+            "fake_mutation_attempts",
+        ];
+        const CONTROLS: [&str; 3] = [
+            "poll_completed_with_fake",
+            "mutation_intercepted",
+            "forbidden_classes_intercepted",
+        ];
+
+        fn need(ok: bool, reason: &str) -> Result<(), String> {
+            if ok { Ok(()) } else { Err(reason.into()) }
+        }
+        fn hash<T: Serialize>(value: &T) -> Result<String, String> {
+            serde_json::to_vec(value)
+                .map(|v| rehearsal_sha256(&v))
+                .map_err(|_| "PROFILE_ENCODING".into())
+        }
+
+        // Deserialize every nested object ourselves before typed decoding, including Values.
+        struct Unique(Value);
+        impl<'de> Deserialize<'de> for Unique {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                struct Visitor;
+                impl<'de> serde::de::Visitor<'de> for Visitor {
+                    type Value = Unique;
+                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        f.write_str("unique finite JSON")
+                    }
+                    fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Unique, E> {
+                        Ok(Unique(json!(v)))
+                    }
+                    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Unique, E> {
+                        Ok(Unique(json!(v)))
+                    }
+                    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Unique, E> {
+                        Ok(Unique(json!(v)))
+                    }
+                    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Unique, E> {
+                        serde_json::Number::from_f64(v)
+                            .map(|n| Unique(Value::Number(n)))
+                            .ok_or_else(|| E::custom("nonfinite"))
+                    }
+                    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Unique, E> {
+                        Ok(Unique(json!(v)))
+                    }
+                    fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Unique, E> {
+                        Ok(Unique(json!(v)))
+                    }
+                    fn visit_unit<E: serde::de::Error>(self) -> Result<Unique, E> {
+                        Ok(Unique(Value::Null))
+                    }
+                    fn visit_none<E: serde::de::Error>(self) -> Result<Unique, E> {
+                        Ok(Unique(Value::Null))
+                    }
+                    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                        self,
+                        mut seq: A,
+                    ) -> Result<Unique, A::Error> {
+                        let mut values = Vec::new();
+                        while let Some(Unique(v)) = seq.next_element()? {
+                            values.push(v);
+                        }
+                        Ok(Unique(Value::Array(values)))
+                    }
+                    fn visit_map<A: serde::de::MapAccess<'de>>(
+                        self,
+                        mut map: A,
+                    ) -> Result<Unique, A::Error> {
+                        let mut values = serde_json::Map::new();
+                        while let Some((k, Unique(v))) = map.next_entry::<String, Unique>()? {
+                            if values.insert(k, v).is_some() {
+                                return Err(serde::de::Error::custom("duplicate"));
+                            }
+                        }
+                        Ok(Unique(Value::Object(values)))
+                    }
+                }
+                d.deserialize_any(Visitor)
+            }
+        }
+        fn strict<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
+            let Unique(v) = serde_json::from_slice(bytes).map_err(|_| "PROFILE_JSON")?;
+            serde_json::from_value(v).map_err(|_| "PROFILE_SHAPE".into())
+        }
+
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        struct Binding {
+            task_id: String,
+            attempt_count: u64,
+            attempt_rows_sha256: String,
+        }
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        struct Marker {
+            schema_version: u32,
+            profile: String,
+            purpose: String,
+            run_id: String,
+            database_sha256: String,
+            export_sha256: String,
+            native_candidate_sha256: String,
+            infra_candidate_sha256: String,
+            export_task_ids: Vec<String>,
+            retained_tasks: Vec<Binding>,
+        }
+        impl Marker {
+            fn ids(&self) -> BTreeSet<String> {
+                self.retained_tasks
+                    .iter()
+                    .map(|b| b.task_id.clone())
+                    .collect()
+            }
+            fn validate(&self) -> Result<(), String> {
+                need(
+                    self.schema_version == 2
+                        && self.profile == PROFILE
+                        && self.purpose == "exclusive-native-copy",
+                    "PROFILE_MARKER",
+                )?;
+                need(
+                    (8..=128).contains(&self.run_id.len())
+                        && self
+                            .run_id
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')),
+                    "PROFILE_RUN",
+                )?;
+                need(
+                    [
+                        &self.database_sha256,
+                        &self.export_sha256,
+                        &self.native_candidate_sha256,
+                        &self.infra_candidate_sha256,
+                    ]
+                    .iter()
+                    .all(|s| digest_shape(s)),
+                    "PROFILE_HASH",
+                )?;
+                need(
+                    !self.export_task_ids.is_empty()
+                        && self.export_task_ids.len() <= 10000
+                        && self
+                            .export_task_ids
+                            .iter()
+                            .all(|id| !id.is_empty() && id.len() <= 128)
+                        && self.export_task_ids.iter().collect::<BTreeSet<_>>().len()
+                            == self.export_task_ids.len(),
+                    "PROFILE_IDS",
+                )?;
+                need(
+                    !self.retained_tasks.is_empty()
+                        && self.retained_tasks.len() <= 10000
+                        && self
+                            .retained_tasks
+                            .windows(2)
+                            .all(|w| w[0].task_id < w[1].task_id),
+                    "PROFILE_RETAINED_ORDER",
+                )?;
+                for b in &self.retained_tasks {
+                    need(
+                        self.export_task_ids.contains(&b.task_id)
+                            && b.attempt_count > 0
+                            && digest_shape(&b.attempt_rows_sha256),
+                        "PROFILE_BINDING",
+                    )?;
+                }
+                Ok(())
+            }
+        }
+
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        struct Row {
+            rowid: i64,
+            values: Vec<Value>,
+        }
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        struct Table {
+            columns: Vec<Vec<Value>>,
+            rows: Vec<Row>,
+        }
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        struct Image {
+            master: Vec<Vec<Value>>,
+            tables: BTreeMap<String, Table>,
+        }
+        fn cell(v: rusqlite::types::Value) -> Value {
+            use rusqlite::types::Value as V;
+            match v {
+                V::Null => json!(["null", null]),
+                V::Integer(n) => json!(["integer", n]),
+                V::Real(n) => json!(["real", format!("{:016x}", n.to_bits())]),
+                V::Text(s) => json!(["text", s]),
+                V::Blob(b) => json!([
+                    "blob",
+                    b.iter().map(|n| format!("{n:02x}")).collect::<String>()
+                ]),
+            }
+        }
+        fn sql_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<Value>>, String> {
+            let mut statement = conn.prepare(sql).map_err(|_| "PROFILE_SNAPSHOT")?;
+            let count = statement.column_count();
+            statement
+                .query_map([], |r| {
+                    (0..count)
+                        .map(|i| r.get(i).map(cell))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .and_then(|r| r.collect::<rusqlite::Result<Vec<_>>>())
+                .map_err(|_| "PROFILE_SNAPSHOT".into())
+        }
+        fn quote(s: &str) -> String {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        }
+        fn text(cell: &Value) -> Result<&str, String> {
+            need(cell[0] == "text", "PROFILE_CELL")?;
+            cell[1].as_str().ok_or("PROFILE_CELL".into())
+        }
+        fn number(cell: &Value) -> Result<i64, String> {
+            need(cell[0] == "integer", "PROFILE_CELL")?;
+            cell[1].as_i64().ok_or("PROFILE_CELL".into())
+        }
+        fn image(conn: &rusqlite::Connection) -> Result<Image, String> {
+            let master = sql_rows(
+                conn,
+                "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
+            )?;
+            let mut tables = BTreeMap::new();
+            for entry in &master {
+                if text(&entry[0])? != "table" {
+                    continue;
+                }
+                let name = text(&entry[1])?;
+                let columns = sql_rows(conn, &format!("PRAGMA table_info({})", quote(name)))?;
+                let raw = sql_rows(
+                    conn,
+                    &format!("SELECT rowid,* FROM {} ORDER BY rowid", quote(name)),
+                )?;
+                need(raw.len() <= 100000, "PROFILE_ROWS")?;
+                let rows = raw
+                    .into_iter()
+                    .map(|mut r| {
+                        let id = number(&r.remove(0))?;
+                        Ok(Row {
+                            rowid: id,
+                            values: r,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                tables.insert(name.into(), Table { columns, rows });
+            }
+            Ok(Image { master, tables })
+        }
+        fn schema(i: &Image) -> Result<String, String> {
+            hash(&(
+                &i.master,
+                i.tables
+                    .iter()
+                    .map(|(n, t)| (n, &t.columns))
+                    .collect::<BTreeMap<_, _>>(),
+            ))
+        }
+        fn known_schema(i: &Image) -> Result<(), String> {
+            let mut fresh = V2Store::open_in_memory().map_err(|_| "PROFILE_SCHEMA")?;
+            need(
+                schema(i)? == schema(&image(fresh.connection_mut())?)?,
+                "PROFILE_SCHEMA",
+            )
+        }
+        fn column(t: &Table, name: &str) -> Result<usize, String> {
+            t.columns
+                .iter()
+                .position(|r| r.get(1).is_some_and(|c| text(c).ok() == Some(name)))
+                .ok_or("PROFILE_COLUMN".into())
+        }
+        fn field<'a>(t: &Table, r: &'a Row, name: &str) -> Result<&'a Value, String> {
+            r.values
+                .get(column(t, name)?)
+                .ok_or("PROFILE_COLUMN".into())
+        }
+        fn task_row<'a>(i: &'a Image, id: &str) -> Result<&'a Row, String> {
+            let t = i.tables.get("tasks").ok_or("PROFILE_TABLE")?;
+            let col = column(t, "task_id")?;
+            let rows = t
+                .rows
+                .iter()
+                .filter(|r| text(&r.values[col]).ok() == Some(id))
+                .collect::<Vec<_>>();
+            need(rows.len() == 1, "PROFILE_INVENTORY")?;
+            Ok(rows[0])
+        }
+        fn selected(i: &Image, table: &str, id: &str) -> Result<Table, String> {
+            let t = i.tables.get(table).ok_or("PROFILE_TABLE")?;
+            let col = column(t, "task_id")?;
+            Ok(Table {
+                columns: t.columns.clone(),
+                rows: t
+                    .rows
+                    .iter()
+                    .filter(|r| text(&r.values[col]).ok() == Some(id))
+                    .cloned()
+                    .collect(),
+            })
+        }
+        fn history(i: &Image, id: &str) -> Result<String, String> {
+            hash(
+                &HISTORY
+                    .iter()
+                    .map(|name| {
+                        let mut table = selected(i, name, id)?;
+                        // Standard separately validates the full event stream and allocator.
+                        // The retained runtime receipt excludes board-only observations.
+                        if *name == "task_events" {
+                            let kind = column(&table, "event_type")?;
+                            table.rows.retain(|row| {
+                                text(&row.values[kind]).ok() != Some("BOARD_STATUS_OBSERVED")
+                            });
+                        }
+                        Ok((*name, table))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, String>>()?,
+            )
+        }
+        fn task_hash(i: &Image, id: &str) -> Result<String, String> {
+            hash(&(&i.tables["tasks"].columns, task_row(i, id)?))
+        }
+
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        struct Decoder {
+            phase_seq: u32,
+            export_sha256: String,
+            records_sha256: String,
+            provenance_sha256: String,
+            profile_witness_sha256: String,
+            started_epoch: i64,
+            ended_epoch: i64,
+        }
+        struct Witness {
+            decoder: Decoder,
+            actual: ActualDecodeTimeWitness,
+        }
+        impl Witness {
+            fn new(seq: u32, export: &str) -> Result<Self, String> {
+                need(matches!(seq, 1 | 2), "PROFILE_PHASE")?;
+                let actual = actual_decode(export)?;
+                let decoder = Decoder {
+                    phase_seq: seq,
+                    export_sha256: actual.export_hash.clone(),
+                    records_sha256: actual.records_hash.clone(),
+                    provenance_sha256: actual.provenance_hash.clone(),
+                    profile_witness_sha256: hash(&(PROFILE, seq, &actual.provenance_hash))?,
+                    started_epoch: actual.start,
+                    ended_epoch: actual.end,
+                };
+                Ok(Self { decoder, actual })
+            }
+            fn verify(&self, seq: u32, export: &str) -> Result<(), String> {
+                self.actual.verify(export, now_epoch())?;
+                need(
+                    self.decoder.phase_seq == seq
+                        && self.decoder.export_sha256 == self.actual.export_hash
+                        && self.decoder.records_sha256 == self.actual.records_hash
+                        && self.decoder.provenance_sha256 == self.actual.provenance_hash
+                        && self.decoder.started_epoch == self.actual.start
+                        && self.decoder.ended_epoch == self.actual.end
+                        && self.decoder.profile_witness_sha256
+                            == hash(&(PROFILE, seq, &self.actual.provenance_hash))?,
+                    "PROFILE_DECODER",
+                )
+            }
+        }
+
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        struct Identity {
+            native_candidate_sha256: String,
+            infra_candidate_sha256: String,
+            harness_binary_sha256: String,
+            database_input_sha256: String,
+            export_input_sha256: String,
+            marker_input_sha256: String,
+        }
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        struct Schema {
+            before_sha256: String,
+            after_sha256: String,
+        }
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        struct Phase {
+            name: String,
+            started_epoch: i64,
+            ended_epoch: i64,
+            before_schema_sha256: String,
+            after_schema_sha256: String,
+            before_image_sha256: String,
+            after_image_sha256: String,
+            decoder: Option<Decoder>,
+        }
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        struct Receipt {
+            phase_seq: u32,
+            task_id: String,
+            old_status: String,
+            canonical_status: String,
+            accepted_status: String,
+            before_row_sha256: String,
+            canonical_record_sha256: String,
+            after_row_sha256: String,
+            before_history_sha256: String,
+            after_history_sha256: String,
+            changed_columns: Vec<String>,
+        }
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        struct Checks {
+            raw_inventory_and_history_compared: bool,
+            only_reviewed_differences: bool,
+            input_identity_rechecked: bool,
+            system_driver_executions: u64,
+        }
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(deny_unknown_fields)]
+        struct ResultRecord {
+            schema_version: u32,
+            profile: String,
+            run_id: String,
+            status: String,
+            failure_class: String,
+            identity: Identity,
+            schema: Schema,
+            phases: Vec<Phase>,
+            retained_receipts: Vec<Receipt>,
+            delivery_poll: BTreeMap<String, u64>,
+            forbidden_intents: BTreeMap<String, u64>,
+            effects: BTreeMap<String, u64>,
+            checks: Checks,
+            positive_controls: BTreeMap<String, bool>,
+        }
+
+        fn zero(keys: &[&str]) -> BTreeMap<String, u64> {
+            keys.iter().map(|s| ((*s).into(), 0)).collect()
+        }
+        fn exact_keys<V>(map: &BTreeMap<String, V>, keys: &[&str]) -> bool {
+            map.keys().map(String::as_str).collect::<BTreeSet<_>>()
+                == keys.iter().copied().collect()
+        }
+        fn initial(
+            m: &Marker,
+            marker_hash: &str,
+            binary: &str,
+            i: &Image,
+        ) -> Result<ResultRecord, String> {
+            Ok(ResultRecord {
+                schema_version: 2,
+                profile: PROFILE.into(),
+                run_id: m.run_id.clone(),
+                status: "REFUSED".into(),
+                failure_class: "INCOMPLETE".into(),
+                identity: Identity {
+                    native_candidate_sha256: m.native_candidate_sha256.clone(),
+                    infra_candidate_sha256: m.infra_candidate_sha256.clone(),
+                    harness_binary_sha256: binary.into(),
+                    database_input_sha256: m.database_sha256.clone(),
+                    export_input_sha256: m.export_sha256.clone(),
+                    marker_input_sha256: marker_hash.into(),
+                },
+                schema: Schema {
+                    before_sha256: schema(i)?,
+                    after_sha256: schema(i)?,
+                },
+                phases: vec![],
+                retained_receipts: vec![],
+                delivery_poll: zero(&POLL),
+                forbidden_intents: zero(&FORBIDDEN),
+                effects: zero(&EFFECTS),
+                checks: Checks {
+                    raw_inventory_and_history_compared: false,
+                    only_reviewed_differences: false,
+                    input_identity_rechecked: false,
+                    system_driver_executions: 0,
+                },
+                positive_controls: CONTROLS.iter().map(|s| ((*s).into(), false)).collect(),
+            })
+        }
+
+        #[derive(Clone, Default)]
+        struct Counters {
+            poll: BTreeMap<String, u64>,
+            forbidden: BTreeMap<String, u64>,
+        }
+        fn snapshot_counters(c: &Coordinator) -> Result<Counters, String> {
+            let p = c.submission_probe.as_ref().ok_or("BARRIER_ABSENT")?;
+            let n = |key| p.get(key).copied().unwrap_or(0) as u64;
+            let progress = c.rehearsal_poll_progress.as_ref();
+            let executed = progress
+                .map(|p| p[0].load(Ordering::Relaxed) as u64)
+                .unwrap_or(0);
+            let completed = progress
+                .map(|p| p[1].load(Ordering::Relaxed) as u64)
+                .unwrap_or(0);
+            let (reads, mutations) = if let Some(d) = &c.rehearsal_delivery {
+                let d = d.lock().map_err(|_| "FAKE_UNAVAILABLE")?;
+                (d.reads as u64, d.mutations as u64)
+            } else {
+                (0, 0)
+            };
+            let mut poll = BTreeMap::new();
+            poll.insert("attempted".into(), n("delivery-poll"));
+            poll.insert("executed".into(), executed);
+            poll.insert("completed".into(), completed);
+            poll.insert("fake_reads".into(), reads);
+            poll.insert("fake_mutation_attempts".into(), mutations);
+            let mut forbidden = BTreeMap::new();
+            forbidden.insert("stage_launch".into(), n("worker"));
+            forbidden.insert("preparation_apply".into(), n("preparation") + n("pipeline"));
+            forbidden.insert("lifecycle_mutation".into(), n("publication"));
+            forbidden.insert("deploy".into(), n("deploy"));
+            forbidden.insert("publication".into(), n("publication"));
+            forbidden.insert("pr_merge".into(), n("merge"));
+            forbidden.insert("delivery_apply".into(), n("delivery"));
+            forbidden.insert(
+                "other".into(),
+                n("other") + n("inspection") + n("unit-mutation") + n("control"),
+            );
+            Ok(Counters { poll, forbidden })
+        }
+        fn accumulate_delta(
+            before: &Counters,
+            after: &Counters,
+            result: &mut ResultRecord,
+        ) -> Result<(), String> {
+            for k in POLL {
+                let delta = after.poll[k]
+                    .checked_sub(before.poll[k])
+                    .ok_or("COUNTER_UNDERFLOW")?;
+                *result.delivery_poll.get_mut(k).ok_or("RESULT_SCHEMA")? += delta;
+            }
+            for k in FORBIDDEN {
+                let delta = after.forbidden[k]
+                    .checked_sub(before.forbidden[k])
+                    .ok_or("COUNTER_UNDERFLOW")?;
+                *result.forbidden_intents.get_mut(k).ok_or("RESULT_SCHEMA")? += delta;
+            }
+            Ok(())
+        }
+        fn record_image_effects(before: &Image, after: &Image, result: &mut ResultRecord) {
+            for table in before
+                .tables
+                .keys()
+                .chain(after.tables.keys())
+                .collect::<BTreeSet<_>>()
+            {
+                if before.tables.get(table) == after.tables.get(table) {
+                    continue;
+                }
+                let key = match table.as_str() {
+                    "tasks" => "unexpected_task_changes",
+                    "stage_attempts" => "attempts",
+                    "path_locks" => "locks",
+                    "pending_decisions" => "decisions",
+                    "lifecycle_ops" => "lifecycle",
+                    "merge_queue" => "queue",
+                    "post_merge_deliveries" => "delivery",
+                    _ => "other",
+                };
+                if let Some(v) = result.effects.get_mut(key) {
+                    *v += 1;
+                }
+                if table == "tasks" {
+                    if let Some(v) = result.effects.get_mut("retries_or_failures") {
+                        *v += 1;
+                    }
+                }
+            }
+        }
+
+        fn validate_retained_domain(
+            initial: &Image,
+            marker: &Marker,
+            old_tasks: &[TaskRecord],
+            incoming_records: &[TaskRecord],
+        ) -> Result<(), String> {
+            let export_ids: Vec<&str> = incoming_records
+                .iter()
+                .map(|r| r.task_id.as_str())
+                .collect();
+            let marker_ids: Vec<&str> = marker.export_task_ids.iter().map(String::as_str).collect();
+            need(export_ids == marker_ids, "PROFILE_EXPORT_ORDER")?;
+            let meta = initial.tables.get("daemon_meta").ok_or("PROFILE_TABLE")?;
+            let meta_key_col = column(meta, "key")?;
+            need(
+                meta.rows
+                    .iter()
+                    .filter(|r| text(&r.values[meta_key_col]).ok() == Some("last_sync_epoch"))
+                    .count()
+                    == 1,
+                "PROFILE_META_LAST_SYNC",
+            )?;
+            let attempts_tbl = initial
+                .tables
+                .get("stage_attempts")
+                .ok_or("PROFILE_TABLE")?;
+            let decisions_tbl = initial
+                .tables
+                .get("pending_decisions")
+                .ok_or("PROFILE_TABLE")?;
+            for b in &marker.retained_tasks {
+                let old = old_tasks
+                    .iter()
+                    .find(|t| t.task_id == b.task_id)
+                    .ok_or("PROFILE_INVENTORY")?;
+                let incoming = incoming_records
+                    .iter()
+                    .find(|t| t.task_id == b.task_id)
+                    .ok_or("PROFILE_INVENTORY")?;
+                need(
+                    old.repository == incoming.repository
+                        && old.github_repo == incoming.github_repo
+                        && old.issue_number == incoming.issue_number
+                        && old.branch == incoming.branch
+                        && old.worktree_path == incoming.worktree_path
+                        && old.branch.as_deref().is_some_and(|s| !s.is_empty())
+                        && old.worktree_path.as_deref().is_some_and(|s| !s.is_empty()),
+                    "PROFILE_IDENTITY",
+                )?;
+                need(
+                    old.executor.as_deref() == Some("zach")
+                        && incoming.executor.as_deref() == Some("zach")
+                        && !old.autonomous_consent
+                        && !incoming.autonomous_consent,
+                    "PROFILE_CONSENT_OR_EXECUTOR",
+                )?;
+                need(
+                    matches!(
+                        (old.status.as_str(), incoming.status.as_str()),
+                        ("Ready", "Ready") | ("Blocked", "Blocked") | ("Ready", "Blocked")
+                    ),
+                    "PROFILE_STATUS_MATRIX",
+                )?;
+                need(
+                    old.current_stage.as_deref() == Some("impl")
+                        && known_weight(&old.weight).is_some()
+                        && old.weight == incoming.weight
+                        && old.context_pack.weight == old.weight
+                        && old.version.checked_add(2).is_some(),
+                    "PROFILE_STAGE_OR_WEIGHT",
+                )?;
+                let mut expected_req = crate::v2::intake::default_required_stages(&old.weight);
+                for s in &old.required_stages {
+                    if !expected_req.contains(s) {
+                        expected_req.push(s.clone());
+                    }
+                }
+                need(
+                    expected_req == old.required_stages
+                        && old.required_stages == incoming.required_stages
+                        && old.stages_completed == incoming.stages_completed
+                        && old.depends_on == incoming.depends_on
+                        && old.context_pack == incoming.context_pack
+                        && old.task_group == incoming.task_group
+                        && old.title == incoming.title
+                        && old.reviewed_sha == incoming.reviewed_sha
+                        && old.plan_base_sha == incoming.plan_base_sha,
+                    "PROFILE_METADATA_DRIFT",
+                )?;
+                need(
+                    old.memory.governance_started
+                        && !old.memory.governance_terminal_observed
+                        && !incoming.memory.governance_terminal_observed
+                        && old.active_attempt_id.is_none()
+                        && old.lease_owner.is_none()
+                        && old.lease_expires_epoch.is_none()
+                        && old.memory.suspended_impl_attempt_id.is_none()
+                        && old.memory.pipeline_checkpoint.is_none()
+                        && old.memory.merge_checkpoint.is_none(),
+                    "PROFILE_ACTIVE_OR_CHECKPOINT",
+                )?;
+                let attempts = selected(initial, "stage_attempts", &b.task_id)?;
+                need(
+                    !attempts.rows.is_empty()
+                        && attempts.rows.len() as u64 == b.attempt_count
+                        && hash(&attempts)? == b.attempt_rows_sha256,
+                    "PROFILE_ATTEMPT_BINDING",
+                )?;
+                for row in &attempts.rows {
+                    let stage = text(field(attempts_tbl, row, "stage")?)?;
+                    let status = text(field(attempts_tbl, row, "status")?)?;
+                    let phase = text(field(attempts_tbl, row, "phase")?)?;
+                    let started = number(field(attempts_tbl, row, "started_epoch")?)?;
+                    let ended = number(field(attempts_tbl, row, "ended_epoch")?)?;
+                    let aid = text(field(attempts_tbl, row, "attempt_id")?)?;
+                    let model = text(field(attempts_tbl, row, "model")?)?;
+                    let effort = text(field(attempts_tbl, row, "effort")?)?;
+                    need(
+                        stage == "impl"
+                            && status == "FAILED"
+                            && phase == "COMPLETE"
+                            && started > 0
+                            && ended > 0
+                            && !aid.is_empty()
+                            && !model.is_empty()
+                            && !effort.is_empty(),
+                        "PROFILE_ATTEMPT_STATE",
+                    )?;
+                }
+                need(
+                    selected(initial, "path_locks", &b.task_id)?.rows.is_empty()
+                        && selected(initial, "merge_queue", &b.task_id)?
+                            .rows
+                            .is_empty(),
+                    "PROFILE_EFFECT_ROWS",
+                )?;
+                let decisions = selected(initial, "pending_decisions", &b.task_id)?;
+                for row in &decisions.rows {
+                    let d_id = text(field(decisions_tbl, row, "decision_id")?)?;
+                    let d_status = text(field(decisions_tbl, row, "status")?)?;
+                    match d_status {
+                        "OPEN" => {}
+                        "RESOLVED" => {
+                            need(
+                                old.memory.applied_decisions.iter().any(|id| id == d_id),
+                                "PROFILE_UNAPPLIED_DECISION",
+                            )?;
+                        }
+                        _ => return Err("PROFILE_DECISION_STATUS".into()),
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn validate_retained_standard(
+            phase_seq: u32,
+            before_img: &Image,
+            after_img: &Image,
+            obs: &StandardObservation,
+            witness: &Witness,
+            export: &str,
+            intake_start: i64,
+            intake_end: i64,
+            retained_ids: &BTreeSet<String>,
+        ) -> Result<Vec<Receipt>, String> {
+            need(schema(before_img)? == schema(after_img)?, "PROFILE_SCHEMA")?;
+            known_schema(before_img)?;
+            witness.verify(phase_seq, export)?;
+            validate_standard_for_profile(obs, &witness.actual, export, Some(retained_ids))?;
+            // Require canonical deterministic JSON serialization for retained rows before intake.
+            let old_retained: Vec<TaskRecord> = obs
+                .old
+                .iter()
+                .filter(|t| retained_ids.contains(&t.task_id))
+                .cloned()
+                .collect();
+            let before_tasks_tbl = before_img.tables.get("tasks").ok_or("PROFILE_TABLE")?;
+            let after_tasks_tbl = after_img.tables.get("tasks").ok_or("PROFILE_TABLE")?;
+            let id_col = column(before_tasks_tbl, "task_id")?;
+            let retained_before_rows: Vec<Vec<rusqlite::types::Value>> = obs
+                .before
+                .get("tasks")
+                .ok_or("PROFILE_TABLE")?
+                .iter()
+                .filter(
+                    |r| match &r[obs.columns.iter().position(|c| c == "task_id").unwrap()] {
+                        rusqlite::types::Value::Text(id) => retained_ids.contains(id),
+                        _ => false,
+                    },
+                )
+                .cloned()
+                .collect();
+            let mut retained_db_img = DatabaseImage::new();
+            retained_db_img.insert("tasks".into(), retained_before_rows);
+            bind_task_rows(&retained_db_img, &obs.columns, &old_retained, true)?;
+
+            // Every table other than tasks, task_events, sqlite_sequence, daemon_meta must be identical (rows + rowids).
+            need(
+                before_img.tables.keys().eq(after_img.tables.keys()),
+                "PROFILE_TABLES",
+            )?;
+            for (name, b_tbl) in &before_img.tables {
+                let a_tbl = after_img.tables.get(name).ok_or("PROFILE_TABLE")?;
+                need(b_tbl.columns == a_tbl.columns, "PROFILE_SCHEMA")?;
+                if matches!(
+                    name.as_str(),
+                    "tasks" | "task_events" | "sqlite_sequence" | "daemon_meta"
+                ) {
+                    continue;
+                }
+                need(b_tbl == a_tbl, "PROFILE_EFFECT_TABLE")?;
+            }
+
+            // daemon_meta: only existing last_sync_epoch row may change, preserving rowid/key, to decimal epoch in [intake_start, intake_end].
+            let b_meta = before_img
+                .tables
+                .get("daemon_meta")
+                .ok_or("PROFILE_TABLE")?;
+            let a_meta = after_img.tables.get("daemon_meta").ok_or("PROFILE_TABLE")?;
+            need(b_meta.rows.len() == a_meta.rows.len(), "PROFILE_META_ROWS")?;
+            let mut saw_last_sync = false;
+            for (br, ar) in b_meta.rows.iter().zip(&a_meta.rows) {
+                need(br.rowid == ar.rowid, "PROFILE_META_ROWID")?;
+                if text(field(b_meta, br, "key")?)? == "last_sync_epoch" {
+                    need(
+                        text(field(a_meta, ar, "key")?)? == "last_sync_epoch",
+                        "PROFILE_META_KEY",
+                    )?;
+                    let val = text(field(a_meta, ar, "value")?)?;
+                    let parsed: i64 = val.parse().map_err(|_| "PROFILE_META_VALUE")?;
+                    need(
+                        parsed.to_string() == val && parsed >= intake_start && parsed <= intake_end,
+                        "PROFILE_META_BOUNDS",
+                    )?;
+                    saw_last_sync = true;
+                } else {
+                    need(br == ar, "PROFILE_META_OTHER")?;
+                }
+            }
+            need(saw_last_sync, "PROFILE_META_LAST_SYNC")?;
+
+            // Bind the raw receipt to the exact events and allocator validated above.
+            for (image, observed, allocator) in [
+                (before_img, &obs.before, &obs.allocator_before),
+                (after_img, &obs.after, &obs.allocator_after),
+            ] {
+                for (name, expected) in [
+                    (
+                        "task_events",
+                        event_rows(observed.get("task_events").ok_or("PROFILE_TABLE")?)?,
+                    ),
+                    ("sqlite_sequence", allocator_rows(allocator)?),
+                ] {
+                    let actual = &image.tables.get(name).ok_or("PROFILE_TABLE")?.rows;
+                    need(actual.len() == expected.len(), "PROFILE_EVENT_INVENTORY")?;
+                    for (actual, expected) in actual.iter().zip(expected) {
+                        let cells = expected.into_iter().map(cell).collect::<Vec<_>>();
+                        let values = if name == "sqlite_sequence" {
+                            &cells[1..]
+                        } else {
+                            &cells[..]
+                        };
+                        need(
+                            actual.rowid == number(&cells[0])? && actual.values == values,
+                            "PROFILE_EVENT_BINDING",
+                        )?;
+                    }
+                }
+            }
+
+            // tasks rowid preservation + exact retained allowlist & receipt generation.
+            need(
+                before_tasks_tbl.rows.len() == after_tasks_tbl.rows.len(),
+                "PROFILE_TASK_COUNT",
+            )?;
+            for (br, ar) in before_tasks_tbl.rows.iter().zip(&after_tasks_tbl.rows) {
+                need(br.rowid == ar.rowid, "PROFILE_TASK_ROWID")?;
+                let b_id = text(&br.values[id_col])?;
+                let a_id = text(&ar.values[id_col])?;
+                need(b_id == a_id, "PROFILE_TASK_ROWID_ORDER")?;
+            }
+
+            let mut receipts = Vec::new();
+            let mut sorted_ids: Vec<&String> = retained_ids.iter().collect();
+            sorted_ids.sort();
+            for id in sorted_ids {
+                let old = obs
+                    .old
+                    .iter()
+                    .find(|t| &t.task_id == id)
+                    .ok_or("PROFILE_INVENTORY")?;
+                let incoming = witness
+                    .actual
+                    .records
+                    .iter()
+                    .find(|t| &t.task_id == id)
+                    .ok_or("PROFILE_INVENTORY")?;
+                let accepted = obs
+                    .accepted
+                    .iter()
+                    .find(|t| &t.task_id == id)
+                    .ok_or("PROFILE_INVENTORY")?;
+                need(
+                    profile_status_matches(old, incoming, Some(retained_ids))
+                        && accepted.status == old.status
+                        && old.version.checked_add(1) == Some(accepted.version)
+                        && accepted.updated_epoch == incoming.updated_epoch
+                        && accepted.updated_epoch > 0
+                        && accepted.updated_epoch >= witness.decoder.started_epoch
+                        && accepted.updated_epoch <= witness.decoder.ended_epoch
+                        && old.memory == accepted.memory
+                        && old.task_group == incoming.task_group
+                        && old.title == incoming.title
+                        && old.repository == incoming.repository
+                        && old.github_repo == incoming.github_repo
+                        && old.issue_number == incoming.issue_number
+                        && old.weight == incoming.weight
+                        && old.branch == incoming.branch
+                        && old.worktree_path == incoming.worktree_path
+                        && old.context_pack == incoming.context_pack
+                        && old.depends_on == incoming.depends_on
+                        && old.required_stages == incoming.required_stages
+                        && old.stages_completed == incoming.stages_completed
+                        && old.reviewed_sha == incoming.reviewed_sha
+                        && old.plan_base_sha == incoming.plan_base_sha
+                        && old.executor == incoming.executor,
+                    "PROFILE_RETAINED_INVARIANT",
+                )?;
+                let br = task_row(before_img, id)?;
+                let ar = task_row(after_img, id)?;
+                let mut changed_columns = Vec::new();
+                for ((col_meta, bv), av) in before_tasks_tbl
+                    .columns
+                    .iter()
+                    .zip(&br.values)
+                    .zip(&ar.values)
+                {
+                    if bv != av {
+                        let cname = text(&col_meta[1])?;
+                        need(
+                            matches!(cname, "version" | "updated_epoch"),
+                            "PROFILE_DISALLOWED_COLUMN",
+                        )?;
+                        changed_columns.push(cname.to_string());
+                    }
+                }
+                need(
+                    changed_columns.iter().any(|c| c == "version"),
+                    "PROFILE_VERSION_UNCHANGED",
+                )?;
+                let bh = history(before_img, id)?;
+                let ah = history(after_img, id)?;
+                need(bh == ah, "PROFILE_HISTORY_CHANGED")?;
+                receipts.push(Receipt {
+                    phase_seq,
+                    task_id: id.clone(),
+                    old_status: old.status.clone(),
+                    canonical_status: incoming.status.clone(),
+                    accepted_status: accepted.status.clone(),
+                    before_row_sha256: task_hash(before_img, id)?,
+                    canonical_record_sha256: hash(&incoming)?,
+                    after_row_sha256: task_hash(after_img, id)?,
+                    before_history_sha256: bh,
+                    after_history_sha256: ah,
+                    changed_columns,
+                });
+            }
+            Ok(receipts)
+        }
+
+        fn run_phase_noop<F>(
+            name: &str,
+            c: &mut Coordinator,
+            result: &mut ResultRecord,
+            expected_schema: &str,
+            op: F,
+        ) -> Result<(), String>
+        where
+            F: FnOnce(&mut Coordinator) -> Result<(), String>,
+        {
+            let before_img = image(c.store.connection_mut())?;
+            let before_schema = schema(&before_img)?;
+            need(before_schema == expected_schema, "PROFILE_SCHEMA")?;
+            let before_c = snapshot_counters(c)?;
+            let started = now_epoch();
+            let res = op(c);
+            let ended = now_epoch();
+            let after_c = snapshot_counters(c)?;
+            accumulate_delta(&before_c, &after_c, result)?;
+            let after_img = image(c.store.connection_mut())?;
+            let after_schema = schema(&after_img)?;
+            record_image_effects(&before_img, &after_img, result);
+            result.phases.push(Phase {
+                name: name.into(),
+                started_epoch: started,
+                ended_epoch: ended.max(started),
+                before_schema_sha256: before_schema.clone(),
+                after_schema_sha256: after_schema.clone(),
+                before_image_sha256: hash(&before_img)?,
+                after_image_sha256: hash(&after_img)?,
+                decoder: None,
+            });
+            res?;
+            need(before_schema == after_schema, "PROFILE_SCHEMA")?;
+            need(before_img == after_img, "PROFILE_NOOP_EFFECT")?;
+            Ok(())
+        }
+
+        fn run_standard_phase(
+            name: &str,
+            phase_seq: u32,
+            c: &mut Coordinator,
+            export: &str,
+            retained_ids: &BTreeSet<String>,
+            expected_schema: &str,
+            result: &mut ResultRecord,
+        ) -> Result<(), String> {
+            let before_img = image(c.store.connection_mut())?;
+            let before_schema = schema(&before_img)?;
+            need(before_schema == expected_schema, "PROFILE_SCHEMA")?;
+            let before_c = snapshot_counters(c)?;
+            let started = now_epoch();
+            let witness = Witness::new(phase_seq, export)?;
+            let intake_start = now_epoch();
+            let obs = observe_standard_for_profile(c, &witness.actual, export, Some(retained_ids))?;
+            let intake_end = now_epoch();
+            let ended = now_epoch();
+            let after_c = snapshot_counters(c)?;
+            accumulate_delta(&before_c, &after_c, result)?;
+            let after_img = image(c.store.connection_mut())?;
+            let after_schema = schema(&after_img)?;
+            let receipts = validate_retained_standard(
+                phase_seq,
+                &before_img,
+                &after_img,
+                &obs,
+                &witness,
+                export,
+                intake_start,
+                intake_end,
+                retained_ids,
+            )?;
+            result.phases.push(Phase {
+                name: name.into(),
+                started_epoch: started,
+                ended_epoch: ended.max(started),
+                before_schema_sha256: before_schema,
+                after_schema_sha256: after_schema,
+                before_image_sha256: hash(&before_img)?,
+                after_image_sha256: hash(&after_img)?,
+                decoder: Some(witness.decoder),
+            });
+            result.retained_receipts.extend(receipts);
+            Ok(())
+        }
+
+        fn verify_result_invariants(r: &ResultRecord, m: &Marker) -> Result<(), String> {
+            need(
+                r.schema_version == 2
+                    && r.profile == PROFILE
+                    && r.run_id == m.run_id
+                    && r.status == "PASS"
+                    && r.failure_class == "NONE",
+                "RESULT_INVARIANT",
+            )?;
+            need(
+                r.schema.before_sha256 == r.schema.after_sha256
+                    && digest_shape(&r.schema.before_sha256),
+                "RESULT_SCHEMA_HASH",
+            )?;
+            need(
+                r.phases.iter().map(|p| p.name.as_str()).collect::<Vec<_>>() == PHASES,
+                "RESULT_PHASES",
+            )?;
+            for (idx, p) in r.phases.iter().enumerate() {
+                need(
+                    p.started_epoch > 0
+                        && p.ended_epoch >= p.started_epoch
+                        && p.before_schema_sha256 == r.schema.before_sha256
+                        && p.after_schema_sha256 == r.schema.before_sha256,
+                    "RESULT_PHASE_INVARIANT",
+                )?;
+                if idx > 0 {
+                    need(
+                        p.started_epoch >= r.phases[idx - 1].ended_epoch,
+                        "RESULT_PHASE_ORDER",
+                    )?;
+                }
+                match p.name.as_str() {
+                    "standard_1" => {
+                        let d = p.decoder.as_ref().ok_or("RESULT_DECODER")?;
+                        need(
+                            d.phase_seq == 1
+                                && d.started_epoch >= p.started_epoch
+                                && d.ended_epoch <= p.ended_epoch,
+                            "RESULT_DECODER",
+                        )?;
+                    }
+                    "standard_2" => {
+                        let d = p.decoder.as_ref().ok_or("RESULT_DECODER")?;
+                        need(
+                            d.phase_seq == 2
+                                && d.started_epoch >= p.started_epoch
+                                && d.ended_epoch <= p.ended_epoch,
+                            "RESULT_DECODER",
+                        )?;
+                    }
+                    _ => need(p.decoder.is_none(), "RESULT_DECODER")?,
+                }
+            }
+            let expected_receipts = m.retained_tasks.len() * 2;
+            need(
+                r.retained_receipts.len() == expected_receipts,
+                "RESULT_RECEIPTS",
+            )?;
+            let mut sorted_ids: Vec<String> =
+                m.retained_tasks.iter().map(|b| b.task_id.clone()).collect();
+            sorted_ids.sort();
+            for (seq, chunk) in [1u32, 2u32]
+                .into_iter()
+                .zip(r.retained_receipts.chunks_exact(sorted_ids.len()))
+            {
+                for (rcpt, expected_id) in chunk.iter().zip(&sorted_ids) {
+                    need(
+                        rcpt.phase_seq == seq
+                            && &rcpt.task_id == expected_id
+                            && rcpt.before_history_sha256 == rcpt.after_history_sha256
+                            && rcpt
+                                .changed_columns
+                                .iter()
+                                .all(|c| matches!(c.as_str(), "version" | "updated_epoch")),
+                        "RESULT_RECEIPT_INVARIANT",
+                    )?;
+                }
+            }
+            need(
+                exact_keys(&r.delivery_poll, &POLL)
+                    && exact_keys(&r.forbidden_intents, &FORBIDDEN)
+                    && exact_keys(&r.effects, &EFFECTS)
+                    && exact_keys(&r.positive_controls, &CONTROLS)
+                    && r.forbidden_intents.values().all(|v| *v == 0)
+                    && r.effects.values().all(|v| *v == 0)
+                    && r.delivery_poll["attempted"] == r.delivery_poll["executed"]
+                    && r.delivery_poll["executed"] == r.delivery_poll["completed"]
+                    && r.delivery_poll["fake_mutation_attempts"] == 0
+                    && r.checks.raw_inventory_and_history_compared
+                    && r.checks.only_reviewed_differences
+                    && r.checks.input_identity_rechecked
+                    && r.checks.system_driver_executions == 0
+                    && r.positive_controls.values().all(|v| *v),
+                "RESULT_INVARIANT",
+            )?;
+            Ok(())
+        }
+
+        fn execute_rehearsal(
+            dir: &Path,
+            db_path: &Path,
+            export_bytes: &[u8],
+            marker: &Marker,
+            marker_hash: &str,
+            binary_hash: &str,
+        ) -> Result<ResultRecord, String> {
+            let export = std::str::from_utf8(export_bytes).map_err(|_| "EXPORT_SCHEMA")?;
+            let _: Value = strict(export_bytes)?;
+            let probe_witness = actual_decode(export)?;
+            let check = rusqlite::Connection::open_with_flags(
+                db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .map_err(|_| "DATABASE_OPEN")?;
+            let version: String = check
+                .query_row(
+                    "SELECT value FROM daemon_meta WHERE key='schema_version'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|_| "DATABASE_SCHEMA")?;
+            need(version == "4", "DATABASE_SCHEMA")?;
+            let initial_img = image(&check)?;
+            drop(check);
+            known_schema(&initial_img)?;
+            let expected_schema = schema(&initial_img)?;
+            let mut result = initial(marker, marker_hash, binary_hash, &initial_img)?;
+            let retained_ids = marker.ids();
+
+            let store = V2Store::open(db_path).map_err(|_| "DATABASE_OPEN")?;
+            let old_tasks = store.list_tasks(None).map_err(|_| "DATABASE_READ")?;
+            validate_retained_domain(&initial_img, marker, &old_tasks, &probe_witness.records)?;
+
+            let units = Arc::new(RehearsalUnits::default());
+            let ws = Arc::new(RehearsalWs {
+                export: export.to_string(),
+                reads: AtomicUsize::new(0),
+                mutations: AtomicUsize::new(0),
+            });
+
+            let make_coord = |s: V2Store| -> Coordinator {
+                let (mut c, _h) = Coordinator::create(s, dir.to_path_buf());
+                c.controller = units.clone();
+                c.ws = ws.clone();
+                c.submission_probe = Some(BTreeMap::new());
+                c
+            };
+
+            let mut c1 = make_coord(store);
+            need(
+                image(c1.store.connection_mut())? == initial_img,
+                "DATABASE_OPEN_EFFECT",
+            )?;
+            run_phase_noop(
+                "startup_1",
+                &mut c1,
+                &mut result,
+                &expected_schema,
+                rehearsal_startup,
+            )?;
+            run_phase_noop("pass_1", &mut c1, &mut result, &expected_schema, |c| {
+                rehearsal_pass(c, &mut RehearsalDelivery::default())
+            })?;
+            let exact = c1
+                .ws
+                .execute(&["export".into(), "--sync".into(), "--json".into()])
+                .map_err(|_| "EXPORT_FAKE")?;
+            need(exact.as_bytes() == export_bytes, "EXPORT_BINDING")?;
+            run_standard_phase(
+                "standard_1",
+                1,
+                &mut c1,
+                &exact,
+                &retained_ids,
+                &expected_schema,
+                &mut result,
+            )?;
+            run_phase_noop("pass_2", &mut c1, &mut result, &expected_schema, |c| {
+                rehearsal_pass(c, &mut RehearsalDelivery::default())
+            })?;
+            need(
+                c1.jobs.is_empty()
+                    && units.mutations.load(Ordering::Relaxed) == 0
+                    && ws.mutations.load(Ordering::Relaxed) == 0,
+                "FAKE_MUTATION",
+            )?;
+            drop(c1);
+
+            let mut c2 = make_coord(V2Store::open(db_path).map_err(|_| "DATABASE_REOPEN")?);
+            run_phase_noop(
+                "startup_2",
+                &mut c2,
+                &mut result,
+                &expected_schema,
+                rehearsal_startup,
+            )?;
+            run_phase_noop("pass_3", &mut c2, &mut result, &expected_schema, |c| {
+                rehearsal_pass(c, &mut RehearsalDelivery::default())
+            })?;
+            let exact2 = c2
+                .ws
+                .execute(&["export".into(), "--sync".into(), "--json".into()])
+                .map_err(|_| "EXPORT_FAKE")?;
+            need(exact2.as_bytes() == export_bytes, "EXPORT_BINDING")?;
+            run_standard_phase(
+                "standard_2",
+                2,
+                &mut c2,
+                &exact2,
+                &retained_ids,
+                &expected_schema,
+                &mut result,
+            )?;
+            run_phase_noop("pass_4", &mut c2, &mut result, &expected_schema, |c| {
+                rehearsal_pass(c, &mut RehearsalDelivery::default())
+            })?;
+            need(
+                c2.jobs.is_empty()
+                    && units.mutations.load(Ordering::Relaxed) == 0
+                    && ws.mutations.load(Ordering::Relaxed) == 0,
+                "FAKE_MUTATION",
+            )?;
+            drop(c2);
+
+            let mut c3 = make_coord(V2Store::open(db_path).map_err(|_| "DATABASE_REOPEN")?);
+            run_phase_noop(
+                "startup_3",
+                &mut c3,
+                &mut result,
+                &expected_schema,
+                rehearsal_startup,
+            )?;
+            run_phase_noop("pass_5", &mut c3, &mut result, &expected_schema, |c| {
+                rehearsal_pass(c, &mut RehearsalDelivery::default())
+            })?;
+            need(
+                c3.jobs.is_empty()
+                    && units.mutations.load(Ordering::Relaxed) == 0
+                    && ws.mutations.load(Ordering::Relaxed) == 0,
+                "NOT_QUIESCENT",
+            )?;
+            let final_img = image(c3.store.connection_mut())?;
+            result.schema.after_sha256 = schema(&final_img)?;
+            result.checks.raw_inventory_and_history_compared = true;
+            result.checks.only_reviewed_differences = true;
+            Ok(result)
+        }
+
+        pub(super) fn run_private() -> Result<(), String> {
+            use std::os::unix::fs::MetadataExt;
+            let (dir, uid, dir_identity) = rehearsal_directory_for("ZACH_RETAINED_REHEARSAL_DIR")?;
+            let (db, db_id) = rehearsal_file(&dir.join("zach-v2.sqlite3"), uid)?;
+            let (export, export_id) = rehearsal_file(&dir.join("canonical-export.json"), uid)?;
+            let (marker_file, marker_id) = rehearsal_file(&dir.join("copy-only.json"), uid)?;
+            let db_bytes = rehearsal_bytes(db, 256 * 1024 * 1024)?;
+            let db_hash = rehearsal_sha256(&db_bytes);
+            let export_bytes = rehearsal_bytes(export, 16 * 1024 * 1024)?;
+            let marker_bytes = rehearsal_bytes(marker_file, 16 * 1024)?;
+            let marker_hash = rehearsal_sha256(&marker_bytes);
+            let marker: Marker = strict(&marker_bytes)?;
+            marker.validate()?;
+            need(
+                marker.database_sha256 == db_hash
+                    && marker.export_sha256 == rehearsal_sha256(&export_bytes),
+                "INPUT_BINDING",
+            )?;
+            let binary = rehearsal_sha256(&rehearsal_bytes(
+                File::open("/proc/self/exe").map_err(|_| "BINARY_IDENTITY")?,
+                256 * 1024 * 1024,
+            )?);
+
+            // Run positive controls on synthetic in-memory/disposable inputs only.
+            std::panic::catch_unwind(|| {
+                rehearsal_barrier_and_fake_mutations_are_non_vacuous();
+                real_coordinator_positive_controls_detect_jobs_and_direct_database_effects();
+                retained_synthetic_positive_and_negative_controls();
+            })
+            .map_err(|_| "POSITIVE_CONTROL")?;
+
+            need(
+                rehearsal_file(&dir.join("zach-v2.sqlite3"), uid)?.1 == db_id,
+                "IDENTITY_CHANGED",
+            )?;
+            let mut result = execute_rehearsal(
+                &dir,
+                &dir.join("zach-v2.sqlite3"),
+                &export_bytes,
+                &marker,
+                &marker_hash,
+                &binary,
+            )?;
+            for k in CONTROLS {
+                result.positive_controls.insert(k.into(), true);
+            }
+
+            let recheck = (|| -> Result<(), String> {
+                rehearsal_entries(&dir, uid, true)?;
+                let m = std::fs::symlink_metadata(&dir).map_err(|_| "IDENTITY_CHANGED")?;
+                need(
+                    (m.dev(), m.ino()) == dir_identity
+                        && m.uid() == uid
+                        && m.mode() & 0o7777 == 0o700,
+                    "IDENTITY_CHANGED",
+                )?;
+                for (name, id, expected_hash) in [
+                    ("zach-v2.sqlite3", db_id, None),
+                    (
+                        "canonical-export.json",
+                        export_id,
+                        Some(rehearsal_sha256(&export_bytes)),
+                    ),
+                    ("copy-only.json", marker_id, Some(marker_hash.clone())),
+                ] {
+                    let (file, current) = rehearsal_file(&dir.join(name), uid)?;
+                    need(id == current, "IDENTITY_CHANGED")?;
+                    if let Some(h) = expected_hash {
+                        need(
+                            rehearsal_sha256(&rehearsal_bytes(file, 16 * 1024 * 1024)?) == h,
+                            "IDENTITY_CHANGED",
+                        )?;
+                    }
+                }
+                Ok(())
+            })();
+            let mut outcome = Ok(());
+            if recheck.is_ok() {
+                result.checks.input_identity_rechecked = true;
+                result.status = "PASS".into();
+                result.failure_class = "NONE".into();
+                if let Err(e) = verify_result_invariants(&result, &marker) {
+                    result.status = "REFUSED".into();
+                    result.failure_class = e.clone();
+                    outcome = Err(e);
+                }
+            } else if let Err(e) = recheck {
+                result.status = "REFUSED".into();
+                result.failure_class = e.clone();
+                outcome = Err(e);
+            }
+            let out_bytes = serde_json::to_vec(&result).map_err(|_| "RESULT_SCHEMA")?;
+            write_rehearsal_result(&dir, uid, &out_bytes)?;
+            outcome
+        }
+
+        fn retained_fixture(
+            native_status: &str,
+            canonical_status: &str,
+            include_open_decision: bool,
+        ) -> (TestDirectory, PathBuf, Vec<u8>, Marker) {
+            let dir = TestDirectory::new();
+            let db_path = dir.0.join("zach-v2.sqlite3");
+            let mut store = V2Store::open(&db_path).unwrap();
+            let export_json = serde_json::json!({
+                "schema_version": 2,
+                "tasks": [
+                    {
+                        "id": "T-RET-1",
+                        "repository": "repo-a",
+                        "github_repo": "owner/repo-a",
+                        "issue_number": 10,
+                        "task_group": "grp-a",
+                        "title": "Retained revoked task",
+                        "weight": "L",
+                        "status": canonical_status,
+                        "branch": "task/T-RET-1-demo",
+                        "worktree": "/tmp/ws/repo-a--T-RET-1-demo",
+                        "executor": "zach",
+                        "autonomous_consent": false,
+                        "memory": {"governance_started": true, "governance_terminal_observed": false}
+                    },
+                    {
+                        "id": "T-UNL-1",
+                        "repository": "repo-a",
+                        "task_group": "grp-a",
+                        "title": "Unlisted settled task",
+                        "weight": "S",
+                        "status": "Done",
+                        "executor": "external",
+                        "autonomous_consent": false
+                    }
+                ]
+            });
+            let export_bytes = serde_json::to_vec(&export_json).unwrap();
+            let records =
+                intake::decode_export_records(std::str::from_utf8(&export_bytes).unwrap()).unwrap();
+            let mut ret = records[0].clone();
+            ret.status = native_status.into();
+            ret.current_stage = Some("impl".into());
+            ret.retry_count = 3;
+            ret.next_retry_epoch = 123456;
+            ret.memory.governance_started = true;
+            ret.memory.recent_attempts = vec!["failed impl".into()];
+            store.upsert_task(&ret).unwrap();
+            store.upsert_task(&records[1]).unwrap();
+            for i in 1..=3 {
+                store
+                    .connection_mut()
+                    .execute(
+                        "INSERT INTO stage_attempts(attempt_id,task_id,stage,model,effort,started_epoch,ended_epoch,status,phase,last_liveness_epoch,last_output_bytes) VALUES(?1,?2,'impl','gpt-6.1-sol','high',?3,?4,'FAILED','COMPLETE',?4,10)",
+                        rusqlite::params![format!("att-{i}"), "T-RET-1", 100 + i, 200 + i],
+                    )
+                    .unwrap();
+            }
+            if include_open_decision {
+                store
+                    .connection_mut()
+                    .execute(
+                        "INSERT INTO pending_decisions(decision_id,task_id,task_group,kind,question,options_json,context_summary,status,created_seq) VALUES('dec-open-1','T-RET-1','grp-a','plan_approval','Approve?','[\"approve\",\"reject\"]','ctx','OPEN',1)",
+                        [],
+                    )
+                    .unwrap();
+            }
+            store
+                .connection_mut()
+                .execute(
+                    "INSERT OR REPLACE INTO daemon_meta(key,value) VALUES('last_sync_epoch','100')",
+                    [],
+                )
+                .unwrap();
+            let img = image(store.connection_mut()).unwrap();
+            let attempts = selected(&img, "stage_attempts", "T-RET-1").unwrap();
+            let attempt_rows_sha256 = hash(&attempts).unwrap();
+            drop(store);
+            let db_bytes = std::fs::read(&db_path).unwrap();
+            let marker = Marker {
+                schema_version: 2,
+                profile: PROFILE.into(),
+                purpose: "exclusive-native-copy".into(),
+                run_id: "synthetic-run-001".into(),
+                database_sha256: rehearsal_sha256(&db_bytes),
+                export_sha256: rehearsal_sha256(&export_bytes),
+                native_candidate_sha256: "a".repeat(64),
+                infra_candidate_sha256: "b".repeat(64),
+                export_task_ids: vec!["T-RET-1".into(), "T-UNL-1".into()],
+                retained_tasks: vec![Binding {
+                    task_id: "T-RET-1".into(),
+                    attempt_count: 3,
+                    attempt_rows_sha256,
+                }],
+            };
+            (dir, db_path, export_bytes, marker)
+        }
+
+        fn retained_synthetic_positive_and_negative_controls() {
+            // Positive: Ready/Blocked/Ready with 3 FAILED COMPLETE attempts and OPEN decision passes 10 phases.
+            let (dir, db_path, export_bytes, marker) = retained_fixture("Ready", "Blocked", true);
+            let r = execute_rehearsal(
+                &dir.0,
+                &db_path,
+                &export_bytes,
+                &marker,
+                &hash(&marker).unwrap(),
+                &"c".repeat(64),
+            )
+            .unwrap();
+            let mut r = r;
+            r.checks.input_identity_rechecked = true;
+            r.status = "PASS".into();
+            r.failure_class = "NONE".into();
+            for k in CONTROLS {
+                r.positive_controls.insert(k.into(), true);
+            }
+            verify_result_invariants(&r, &marker).unwrap();
+            assert_eq!(r.retained_receipts.len(), 2);
+            assert_eq!(r.retained_receipts[0].old_status, "Ready");
+            assert_eq!(r.retained_receipts[0].canonical_status, "Blocked");
+            assert_eq!(r.retained_receipts[0].accepted_status, "Ready");
+        }
+
+        #[test]
+        fn retained_profile_matrix_and_repeated_standard_pass_while_original_stays_strict() {
+            for (nat, can, open_dec) in [
+                ("Ready", "Ready", false),
+                ("Blocked", "Blocked", false),
+                ("Ready", "Blocked", true),
+            ] {
+                let (dir, db_path, export_bytes, marker) = retained_fixture(nat, can, open_dec);
+                let mut r = execute_rehearsal(
+                    &dir.0,
+                    &db_path,
+                    &export_bytes,
+                    &marker,
+                    &hash(&marker).unwrap(),
+                    &"c".repeat(64),
+                )
+                .unwrap();
+                r.checks.input_identity_rechecked = true;
+                r.status = "PASS".into();
+                r.failure_class = "NONE".into();
+                for k in CONTROLS {
+                    r.positive_controls.insert(k.into(), true);
+                }
+                verify_result_invariants(&r, &marker).unwrap();
+                let store = V2Store::open(&db_path).unwrap();
+                let final_task = store
+                    .list_tasks(None)
+                    .unwrap()
+                    .into_iter()
+                    .find(|t| t.task_id == "T-RET-1")
+                    .unwrap();
+                assert_eq!(final_task.status, nat);
+                assert_eq!(final_task.retry_count, 3);
+                assert_eq!(final_task.version, 3); // 1 + Standard1 + Standard2
+            }
+
+            // Original strict profile must still reject Ready/Blocked mismatch.
+            let (_dir, db_path, export_bytes, _m) = retained_fixture("Ready", "Blocked", false);
+            let export = std::str::from_utf8(&export_bytes).unwrap();
+            let w = actual_decode(export).unwrap();
+            let mut c = coordinator(&db_path.parent().unwrap().to_path_buf());
+            c.store = V2Store::open(&db_path).unwrap();
+            c.controller = Arc::new(RehearsalUnits::default());
+            c.submission_probe = Some(BTreeMap::new());
+            assert_eq!(
+                observe_standard(&mut c, &w, export).err().as_deref(),
+                Some("STANDARD_INVENTORY")
+            );
+        }
+
+        #[test]
+        fn retained_profile_rejects_disallowed_matrix_domain_and_json_duplicates() {
+            // Reversed Blocked/Ready/Blocked refuses.
+            let (dir, db_path, export_bytes, marker) = retained_fixture("Blocked", "Ready", false);
+            assert!(
+                execute_rehearsal(
+                    &dir.0,
+                    &db_path,
+                    &export_bytes,
+                    &marker,
+                    &hash(&marker).unwrap(),
+                    &"c".repeat(64),
+                )
+                .is_err()
+            );
+
+            // Duplicate JSON key in marker refuses.
+            let dup = br#"{"schema_version":2,"schema_version":2,"profile":"retained-revoked-v1"}"#;
+            assert!(strict::<Marker>(dup).is_err());
+
+            // Unapplied resolved decision refuses.
+            let (dir, db_path, export_bytes, marker) = retained_fixture("Ready", "Blocked", true);
+            {
+                let mut store = V2Store::open(&db_path).unwrap();
+                store
+                    .connection_mut()
+                    .execute(
+                        "UPDATE pending_decisions SET status='RESOLVED', choice='approve' WHERE decision_id='dec-open-1'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            assert!(
+                execute_rehearsal(
+                    &dir.0,
+                    &db_path,
+                    &export_bytes,
+                    &marker,
+                    &hash(&marker).unwrap(),
+                    &"c".repeat(64),
+                )
+                .is_err()
+            );
+
+            // PASSED attempt refuses.
+            let (dir, db_path, export_bytes, mut marker) =
+                retained_fixture("Ready", "Blocked", false);
+            {
+                let mut store = V2Store::open(&db_path).unwrap();
+                store
+                    .connection_mut()
+                    .execute(
+                        "UPDATE stage_attempts SET status='PASSED' WHERE attempt_id='att-1'",
+                        [],
+                    )
+                    .unwrap();
+                let img = image(store.connection_mut()).unwrap();
+                marker.retained_tasks[0].attempt_rows_sha256 =
+                    hash(&selected(&img, "stage_attempts", "T-RET-1").unwrap()).unwrap();
+            }
+            assert!(
+                execute_rehearsal(
+                    &dir.0,
+                    &db_path,
+                    &export_bytes,
+                    &marker,
+                    &hash(&marker).unwrap(),
+                    &"c".repeat(64),
+                )
+                .is_err()
+            );
+        }
+
+        #[test]
+        fn retained_profile_paired_schema_and_data_and_witness_controls() {
+            // Paired control 1: row value change with identical schema -> schema equal, image differs.
+            let (dir1, db1, _e1, _m1) = retained_fixture("Ready", "Blocked", false);
+            let mut s1 = V2Store::open(&db1).unwrap();
+            let img_before = image(s1.connection_mut()).unwrap();
+            s1.connection_mut()
+                .execute("UPDATE tasks SET retry_count=4 WHERE task_id='T-RET-1'", [])
+                .unwrap();
+            let img_data_mut = image(s1.connection_mut()).unwrap();
+            assert_eq!(schema(&img_before).unwrap(), schema(&img_data_mut).unwrap());
+            assert_ne!(hash(&img_before).unwrap(), hash(&img_data_mut).unwrap());
+
+            // Paired control 2: extra table/view -> schema differs and known_schema refuses.
+            s1.connection_mut()
+                .execute("CREATE TABLE rogue_table(id INTEGER PRIMARY KEY)", [])
+                .unwrap();
+            let img_schema_mut = image(s1.connection_mut()).unwrap();
+            assert_ne!(
+                schema(&img_before).unwrap(),
+                schema(&img_schema_mut).unwrap()
+            );
+            assert!(known_schema(&img_schema_mut).is_err());
+            drop(s1);
+            drop(dir1);
+
+            // Witness phase-seq substitution refuses.
+            let (_dir, _db, export_bytes, _m) = retained_fixture("Ready", "Blocked", false);
+            let export = std::str::from_utf8(&export_bytes).unwrap();
+            let w1 = Witness::new(1, export).unwrap();
+            let w2 = Witness::new(2, export).unwrap();
+            assert_ne!(
+                w1.decoder.profile_witness_sha256,
+                w2.decoder.profile_witness_sha256
+            );
+            assert!(w1.verify(2, export).is_err());
+
+            // Same-second separate witnesses are both valid for their own phase_seq.
+            assert!(w1.verify(1, export).is_ok());
+            assert!(w2.verify(2, export).is_ok());
+
+            // Effect table mutation in noop phase refuses.
+            let (dir, db_path, _e, _m) = retained_fixture("Ready", "Blocked", false);
+            let mut c = coordinator(&dir.0);
+            c.store = V2Store::open(&db_path).unwrap();
+            c.controller = Arc::new(RehearsalUnits::default());
+            c.submission_probe = Some(BTreeMap::new());
+            let img = image(c.store.connection_mut()).unwrap();
+            let expected_schema = schema(&img).unwrap();
+            let mut r = ResultRecord {
+                schema_version: 2,
+                profile: PROFILE.into(),
+                run_id: "synthetic-run-002".into(),
+                status: "REFUSED".into(),
+                failure_class: "INCOMPLETE".into(),
+                identity: Identity {
+                    native_candidate_sha256: "a".repeat(64),
+                    infra_candidate_sha256: "b".repeat(64),
+                    harness_binary_sha256: "c".repeat(64),
+                    database_input_sha256: "d".repeat(64),
+                    export_input_sha256: "e".repeat(64),
+                    marker_input_sha256: "f".repeat(64),
+                },
+                schema: Schema {
+                    before_sha256: expected_schema.clone(),
+                    after_sha256: expected_schema.clone(),
+                },
+                phases: vec![],
+                retained_receipts: vec![],
+                delivery_poll: zero(&POLL),
+                forbidden_intents: zero(&FORBIDDEN),
+                effects: zero(&EFFECTS),
+                checks: Checks {
+                    raw_inventory_and_history_compared: false,
+                    only_reviewed_differences: false,
+                    input_identity_rechecked: false,
+                    system_driver_executions: 0,
+                },
+                positive_controls: CONTROLS.iter().map(|s| ((*s).into(), false)).collect(),
+            };
+            let err = run_phase_noop("pass_1", &mut c, &mut r, &expected_schema, |coord| {
+                coord
+                    .store
+                    .connection_mut()
+                    .execute(
+                        "INSERT INTO path_locks(repo,path,task_id,acquired_epoch) VALUES('repo-a','src/lib.rs','T-RET-1',100)",
+                        [],
+                    )
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap_err();
+            assert_eq!(err, "PROFILE_NOOP_EFFECT");
+            assert_eq!(r.effects["locks"], 1);
+        }
+
+        #[test]
+        fn retained_profile_rejects_version_time_allocator_rowid_and_restart2_mutations() {
+            // Version overflow (i64::MAX - 1 cannot support +2).
+            let (dir, db_path, export_bytes, marker) = retained_fixture("Ready", "Blocked", false);
+            {
+                let mut store = V2Store::open(&db_path).unwrap();
+                store
+                    .connection_mut()
+                    .execute(
+                        "UPDATE tasks SET version=?1 WHERE task_id='T-RET-1'",
+                        [i64::MAX - 1],
+                    )
+                    .unwrap();
+            }
+            assert!(
+                execute_rehearsal(
+                    &dir.0,
+                    &db_path,
+                    &export_bytes,
+                    &marker,
+                    &hash(&marker).unwrap(),
+                    &"c".repeat(64),
+                )
+                .is_err()
+            );
+
+            // Allocator advance without event refuses in validate_retained_standard / noop.
+            let (dir, db_path, export_bytes, marker) = retained_fixture("Ready", "Blocked", false);
+            let export = std::str::from_utf8(&export_bytes).unwrap();
+            let mut c = coordinator(&dir.0);
+            c.store = V2Store::open(&db_path).unwrap();
+            c.controller = Arc::new(RehearsalUnits::default());
+            c.submission_probe = Some(BTreeMap::new());
+            let before_img = image(c.store.connection_mut()).unwrap();
+            let w = Witness::new(1, export).unwrap();
+            let intake_start = now_epoch();
+            let obs = observe_standard_for_profile(&mut c, &w.actual, export, Some(&marker.ids()))
+                .unwrap();
+            let intake_end = now_epoch();
+            c.store
+                .connection_mut()
+                .execute(
+                    "INSERT INTO sqlite_sequence(name,seq) VALUES('rogue_seq', 42)",
+                    [],
+                )
+                .unwrap();
+            let after_img = image(c.store.connection_mut()).unwrap();
+            assert!(
+                validate_retained_standard(
+                    1,
+                    &before_img,
+                    &after_img,
+                    &obs,
+                    &w,
+                    export,
+                    intake_start,
+                    intake_end,
+                    &marker.ids(),
+                )
+                .is_err()
+            );
+
+            // Restart2 / pass_5 synchronous DB write refuses.
+            let (dir, db_path, _e, _m) = retained_fixture("Ready", "Blocked", false);
+            let mut c3 = coordinator(&dir.0);
+            c3.store = V2Store::open(&db_path).unwrap();
+            c3.controller = Arc::new(RehearsalUnits::default());
+            c3.submission_probe = Some(BTreeMap::new());
+            let img = image(c3.store.connection_mut()).unwrap();
+            let expected_schema = schema(&img).unwrap();
+            let mut r = ResultRecord {
+                schema_version: 2,
+                profile: PROFILE.into(),
+                run_id: "synthetic-run-003".into(),
+                status: "REFUSED".into(),
+                failure_class: "INCOMPLETE".into(),
+                identity: Identity {
+                    native_candidate_sha256: "a".repeat(64),
+                    infra_candidate_sha256: "b".repeat(64),
+                    harness_binary_sha256: "c".repeat(64),
+                    database_input_sha256: "d".repeat(64),
+                    export_input_sha256: "e".repeat(64),
+                    marker_input_sha256: "f".repeat(64),
+                },
+                schema: Schema {
+                    before_sha256: expected_schema.clone(),
+                    after_sha256: expected_schema.clone(),
+                },
+                phases: vec![],
+                retained_receipts: vec![],
+                delivery_poll: zero(&POLL),
+                forbidden_intents: zero(&FORBIDDEN),
+                effects: zero(&EFFECTS),
+                checks: Checks {
+                    raw_inventory_and_history_compared: false,
+                    only_reviewed_differences: false,
+                    input_identity_rechecked: false,
+                    system_driver_executions: 0,
+                },
+                positive_controls: CONTROLS.iter().map(|s| ((*s).into(), false)).collect(),
+            };
+            let err = run_phase_noop("pass_5", &mut c3, &mut r, &expected_schema, |coord| {
+                coord
+                    .store
+                    .connection_mut()
+                    .execute(
+                        "UPDATE daemon_meta SET value='999999' WHERE key='last_sync_epoch'",
+                        [],
+                    )
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap_err();
+            assert_eq!(err, "PROFILE_NOOP_EFFECT");
+            assert_eq!(r.effects["other"], 1);
+        }
+
+        #[test]
+        fn retained_profile_result_strict_json_and_all_zero_forgery_refuse() {
+            let (dir, db_path, export_bytes, marker) = retained_fixture("Ready", "Blocked", false);
+            let mut r = execute_rehearsal(
+                &dir.0,
+                &db_path,
+                &export_bytes,
+                &marker,
+                &hash(&marker).unwrap(),
+                &"c".repeat(64),
+            )
+            .unwrap();
+            r.checks.input_identity_rechecked = true;
+            r.status = "PASS".into();
+            r.failure_class = "NONE".into();
+            for k in CONTROLS {
+                r.positive_controls.insert(k.into(), true);
+            }
+            verify_result_invariants(&r, &marker).unwrap();
+
+            // Missing phase refuses.
+            let mut bad = r.clone();
+            bad.phases.pop();
+            assert!(verify_result_invariants(&bad, &marker).is_err());
+
+            // Forged false positive control refuses.
+            let mut bad2 = r.clone();
+            bad2.positive_controls
+                .insert("mutation_intercepted".into(), false);
+            assert!(verify_result_invariants(&bad2, &marker).is_err());
+
+            // Unknown result field refuses strict decoding.
+            let mut val = serde_json::to_value(&r).unwrap();
+            val.as_object_mut()
+                .unwrap()
+                .insert("extra".into(), json!(true));
+            assert!(strict::<ResultRecord>(&serde_json::to_vec(&val).unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn idle_coordinator_wakes_immediately_on_socket_and_shutdown() {
+        let dir = TestDirectory::new();
+        let (mut c, handle) =
+            Coordinator::create(V2Store::open_in_memory().unwrap(), dir.0.clone());
+        c.preflight = true;
+        c.reconciled = true;
+        c.synced = true;
+        c.last_export = Instant::now();
+        c.last_heartbeat = Instant::now();
+
+        let thread = std::thread::spawn(move || c.run());
+
+        // Initial tick emits Ready.
+        assert!(matches!(
+            handle
+                .deliveries
+                .recv_timeout(Duration::from_millis(500))
+                .unwrap(),
+            SocketDelivery::Ready
+        ));
+
+        // Socket command wakes recv_timeout immediately without waiting for 1s heartbeat.
+        let started = Instant::now();
+        handle
+            .commands
+            .send(CoordinatorEvent::Socket {
+                client_id: 7,
+                command: ClientCommand::Status,
+            })
+            .unwrap();
+        assert!(matches!(
+            handle
+                .deliveries
+                .recv_timeout(Duration::from_millis(250))
+                .unwrap(),
+            SocketDelivery::Reply { client_id: 7, .. }
+        ));
+        assert!(started.elapsed() < Duration::from_millis(250));
+
+        // Shutdown wakes recv_timeout immediately and exits cleanly.
+        let shutdown_started = Instant::now();
+        handle.commands.send(CoordinatorEvent::Shutdown).unwrap();
+        assert!(matches!(
+            handle
+                .deliveries
+                .recv_timeout(Duration::from_millis(250))
+                .unwrap(),
+            SocketDelivery::Stopped
+        ));
+        assert!(shutdown_started.elapsed() < Duration::from_millis(250));
+        thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn idle_heartbeat_wakeup_does_not_invoke_list_tasks() {
+        let dir = TestDirectory::new();
+        let (mut c, handle) =
+            Coordinator::create(V2Store::open_in_memory().unwrap(), dir.0.clone());
+        c.preflight = true;
+        c.reconciled = true;
+        c.synced = true;
+        c.last_export = Instant::now();
+        c.last_heartbeat = Instant::now() - Duration::from_millis(920);
+
+        let thread = std::thread::spawn(move || {
+            c.run().unwrap();
+            (c.task_list_reads, c.store.meta("heartbeat_epoch").unwrap())
+        });
+
+        assert!(matches!(
+            handle
+                .deliveries
+                .recv_timeout(Duration::from_millis(500))
+                .unwrap(),
+            SocketDelivery::Ready
+        ));
+
+        // Allow the 1s heartbeat deadline to fire (~80ms) plus margin, and also send a read-only Status.
+        std::thread::sleep(Duration::from_millis(180));
+        handle
+            .commands
+            .send(CoordinatorEvent::Socket {
+                client_id: 9,
+                command: ClientCommand::Status,
+            })
+            .unwrap();
+        assert!(matches!(
+            handle
+                .deliveries
+                .recv_timeout(Duration::from_millis(250))
+                .unwrap(),
+            SocketDelivery::Reply { client_id: 9, .. }
+        ));
+
+        handle.commands.send(CoordinatorEvent::Shutdown).unwrap();
+        let (reads, heartbeat_meta) = thread.join().unwrap();
+        assert_eq!(
+            reads, 1,
+            "idle heartbeat and read-only socket commands must not invoke list_tasks(None)"
+        );
+        assert!(heartbeat_meta.is_some());
+    }
+
+    #[test]
+    fn tick_tasks_cache_deduplicates_and_invalidates_on_mutation() {
+        let dir = TestDirectory::new();
+        let (mut c, _handle) =
+            Coordinator::create(V2Store::open_in_memory().unwrap(), dir.0.clone());
+        c.preflight = true;
+        c.reconciled = true;
+        c.synced = true;
+        c.last_export = Instant::now();
+
+        // Inside tick(): multiple list_all_tasks_cached() calls result in a single SQLite read.
+        c.tick().unwrap();
+        assert_eq!(c.task_list_reads, 1);
+        assert!(!c.in_tick);
+        assert!(c.tick_tasks_cache.is_none());
+
+        // Outside tick(): list_all_tasks_cached() reads directly from store without caching.
+        let _ = c.list_all_tasks_cached().unwrap();
+        assert_eq!(c.task_list_reads, 2);
+        assert!(c.tick_tasks_cache.is_none());
+
+        // Inside tick scope: cache hits until a task mutation invalidates it.
+        c.in_tick = true;
+        c.tick_tasks_cache = None;
+        let first = c.list_all_tasks_cached().unwrap();
+        assert!(first.is_empty());
+        assert_eq!(c.task_list_reads, 3);
+        let second = c.list_all_tasks_cached().unwrap();
+        assert!(second.is_empty());
+        assert_eq!(c.task_list_reads, 3);
+
+        c.save(&task("T-CACHE-1")).unwrap();
+        assert!(c.tick_tasks_cache.is_none());
+        let after_save = c.list_all_tasks_cached().unwrap();
+        assert_eq!(after_save.len(), 1);
+        assert_eq!(after_save[0].task_id, "T-CACHE-1");
+        assert_eq!(c.task_list_reads, 4);
+
+        c.in_tick = false;
+        c.tick_tasks_cache = None;
+    }
+
+    #[test]
+    fn completed_failure_emits_enriched_supervisor_error_and_writes_attempt_log() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        let mut t = task("T-ERR-1");
+        t.current_stage = Some("plan".into());
+        t.memory.pipeline_checkpoint = Some(PipelineCheckpoint {
+            attempt_id: "att-prep-1".into(),
+            operation: "PREPARE".into(),
+        });
+        c.save(&t).unwrap();
+        let prep_dir = dir.0.join("attempts/att-prep-1");
+        std::fs::create_dir_all(&prep_dir).unwrap();
+
+        c.handle_event(CoordinatorEvent::Completed {
+            key: "prepare:T-ERR-1".into(),
+            task_id: Some("T-ERR-1".into()),
+            result: Box::new(Err("canonicalizing worktree /missing: os error 2".into())),
+        })
+        .unwrap();
+
+        let launch_dir = dir.0.join("attempts/att-launch-2");
+        std::fs::create_dir_all(&launch_dir).unwrap();
+        c.handle_event(CoordinatorEvent::Completed {
+            key: "launch:att-launch-2".into(),
+            task_id: Some("T-ERR-1".into()),
+            result: Box::new(Err("spawning /missing/systemd-run: os error 2".into())),
+        })
+        .unwrap();
+
+        let events: Vec<_> = c
+            .store
+            .list_events_since(None, 0, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == "SUPERVISOR_ERROR")
+            .collect();
+        assert_eq!(events.len(), 2);
+
+        let p0 = &events[0].payload;
+        assert_eq!(p0["error"], "canonicalizing worktree /missing: os error 2");
+        assert_eq!(p0["job_key"], "prepare:T-ERR-1");
+        assert_eq!(p0["attempt_id"], "att-prep-1");
+
+        let p1 = &events[1].payload;
+        assert_eq!(p1["error"], "spawning /missing/systemd-run: os error 2");
+        assert_eq!(p1["job_key"], "launch:att-launch-2");
+        assert_eq!(p1["attempt_id"], "att-launch-2");
+
+        let prep_log = std::fs::read_to_string(prep_dir.join("supervisor-error.log")).unwrap();
+        assert!(prep_log.contains("key=prepare:T-ERR-1"), "{prep_log}");
+        assert!(prep_log.contains("stage=plan"), "{prep_log}");
+        assert!(
+            prep_log.contains("canonicalizing worktree /missing"),
+            "{prep_log}"
+        );
+
+        let launch_log = std::fs::read_to_string(launch_dir.join("supervisor-error.log")).unwrap();
+        assert!(
+            launch_log.contains("key=launch:att-launch-2"),
+            "{launch_log}"
+        );
+        assert!(
+            launch_log.contains("spawning /missing/systemd-run"),
+            "{launch_log}"
+        );
+    }
+
+    #[test]
+    fn missing_worktree_on_started_task_enqueues_start_resume_instead_of_preparing() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        let missing_wt = dir.0.join("missing-worktree");
+        let mut t = task("ZACH-060-DISPATCH");
+        t.status = "Ready".into();
+        t.worktree_path = Some(missing_wt.to_string_lossy().into_owned());
+        t.memory.governance_started = true;
+        t.version = 3;
+        c.save(&t).unwrap();
+
+        c.dispatch().unwrap();
+
+        let after = c.task("ZACH-060-DISPATCH").unwrap();
+        assert!(after.memory.pipeline_checkpoint.is_none());
+        assert_eq!(after.status, "In Progress");
+
+        let ops = c.store.lifecycle_ops().unwrap();
+        assert_eq!(ops.len(), 1);
+        let op = &ops[0];
+        assert!(
+            op.operation_id.starts_with("start-ZACH-060-DISPATCH-v"),
+            "{}",
+            op.operation_id
+        );
+        assert_eq!(op.kind, "start");
+        assert_eq!(op.state, "PENDING");
+        assert_eq!(
+            op.args,
+            vec![
+                "start",
+                "ZACH-060-DISPATCH",
+                "--executor",
+                "zach",
+                "--resume",
+            ]
+        );
+    }
+
+    #[test]
+    fn acknowledging_resume_start_updates_worktree_and_branch_preserving_in_progress_status() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        let missing_wt = dir.0.join("missing-worktree");
+        let recreated_wt = dir.0.join("recreated-worktree");
+        std::fs::create_dir_all(&recreated_wt).unwrap();
+        let mut t = task("ZACH-060-ACK");
+        t.status = "Ready".into();
+        t.worktree_path = Some(missing_wt.to_string_lossy().into_owned());
+        t.branch = Some("task/old-branch".into());
+        t.memory.governance_started = true;
+        t.version = 4;
+        c.save(&t).unwrap();
+
+        c.dispatch().unwrap();
+
+        let ops = c.store.lifecycle_ops().unwrap();
+        assert_eq!(ops.len(), 1);
+        let op_id = ops[0].operation_id.clone();
+        assert_eq!(c.task("ZACH-060-ACK").unwrap().status, "In Progress");
+
+        let receipt = serde_json::json!({
+            "task_id": "ZACH-060-ACK",
+            "weight": "S",
+            "branch": "task/ZACH-060-ACK-recreated",
+            "worktree": recreated_wt.to_string_lossy(),
+        })
+        .to_string();
+        c.lifecycle_ack(&op_id, &receipt).unwrap();
+
+        let acked = c.task("ZACH-060-ACK").unwrap();
+        assert_eq!(acked.status, "Ready");
+        assert!(acked.memory.governance_started);
+        assert_eq!(acked.executor.as_deref(), Some("zach"));
+        assert_eq!(acked.branch.as_deref(), Some("task/ZACH-060-ACK-recreated"));
+        assert_eq!(
+            acked.worktree_path.as_deref(),
+            Some(recreated_wt.to_string_lossy().as_ref())
+        );
+
+        c.dispatch().unwrap();
+        let dispatched = c.task("ZACH-060-ACK").unwrap();
+        assert_eq!(
+            dispatched
+                .memory
+                .pipeline_checkpoint
+                .as_ref()
+                .map(|cp| cp.operation.as_str()),
+            Some("PREPARING")
+        );
+    }
+
+    #[test]
+    fn dispatch_without_governance_started_omits_resume_and_skips_backlog() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+
+        let mut ready = task("ZACH-061-READY");
+        ready.status = "Ready".into();
+        ready.memory.governance_started = false;
+        ready.version = 3;
+        c.save(&ready).unwrap();
+
+        let mut backlog = task("ZACH-061-BACKLOG");
+        backlog.status = "Backlog".into();
+        backlog.memory.governance_started = false;
+        c.save(&backlog).unwrap();
+
+        c.dispatch().unwrap();
+
+        let ops = c.store.lifecycle_ops().unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].task_id, "ZACH-061-READY");
+        assert_eq!(ops[0].kind, "start");
+        assert_eq!(ops[0].operation_id, "start-ZACH-061-READY-v2");
+        assert!(
+            !ops[0].args.iter().any(|a| a == "--resume"),
+            "unexpected --resume in args: {:?}",
+            ops[0].args
+        );
+        assert!(
+            c.store
+                .list_stage_attempts("ZACH-061-BACKLOG")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn failed_agy_harvest_persists_tokens_failure_class_and_preserves_duration_ended_epoch() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        let now = now_epoch();
+
+        let mut t = task("ZACH-071-USAGE");
+        t.status = "In Progress".into();
+        t.current_stage = Some("impl".into());
+        t.active_attempt_id = Some("att-fail-2".into());
+        c.save(&t).unwrap();
+
+        // Seed a prior attempt on the same stage to verify token_usage_by_stage accumulates.
+        let prior = StageAttemptRecord {
+            attempt_id: "att-fail-1".into(),
+            task_id: t.task_id.clone(),
+            stage: "impl".into(),
+            model: "gemini-4-hydrogen-high".into(),
+            effort: "high".into(),
+            systemd_unit: None,
+            invocation_id: None,
+            started_epoch: now - 300,
+            ended_epoch: Some(now - 200),
+            status: "FAILED".into(),
+            failure_class: Some("infra".into()),
+            summary: Some("AGY_TIMEOUT: prior".into()),
+            input_tokens: Some(1_000),
+            output_tokens: Some(500),
+            total_tokens: Some(1_500),
+            sha_before: None,
+            sha_after: None,
+            phase: "COMPLETE".into(),
+            last_liveness_epoch: now - 200,
+            last_output_bytes: 0,
+            last_cpu_usage_usec: None,
+            control_group: None,
+            exit_code: Some(124),
+            exit_code_kind: Some("exited".into()),
+            retry_generation: 0,
+        };
+        c.store.record_stage_attempt(&prior).unwrap();
+
+        let active_started = now;
+        let current = StageAttemptRecord {
+            attempt_id: "att-fail-2".into(),
+            task_id: t.task_id.clone(),
+            stage: "impl".into(),
+            model: "gemini-4-hydrogen-high".into(),
+            effort: "high".into(),
+            systemd_unit: Some("zach-stage-zach-071-usage-impl-att-fail-2".into()),
+            invocation_id: Some("inv-2".into()),
+            started_epoch: active_started,
+            ended_epoch: None,
+            status: "RUNNING".into(),
+            failure_class: None,
+            summary: None,
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            sha_before: Some("abc".into()),
+            sha_after: None,
+            phase: "RUNNING".into(),
+            last_liveness_epoch: active_started,
+            last_output_bytes: 0,
+            last_cpu_usage_usec: None,
+            control_group: None,
+            exit_code: Some(124),
+            exit_code_kind: Some("exited".into()),
+            retry_generation: 0,
+        };
+        c.store.record_stage_attempt(&current).unwrap();
+
+        let expected_ended = active_started + 1800;
+        c.worker_result(WorkerResult::Harvested {
+            attempt_id: "att-fail-2".into(),
+            result: Ok(StageExecutionResult {
+                status: "FAILED".into(),
+                summary: "AGY_TIMEOUT: AGY_TIMEOUT: worker timed out".into(),
+                review_markdown: None,
+                review_output: None,
+                stage_output: None,
+                invocation_id: Some("inv-2".into()),
+                input_tokens: Some(40_000),
+                output_tokens: Some(2_000),
+                total_tokens: Some(42_000),
+                duration_seconds: Some(1800.2),
+                sha_before: Some("abc".into()),
+                sha_after: Some("abc".into()),
+                diff_files: Vec::new(),
+            }),
+        })
+        .unwrap();
+
+        let harvested = c.store.get_stage_attempt("att-fail-2").unwrap().unwrap();
+        assert_eq!(harvested.phase, "HARVESTED");
+        assert_eq!(harvested.status, "FAILED");
+        assert_eq!(harvested.failure_class.as_deref(), Some("infra"));
+        assert_eq!(harvested.input_tokens, Some(40_000));
+        assert_eq!(harvested.output_tokens, Some(2_000));
+        assert_eq!(harvested.total_tokens, Some(42_000));
+        assert_eq!(harvested.ended_epoch, Some(expected_ended));
+
+        // Follow up with WorkerResult::Stopped -> fail_task and verify ended_epoch & tokens survive.
+        c.worker_result(WorkerResult::Stopped("att-fail-2".into()))
+            .unwrap();
+
+        let completed = c.store.get_stage_attempt("att-fail-2").unwrap().unwrap();
+        assert_eq!(completed.phase, "COMPLETE");
+        assert_eq!(completed.status, "FAILED");
+        assert_eq!(completed.failure_class.as_deref(), Some("infra"));
+        assert_eq!(completed.input_tokens, Some(40_000));
+        assert_eq!(completed.output_tokens, Some(2_000));
+        assert_eq!(completed.total_tokens, Some(42_000));
+        assert_eq!(completed.ended_epoch, Some(expected_ended));
+
+        let updated_task = c.task("ZACH-071-USAGE").unwrap();
+        assert_eq!(
+            updated_task
+                .memory
+                .token_usage_by_stage
+                .get("impl")
+                .copied(),
+            Some(43_500)
+        );
+    }
+
+    #[test]
+    fn periodic_attempt_prune_offloads_to_worker_pool_unions_active_ids_and_is_non_dirty() {
+        let dir = TestDirectory::new();
+        let db_path = dir.0.join("zach.db");
+        let (mut c, _handle) = Coordinator::create(V2Store::open(&db_path).unwrap(), dir.0.clone());
+        c.preflight = true;
+        c.reconciled = true;
+        c.synced = true;
+        c.ready = true;
+
+        // 1. When <state_dir>/attempts does not exist, skip without submitting.
+        assert!(!c.maybe_submit_attempt_prune().unwrap());
+        assert!(c.last_prune.is_some());
+        assert!(!c.jobs.contains("prune-attempts"));
+
+        // Reset timer and create attempts/ with expired dirs containing manifest.json.
+        c.last_prune = None;
+        let attempts_dir = dir.0.join("attempts");
+        let expired_completed = attempts_dir.join("att-expired-completed");
+        let expired_sqlite_active = attempts_dir.join("att-expired-sqlite");
+        let expired_mem_attached = attempts_dir.join("att-expired-attached");
+        for p in [
+            &expired_completed,
+            &expired_sqlite_active,
+            &expired_mem_attached,
+        ] {
+            std::fs::create_dir_all(p).unwrap();
+            std::fs::write(p.join("manifest.json"), "{}").unwrap();
+            let status = std::process::Command::new("touch")
+                .args(["-d", "10 days ago"])
+                .arg(p)
+                .status()
+                .expect("touch old mtime");
+            assert!(status.success());
+        }
+
+        // Seed SQLite active attempt and in-memory attached attempt.
+        let mut t = task("ZACH-071-PRUNE");
+        t.status = "In Progress".into();
+        t.active_attempt_id = Some("att-expired-sqlite".into());
+        c.save(&t).unwrap();
+        c.attached.insert("att-expired-attached".into());
+
+        // 2. Submit prune job to WorkerPool.
+        assert!(c.maybe_submit_attempt_prune().unwrap());
+        assert!(c.jobs.contains("prune-attempts"));
+        // Respects cooldown while in flight / recently run.
+        assert!(!c.maybe_submit_attempt_prune().unwrap());
+
+        // 3. Wait for WorkerPool completion and verify handle_event_dirty returns false.
+        let event =
+            c.rx.recv_timeout(Duration::from_secs(5))
+                .expect("prune-attempts worker result");
+        let dirty = c.handle_event_dirty(event).unwrap();
+        assert!(
+            !dirty,
+            "prune-attempts completion must not mark coordinator dirty"
+        );
+        assert!(!c.jobs.contains("prune-attempts"));
+        assert!(!expired_completed.exists());
+        assert!(expired_sqlite_active.exists());
+        assert!(expired_mem_attached.exists());
+
+        // 4. Corrupt memory_json causes active_attempt_ids() to fail closed and tick_inner emits SUPERVISOR_ERROR.
+        c.last_prune = None;
+        c.last_export = Instant::now();
+        c.last_delivery_poll = Instant::now();
+        let raw_conn = rusqlite::Connection::open(&db_path).unwrap();
+        raw_conn
+            .execute(
+                "UPDATE tasks SET memory_json = '{corrupt' WHERE task_id = 'ZACH-071-PRUNE'",
+                [],
+            )
+            .unwrap();
+        drop(raw_conn);
+        c.tick().unwrap();
+        let events = c.store.list_events_since(None, 0, 100).unwrap();
+        assert!(
+            events.iter().any(|e| {
+                e.event_type == "SUPERVISOR_ERROR"
+                    && e.payload.get("job_key").and_then(|v| v.as_str()) == Some("prune-attempts")
+            }),
+            "expected SUPERVISOR_ERROR event for prune-attempts, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn coordinator_persists_attempt_audits_and_emits_fail_closed_task_audit_digest_on_done_and_blocked()
+     {
+        let dir = TestDirectory::new();
+        let db_path = dir.0.join("zach.db");
+        let (mut c, _handle) = Coordinator::create(V2Store::open(&db_path).unwrap(), dir.0.clone());
+
+        // 1. WorkerResult::Stopped persists attempt_audits from <attempt_dir>/audit.json.
+        let mut t = task("ZACH-072-T1");
+        t.status = "In Progress".into();
+        t.current_stage = Some("impl".into());
+        t.active_attempt_id = Some("att-stopped-1".into());
+        t.memory.pipeline_checkpoint = Some(PipelineCheckpoint {
+            attempt_id: "att-stopped-1".into(),
+            operation: "CLEANUP_PENDING".into(),
+        });
+        c.save(&t).unwrap();
+
+        let att_dir = dir.0.join("attempts/att-stopped-1");
+        std::fs::create_dir_all(&att_dir).unwrap();
+        std::fs::write(
+            att_dir.join("manifest.json"),
+            r#"{"attempt_id":"att-stopped-1","task_id":"ZACH-072-T1","route":{"stage":"impl","family":"OpenAiSol"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            att_dir.join("stdout.jsonl"),
+            [
+                r#"{"type":"item.completed","item":{"id":"1","type":"file_change","changes":[{"path":"src/lib.rs"}]}}"#,
+                r#"{"type":"item.completed","item":{"id":"2","type":"command_execution","command":"cargo test","exit_code":101,"status":"failed"}}"#,
+                r#"{"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":300,"output_tokens":200,"reasoning_output_tokens":50}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        crate::v2::audit::extract_and_write_attempt_audit(&att_dir).unwrap();
+
+        let stopped_attempt = StageAttemptRecord {
+            attempt_id: "att-stopped-1".into(),
+            task_id: "ZACH-072-T1".into(),
+            stage: "impl".into(),
+            model: "gpt-6.1-sol".into(),
+            effort: "medium".into(),
+            systemd_unit: Some("zach-test.service".into()),
+            invocation_id: None,
+            started_epoch: now_epoch() - 5,
+            ended_epoch: Some(now_epoch()),
+            status: "PASSED".into(),
+            failure_class: None,
+            summary: Some("ok".into()),
+            input_tokens: Some(1000),
+            output_tokens: Some(200),
+            total_tokens: Some(1200),
+            sha_before: None,
+            sha_after: None,
+            phase: "HARVESTED".into(),
+            last_liveness_epoch: now_epoch(),
+            last_output_bytes: 0,
+            last_cpu_usage_usec: None,
+            control_group: None,
+            exit_code: Some(0),
+            exit_code_kind: Some("exited".into()),
+            retry_generation: 0,
+        };
+        c.store.record_stage_attempt(&stopped_attempt).unwrap();
+
+        c.worker_result(WorkerResult::Stopped("att-stopped-1".into()))
+            .unwrap();
+        let persisted = c
+            .store
+            .get_attempt_audit("att-stopped-1")
+            .unwrap()
+            .expect("attempt_audits row persisted on Stopped");
+        assert_eq!(persisted.turn_count, 1);
+        assert_eq!(persisted.tool_call_count, 2);
+        assert_eq!(persisted.tool_error_count, 1);
+        assert_eq!(persisted.edit_compile_fail_loops, 1);
+        assert_eq!(persisted.cached_input_tokens, Some(300));
+        assert_eq!(persisted.reasoning_tokens, Some(50));
+        assert!(!persisted.check_divergence);
+
+        // 2. Post-harvest VALIDATE failure (policy) must NOT falsely flag check_divergence,
+        //    and terminal Blocked emits TASK_AUDIT_DIGEST.
+        let mut t_val = task("ZACH-072-VAL");
+        t_val.status = "In Progress".into();
+        t_val.current_stage = Some("impl".into());
+        t_val.active_attempt_id = Some("att-val-1".into());
+        t_val.memory.pipeline_checkpoint = Some(PipelineCheckpoint {
+            attempt_id: "att-val-1".into(),
+            operation: "VALIDATE".into(),
+        });
+        c.save(&t_val).unwrap();
+        let mut val_attempt = stopped_attempt.clone();
+        val_attempt.attempt_id = "att-val-1".into();
+        val_attempt.task_id = "ZACH-072-VAL".into();
+        c.store.record_stage_attempt(&val_attempt).unwrap();
+        // Policy limit is 0 so first failure transitions directly to Blocked.
+        c.fail_task(
+            "ZACH-072-VAL",
+            "scope violation: modified forbidden path .github/ci.yml",
+            Some("policy"),
+        )
+        .unwrap();
+        let val_audit = c.store.get_attempt_audit("att-val-1").unwrap().unwrap();
+        assert!(
+            !val_audit.check_divergence,
+            "VALIDATE scope_violation failure must not flag check_divergence"
+        );
+        let val_events = c.store.list_task_events("ZACH-072-VAL").unwrap();
+        let blocked_digest_ev = val_events
+            .iter()
+            .find(|e| e.event_type == "TASK_AUDIT_DIGEST")
+            .expect("Blocked transition must emit TASK_AUDIT_DIGEST");
+        let blocked_digest: crate::v2::audit::TaskAuditDigest =
+            serde_json::from_value(blocked_digest_ev.payload.clone()).unwrap();
+        assert!(crate::v2::audit::validate_task_audit_digest(&blocked_digest).is_ok());
+        assert!(!blocked_digest.check_divergence);
+        assert!(blocked_digest.blocked_events >= 1);
+
+        // 3. Post-harvest CHECKS failure marks check_divergence = true.
+        let mut t_chk = c.task("ZACH-072-T1").unwrap();
+        t_chk.memory.pipeline_checkpoint = Some(PipelineCheckpoint {
+            attempt_id: "att-stopped-1".into(),
+            operation: "CHECKS".into(),
+        });
+        c.save(&t_chk).unwrap();
+        c.fail_task(
+            "ZACH-072-T1",
+            "check 'cargo test' failed with exit code 101",
+            Some("semantic"),
+        )
+        .unwrap();
+        let after_chk = c.store.get_attempt_audit("att-stopped-1").unwrap().unwrap();
+        assert!(
+            after_chk.check_divergence,
+            "CHECKS failure must mark check_divergence = true"
+        );
+
+        // 4. TASK_DONE via lifecycle_ack("close") emits validated TASK_AUDIT_DIGEST.
+        let mut t_done = c.task("ZACH-072-T1").unwrap();
+        t_done.status = "Queued for Merge".into();
+        t_done.memory.merge_checkpoint = Some(MergeCheckpoint {
+            phase: "CLOSE_PENDING".into(),
+            target_sha: "abc1234".into(),
+            pr_number: 146,
+            merge_sha: Some("def5678".into()),
+            post_merge_verified: true,
+            phase_started_epoch: now_epoch(),
+        });
+        c.save(&t_done).unwrap();
+        c.store
+            .enqueue_lifecycle(&crate::v2::store::LifecycleOperation {
+                attempt_id: None,
+                decision_id: None,
+                operation_id: "close-ZACH-072-T1".into(),
+                task_id: "ZACH-072-T1".into(),
+                kind: "close".into(),
+                args: vec!["close".into(), "ZACH-072-T1".into()],
+                body_path: None,
+                depends_on: None,
+                state: "PENDING".into(),
+                retry_epoch: 0,
+                attempts: 1,
+                last_error: None,
+            })
+            .unwrap();
+        c.lifecycle_ack("close-ZACH-072-T1", "closed").unwrap();
+        let done_events = c.store.list_task_events("ZACH-072-T1").unwrap();
+        let done_digest_ev = done_events
+            .iter()
+            .rfind(|e| e.event_type == "TASK_AUDIT_DIGEST")
+            .expect("TASK_DONE must emit TASK_AUDIT_DIGEST");
+        let done_digest: crate::v2::audit::TaskAuditDigest =
+            serde_json::from_value(done_digest_ev.payload.clone()).unwrap();
+        assert!(crate::v2::audit::validate_task_audit_digest(&done_digest).is_ok());
+        assert_eq!(done_digest.task_id, "ZACH-072-T1");
+        assert_eq!(done_digest.executor, "zach");
+        assert!(done_digest.check_divergence);
+        assert_eq!(done_digest.tool_error_count, 1);
+        assert_eq!(done_digest.edit_compile_fail_loops, 1);
+    }
+
+    #[test]
+    fn stage_run_grant_executes_single_stage_and_stops_before_next() {
+        let dir = std::env::temp_dir().join(format!("zach-stage-run-grant-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = coordinator(&dir);
+        let mut t = task("ZACH-081-T1");
+        t.weight = "M".into();
+        t.status = "Ready".into();
+        t.autonomous_consent = false;
+        t.memory.governance_started = true;
+        t.required_stages = vec![
+            "plan".into(),
+            "plan-review".into(),
+            "impl".into(),
+            "pr-review".into(),
+        ];
+        c.store.upsert_task(&t).unwrap();
+
+        // 1. Without autonomous_consent and without a stage grant, scheduler dispatches nothing.
+        assert!(
+            scheduler::schedule_scoped_dispatches(&mut c.store, None, None)
+                .unwrap()
+                .is_empty()
+        );
+
+        // 2. Requesting a non-next stage ('impl' before 'plan') is rejected fail-closed.
+        let rejected = c
+            .socket_command(ClientCommand::StageRun {
+                task: "ZACH-081-T1".into(),
+                stage: "impl".into(),
+                wait: true,
+            })
+            .unwrap();
+        match &rejected[0] {
+            ServerMessage::StageRunResult { ok, status, .. } => {
+                assert!(!ok);
+                assert_eq!(status, "REJECTED");
+            }
+            other => panic!("expected REJECTED StageRunResult, got {other:?}"),
+        }
+
+        // 3. StageRun for 'plan' succeeds WITHOUT global autonomous_consent and WITHOUT mutating self.scope.
+        assert!(c.scope.is_none());
+        let admitted = c
+            .socket_command(ClientCommand::StageRun {
+                task: "ZACH-081-T1".into(),
+                stage: "plan".into(),
+                wait: true,
+            })
+            .unwrap();
+        assert!(
+            c.scope.is_none(),
+            "StageRun must not mutate coordinator.scope"
+        );
+        match &admitted[0] {
+            ServerMessage::StageRunResult { ok, status, .. } => {
+                assert!(ok);
+                assert_eq!(status, "ACCEPTED");
+            }
+            other => panic!("expected ACCEPTED StageRunResult, got {other:?}"),
+        }
+
+        // 4. Scheduler now dispatches ONLY 'plan'.
+        let dispatches = scheduler::schedule_scoped_dispatches(&mut c.store, None, None).unwrap();
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(dispatches[0].task_id, "ZACH-081-T1");
+        assert_eq!(dispatches[0].stage, "plan");
+
+        // 5. Simulate 'plan' publication completing via lifecycle_ack.
+        let mut live = c.task("ZACH-081-T1").unwrap();
+        live.current_stage = Some("plan".into());
+        live.active_attempt_id = Some("att-plan-081".into());
+        live.memory.pipeline_checkpoint = Some(PipelineCheckpoint {
+            attempt_id: "att-plan-081".into(),
+            operation: "PUBLISH".into(),
+        });
+        c.store
+            .checkpoint_with_lifecycle(
+                &live,
+                &LifecycleOperation {
+                    attempt_id: Some("att-plan-081".into()),
+                    decision_id: None,
+                    operation_id: "pub-plan-081".into(),
+                    task_id: "ZACH-081-T1".into(),
+                    kind: "plan".into(),
+                    args: vec!["stage".into(), "ZACH-081-T1".into(), "plan".into()],
+                    body_path: None,
+                    depends_on: None,
+                    state: "DISPATCHED".into(),
+                    retry_epoch: 0,
+                    attempts: 1,
+                    last_error: None,
+                },
+            )
+            .unwrap();
+        c.lifecycle_ack(
+            "pub-plan-081",
+            r#"{"task_id":"ZACH-081-T1","stage":"plan","weight":"M"}"#,
+        )
+        .unwrap();
+
+        // 6. Grant is now consumed, STAGE_RUN_FINISHED was emitted, and 'plan' is completed.
+        let after = c.task("ZACH-081-T1").unwrap();
+        assert!(after.stages_completed.iter().any(|s| s == "plan"));
+        let grant = after.memory.stage_run_grant.as_ref().unwrap();
+        assert!(grant.consumed);
+        assert_eq!(grant.terminal_status.as_deref(), Some("PASSED"));
+        assert_eq!(grant.terminal_attempt_id.as_deref(), Some("att-plan-081"));
+        let events = c.store.list_task_events("ZACH-081-T1").unwrap();
+        assert!(events.iter().any(|e| e.event_type == "STAGE_RUN_GRANTED"));
+        assert!(events.iter().any(|e| e.event_type == "STAGE_RUN_FINISHED"));
+
+        // 7. Re-attaching via StageRun returns the durable terminal PASSED result.
+        let reattached = c
+            .socket_command(ClientCommand::StageRun {
+                task: "ZACH-081-T1".into(),
+                stage: "plan".into(),
+                wait: true,
+            })
+            .unwrap();
+        match &reattached[0] {
+            ServerMessage::StageRunResult {
+                ok,
+                status,
+                attempt_id,
+                ..
+            } => {
+                assert!(ok);
+                assert_eq!(status, "PASSED");
+                assert_eq!(attempt_id.as_deref(), Some("att-plan-081"));
+            }
+            other => panic!("expected terminal PASSED StageRunResult, got {other:?}"),
+        }
+
+        // 8. Subsequent scheduler ticks MUST NOT dispatch 'plan-review' (daemon stops after requested stage).
+        assert!(
+            scheduler::schedule_scoped_dispatches(&mut c.store, None, None)
+                .unwrap()
+                .is_empty(),
+            "daemon must stop after the single granted stage and never dispatch plan-review"
+        );
     }
 }

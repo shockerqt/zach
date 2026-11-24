@@ -3890,4 +3890,169 @@ promotions:
             assert!(inflate(&bytes[..end], expected.len()).is_err());
         }
     }
+
+    #[test]
+    fn zach_delivery_contract_parses_and_completes_plan_authority_promotion() {
+        let contract = parse_contract(include_str!("../../.github/zach-delivery.yaml")).unwrap();
+        assert_eq!(contract.schema_version, 1);
+        assert!(contract.post_merge_workflows.is_empty());
+        assert_eq!(contract.promotions.len(), 1);
+        let rule = &contract.promotions[0];
+        assert_eq!(rule.name, "zach-runtime");
+        assert!(rule.when_paths.is_empty());
+        assert_eq!(rule.build_workflow, "ci.yml");
+        assert_eq!(rule.artifact_name_template, "zach-release-digest-${sha}");
+        assert_eq!(rule.digest_file, "release.sha256");
+        assert_eq!(rule.promote_workflow, "promote-zach.yml");
+        assert_eq!(rule.current_source_authority.as_deref(), Some("plan"));
+        assert_eq!(rule.delivery_file.as_deref(), Some("zach-delivery.json"));
+        assert!(rule.health_checks.is_empty());
+
+        let temp = IsolatedDir::new().unwrap();
+        let path = temp.0.join("zach-delivery.sqlite");
+        let mut store = V2Store::open(&path).unwrap();
+        let mut zach_task = task();
+        zach_task.task_id = "ZACH-052".into();
+        zach_task.task_group = "zach".into();
+        zach_task.repository = "zach".into();
+        zach_task.github_repo = Some("shockerqt/zach".into());
+        store.upsert_task(&zach_task).unwrap();
+        let seeded = seed_deliveries(&zach_task, SHA, &contract, &[]);
+        assert_eq!(seeded.len(), 1);
+        store.save_deliveries_and_task(&zach_task, &seeded).unwrap();
+
+        let mut driver = MockDriver::default();
+        driver.run("ci.yml", "push", "100", 1, true, true);
+        driver.files.insert(
+            ("100".into(), "release.sha256".into()),
+            format!("{DIGEST}  zach-release.tar.gz\n").into_bytes(),
+        );
+
+        tick(&mut store, &mut driver); // pending -> plan_dispatch
+        assert_eq!(
+            store.list_deliveries(Some("ZACH-052")).unwrap()[0].state,
+            "plan_dispatch"
+        );
+        tick(&mut store, &mut driver); // plan_dispatch -> plan_waiting
+        assert_eq!(
+            store.list_deliveries(Some("ZACH-052")).unwrap()[0].state,
+            "plan_waiting"
+        );
+        assert_eq!(driver.dispatches[0]["approve_production"], "false");
+        assert!(!driver.dispatches[0].contains_key("expected_current"));
+
+        let plan_json = serde_json::to_vec(&json!({
+            "status": "plan",
+            "compatible": true,
+            "source_sha": SHA,
+            "build_run_id": "100",
+            "artifact_digest": DIGEST,
+            "artifact_sha256": DIGEST,
+            "expected_current": "none",
+            "workers_quiescent": true,
+            "journal_pending": false
+        }))
+        .unwrap();
+        driver.run(
+            "promote-zach.yml",
+            "workflow_dispatch",
+            "201",
+            1,
+            true,
+            true,
+        );
+        driver
+            .files
+            .insert(("201".into(), "zach-plan.json".into()), plan_json.clone());
+
+        tick(&mut store, &mut driver); // plan_waiting -> plan_validated
+        assert_eq!(
+            store.list_deliveries(Some("ZACH-052")).unwrap()[0].state,
+            "plan_validated"
+        );
+        tick(&mut store, &mut driver); // plan_validated -> waiting (Pending Prod Promotion)
+        assert_eq!(
+            store.get_task("ZACH-052").unwrap().unwrap().status,
+            "Pending Prod Promotion"
+        );
+
+        approve(&mut store, "Approve");
+        tick(&mut store, &mut driver); // approved -> revalidate_dispatch
+        tick(&mut store, &mut driver); // revalidate_dispatch -> revalidate_waiting
+        assert_eq!(
+            store.list_deliveries(Some("ZACH-052")).unwrap()[0].state,
+            "revalidate_waiting"
+        );
+
+        driver.run(
+            "promote-zach.yml",
+            "workflow_dispatch",
+            "202",
+            1,
+            true,
+            true,
+        );
+        driver
+            .files
+            .insert(("202".into(), "zach-plan.json".into()), plan_json);
+
+        tick(&mut store, &mut driver); // revalidate_waiting -> apply_ready
+        assert_eq!(
+            store.list_deliveries(Some("ZACH-052")).unwrap()[0].state,
+            "apply_ready"
+        );
+        tick(&mut store, &mut driver); // apply_ready -> approve_waiting
+        assert_eq!(
+            store.list_deliveries(Some("ZACH-052")).unwrap()[0].state,
+            "approve_waiting"
+        );
+        assert_eq!(
+            driver.dispatches.last().unwrap()["approve_production"],
+            "true"
+        );
+        assert_eq!(
+            driver.dispatches.last().unwrap()["expected_current"],
+            "none"
+        );
+
+        // Simulate zach.service restart during deploy by reopening file-backed SQLite store.
+        let mut reopened = V2Store::open(&path).unwrap();
+        assert_eq!(
+            reopened.list_deliveries(Some("ZACH-052")).unwrap()[0].state,
+            "approve_waiting"
+        );
+
+        driver.run(
+            "promote-zach.yml",
+            "workflow_dispatch",
+            "203",
+            1,
+            true,
+            true,
+        );
+        driver.files.insert(
+            ("203".into(), "zach-delivery.json".into()),
+            serde_json::to_vec(&json!({
+                "status": "published",
+                "operation": "deploy",
+                "source_sha": SHA,
+                "build_run_id": "100",
+                "artifact_digest": DIGEST,
+                "artifact_sha256": DIGEST,
+                "expected_current": "none"
+            }))
+            .unwrap(),
+        );
+
+        tick(&mut reopened, &mut driver); // approve_waiting -> verified
+        assert_eq!(
+            reopened.list_deliveries(Some("ZACH-052")).unwrap()[0].state,
+            "verified"
+        );
+        assert!(
+            reopened
+                .delivery_verification_recorded("ZACH-052", SHA)
+                .unwrap()
+        );
+    }
 }
