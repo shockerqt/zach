@@ -1322,6 +1322,12 @@ impl StageExecutor for SystemdStageExecutor {
             let network =
                 NetworkPolicy::resolve(task.context_pack.network.as_deref(), route.family)?;
             let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".into());
+            if spec.writable {
+                prepare_web_node_modules(
+                    std::path::Path::new(&home),
+                    std::path::Path::new(&spec.worktree_path),
+                )?;
+            }
             let mut resources = PreparedResources::prepare(
                 &attempt_dir,
                 std::path::Path::new(&home),
@@ -1522,7 +1528,9 @@ impl StageExecutor for SystemdStageExecutor {
     fn run_checks(&mut self, worktree_path: &str, commands: &[String]) -> Result<(), String> {
         self.check_isolation()?;
         let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".into()));
-        let layout = SandboxLayout::inspect(&home, std::path::Path::new(worktree_path), true)?;
+        let worktree = std::path::Path::new(worktree_path);
+        prepare_web_node_modules(&home, worktree)?;
+        let layout = SandboxLayout::inspect(&home, worktree, true)?;
         for cmd in commands {
             let worker = vec!["bash".into(), "-c".into(), cmd.clone()];
             static CHECK_SEQ: std::sync::atomic::AtomicUsize =
@@ -2785,6 +2793,9 @@ fn prepare_detached_launch_in_dir(
         write_secure_file(&dir.join(name), b"")?;
     }
     let home = PathBuf::from(spec.env.get("HOME").ok_or("missing HOME")?);
+    if spec.writable {
+        prepare_web_node_modules(&home, &worktree)?;
+    }
     let mut resources = PreparedResources::prepare(
         dir,
         &home,
@@ -2842,6 +2853,71 @@ fn prepare_detached_launch_in_dir(
         manifest,
         resources,
     })
+}
+
+/// Ensures `web/node_modules` is available offline for writable worktree stages
+/// and checks when `web/package.json` is present.
+pub fn prepare_web_node_modules(
+    home: &std::path::Path,
+    worktree: &std::path::Path,
+) -> Result<(), String> {
+    let web_dir = worktree.join("web");
+    if !std::fs::symlink_metadata(&web_dir).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+    {
+        return Ok(());
+    }
+    let pkg = web_dir.join("package.json");
+    if !std::fs::symlink_metadata(&pkg).is_ok_and(|m| m.is_file() && !m.file_type().is_symlink()) {
+        return Ok(());
+    }
+    let dst = web_dir.join("node_modules");
+    match std::fs::symlink_metadata(&dst) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(format!(
+                "web/node_modules symlink rejected: {}",
+                dst.display()
+            ));
+        }
+        Ok(meta) if meta.is_dir() && isolation::dir_is_non_empty(&dst) => {
+            return Ok(());
+        }
+        Ok(meta) if !meta.is_dir() => return Ok(()),
+        _ => {}
+    }
+    if isolation::discover_web_node_modules_mount(worktree, true)?.is_some() {
+        return Ok(());
+    }
+    let lock = web_dir.join("package-lock.json");
+    if !std::fs::symlink_metadata(&lock).is_ok_and(|m| m.is_file() && !m.file_type().is_symlink()) {
+        return Ok(());
+    }
+    let fnm_npm = home.join(".local/share/fnm/aliases/default/bin/npm");
+    let npm_bin = if fnm_npm.is_file() {
+        fnm_npm
+    } else {
+        PathBuf::from("npm")
+    };
+    let env = isolation::sandbox_env(home);
+    let output = Command::new(&npm_bin)
+        .args([
+            "ci",
+            "--offline",
+            "--no-audit",
+            "--no-fund",
+            "--prefix",
+            "web",
+        ])
+        .current_dir(worktree)
+        .env_clear()
+        .envs(&env)
+        .stdin(Stdio::null())
+        .output();
+    if !matches!(output, Ok(out) if out.status.success())
+        && std::fs::symlink_metadata(&dst).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+    {
+        let _ = std::fs::remove_dir_all(&dst);
+    }
+    Ok(())
 }
 
 pub fn read_attempt_manifest(
@@ -5287,5 +5363,47 @@ Binary files /dev/null and b/assets/logo.bin differ
         assert!(!meta_json.contains("Known pitfall"));
         assert!(!meta_json.contains("Always run targeted checks"));
         let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn prepare_web_node_modules_handles_offline_fallback_and_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = TempTestDir::new("zach048-web-prep");
+        let home = root.path().join("home");
+        let bin_dir = home.join(".local/share/fnm/aliases/default/bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let fake_npm = bin_dir.join("npm");
+        std::fs::write(
+            &fake_npm,
+            "#!/bin/sh\nif [ \"$1\" = \"ci\" ] && [ \"$2\" = \"--offline\" ]; then\n  if [ -f web/fail-ci ]; then\n    mkdir -p web/node_modules/partial\n    exit 1\n  fi\n  mkdir -p web/node_modules\n  touch web/node_modules/.ok\n  exit 0\nfi\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let wt = root.path().join("wt");
+        std::fs::create_dir_all(wt.join(".git")).unwrap();
+
+        // No web/package.json -> no-op.
+        prepare_web_node_modules(&home, &wt).unwrap();
+        assert!(!wt.join("web/node_modules").exists());
+
+        // Failed offline npm ci removes partial web/node_modules so future runs retry cleanly.
+        std::fs::create_dir_all(wt.join("web")).unwrap();
+        std::fs::write(wt.join("web/package.json"), "{}").unwrap();
+        std::fs::write(wt.join("web/package-lock.json"), "{}").unwrap();
+        std::fs::write(wt.join("web/fail-ci"), "1").unwrap();
+        prepare_web_node_modules(&home, &wt).unwrap();
+        assert!(!wt.join("web/node_modules").exists());
+
+        // Standalone repo with web/package.json + package-lock.json -> invokes offline npm ci.
+        std::fs::remove_file(wt.join("web/fail-ci")).unwrap();
+        prepare_web_node_modules(&home, &wt).unwrap();
+        assert!(wt.join("web/node_modules/.ok").is_file());
+
+        // Symlinked web/node_modules fails closed.
+        std::fs::remove_dir_all(wt.join("web/node_modules")).unwrap();
+        symlink(root.path(), wt.join("web/node_modules")).unwrap();
+        assert!(prepare_web_node_modules(&home, &wt).is_err());
     }
 }
