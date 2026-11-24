@@ -51,6 +51,8 @@ pub struct SandboxLayout {
     pub git_paths: Vec<PathBuf>,
     pub secrets: Vec<PathBuf>,
     pub readonly_files: Vec<PathBuf>,
+    pub tmpfs_dirs: Vec<PathBuf>,
+    pub readonly_mounts: Vec<(PathBuf, PathBuf)>,
     pub auth: Option<(PathBuf, PathBuf)>,
     pub plugin: Option<PathBuf>,
     pub proxy: Option<(PathBuf, PathBuf)>,
@@ -66,6 +68,8 @@ impl SandboxLayout {
             git_paths: vec![worktree.join(".git")],
             secrets: vec![],
             readonly_files: vec![],
+            tmpfs_dirs: vec![],
+            readonly_mounts: vec![],
             auth: None,
             plugin: None,
             proxy: None,
@@ -87,12 +91,17 @@ impl SandboxLayout {
             return Err("Git mount would expose an ancestor directory".into());
         }
         scan_secrets(&worktree, &mut layout.secrets)?;
+        if let Some(overlay) = discover_web_node_modules_mount(&worktree, writable)? {
+            layout.tmpfs_dirs.push(overlay.tmpfs_dir);
+            layout.readonly_mounts.extend(overlay.readonly_mounts);
+        }
         for suffix in [
             ".local/bin",
             ".local/share/fnm",
             ".codex/packages",
             ".cargo",
             ".rustup",
+            ".cache/ms-playwright",
         ] {
             let path = home.join(suffix);
             if path.exists() {
@@ -136,13 +145,12 @@ pub fn scan_secrets(dir: &Path, secrets: &mut Vec<PathBuf>) -> Result<(), String
     Ok(())
 }
 
-pub fn git_mounts(worktree: &Path) -> Result<Vec<PathBuf>, String> {
+fn resolve_linked_git_dirs(worktree: &Path) -> Result<Option<(PathBuf, PathBuf)>, String> {
     let dotgit = worktree.join(".git");
     let meta = fs::symlink_metadata(&dotgit).map_err(|e| format!("missing .git: {e}"))?;
     if meta.file_type().is_symlink() {
         return Err(".git symlink rejected".into());
     }
-    let mut paths = vec![dotgit.clone()];
     if meta.is_file() {
         let text = fs::read_to_string(&dotgit).map_err(|e| e.to_string())?;
         let target = text
@@ -175,15 +183,155 @@ pub fn git_mounts(worktree: &Path) -> Result<Vec<PathBuf>, String> {
         if !objects.is_dir() || objects.file_type().is_symlink() {
             return Err("invalid Git object directory".into());
         }
-        paths.push(common);
-        paths.push(gitdir);
+        return Ok(Some((common, gitdir)));
     } else if !meta.is_dir() {
         return Err("invalid .git type".into());
+    }
+    Ok(None)
+}
+
+pub fn git_mounts(worktree: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut paths = vec![worktree.join(".git")];
+    if let Some((common, gitdir)) = resolve_linked_git_dirs(worktree)? {
+        paths.push(common);
+        paths.push(gitdir);
     }
     // Parent mounts must precede nested mounts.
     paths.sort_by_key(|p| p.components().count());
     paths.dedup();
     Ok(paths)
+}
+
+pub fn dir_is_non_empty(path: &Path) -> bool {
+    fs::read_dir(path)
+        .ok()
+        .and_then(|mut entries| entries.next())
+        .is_some()
+}
+
+fn web_lockfiles_match(worktree_lock: &Path, primary_lock: &Path) -> bool {
+    match (
+        fs::symlink_metadata(worktree_lock),
+        fs::symlink_metadata(primary_lock),
+    ) {
+        (Ok(wm), Ok(pm))
+            if wm.is_file()
+                && !wm.file_type().is_symlink()
+                && pm.is_file()
+                && !pm.file_type().is_symlink() =>
+        {
+            matches!((fs::read(worktree_lock), fs::read(primary_lock)), (Ok(a), Ok(b)) if a == b)
+        }
+        (Err(we), Err(pe))
+            if we.kind() == std::io::ErrorKind::NotFound
+                && pe.kind() == std::io::ErrorKind::NotFound =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Overlay mount specification for sharing `web/node_modules` from the primary
+/// checkout while keeping the directory itself writable in `tmpfs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebNodeModulesOverlay {
+    pub tmpfs_dir: PathBuf,
+    pub readonly_mounts: Vec<(PathBuf, PathBuf)>,
+}
+
+/// Discovers a writable `tmpfs` overlay + read-only entry mounts for
+/// `web/node_modules` from the primary repository when `worktree` is a linked
+/// worktree with `web/package.json` and no populated local `web/node_modules`.
+/// Keeping `node_modules` itself a `tmpfs` allows Vite/Vitest to write
+/// `.vite-temp`, `.vite`, and `.vitest-cache` without mutating the primary repo.
+pub fn discover_web_node_modules_mount(
+    worktree: &Path,
+    writable: bool,
+) -> Result<Option<WebNodeModulesOverlay>, String> {
+    let web_dir = worktree.join("web");
+    if !fs::symlink_metadata(&web_dir).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink()) {
+        return Ok(None);
+    }
+    let pkg = web_dir.join("package.json");
+    if !fs::symlink_metadata(&pkg).is_ok_and(|m| m.is_file() && !m.file_type().is_symlink()) {
+        return Ok(None);
+    }
+    let dst = web_dir.join("node_modules");
+    match fs::symlink_metadata(&dst) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(format!(
+                    "web/node_modules symlink rejected: {}",
+                    dst.display()
+                ));
+            }
+            if meta.is_dir() {
+                if dir_is_non_empty(&dst) {
+                    return Ok(None);
+                }
+            } else {
+                return Ok(None);
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Cannot create a new mountpoint directory inside a read-only worktree mount.
+            if !writable {
+                return Ok(None);
+            }
+        }
+        Err(e) => return Err(e.to_string()),
+    }
+
+    let Some((common, _gitdir)) = resolve_linked_git_dirs(worktree)? else {
+        return Ok(None);
+    };
+    let Some(primary_repo) = common.parent() else {
+        return Ok(None);
+    };
+    if !web_lockfiles_match(
+        &web_dir.join("package-lock.json"),
+        &primary_repo.join("web/package-lock.json"),
+    ) {
+        return Ok(None);
+    }
+    let primary_web = primary_repo.join("web");
+    if !fs::symlink_metadata(&primary_web).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+    {
+        return Ok(None);
+    }
+    let src = primary_web.join("node_modules");
+    let Ok(src_meta) = fs::symlink_metadata(&src) else {
+        return Ok(None);
+    };
+    if !src_meta.is_dir() || src_meta.file_type().is_symlink() || !dir_is_non_empty(&src) {
+        return Ok(None);
+    }
+    let mut mounts = Vec::new();
+    for entry in fs::read_dir(&src).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        if matches!(
+            name.to_str(),
+            Some(".vite" | ".vite-temp" | ".vitest-cache")
+        ) {
+            continue;
+        }
+        let src_entry = entry.path();
+        let meta = fs::symlink_metadata(&src_entry).map_err(|e| e.to_string())?;
+        if meta.file_type().is_symlink() {
+            return Ok(None);
+        }
+        mounts.push((src_entry, dst.join(name)));
+    }
+    if mounts.is_empty() {
+        return Ok(None);
+    }
+    mounts.sort_by(|a, b| a.1.cmp(&b.1));
+    Ok(Some(WebNodeModulesOverlay {
+        tmpfs_dir: dst,
+        readonly_mounts: mounts,
+    }))
 }
 
 pub fn sandbox_env(home: &Path) -> BTreeMap<String, String> {
@@ -250,23 +398,24 @@ pub fn bwrap_args(layout: &SandboxLayout, worker: &[String]) -> Vec<String> {
     for (key, value) in sandbox_env(&layout.home) {
         args.extend(["--setenv".into(), key, value]);
     }
-    let mut bind = |flag: &str, src: &Path, dst: &Path| {
+    fn bind(args: &mut Vec<String>, flag: &str, src: &Path, dst: &Path) {
         args.extend([
             flag.into(),
             src.display().to_string(),
             dst.display().to_string(),
         ]);
-    };
+    }
     if let Some((src, dst)) = &layout.auth {
-        bind("--bind", src, dst);
+        bind(&mut args, "--bind", src, dst);
     }
     for path in &layout.toolchains {
-        bind("--ro-bind", path, path);
+        bind(&mut args, "--ro-bind", path, path);
     }
     if let Some(path) = &layout.plugin {
-        bind("--ro-bind", path, path);
+        bind(&mut args, "--ro-bind", path, path);
     }
     bind(
+        &mut args,
         if layout.writable {
             "--bind"
         } else {
@@ -276,17 +425,23 @@ pub fn bwrap_args(layout: &SandboxLayout, worker: &[String]) -> Vec<String> {
         &layout.worktree,
     );
     for path in &layout.git_paths {
-        bind("--ro-bind", path, path);
+        bind(&mut args, "--ro-bind", path, path);
     }
     for path in &layout.secrets {
-        bind("--ro-bind", Path::new("/dev/null"), path);
+        bind(&mut args, "--ro-bind", Path::new("/dev/null"), path);
     }
     for path in &layout.readonly_files {
-        bind("--ro-bind", path, path);
+        bind(&mut args, "--ro-bind", path, path);
+    }
+    for dir in &layout.tmpfs_dirs {
+        args.extend(["--tmpfs".into(), dir.display().to_string()]);
+    }
+    for (src, dst) in &layout.readonly_mounts {
+        bind(&mut args, "--ro-bind", src, dst);
     }
     if let Some((net, exe)) = &layout.proxy {
-        bind("--ro-bind", net, Path::new("/run/zach-net"));
-        bind("--ro-bind", exe, Path::new(BRIDGE));
+        bind(&mut args, "--ro-bind", net, Path::new("/run/zach-net"));
+        bind(&mut args, "--ro-bind", exe, Path::new(BRIDGE));
     }
     args.extend([
         "--chdir".into(),
@@ -1947,5 +2102,127 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn linked_worktree_mounts_matching_primary_web_node_modules_overlay_and_playwright() {
+        let temp = Temp::new();
+        let repo = temp.repo();
+        let primary_web = repo.join("web");
+        fs::create_dir_all(primary_web.join("node_modules/.bin")).unwrap();
+        fs::create_dir_all(primary_web.join("node_modules/.vite-temp")).unwrap();
+        fs::create_dir_all(temp.0.join(".cache/ms-playwright")).unwrap();
+        fs::write(primary_web.join("package.json"), "{}").unwrap();
+        fs::write(
+            primary_web.join("package-lock.json"),
+            "{\"lockfileVersion\":3}",
+        )
+        .unwrap();
+        fs::write(primary_web.join("node_modules/.bin/tsc"), "#!/bin/sh\n").unwrap();
+
+        let gitdir = repo.join(".git/worktrees/linked");
+        fs::create_dir_all(&gitdir).unwrap();
+        fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+        fs::write(gitdir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let linked = temp.0.join("linked");
+        ensure_secure_dir(&linked).unwrap();
+        fs::write(
+            linked.join(".git"),
+            "gitdir: ../repo/.git/worktrees/linked\n",
+        )
+        .unwrap();
+        fs::create_dir_all(linked.join("web")).unwrap();
+        fs::write(linked.join("web/package.json"), "{}").unwrap();
+        fs::write(
+            linked.join("web/package-lock.json"),
+            "{\"lockfileVersion\":3}",
+        )
+        .unwrap();
+
+        let layout = SandboxLayout::inspect(&temp.0, &linked, true).unwrap();
+        let expected_src = primary_web.join("node_modules/.bin");
+        let expected_dst = linked.join("web/node_modules");
+        let expected_entry_dst = expected_dst.join(".bin");
+        assert!(
+            layout
+                .toolchains
+                .contains(&temp.0.join(".cache/ms-playwright"))
+        );
+        assert_eq!(layout.tmpfs_dirs, vec![expected_dst.clone()]);
+        assert_eq!(
+            layout.readonly_mounts,
+            vec![(expected_src.clone(), expected_entry_dst.clone())]
+        );
+        let args = bwrap_args(&layout, &[]);
+        assert!(contains_bind(
+            &args,
+            "--ro-bind",
+            &expected_src,
+            &expected_entry_dst
+        ));
+        let wt_pos = args
+            .windows(3)
+            .position(|w| {
+                w == [
+                    "--bind",
+                    &linked.display().to_string(),
+                    &linked.display().to_string(),
+                ]
+            })
+            .unwrap();
+        let tmpfs_pos = args
+            .windows(2)
+            .position(|w| w == ["--tmpfs", &expected_dst.display().to_string()])
+            .unwrap();
+        let nm_pos = args
+            .windows(3)
+            .position(|w| {
+                w == [
+                    "--ro-bind",
+                    &expected_src.display().to_string(),
+                    &expected_entry_dst.display().to_string(),
+                ]
+            })
+            .unwrap();
+        assert!(wt_pos < tmpfs_pos && tmpfs_pos < nm_pos);
+
+        // Read-only stage skips mounting when dst does not exist on host, and mounts over empty dir.
+        let ro_layout = SandboxLayout::inspect(&temp.0, &linked, false).unwrap();
+        assert!(ro_layout.readonly_mounts.is_empty());
+        fs::create_dir_all(&expected_dst).unwrap();
+        let ro_empty_layout = SandboxLayout::inspect(&temp.0, &linked, false).unwrap();
+        assert_eq!(ro_empty_layout.tmpfs_dirs, vec![expected_dst.clone()]);
+        assert_eq!(
+            ro_empty_layout.readonly_mounts,
+            vec![(expected_src.clone(), expected_entry_dst)]
+        );
+        fs::remove_dir(&expected_dst).unwrap();
+
+        // Lockfile mismatch skips mounting primary node_modules.
+        fs::write(
+            linked.join("web/package-lock.json"),
+            "{\"lockfileVersion\":2}",
+        )
+        .unwrap();
+        let mismatch_layout = SandboxLayout::inspect(&temp.0, &linked, true).unwrap();
+        assert!(mismatch_layout.tmpfs_dirs.is_empty());
+        assert!(mismatch_layout.readonly_mounts.is_empty());
+
+        // Populated local node_modules takes precedence without external mount.
+        fs::write(
+            linked.join("web/package-lock.json"),
+            "{\"lockfileVersion\":3}",
+        )
+        .unwrap();
+        fs::create_dir_all(expected_dst.join("pkg")).unwrap();
+        let local_layout = SandboxLayout::inspect(&temp.0, &linked, true).unwrap();
+        assert!(local_layout.tmpfs_dirs.is_empty());
+        assert!(local_layout.readonly_mounts.is_empty());
+
+        // Symlinked web/node_modules fails closed.
+        fs::remove_dir_all(&expected_dst).unwrap();
+        symlink(primary_web.join("node_modules"), &expected_dst).unwrap();
+        assert!(SandboxLayout::inspect(&temp.0, &linked, true).is_err());
     }
 }
