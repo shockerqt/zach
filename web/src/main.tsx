@@ -308,7 +308,9 @@ function App() {
     );
   const c = connection.current;
   useEffect(() => {
-    void c.connectAuto();
+    const boot = setTimeout(() => {
+      void c.connectAuto();
+    }, 0);
     const timer = setInterval(() => setNow(Date.now()), 1000);
     const hide = () => {
       if (document.hidden) {
@@ -318,6 +320,7 @@ function App() {
     };
     document.addEventListener("visibilitychange", hide);
     return () => {
+      clearTimeout(boot);
       clearInterval(timer);
       document.removeEventListener("visibilitychange", hide);
       c.disconnect();
