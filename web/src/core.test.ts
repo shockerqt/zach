@@ -10,6 +10,7 @@ import {
   taskLane,
   taskDecision,
   observedStage,
+  sortTasksNewestFirst,
 } from "./state";
 export const sampleTask = {
   task_id: "ZACH-030",
@@ -314,4 +315,86 @@ it("classifies observed Ready stage start as active without inventing task statu
   expect(mood(s)).toBe("idle");
   expect(observedStage(s, s.tasks[0])?.status).toBe("FUTURE_STATUS");
   expect(s.tasks[0].status).toBe("Ready");
+});
+
+describe("newest-first ordering", () => {
+  it("orders snapshot decisions by created_seq descending and prepends live DECISION_REQUIRED events", () => {
+    const makeDecision = (id: string, createdSeq: number) => ({
+      decision_id: id,
+      task_id: sampleTask.task_id,
+      kind: "plan_approval",
+      question: `Question ${id}?`,
+      options: ["Approve", "Reject"],
+      created_seq: createdSeq,
+    });
+    let s = acceptSnapshot(
+      initial,
+      snapshot({
+        ...snap,
+        open_decisions: [
+          makeDecision("d-old", 5),
+          makeDecision("d-mid", 8),
+          makeDecision("d-new", 10),
+        ],
+      }),
+    );
+    expect(s.decisions.map((d) => d.decision_id)).toEqual([
+      "d-new",
+      "d-mid",
+      "d-old",
+    ]);
+
+    s = applyEvent(
+      s,
+      ev(11, "DECISION_REQUIRED", {
+        decision_id: "d-live-1",
+        kind: "plan_approval",
+        question: "Live 1?",
+        options: ["Approve", "Reject"],
+      }),
+    );
+    s = applyEvent(
+      s,
+      ev(12, "DECISION_REQUIRED", {
+        decision_id: "d-live-2",
+        kind: "plan_approval",
+        question: "Live 2?",
+        options: ["Approve", "Reject"],
+      }),
+    );
+    expect(s.decisions.map((d) => d.decision_id)).toEqual([
+      "d-live-2",
+      "d-live-1",
+      "d-new",
+      "d-mid",
+      "d-old",
+    ]);
+    expect(taskDecision(s, s.tasks[0])?.decision_id).toBe("d-live-2");
+  });
+
+  it("orders active and queued tasks by updated_epoch descending with deterministic task_id tie-breaker", () => {
+    const parsed = snapshot({
+      ...snap,
+      tasks: [
+        { ...sampleTask, task_id: "ZACH-002", status: "In Progress", updated_epoch: 100 },
+        { ...sampleTask, task_id: "ZACH-001", status: "In Progress", updated_epoch: 100 },
+        { ...sampleTask, task_id: "ZACH-003", status: "In Progress", updated_epoch: 250 },
+        { ...sampleTask, task_id: "ZACH-010", status: "Ready", current_stage: null, updated_epoch: 50 },
+        { ...sampleTask, task_id: "ZACH-011", status: "Ready", current_stage: null, updated_epoch: 300 },
+      ],
+    });
+    const s = acceptSnapshot(initial, parsed);
+    const active = sortTasksNewestFirst(
+      s.tasks.filter((t) => taskLane(s, t) === "active"),
+    );
+    const queued = sortTasksNewestFirst(
+      s.tasks.filter((t) => taskLane(s, t) === "queued"),
+    );
+    expect(active.map((t) => t.task_id)).toEqual([
+      "ZACH-003",
+      "ZACH-001",
+      "ZACH-002",
+    ]);
+    expect(queued.map((t) => t.task_id)).toEqual(["ZACH-011", "ZACH-010"]);
+  });
 });
