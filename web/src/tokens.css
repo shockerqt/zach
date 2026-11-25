@@ -1,6 +1,7 @@
 :root {
   --ground: #121316;
   --panel: #1a1c20;
+  --panel-hi: #21242a;
   --line: #2a2d33;
   --line-strong: #3a3e46;
   --text: #eceae4;
@@ -8,6 +9,7 @@
   --text-3: #a3a6ad;
   --amber: #f0c94a;
   --blue: #7fb2ff;
+  --ok: #5dd39e;
   --fail: #ffa98c;
   --fail-bg: #2a1a15;
   --fail-border: #8a4630;
@@ -19,22 +21,22 @@
   --heading: "Space Grotesk", sans-serif;
   --body: Inter, sans-serif;
   --mono: "JetBrains Mono", monospace;
-  --card-radius: 16px;
-  --control-radius: 10px;
+  --card-radius: 10px;
+  --control-radius: 8px;
   --chip-radius: 999px;
-  --space: 8px;
-  --body-size: 14px;
-  --wordmark-size: 22px;
-  --section-size: 16px;
-  --card-heading-size: 18px;
-  --task-heading-size: 17px;
-  --mascot-heading-size: 20px;
-  --metadata-size: 12px;
+  --space: 6px;
+  --body-size: 13px;
+  --wordmark-size: 18px;
+  --section-size: 13px;
+  --card-heading-size: 15px;
+  --task-heading-size: 13.5px;
+  --mascot-heading-size: 15px;
+  --metadata-size: 11.5px;
   --strong-weight: 600;
 }
 
 @media (max-width: 700px) {
   :root {
-    --body-size: 15px;
+    --body-size: 14px;
   }
 }

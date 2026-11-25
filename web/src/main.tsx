@@ -15,6 +15,9 @@ import {
   taskDecision,
   observedStage,
   sortTasksNewestFirst,
+  matchesTaskFilter,
+  filterEvents,
+  type EventFilterKind,
   type State,
 } from "./state";
 import { github, type Task, type Decision } from "./protocol";
@@ -258,7 +261,11 @@ function App() {
     [authMode, setAuthMode] = useState<AuthMode>("none"),
     [on, setOn] = useState(false),
     [now, setNow] = useState(Date.now()),
-    [epoch, setEpoch] = useState(0);
+    [epoch, setEpoch] = useState(0),
+    [query, setQuery] = useState(""),
+    [repoFilter, setRepoFilter] = useState("all"),
+    [ultraDense, setUltraDense] = useState(false),
+    [eventFilter, setEventFilter] = useState<EventFilterKind>("ALL");
   const input = useRef<HTMLInputElement>(null),
     sound = useRef(new Sound()),
     connection = useRef<Connection | null>(null);
@@ -298,17 +305,19 @@ function App() {
     };
   }, [c]);
   const currentMood = mood(s, false, now);
+  const repos = Array.from(new Set(s.tasks.map((t) => t.repository))).sort();
   const active = sortTasksNewestFirst(
-    s.tasks.filter((t) => taskLane(s, t) === "active"),
+    s.tasks.filter((t) => taskLane(s, t) === "active" && matchesTaskFilter(t, query, repoFilter)),
   );
   const queued = sortTasksNewestFirst(
-    s.tasks.filter((t) => taskLane(s, t) === "queued"),
+    s.tasks.filter((t) => taskLane(s, t) === "queued" && matchesTaskFilter(t, query, repoFilter)),
   );
   const candidates = s.tasks.filter((t) => t.memory.merge_checkpoint);
+  const visibleFeed = filterEvents(s.feed, query, eventFilter);
   const connected =
     notice.includes("SSE") || notice.startsWith("Resincronizado");
   return (
-    <>
+    <div data-density={ultraDense ? "ultra" : "compact"}>
       <a className="skip" href="#main">
         Ir al contenido
       </a>
@@ -329,14 +338,40 @@ function App() {
               ? `${s.status.running_task_slots} de ${s.status.max_parallel_tasks}`
               : "no disponibles"}
           </span>
-          <span className="chip">Codex · cuota no disponible</span>
-          <span className="chip">Gemini · cuota no disponible</span>
+          <span className="chip">En curso: {active.length}</span>
+          <span className="chip">En cola: {queued.length}</span>
         </div>
         <div className="controls">
-          <div>
-            <button disabled>Pausar cola</button>
-            <div className="meta">No disponible en esta versión</div>
-          </div>
+          <input
+            type="search"
+            className="filter-input"
+            aria-label="Filtrar tareas y eventos"
+            placeholder="Filtrar tarea, repo, evento..."
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+          <select
+            aria-label="Filtrar repositorio"
+            value={repoFilter}
+            onChange={(e) => setRepoFilter(e.target.value)}
+          >
+            <option value="all">Todos los repos</option>
+            {repos.map((r) => (
+              <option key={r} value={r}>
+                {r}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            aria-pressed={ultraDense}
+            onClick={() => setUltraDense((u) => !u)}
+          >
+            {ultraDense ? "Densidad: Ultra" : "Densidad: Compacta"}
+          </button>
+          <button disabled title="No disponible en esta versión">
+            Pausar cola
+          </button>
           <button
             aria-pressed={on}
             onClick={async () => {
@@ -452,15 +487,36 @@ function App() {
             )}
           </section>
           <section className="card" aria-labelledby="events-heading">
-            <h2 id="events-heading">Eventos</h2>
+            <div className="section-bar">
+              <h2 id="events-heading">Eventos</h2>
+              <div className="actions">
+                {(
+                  [
+                    ["ALL", "Todos"],
+                    ["STAGE", "Etapas"],
+                    ["DECISION", "Decisiones"],
+                    ["ERR", "Errores"],
+                  ] as const
+                ).map(([kind, label]) => (
+                  <button
+                    key={kind}
+                    type="button"
+                    aria-pressed={eventFilter === kind}
+                    onClick={() => setEventFilter(kind)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
             <p className="meta">
-              {s.feed.length === 1
-                ? "Último 1 evento aplicado"
-                : `Últimos ${s.feed.length} eventos aplicados`}{" "}
-              · máximo 200
+              {visibleFeed.length === 1
+                ? "Mostrando 1 evento"
+                : `Mostrando ${visibleFeed.length} eventos`}{" "}
+              · total {s.feed.length} (máximo 200)
             </p>
             <ol className="events">
-              {s.feed.map((e) => (
+              {visibleFeed.map((e) => (
                 <li key={e.seq_id}>
                   <time>
                     {new Date(e.ts_epoch * 1000).toLocaleTimeString("es")}
@@ -471,7 +527,7 @@ function App() {
                 </li>
               ))}
             </ol>
-            {!s.feed.length && (
+            {!visibleFeed.length && (
               <p className="empty">Esperando nuevos eventos del stream.</p>
             )}
           </section>
@@ -482,7 +538,7 @@ function App() {
           </p>
         </aside>
       </main>
-    </>
+    </div>
   );
 }
 if (typeof document !== "undefined") {

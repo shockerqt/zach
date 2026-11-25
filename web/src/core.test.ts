@@ -11,6 +11,8 @@ import {
   taskDecision,
   observedStage,
   sortTasksNewestFirst,
+  matchesTaskFilter,
+  filterEvents,
 } from "./state";
 export const sampleTask = {
   task_id: "ZACH-030",
@@ -396,5 +398,28 @@ describe("newest-first ordering", () => {
       "ZACH-002",
     ]);
     expect(queued.map((t) => t.task_id)).toEqual(["ZACH-011", "ZACH-010"]);
+  });
+});
+
+describe("compact UI filters", () => {
+  it("filters tasks by query and repository and filters events by kind and query", () => {
+    const t1 = { ...sampleTask, task_id: "ZACH-085", repository: "zach", title: "Compact UI" };
+    const t2 = { ...sampleTask, task_id: "BAL-053", repository: "balance", title: "Meal days" };
+    expect(matchesTaskFilter(t1, "", "all")).toBe(true);
+    expect(matchesTaskFilter(t1, "compact", "zach")).toBe(true);
+    expect(matchesTaskFilter(t1, "compact", "balance")).toBe(false);
+    expect(matchesTaskFilter(t2, "meal", "all")).toBe(true);
+    expect(matchesTaskFilter(t2, "compact", "all")).toBe(false);
+
+    const feed = [
+      { seq_id: 3, task_id: "ZACH-085", ts_epoch: 100, event_type: "STAGE_STARTED", payload: {}, detail: "impl" },
+      { seq_id: 2, task_id: "BAL-053", ts_epoch: 99, event_type: "DECISION_REQUIRED", payload: {} },
+      { seq_id: 1, task_id: "INF-024", ts_epoch: 98, event_type: "STAGE_FAILED", payload: {} },
+    ];
+    expect(filterEvents(feed, "", "ALL")).toHaveLength(3);
+    expect(filterEvents(feed, "", "STAGE").map((e) => e.seq_id)).toEqual([3, 1]);
+    expect(filterEvents(feed, "", "DECISION").map((e) => e.seq_id)).toEqual([2]);
+    expect(filterEvents(feed, "", "ERR").map((e) => e.seq_id)).toEqual([1]);
+    expect(filterEvents(feed, "zach-085", "ALL").map((e) => e.seq_id)).toEqual([3]);
   });
 });

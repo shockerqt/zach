@@ -56,6 +56,35 @@ export function sortTasksNewestFirst(tasks: Task[]): Task[] {
     return a.task_id < b.task_id ? -1 : a.task_id > b.task_id ? 1 : 0;
   });
 }
+export type EventFilterKind = "ALL" | "STAGE" | "DECISION" | "ERR";
+export function matchesTaskFilter(
+  t: Task,
+  query: string,
+  repo: string,
+): boolean {
+  if (repo !== "all" && t.repository !== repo) return false;
+  const q = query.trim().toLowerCase();
+  if (!q) return true;
+  return `${t.task_id} ${t.repository} ${t.title} ${t.status} ${t.current_stage ?? ""}`
+    .toLowerCase()
+    .includes(q);
+}
+export function filterEvents(
+  feed: State["feed"],
+  query: string,
+  kind: EventFilterKind,
+): State["feed"] {
+  const q = query.trim().toLowerCase();
+  return feed.filter((e) => {
+    if (kind === "STAGE" && !e.event_type.startsWith("STAGE_")) return false;
+    if (kind === "DECISION" && !e.event_type.startsWith("DECISION_")) return false;
+    if (kind === "ERR" && !/FAIL|ERROR|REJECT|DENIED/.test(e.event_type)) return false;
+    if (!q) return true;
+    return `${e.task_id} ${e.event_type} ${e.detail ?? ""}`
+      .toLowerCase()
+      .includes(q);
+  });
+}
 export function acceptSnapshot(s: State, v: Snapshot): State {
   const reset = v.as_of_seq < s.cursor;
   return {
