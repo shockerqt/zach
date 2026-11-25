@@ -38,13 +38,31 @@ export const initial: State = {
   reset: false,
   syncVersion: 0,
 };
+function sortDecisionsNewestFirst(decisions: Decision[]): Decision[] {
+  return [...decisions].sort((a, b) => {
+    const seqDiff = (b.created_seq ?? -1) - (a.created_seq ?? -1);
+    if (seqDiff !== 0) return seqDiff;
+    return b.decision_id < a.decision_id
+      ? -1
+      : b.decision_id > a.decision_id
+        ? 1
+        : 0;
+  });
+}
+export function sortTasksNewestFirst(tasks: Task[]): Task[] {
+  return [...tasks].sort((a, b) => {
+    const epochDiff = (b.updated_epoch ?? 0) - (a.updated_epoch ?? 0);
+    if (epochDiff !== 0) return epochDiff;
+    return a.task_id < b.task_id ? -1 : a.task_id > b.task_id ? 1 : 0;
+  });
+}
 export function acceptSnapshot(s: State, v: Snapshot): State {
   const reset = v.as_of_seq < s.cursor;
   return {
     ...s,
     syncVersion: s.syncVersion + 1,
     tasks: v.tasks,
-    decisions: v.open_decisions,
+    decisions: sortDecisionsNewestFirst(v.open_decisions),
     cursor: v.as_of_seq,
     watermark: v.as_of_seq,
     status: v.status ?? s.status,
@@ -95,9 +113,10 @@ export function applyEvent(s: State, e: Event): State {
   switch (e.event_type) {
     case "DECISION_REQUIRED": {
       const d = decision(p, e.task_id);
+      if (d.created_seq == null) d.created_seq = e.seq_id;
       decisions = [
-        ...decisions.filter((x) => x.decision_id !== d.decision_id),
         d,
+        ...decisions.filter((x) => x.decision_id !== d.decision_id),
       ];
       break;
     }
@@ -199,7 +218,7 @@ export function observedStage(s: State, t: Task): Stage | undefined {
 }
 export function taskDecision(s: State, t: Task): Decision | undefined {
   const open = s.decisions.filter((d) => d.task_id === t.task_id);
-  return open.findLast((d) => d.linked_unverified_delivery) ?? open.at(-1);
+  return open.find((d) => d.linked_unverified_delivery) ?? open[0];
 }
 export function taskLane(s: State, t: Task): "active" | "queued" | "terminal" {
   const status = t.status.toLowerCase();

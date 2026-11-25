@@ -8,7 +8,15 @@ import "@fontsource/space-grotesk/latin-700.css";
 import "@fontsource/jetbrains-mono/latin-400.css";
 import "./style.css";
 import { Connection, type AuthMode } from "./connection";
-import { initial, mood, taskLane, taskDecision, observedStage, type State } from "./state";
+import {
+  initial,
+  mood,
+  taskLane,
+  taskDecision,
+  observedStage,
+  sortTasksNewestFirst,
+  type State,
+} from "./state";
 import { github, type Task, type Decision } from "./protocol";
 import { Mascot, moodText } from "./Mascot";
 import { Sound } from "./sound";
@@ -290,8 +298,12 @@ function App() {
     };
   }, [c]);
   const currentMood = mood(s, false, now);
-  const active = s.tasks.filter((t) => taskLane(s, t) === "active");
-  const queued = s.tasks.filter((t) => taskLane(s, t) === "queued");
+  const active = sortTasksNewestFirst(
+    s.tasks.filter((t) => taskLane(s, t) === "active"),
+  );
+  const queued = sortTasksNewestFirst(
+    s.tasks.filter((t) => taskLane(s, t) === "queued"),
+  );
   const candidates = s.tasks.filter((t) => t.memory.merge_checkpoint);
   const connected =
     notice.includes("SSE") || notice.startsWith("Resincronizado");

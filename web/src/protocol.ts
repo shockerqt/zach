@@ -37,6 +37,7 @@ export interface Task {
   stages_completed: string[];
   current_stage?: string;
   active_attempt_id?: string;
+  updated_epoch?: number;
   memory: Obj;
 }
 export interface Decision {
@@ -48,6 +49,7 @@ export interface Decision {
   context_summary: string;
   status: string;
   choice?: string;
+  created_seq?: number;
   linked_unverified_delivery?: boolean;
 }
 export interface Snapshot {
@@ -82,6 +84,7 @@ export function task(v: unknown): Task {
     stages_completed: strings(o.stages_completed),
     current_stage: optional(o.current_stage),
     active_attempt_id: optional(o.active_attempt_id),
+    updated_epoch: o.updated_epoch == null ? undefined : integer(o.updated_epoch),
     memory: displayMemory(o.memory),
   };
 }
@@ -99,6 +102,7 @@ export function decision(v: unknown, eventTask?: string): Decision {
         : string(o.context_summary),
     status: o.status == null ? "OPEN" : string(o.status),
     choice: optional(o.choice),
+    created_seq: o.created_seq == null ? undefined : integer(o.created_seq),
     linked_unverified_delivery: o.linked_unverified_delivery === true,
   };
 }

@@ -97,8 +97,8 @@ describe("generation-owned transport", () => {
     expect(streams).toBeGreaterThan(1);
     expect(audio).toEqual(["DECISION_REQUIRED", "DECISION_REQUIRED"]);
     expect(c.state.decisions.map((d) => d.decision_id)).toEqual([
-      "d",
       "new-live-decision",
+      "d",
     ]);
     expect(c.state.reset).toBe(false);
     await vi.advanceTimersByTimeAsync(2500);
