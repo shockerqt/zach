@@ -1,42 +1,23 @@
 :root {
-  --ground: #121316;
-  --panel: #1a1c20;
-  --panel-hi: #21242a;
-  --line: #2a2d33;
-  --line-strong: #3a3e46;
-  --text: #eceae4;
-  --text-2: #c9ccd3;
-  --text-3: #a3a6ad;
-  --amber: #f0c94a;
-  --blue: #7fb2ff;
-  --ok: #5dd39e;
-  --fail: #ffa98c;
-  --fail-bg: #2a1a15;
-  --fail-border: #8a4630;
-  --now-bg: #2a2510;
+  --z2-bg: #0c0d10;
+  --z2-surface: #12141a;
+  --z2-surface-hi: #181b23;
+  --z2-border: #232733;
+  --z2-border-soft: #1a1d26;
+  --z2-fg: #e8eaef;
+  --z2-muted: #9399a8;
+  --z2-faint: #848b9c;
+  --z2-accent: #e5a93b;
+  --z2-ok: #3ecf8e;
+  --z2-info: #5aa9e6;
+  --z2-warn: #f0b429;
+  --z2-err: #ef6461;
+  --z2-purple: #a78bfa;
   --moon: #f3e4a4;
   --crater: #e6d48c;
   --cat: #0e0e10;
-  --button-text: #17150c;
-  --heading: "Space Grotesk", sans-serif;
-  --body: Inter, sans-serif;
-  --mono: "JetBrains Mono", monospace;
-  --card-radius: 10px;
-  --control-radius: 8px;
-  --chip-radius: 999px;
-  --space: 6px;
-  --body-size: 13px;
-  --wordmark-size: 18px;
-  --section-size: 13px;
-  --card-heading-size: 15px;
-  --task-heading-size: 13.5px;
-  --mascot-heading-size: 15px;
-  --metadata-size: 11.5px;
-  --strong-weight: 600;
-}
-
-@media (max-width: 700px) {
-  :root {
-    --body-size: 14px;
-  }
+  --amber: #f0c94a;
+  --font-ui: Inter, system-ui, sans-serif;
+  --font-heading: "Space Grotesk", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
 }

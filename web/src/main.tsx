@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "@fontsource/inter/latin-400.css";
 import "@fontsource/inter/latin-500.css";
@@ -23,7 +23,23 @@ import {
 import { github, type Task, type Decision } from "./protocol";
 import { Mascot, moodText } from "./Mascot";
 import { Sound } from "./sound";
-function DecisionCard({
+
+function formatAge(nowMs: number, epoch?: number): string {
+  if (!epoch) return "—";
+  const diff = Math.max(0, Math.floor(nowMs / 1000 - epoch));
+  if (diff < 60) return `${diff}s`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}m`;
+  return `${Math.floor(diff / 3600)}h`;
+}
+
+function eventTone(eventType: string): string {
+  if (/COMPLETED|PASSED|RESOLVED|MERGED/.test(eventType)) return "is-ok";
+  if (/FAIL|ERROR|REJECT|DENIED/.test(eventType)) return "is-err";
+  if (/DECISION/.test(eventType)) return "is-warn";
+  return "";
+}
+
+function DecisionRow({
   d,
   t,
   connection,
@@ -70,124 +86,127 @@ function DecisionCard({
   }
   const plan = ["plan_approval", "human-plan-approval"].includes(d.kind);
   return (
-    <article className="card decision" aria-label={`Decisión ${d.decision_id}`}>
-      <div className="eyebrow">{d.kind}</div>
-      <div className="mono">
-        {d.task_id} · {t?.weight ?? "Peso no disponible"}
-      </div>
-      <h2>{d.question}</h2>
-      <p>{d.context_summary}</p>
-      {issue && (
-        <a href={issue} target="_blank" rel="noreferrer">
-          Leer la tarea y sus revisiones ↗
-        </a>
-      )}
-      {["merge_approval", "human-merge-approval"].includes(d.kind) && (
-        <p className="meta">
-          La política del servidor deniega merge por defecto.
-        </p>
-      )}
-      <label>
-        Nota (opcional)
-        <input
-          maxLength={2000}
-          value={note}
-          onChange={(e) => setNote(e.target.value)}
-          disabled={pending || unknown || !connection.active}
-        />
-      </label>
-      <div className="actions">
-        {d.options.map((choice, i) => (
-          <button
-            key={choice}
-            className={i === 0 ? "primary" : ""}
-            disabled={pending || unknown || !connection.active}
-            onClick={() => void choose(choice)}
-          >
-            {plan && choice === "Approve"
-              ? "Aprobar"
-              : plan && choice === "Reject"
-                ? "Rechazar"
-                : choice}
-          </button>
-        ))}
-      </div>
-      {message && (
-        <p className="notice" role="status">
-          {message}
-        </p>
-      )}
-      <p className="meta">Las decisiones no se aprueban solas por tiempo.</p>
-    </article>
-  );
-}
-function TaskCard({ t, s }: { t: Task; s: State }) {
-  const pr = github(t, "pull");
-  const openDecision = taskDecision(s, t);
-  return (
-    <article className="card task">
-      <div className="taskhead">
-        <span className="id">{t.task_id}</span>
-        <h3>{t.title}</h3>
-        <span className="meta">
-          {t.repository} · peso {t.weight}
+    <article className="zcp2-dec-row decision" aria-label={`Decisión ${d.decision_id}`}>
+      <div className="zcp2-dec-top">
+        <span className="zcp2-dec-kind zcp2-mono">{d.kind}</span>
+        <span className="zcp2-mono mono" style={{ fontWeight: 700, fontSize: 11 }}>
+          {d.task_id} · {t?.weight ?? "Peso no disponible"}
         </span>
-      </div>
-      <ol className="stages">
-        {t.required_stages.map((stage) => {
-          const obs = s.stages[t.task_id + ":" + stage],
-            done = t.stages_completed.includes(stage),
-            fail = obs && /FAIL|ERROR/.test(obs.status),
-            wait =
-              s.decisions.some((d) => d.task_id === t.task_id) &&
-              t.current_stage === stage;
-          return (
-            <li
-              className={`stage ${fail ? "failure" : wait ? "wait" : ""}`}
-              key={stage}
-            >
-              <b>
-                {done ? "✓" : fail ? "×" : wait ? "●" : "○"} {stage}
-              </b>
-              <span className="meta">
-                {obs?.model ?? "Modelo no disponible"} ·{" "}
-                {obs?.duration != null
-                  ? `${obs.duration} s`
-                  : "Duración no disponible"}
-              </span>
-            </li>
-          );
-        })}
-      </ol>
-      <div className="taskfoot">
-        <p className={t.memory.last_check_failure ? "failure" : ""}>
-          {t.memory.last_check_failure ? "⚠ Fallo registrado · " : ""}
-          Estado efectivo: {t.status} · GitHub: {t.board_status ?? "Desconocido"}
-          {openDecision && (
-            <span> · Decisión abierta: {openDecision.question} ({openDecision.decision_id})</span>
-          )}
-          {observedStage(s, t) && (
-            <span> · Etapa observada: {observedStage(s, t)!.status}</span>
-          )}
-        </p>
-        {pr && (
-          <a className="action" href={pr} target="_blank" rel="noreferrer">
-            Ver PR #{t.pr_number} ↗
+        <h2 className="zcp2-dec-q">{d.question}</h2>
+        {issue && (
+          <a className="zcp2-link" href={issue} target="_blank" rel="noreferrer">
+            Issue ↗
           </a>
         )}
       </div>
-      {!!t.memory.last_check_failure && (
-        <>
-          <button disabled>Reintentar merge</button>
-          <small>
-            Solo disponible mediante una opción de decisión abierta del
-            servidor.
-          </small>
-        </>
+      <div className="zcp2-dec-bottom">
+        <label className="zcp2-note-label">
+          <span>Nota (opcional)</span>
+          <input
+            className="zcp2-note-input"
+            maxLength={2000}
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+            disabled={pending || unknown || !connection.active}
+          />
+        </label>
+        <div className="zcp2-dec-actions">
+          {d.options.map((choice, i) => (
+            <button
+              key={choice}
+              type="button"
+              className={`zcp2-btn ${i === 0 ? "zcp2-btn-ok" : choice === "Reject" ? "zcp2-btn-err" : ""}`}
+              disabled={pending || unknown || !connection.active}
+              onClick={() => void choose(choice)}
+            >
+              {plan && choice === "Approve"
+                ? "Aprobar"
+                : plan && choice === "Reject"
+                  ? "Rechazar"
+                  : choice}
+            </button>
+          ))}
+        </div>
+      </div>
+      {message && (
+        <p className="zcp2-notice" role="status">
+          {message}
+        </p>
       )}
     </article>
   );
 }
+
+function TaskRow({
+  t,
+  s,
+  now,
+  onSelect,
+}: {
+  t: Task;
+  s: State;
+  now: number;
+  onSelect: (t: Task) => void;
+}) {
+  const lane = taskLane(s, t);
+  const blocked = !!t.memory.last_check_failure || t.status.toLowerCase() === "blocked";
+  const dotClass = blocked
+    ? "is-blocked"
+    : t.memory.merge_checkpoint
+      ? "is-merge"
+      : lane === "active"
+        ? "is-active"
+        : lane === "queued"
+          ? "is-queued"
+          : "is-done";
+  const obs = observedStage(s, t);
+  return (
+    <div
+      className="zcp2-task-row"
+      role="button"
+      tabIndex={0}
+      onClick={() => onSelect(t)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onSelect(t);
+        }
+      }}
+    >
+      <span className="zcp2-task-id zcp2-mono">
+        <span className={`zcp2-status-dot ${dotClass}`} />
+        {t.task_id}
+      </span>
+      <span className="zcp2-repo zcp2-mono">{t.repository}</span>
+      <span className="zcp2-weight zcp2-mono">{t.weight}</span>
+      <span className="zcp2-task-title" title={t.title}>
+        <span>{t.title}</span>
+        {obs && (
+          <span style={{ color: "var(--z2-muted)", marginLeft: 6, fontSize: 10.5 }}>
+            · Etapa observada: {obs.status}
+          </span>
+        )}
+      </span>
+      <span className="zcp2-pipeline" aria-label={`Etapas de ${t.task_id}`}>
+        {t.required_stages.map((stage) => {
+          const st = s.stages[t.task_id + ":" + stage];
+          const done = t.stages_completed.includes(stage);
+          const fail = st && /FAIL|ERROR/.test(st.status);
+          const running = st?.status === "RUNNING" || t.current_stage === stage;
+          return (
+            <span
+              key={stage}
+              title={stage}
+              className={`zcp2-pip ${done ? "is-done" : fail ? "is-failed" : running ? "is-running" : ""}`}
+            />
+          );
+        })}
+      </span>
+      <span className="zcp2-age zcp2-mono">{formatAge(now, t.updated_epoch)}</span>
+    </div>
+  );
+}
+
 export function ConnectionBar({
   authMode,
   connected,
@@ -212,7 +231,7 @@ export function ConnectionBar({
         <div className="status" role="status">
           {notice}
         </div>
-        <button className="primary" type="button" onClick={onReconnect}>
+        <button className="zcp2-btn zcp2-btn-ok" type="button" onClick={onReconnect}>
           Reconectar
         </button>
       </section>
@@ -230,7 +249,7 @@ export function ConnectionBar({
       }}
     >
       <label>
-        Credencial de sesión
+        <span>Credencial de sesión</span>
         <input
           ref={inputRef}
           type="password"
@@ -239,15 +258,13 @@ export function ConnectionBar({
           required
         />
       </label>
-      <button className="primary" type="submit">
+      <button className="zcp2-btn zcp2-btn-ok" type="submit">
         Conectar
       </button>
-      <button type="button" onClick={onDisconnect}>
+      <button className="zcp2-btn" type="button" onClick={onDisconnect}>
         Desconectar
       </button>
-      <p>
-        Solo en memoria durante la conexión. El campo se borra al conectar.
-      </p>
+      <p>Solo en memoria durante la conexión. El campo se borra al conectar.</p>
       <div className="status" role="status">
         {connected ? "● " : ""}
         {notice}
@@ -255,6 +272,7 @@ export function ConnectionBar({
     </form>
   );
 }
+
 function App() {
   const [s, setS] = useState(initial),
     [notice, setNotice] = useState("Desconectado"),
@@ -265,7 +283,9 @@ function App() {
     [query, setQuery] = useState(""),
     [repoFilter, setRepoFilter] = useState("all"),
     [ultraDense, setUltraDense] = useState(false),
-    [eventFilter, setEventFilter] = useState<EventFilterKind>("ALL");
+    [activeTab, setActiveTab] = useState<"all" | "active" | "queued">("all"),
+    [eventFilter, setEventFilter] = useState<EventFilterKind>("ALL"),
+    [selectedTask, setSelectedTask] = useState<Task | null>(null);
   const input = useRef<HTMLInputElement>(null),
     sound = useRef(new Sound()),
     connection = useRef<Connection | null>(null);
@@ -304,53 +324,90 @@ function App() {
       sound.current.close();
     };
   }, [c]);
+
   const currentMood = mood(s, false, now);
-  const repos = Array.from(new Set(s.tasks.map((t) => t.repository))).sort();
-  const active = sortTasksNewestFirst(
-    s.tasks.filter((t) => taskLane(s, t) === "active" && matchesTaskFilter(t, query, repoFilter)),
+  const repos = useMemo(
+    () => Array.from(new Set(s.tasks.map((t) => t.repository))).sort(),
+    [s.tasks],
   );
-  const queued = sortTasksNewestFirst(
-    s.tasks.filter((t) => taskLane(s, t) === "queued" && matchesTaskFilter(t, query, repoFilter)),
+  const active = useMemo(
+    () =>
+      sortTasksNewestFirst(
+        s.tasks.filter(
+          (t) => taskLane(s, t) === "active" && matchesTaskFilter(t, query, repoFilter),
+        ),
+      ),
+    [s, query, repoFilter],
+  );
+  const queued = useMemo(
+    () =>
+      sortTasksNewestFirst(
+        s.tasks.filter(
+          (t) => taskLane(s, t) === "queued" && matchesTaskFilter(t, query, repoFilter),
+        ),
+      ),
+    [s, query, repoFilter],
   );
   const candidates = s.tasks.filter((t) => t.memory.merge_checkpoint);
-  const visibleFeed = filterEvents(s.feed, query, eventFilter);
-  const connected =
-    notice.includes("SSE") || notice.startsWith("Resincronizado");
+  const visibleFeed = useMemo(
+    () => filterEvents(s.feed, query, eventFilter),
+    [s.feed, query, eventFilter],
+  );
+  const connected = notice.includes("SSE") || notice.startsWith("Resincronizado");
+
   return (
-    <div data-density={ultraDense ? "ultra" : "compact"}>
+    <div className="zcp2-root" data-density={ultraDense ? "ultra" : "compact"}>
       <a className="skip" href="#main">
         Ir al contenido
       </a>
-      <header>
-        <div className="brand">
+      <header className="zcp2-topbar">
+        <div className="zcp2-brand">
           <Mascot mood={currentMood} small />
-          <h1>Zach</h1>
-        </div>
-        <div className="chips">
-          <span className="chip">
+          <h1 className="zcp2-title">Zach</h1>
+          <span className={`zcp2-pill ${connected ? "is-live" : ""}`}>
+            <span className="zcp2-dot" />
             {s.status
-              ? `Latido observado hace ${Math.max(0, Math.floor(now / 1000 - s.status.heartbeat_epoch))} s`
-              : "Latido no disponible"}
-          </span>
-          <span className="chip">
-            Slots{" "}
+              ? `Latido ${Math.max(0, Math.floor(now / 1000 - s.status.heartbeat_epoch))}s`
+              : "Latido —"}
             {s.status
-              ? `${s.status.running_task_slots} de ${s.status.max_parallel_tasks}`
-              : "no disponibles"}
+              ? ` · ${s.status.running_task_slots}/${s.status.max_parallel_tasks}`
+              : ""}
           </span>
-          <span className="chip">En curso: {active.length}</span>
-          <span className="chip">En cola: {queued.length}</span>
         </div>
-        <div className="controls">
+
+        <div className="zcp2-kpis">
+          <button
+            type="button"
+            className="zcp2-kpi-btn"
+            aria-pressed={activeTab === "active"}
+            onClick={() => setActiveTab(activeTab === "active" ? "all" : "active")}
+          >
+            <span>En curso</span>
+            <span className="zcp2-kpi-num">{active.length}</span>
+          </button>
+          <button
+            type="button"
+            className="zcp2-kpi-btn"
+            aria-pressed={activeTab === "queued"}
+            onClick={() => setActiveTab(activeTab === "queued" ? "all" : "queued")}
+          >
+            <span>En cola</span>
+            <span className="zcp2-kpi-num">{queued.length}</span>
+          </button>
+          <span className="zcp2-pill">Merge {candidates.length}</span>
+        </div>
+
+        <div className="zcp2-controls">
           <input
             type="search"
-            className="filter-input"
+            className="zcp2-search zcp2-mono"
             aria-label="Filtrar tareas y eventos"
             placeholder="Filtrar tarea, repo, evento..."
             value={query}
             onChange={(e) => setQuery(e.target.value)}
           />
           <select
+            className="zcp2-select"
             aria-label="Filtrar repositorio"
             value={repoFilter}
             onChange={(e) => setRepoFilter(e.target.value)}
@@ -364,15 +421,15 @@ function App() {
           </select>
           <button
             type="button"
+            className="zcp2-btn"
             aria-pressed={ultraDense}
             onClick={() => setUltraDense((u) => !u)}
           >
-            {ultraDense ? "Densidad: Ultra" : "Densidad: Compacta"}
-          </button>
-          <button disabled title="No disponible en esta versión">
-            Pausar cola
+            {ultraDense ? "Ultra-dense" : "Compact"}
           </button>
           <button
+            type="button"
+            className="zcp2-btn"
             aria-pressed={on}
             onClick={async () => {
               await sound.current.toggle();
@@ -383,6 +440,7 @@ function App() {
           </button>
         </div>
       </header>
+
       <ConnectionBar
         authMode={authMode}
         connected={connected}
@@ -408,72 +466,124 @@ function App() {
           if (input.current) input.current.value = "";
         }}
       />
-      <main id="main">
-        <section className="column" aria-label="Decisiones pendientes">
-          {s.decisions.length ? (
-            s.decisions.map((d) => (
-              <DecisionCard
-                key={d.decision_id}
-                d={d}
-                t={s.tasks.find((t) => t.task_id === d.task_id)}
-                connection={c}
-                epoch={epoch}
-                syncVersion={s.syncVersion}
-              />
-            ))
-          ) : (
-            <div className="card empty">
-              No hay decisiones abiertas en el último estado recibido.
-            </div>
-          )}
-          <div className="card identity">
-            <Mascot mood={currentMood} />
-            <div>
-              <h2>{moodText[currentMood]}</h2>
-              <p className="meta">
-                {s.decisions.length}{" "}
-                {s.decisions.length === 1
-                  ? "decisión abierta"
-                  : "decisiones abiertas"}
-              </p>
-            </div>
+
+      <main id="main" className="zcp2-grid">
+        {/* Left Pane: Pending Decisions Strip + Tabbed Dense Task Table */}
+        <section className="zcp2-col" aria-label="Decisiones pendientes y Tareas">
+          <div className="zcp2-sec-head">
+            <span className="zcp2-sec-title">
+              Decisiones pendientes
+              <span className="zcp2-count">{s.decisions.length}</span>
+            </span>
+            <span className="zcp2-mono" style={{ color: "var(--z2-faint)", fontSize: 10 }}>
+              {moodText[currentMood]}
+            </span>
           </div>
-        </section>
-        <section className="column" aria-label="Tareas">
-          <div>
-            <h2>En curso</h2>
-            {active.length ? (
-              active.map((t) => <TaskCard key={t.task_id} t={t} s={s} />)
+
+          <section aria-label="Decisiones pendientes" className="zcp2-decisions">
+            {s.decisions.length ? (
+              s.decisions.map((d) => (
+                <DecisionRow
+                  key={d.decision_id}
+                  d={d}
+                  t={s.tasks.find((t) => t.task_id === d.task_id)}
+                  connection={c}
+                  epoch={epoch}
+                  syncVersion={s.syncVersion}
+                />
+              ))
             ) : (
-              <p className="card empty">
-                No hay tareas en curso en el último estado recibido.
-              </p>
+              <div style={{ padding: "6px 10px", color: "var(--z2-muted)", fontSize: 11 }}>
+                No hay decisiones abiertas en el último estado recibido.
+              </div>
             )}
+          </section>
+
+          <div className="zcp2-tabs-list" role="tablist" aria-label="Filtro de tareas">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === "all"}
+              className="zcp2-tab"
+              onClick={() => setActiveTab("all")}
+            >
+              Todas ({active.length + queued.length})
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === "active"}
+              className="zcp2-tab"
+              onClick={() => setActiveTab("active")}
+            >
+              En curso ({active.length})
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === "queued"}
+              className="zcp2-tab"
+              onClick={() => setActiveTab("queued")}
+            >
+              En cola ({queued.length})
+            </button>
           </div>
-          <div>
-            <h2>En cola</h2>
-            {queued.length ? (
-              queued.map((t) => <TaskCard key={t.task_id} t={t} s={s} />)
-            ) : (
-              <p className="card empty">
-                No hay tareas en cola en el último estado recibido.
-              </p>
+
+          <section className="zcp2-tab-panel" aria-label="Tareas">
+            <div className="zcp2-table-head">
+              <span>Task</span>
+              <span>Repo</span>
+              <span>W</span>
+              <span>Title</span>
+              <span>Stages</span>
+              <span style={{ textAlign: "right" }}>Age</span>
+            </div>
+            {activeTab !== "queued" && (
+              <div>
+                <h2 className="zcp2-group-label">En curso ({active.length})</h2>
+                {active.length ? (
+                  active.map((t) => (
+                    <TaskRow key={t.task_id} t={t} s={s} now={now} onSelect={setSelectedTask} />
+                  ))
+                ) : (
+                  <p style={{ padding: "6px 10px", color: "var(--z2-muted)", margin: 0 }}>
+                    No hay tareas en curso en el último estado recibido.
+                  </p>
+                )}
+              </div>
             )}
-          </div>
+            {activeTab !== "active" && (
+              <div>
+                <h2 className="zcp2-group-label">En cola ({queued.length})</h2>
+                {queued.length ? (
+                  queued.map((t) => (
+                    <TaskRow key={t.task_id} t={t} s={s} now={now} onSelect={setSelectedTask} />
+                  ))
+                ) : (
+                  <p style={{ padding: "6px 10px", color: "var(--z2-muted)", margin: 0 }}>
+                    No hay tareas en cola en el último estado recibido.
+                  </p>
+                )}
+              </div>
+            )}
+          </section>
         </section>
-        <aside className="column right">
-          <section className="card" aria-labelledby="merge-heading">
-            <h2 id="merge-heading">Cola de merge</h2>
-            <p className="meta">
-              Vista parcial de checkpoints. El servidor no publica la cola FIFO
-              completa.
-            </p>
+
+        {/* Right Pane: Merge Queue Strip + Dense Live Event Stream */}
+        <aside className="zcp2-col" aria-label="Cola de merge y Eventos">
+          <div className="zcp2-sec-head">
+            <h2 id="merge-heading" className="zcp2-sec-title">
+              Cola de merge
+              <span className="zcp2-count">{candidates.length}</span>
+            </h2>
+          </div>
+          <div className="zcp2-merge-list">
             {candidates.length ? (
               candidates.map((t) => (
-                <div className="lane" key={t.task_id}>
-                  <span>{t.repository}</span>
-                  <span className="id">{t.task_id}</span>
-                  <span className="meta">
+                <div className="zcp2-merge-row zcp2-mono" key={t.task_id}>
+                  <span style={{ fontWeight: 700 }}>{t.task_id}</span>
+                  <span style={{ color: "var(--z2-muted)" }}>{t.repository}</span>
+                  <span style={{ color: "var(--z2-purple)" }}>
                     {typeof t.memory.merge_checkpoint === "object" &&
                     t.memory.merge_checkpoint &&
                     "phase" in t.memory.merge_checkpoint
@@ -483,64 +593,138 @@ function App() {
                 </div>
               ))
             ) : (
-              <p className="empty">Sin checkpoints de merge recibidos.</p>
+              <p style={{ padding: "5px 10px", color: "var(--z2-muted)", margin: 0, fontSize: 11 }}>
+                Sin checkpoints de merge recibidos.
+              </p>
             )}
-          </section>
-          <section className="card" aria-labelledby="events-heading">
-            <div className="section-bar">
-              <h2 id="events-heading">Eventos</h2>
-              <div className="actions">
-                {(
-                  [
-                    ["ALL", "Todos"],
-                    ["STAGE", "Etapas"],
-                    ["DECISION", "Decisiones"],
-                    ["ERR", "Errores"],
-                  ] as const
-                ).map(([kind, label]) => (
-                  <button
-                    key={kind}
-                    type="button"
-                    aria-pressed={eventFilter === kind}
-                    onClick={() => setEventFilter(kind)}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-            </div>
-            <p className="meta">
-              {visibleFeed.length === 1
-                ? "Mostrando 1 evento"
-                : `Mostrando ${visibleFeed.length} eventos`}{" "}
-              · total {s.feed.length} (máximo 200)
-            </p>
-            <ol className="events">
-              {visibleFeed.map((e) => (
-                <li key={e.seq_id}>
-                  <time>
-                    {new Date(e.ts_epoch * 1000).toLocaleTimeString("es")}
-                  </time>
-                  <span className="eventkind">{e.event_type}</span>
-                  <span className="id">{e.task_id}</span>
-                  {e.detail && <span className="meta">{e.detail}</span>}
-                </li>
+          </div>
+
+          <div className="zcp2-sec-head">
+            <h2 id="events-heading" className="zcp2-sec-title">
+              Eventos
+              <span className="zcp2-count">{visibleFeed.length}/200</span>
+            </h2>
+            <div className="zcp2-events-filters">
+              {(
+                [
+                  ["ALL", "ALL"],
+                  ["STAGE", "STAGE"],
+                  ["DECISION", "DECISION"],
+                  ["ERR", "ERR"],
+                ] as const
+              ).map(([kind, label]) => (
+                <button
+                  key={kind}
+                  type="button"
+                  className="zcp2-chip zcp2-mono"
+                  aria-pressed={eventFilter === kind}
+                  onClick={() => setEventFilter(kind)}
+                >
+                  {label}
+                </button>
               ))}
-            </ol>
+            </div>
+          </div>
+
+          <ol className="zcp2-events-feed zcp2-mono">
+            {visibleFeed.map((e) => (
+              <li key={e.seq_id} className="zcp2-ev-row">
+                <time className="zcp2-ev-time">
+                  {new Date(e.ts_epoch * 1000).toLocaleTimeString("es")}
+                </time>
+                <span className={`zcp2-ev-type ${eventTone(e.event_type)}`}>
+                  {e.event_type}
+                </span>
+                <button
+                  type="button"
+                  className="zcp2-ev-task"
+                  onClick={() => setQuery(e.task_id === query ? "" : e.task_id)}
+                >
+                  {e.task_id}
+                </button>
+                <span className="zcp2-ev-detail" title={e.detail}>
+                  {e.detail ?? ""}
+                </span>
+              </li>
+            ))}
             {!visibleFeed.length && (
-              <p className="empty">Esperando nuevos eventos del stream.</p>
+              <li style={{ padding: "6px 10px", color: "var(--z2-muted)" }}>
+                Esperando nuevos eventos del stream.
+              </li>
             )}
-          </section>
-          <p className="meta">
-            El latido es una observación fechada; la conexión SSE no prueba
-            actividad del daemon. Los cambios sin evento se verán en el próximo
-            snapshot del stream.
-          </p>
+          </ol>
         </aside>
       </main>
+
+      {selectedTask && (
+        <div
+          className="zcp2-dialog-backdrop"
+          onClick={() => setSelectedTask(null)}
+        >
+          <div
+            className="zcp2-dialog-popup"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="task-dialog-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="zcp2-dialog-head">
+              <div>
+                <div className="zcp2-mono" style={{ color: "var(--z2-accent)", fontSize: 11 }}>
+                  {selectedTask.task_id} · {selectedTask.repository} · Peso {selectedTask.weight}
+                </div>
+                <h2 id="task-dialog-title" style={{ margin: "2px 0 0", fontSize: 14 }}>
+                  {selectedTask.title}
+                </h2>
+              </div>
+              <button
+                type="button"
+                className="zcp2-btn"
+                onClick={() => setSelectedTask(null)}
+              >
+                Cerrar
+              </button>
+            </div>
+            <div className="zcp2-dialog-meta zcp2-mono">
+              <div>Estado: {selectedTask.status}</div>
+              <div>GitHub: {selectedTask.board_status ?? "Desconocido"}</div>
+              <div>Etapa actual: {selectedTask.current_stage ?? "—"}</div>
+              <div>Actualizado: {formatAge(now, selectedTask.updated_epoch)}</div>
+            </div>
+            {taskDecision(s, selectedTask) && (
+              <p style={{ margin: "6px 0", color: "var(--z2-accent)", fontSize: 11.5 }}>
+                Decisión abierta: {taskDecision(s, selectedTask)!.question}
+              </p>
+            )}
+            <div style={{ display: "flex", gap: 6, justifyContent: "flex-end", marginTop: 10 }}>
+              {github(selectedTask, "pull") && (
+                <a
+                  className="zcp2-btn zcp2-link"
+                  href={github(selectedTask, "pull")}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  Ver PR #{selectedTask.pr_number} ↗
+                </a>
+              )}
+              <button
+                type="button"
+                className="zcp2-btn"
+                onClick={() => {
+                  setQuery(selectedTask.task_id);
+                  setSelectedTask(null);
+                }}
+              >
+                Filtrar eventos
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
+
 if (typeof document !== "undefined") {
   const root = document.getElementById("root");
   if (root) {
