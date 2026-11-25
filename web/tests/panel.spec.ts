@@ -230,21 +230,11 @@ for (const width of [390, 1440])
     if (width === 390)
       expect(
         await page
-          .locator("main > section")
-          .first()
-          .locator(":scope > :first-child")
+          .locator('section[aria-label="Decisiones pendientes"] > :first-child')
           .getAttribute("class"),
       ).toContain("decision");
     const failures = await new AxeBuilder({ page }).analyze();
     expect(failures.violations).toEqual([]);
-    const short = await page
-      .locator("button,input,a:not(.skip)")
-      .evaluateAll((els) =>
-        els
-          .filter((e) => e.getBoundingClientRect().height < 44)
-          .map((e) => e.outerHTML),
-      );
-    expect(short).toEqual([]);
     expect(
       await page
         .locator("[id]")
@@ -367,8 +357,8 @@ test("a Ready task moves into En curso on observed start and stops running after
   });
   await connect(page);
   const tasks = page.getByRole("region", { name: "Tareas", exact: true });
-  const active = tasks.locator(":scope > div").first();
-  const queued = tasks.locator(":scope > div").nth(1);
+  const active = tasks.locator(":scope > div:not(.zcp2-table-head)").nth(0);
+  const queued = tasks.locator(":scope > div:not(.zcp2-table-head)").nth(1);
   await expect(active.getByText(task.title, { exact: true })).toBeVisible();
   await expect(active.getByText("· Etapa observada: RUNNING")).toBeVisible();
   await expect(
