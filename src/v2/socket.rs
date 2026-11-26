@@ -2,10 +2,12 @@ pub const DEFAULT_MAX_BUFFER_LEN: usize = 256;
 pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
+use crate::v2::gemini::TaskExplainInput;
 use crate::v2::now_epoch;
 use crate::v2::store::{
     AttemptAuditRecord, DaemonStatusSummary, DecisionResolution, PendingDecisionRecord,
-    ProviderCooldownRecord, StageAttemptRecord, TaskEventRecord, TaskRecord, V2Store, V2StoreError,
+    ProviderCooldownRecord, StageAttemptRecord, TaskEventRecord, TaskExplanationRecord, TaskRecord,
+    V2Store, V2StoreError,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -100,6 +102,12 @@ pub enum ClientCommand {
     Sessions {
         #[serde(default)]
         include_stale: bool,
+    },
+    #[serde(alias = "EXPLAIN_TASK", alias = "ExplainTask")]
+    ExplainTask {
+        task_id: String,
+        #[serde(default)]
+        refresh: bool,
     },
 }
 
@@ -353,6 +361,17 @@ pub enum ServerMessage {
     SessionsList {
         sessions: Vec<SessionAnnouncementRecord>,
         as_of_seq: i64,
+    },
+    #[serde(rename = "TASK_EXPLANATION")]
+    TaskExplanation {
+        ok: bool,
+        task_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        explanation: Option<TaskExplanationRecord>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_code: Option<String>,
     },
     #[serde(rename = "ERROR")]
     Error { error: String },
@@ -818,6 +837,18 @@ impl DaemonServer {
                         },
                     );
                 }
+                Ok(ClientCommand::ExplainTask { task_id, .. }) => {
+                    let _ = write_ndjson(
+                        &mut sub.stream,
+                        &ServerMessage::TaskExplanation {
+                            ok: false,
+                            task_id,
+                            explanation: None,
+                            error: Some("explain_task requires coordinator".into()),
+                            error_code: Some("UNSUPPORTED".into()),
+                        },
+                    );
+                }
                 Err(e) => {
                     let msg = ServerMessage::Error {
                         error: format!("invalid command: {e}"),
@@ -1278,6 +1309,55 @@ pub(crate) fn build_task_detail_message(
         audits,
         decisions,
     })
+}
+
+pub(crate) fn build_task_explain_input(
+    store: &V2Store,
+    task_id: &str,
+) -> Result<Option<(TaskExplainInput, i64, Option<String>)>, V2StoreError> {
+    let ServerMessage::TaskDetail {
+        task: Some(task),
+        attempts,
+        audits: _,
+        decisions,
+    } = build_task_detail_message(store, task_id)?
+    else {
+        return Ok(None);
+    };
+    let updated_epoch = task.updated_epoch;
+    let open_decision_id = decisions
+        .iter()
+        .find(|d| d.status == "OPEN")
+        .map(|d| d.decision_id.clone());
+    let attempts_summary = attempts
+        .iter()
+        .rev()
+        .take(3)
+        .map(|a| {
+            let summary = a.summary.as_deref().unwrap_or("");
+            if summary.is_empty() {
+                format!("{} {}", a.stage, a.status)
+            } else {
+                format!("{} {}: {}", a.stage, a.status, summary)
+            }
+        })
+        .collect();
+    let decisions_summary = decisions
+        .iter()
+        .filter(|d| d.status == "OPEN")
+        .take(2)
+        .map(|d| format!("{} [{}]", d.question, d.options.join(", ")))
+        .collect();
+    let input = TaskExplainInput {
+        task_id: task.task_id,
+        title: task.title,
+        status: task.status,
+        current_stage: task.current_stage,
+        last_check_failure: task.memory.last_check_failure,
+        attempts_summary,
+        decisions_summary,
+    };
+    Ok(Some((input, updated_epoch, open_decision_id)))
 }
 
 #[cfg(test)]

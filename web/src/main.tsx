@@ -25,6 +25,7 @@ import {
   type Task,
   type Decision,
   type TaskDetail,
+  type TaskExplanation,
   type AttemptAudit,
 } from "./protocol";
 import { Mascot, moodText } from "./Mascot";
@@ -43,6 +44,95 @@ function eventTone(eventType: string): string {
   if (/FAIL|ERROR|REJECT|DENIED/.test(eventType)) return "is-err";
   if (/DECISION/.test(eventType)) return "is-warn";
   return "";
+}
+
+function AiExplanationPanel({
+  taskId,
+  connection,
+}: {
+  taskId: string;
+  connection: Connection;
+}) {
+  const [explanation, setExplanation] = useState<TaskExplanation | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  async function requestExplain(refresh: boolean) {
+    if (loading || !connection.active) return;
+    setLoading(true);
+    setError("");
+    try {
+      const result = await connection.explainTask(taskId, refresh);
+      setExplanation(result);
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "No se pudo explicar la tarea",
+      );
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="zcp2-ai-box">
+      <div className="zcp2-ai-actions">
+        <button
+          type="button"
+          className="zcp2-btn zcp2-ai-btn"
+          disabled={loading || !connection.active}
+          onClick={() => void requestExplain(Boolean(explanation))}
+        >
+          {loading
+            ? "Analizando con Gemini…"
+            : explanation
+              ? "Regenerar"
+              : "Explicar con IA"}
+        </button>
+        {explanation && (
+          <span className="zcp2-ai-badge zcp2-mono">
+            {explanation.cached ? "Caché" : "En vivo"} · {explanation.model}
+          </span>
+        )}
+      </div>
+      {error && (
+        <p className="zcp2-notice zcp2-ai-error" role="status">
+          {error}
+        </p>
+      )}
+      {explanation && (
+        <div className="zcp2-ai-panel" aria-label={`Explicación IA de ${taskId}`}>
+          {explanation.task_goal && (
+            <div className="zcp2-ai-section">
+              <div className="zcp2-ai-label">Objetivo</div>
+              <p>{explanation.task_goal}</p>
+            </div>
+          )}
+          {explanation.agent_actions && (
+            <div className="zcp2-ai-section">
+              <div className="zcp2-ai-label">Acciones del agente</div>
+              <p>{explanation.agent_actions}</p>
+            </div>
+          )}
+          {explanation.failure_diagnosis && (
+            <div className="zcp2-ai-section">
+              <div className="zcp2-ai-label">Diagnóstico</div>
+              <p>{explanation.failure_diagnosis}</p>
+            </div>
+          )}
+          {explanation.option_guide.length > 0 && (
+            <div className="zcp2-ai-section">
+              <div className="zcp2-ai-label">Guía de opciones</div>
+              <ul>
+                {explanation.option_guide.map((opt, idx) => (
+                  <li key={idx}>{opt}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function DecisionRow({
@@ -134,6 +224,7 @@ function DecisionRow({
           <pre className="zcp2-pre zcp2-mono">{lastCheckFailure}</pre>
         </details>
       )}
+      <AiExplanationPanel taskId={d.task_id} connection={connection} />
       <div className="zcp2-dec-bottom">
         <label className="zcp2-note-label">
           <span>Nota (opcional)</span>
@@ -752,6 +843,7 @@ function App() {
           detailLoading={detailLoading}
           detailError={detailError}
           now={now}
+          connection={connection.current ?? undefined}
           onClose={() => setSelectedTask(null)}
           onFilterEvents={(taskId) => {
             setQuery(taskId);
@@ -784,6 +876,7 @@ export function TaskDetailModal({
   detailLoading,
   detailError,
   now,
+  connection,
   onClose,
   onFilterEvents,
 }: {
@@ -793,6 +886,7 @@ export function TaskDetailModal({
   detailLoading: boolean;
   detailError: string;
   now: number;
+  connection?: Connection;
   onClose: () => void;
   onFilterEvents: (taskId: string) => void;
 }) {
@@ -884,6 +978,15 @@ export function TaskDetailModal({
 
         {tab === "summary" && (
           <div id="panel-summary" role="tabpanel" aria-labelledby="tab-summary">
+            {connection && (
+              <div className="zcp2-dialog-section">
+                <div className="zcp2-dialog-label">Asistente IA</div>
+                <AiExplanationPanel
+                  taskId={activeTask.task_id}
+                  connection={connection}
+                />
+              </div>
+            )}
             <div className="zcp2-dialog-section">
               <div className="zcp2-dialog-label">Pipeline de etapas</div>
               <div

@@ -519,6 +519,21 @@ pub struct ProviderCooldownRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskExplanationRecord {
+    pub task_id: String,
+    pub updated_epoch: i64,
+    pub open_decision_id: Option<String>,
+    pub model: String,
+    pub task_goal: String,
+    pub agent_actions: String,
+    pub failure_diagnosis: String,
+    pub option_guide: Vec<String>,
+    pub created_epoch: i64,
+    #[serde(default)]
+    pub cached: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DecisionResolution {
     Resolved(PendingDecisionRecord),
     AlreadyResolved(PendingDecisionRecord),
@@ -954,6 +969,19 @@ impl V2Store {
                  check_divergence INTEGER NOT NULL DEFAULT 0,
                  error_code TEXT,
                  created_epoch INTEGER NOT NULL
+             );
+
+             CREATE TABLE IF NOT EXISTS task_explanations (
+                 task_id TEXT NOT NULL,
+                 updated_epoch INTEGER NOT NULL,
+                 open_decision_id TEXT NOT NULL DEFAULT '',
+                 model TEXT NOT NULL,
+                 task_goal TEXT NOT NULL,
+                 agent_actions TEXT NOT NULL,
+                 failure_diagnosis TEXT NOT NULL,
+                 option_guide_json TEXT NOT NULL DEFAULT '[]',
+                 created_epoch INTEGER NOT NULL,
+                 PRIMARY KEY(task_id, updated_epoch, open_decision_id)
              );",
         )?;
 
@@ -4593,6 +4621,79 @@ impl V2Store {
         })
     }
 
+    pub fn get_cached_explanation(
+        &self,
+        task_id: &str,
+        updated_epoch: i64,
+        open_decision_id: Option<&str>,
+    ) -> Result<Option<TaskExplanationRecord>, V2StoreError> {
+        let decision_key = open_decision_id.unwrap_or("");
+        self.conn
+            .query_row(
+                "SELECT task_id, updated_epoch, open_decision_id, model, task_goal, agent_actions, failure_diagnosis, option_guide_json, created_epoch
+                 FROM task_explanations
+                 WHERE task_id = ?1 AND updated_epoch = ?2 AND open_decision_id = ?3",
+                params![task_id, updated_epoch, decision_key],
+                |row| {
+                    let raw_decision: String = row.get(2)?;
+                    let raw_guide: String = row.get(7)?;
+                    let option_guide: Vec<String> =
+                        serde_json::from_str(&raw_guide).unwrap_or_default();
+                    Ok(TaskExplanationRecord {
+                        task_id: row.get(0)?,
+                        updated_epoch: row.get(1)?,
+                        open_decision_id: if raw_decision.is_empty() {
+                            None
+                        } else {
+                            Some(raw_decision)
+                        },
+                        model: row.get(3)?,
+                        task_goal: row.get(4)?,
+                        agent_actions: row.get(5)?,
+                        failure_diagnosis: row.get(6)?,
+                        option_guide,
+                        created_epoch: row.get(8)?,
+                        cached: true,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn upsert_cached_explanation(
+        &mut self,
+        record: &TaskExplanationRecord,
+    ) -> Result<(), V2StoreError> {
+        let decision_key = record.open_decision_id.as_deref().unwrap_or("");
+        let guide_json = serde_json::to_string(&record.option_guide)?;
+        self.conn.execute(
+            "INSERT INTO task_explanations(
+                 task_id, updated_epoch, open_decision_id, model,
+                 task_goal, agent_actions, failure_diagnosis, option_guide_json, created_epoch
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(task_id, updated_epoch, open_decision_id) DO UPDATE SET
+                 model = excluded.model,
+                 task_goal = excluded.task_goal,
+                 agent_actions = excluded.agent_actions,
+                 failure_diagnosis = excluded.failure_diagnosis,
+                 option_guide_json = excluded.option_guide_json,
+                 created_epoch = excluded.created_epoch",
+            params![
+                record.task_id,
+                record.updated_epoch,
+                decision_key,
+                record.model,
+                record.task_goal,
+                record.agent_actions,
+                record.failure_diagnosis,
+                guide_json,
+                record.created_epoch,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn upsert_provider_cooldown(
         &mut self,
         family: &str,
@@ -8100,5 +8201,44 @@ mod tests {
         assert_eq!(for_t1[0].status, "OPEN");
         assert_eq!(for_t1[1].status, "RESOLVED");
         assert_eq!(for_t1[1].note.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn task_explanations_cache_keyed_by_task_epoch_and_decision() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        let rec = TaskExplanationRecord {
+            task_id: "ZACH-091".to_owned(),
+            updated_epoch: 100,
+            open_decision_id: Some("dec-1".to_owned()),
+            model: "gemini-decision-1".to_owned(),
+            task_goal: "Meta".to_owned(),
+            agent_actions: "Acciones".to_owned(),
+            failure_diagnosis: "Diagnóstico".to_owned(),
+            option_guide: vec!["Retry: reintentar".to_owned()],
+            created_epoch: 101,
+            cached: false,
+        };
+        store.upsert_cached_explanation(&rec).unwrap();
+
+        let hit = store
+            .get_cached_explanation("ZACH-091", 100, Some("dec-1"))
+            .unwrap()
+            .expect("cache hit");
+        assert!(hit.cached);
+        assert_eq!(hit.task_goal, "Meta");
+        assert_eq!(hit.option_guide, vec!["Retry: reintentar".to_owned()]);
+
+        assert!(
+            store
+                .get_cached_explanation("ZACH-091", 101, Some("dec-1"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_cached_explanation("ZACH-091", 100, None)
+                .unwrap()
+                .is_none()
+        );
     }
 }

@@ -108,6 +108,26 @@ pub struct GenerateContentResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskExplainInput {
+    pub task_id: String,
+    pub title: String,
+    pub status: String,
+    pub current_stage: Option<String>,
+    pub last_check_failure: Option<String>,
+    pub attempts_summary: Vec<String>,
+    pub decisions_summary: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TaskExplanationOutput {
+    pub task_goal: String,
+    pub agent_actions: String,
+    pub failure_diagnosis: String,
+    #[serde(default)]
+    pub option_guide: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeminiHttpResponse {
     pub body: Vec<u8>,
 }
@@ -449,6 +469,139 @@ impl GeminiClient {
         })?;
         Ok(parse_decision_1_class(&resp))
     }
+
+    /// On-demand read-only task and decision explainer returning structured
+    /// Spanish JSON with ADR-004 redaction on both prompt and output.
+    pub fn explain_task(
+        &self,
+        input: &TaskExplainInput,
+        provider_cooldown_until: Option<i64>,
+    ) -> Result<TaskExplanationOutput, GeminiError> {
+        let prompt = build_task_explain_prompt(input);
+        let resp = self.generate_content(&GenerateContentRequest {
+            model: None,
+            system_instruction: Some(
+                "Eres un asistente técnico de diagnóstico. Responde únicamente en español con JSON válido con las claves: task_goal (string), agent_actions (string), failure_diagnosis (string), option_guide (array de strings). Sé conciso y preciso."
+                    .to_owned(),
+            ),
+            prompt,
+            max_output_tokens: 512,
+            temperature: Some(0.2),
+            response_mime_type: Some("application/json".to_owned()),
+            provider_cooldown_until,
+        })?;
+        parse_task_explanation_output(&resp)
+    }
+}
+
+fn build_task_explain_prompt(input: &TaskExplainInput) -> String {
+    let mut parts = vec![
+        format!("task_id: {}", redact_adr004_text(&input.task_id, 64)),
+        format!("title: {}", redact_adr004_text(&input.title, 160)),
+        format!("status: {}", redact_adr004_text(&input.status, 48)),
+    ];
+    if let Some(stage) = input.current_stage.as_deref() {
+        parts.push(format!("stage: {}", redact_adr004_text(stage, 48)));
+    }
+    if let Some(failure) = input.last_check_failure.as_deref() {
+        parts.push(format!(
+            "last_failure: {}",
+            redact_adr004_text(failure, 240)
+        ));
+    }
+    if !input.decisions_summary.is_empty() {
+        let joined = input
+            .decisions_summary
+            .iter()
+            .take(2)
+            .map(|d| redact_adr004_text(d, 160))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        parts.push(format!("decisions: {joined}"));
+    }
+    if !input.attempts_summary.is_empty() {
+        let joined = input
+            .attempts_summary
+            .iter()
+            .take(3)
+            .map(|a| redact_adr004_text(a, 120))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        parts.push(format!("attempts: {joined}"));
+    }
+    redact_adr004_text(&parts.join("\n"), MAX_GEMINI_PROMPT_CHARS)
+}
+
+fn strip_json_fences(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix("```") {
+        let after_lang = rest
+            .strip_prefix("json")
+            .or_else(|| rest.strip_prefix("JSON"))
+            .unwrap_or(rest)
+            .trim_start_matches(['\r', '\n']);
+        if let Some(stripped) = after_lang.strip_suffix("```") {
+            return stripped.trim();
+        }
+        return after_lang.trim();
+    }
+    trimmed
+}
+
+fn extract_bounded_str(val: &Value, keys: &[&str], max_chars: usize) -> String {
+    for key in keys {
+        if let Some(s) = val.get(*key).and_then(Value::as_str) {
+            let clean = redact_adr004_text(s.trim(), max_chars);
+            if !clean.is_empty() {
+                return clean;
+            }
+        }
+    }
+    String::new()
+}
+
+pub fn parse_task_explanation_output(
+    resp: &GenerateContentResponse,
+) -> Result<TaskExplanationOutput, GeminiError> {
+    let text = resp
+        .text
+        .as_deref()
+        .map(strip_json_fences)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| GeminiError::Parse("empty explanation response".to_owned()))?;
+    let val: Value = serde_json::from_str(text)
+        .map_err(|e| GeminiError::Parse(format!("invalid explanation json: {e}")))?;
+    let task_goal = extract_bounded_str(&val, &["task_goal", "summary"], 512);
+    let agent_actions = extract_bounded_str(&val, &["agent_actions", "actions"], 512);
+    let failure_diagnosis = extract_bounded_str(&val, &["failure_diagnosis", "why_blocked"], 512);
+    let option_guide = match val.get("option_guide").or_else(|| val.get("next_actions")) {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|s| redact_adr004_text(s.trim(), 256))
+            .filter(|s| !s.is_empty())
+            .take(6)
+            .collect(),
+        Some(Value::String(s)) => s
+            .lines()
+            .map(|l| l.trim().trim_start_matches(['-', '*', ' ']).trim())
+            .map(|l| redact_adr004_text(l, 256))
+            .filter(|l| !l.is_empty())
+            .take(6)
+            .collect(),
+        _ => Vec::new(),
+    };
+    if task_goal.is_empty() && agent_actions.is_empty() && failure_diagnosis.is_empty() {
+        return Err(GeminiError::Parse(
+            "explanation json missing required fields".to_owned(),
+        ));
+    }
+    Ok(TaskExplanationOutput {
+        task_goal,
+        agent_actions,
+        failure_diagnosis,
+        option_guide,
+    })
 }
 
 fn match_failure_class_label(raw: &str) -> Option<&'static str> {
@@ -716,5 +869,85 @@ mod tests {
         .unwrap();
         assert!(cfg.contains("header = \"x-goog-api-key: key-\\\"abc\\\"\""));
         assert!(!cfg.contains("key=\"abc\""));
+    }
+
+    #[test]
+    fn explain_task_parses_structured_spanish_json_and_redacts_prompt() {
+        let transport = Arc::new(MockTransport::new(Box::new(|_: usize, _: &Value| {
+            Ok(GeminiHttpResponse {
+                body: serde_json::to_vec(&json!({
+                    "candidates": [{
+                        "finishReason": "STOP",
+                        "content": {
+                            "parts": [{
+                                "text": "```json\n{\"task_goal\":\"Agregar explicador\",\"agent_actions\":\"Ejecutó pruebas\",\"failure_diagnosis\":\"Falló lint\",\"option_guide\":[\"Retry: reintentar etapa\",\"Skip: omitir\"]}\n```"
+                            }]
+                        }
+                    }]
+                }))
+                .unwrap(),
+            })
+        })));
+        let cfg = test_config(Some("secret-key"));
+        let client = GeminiClient::with_transport(cfg, transport.clone());
+
+        let out = client
+            .explain_task(
+                &TaskExplainInput {
+                    task_id: "ZACH-091".to_owned(),
+                    title: "Explicador".to_owned(),
+                    status: "BLOCKED".to_owned(),
+                    current_stage: Some("impl".to_owned()),
+                    last_check_failure: Some("Authorization: Bearer supersecret".to_owned()),
+                    attempts_summary: vec!["impl FAILED".to_owned()],
+                    decisions_summary: vec!["Retry or Skip?".to_owned()],
+                },
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(out.task_goal, "Agregar explicador");
+        assert_eq!(out.agent_actions, "Ejecutó pruebas");
+        assert_eq!(out.failure_diagnosis, "Falló lint");
+        assert_eq!(out.option_guide.len(), 2);
+
+        let prompts = transport.captured_prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert!(!prompts[0].contains("supersecret"));
+    }
+
+    #[test]
+    fn explain_task_respects_offline_missing_key_and_cooldown() {
+        let input = TaskExplainInput {
+            task_id: "ZACH-091".to_owned(),
+            title: "Test".to_owned(),
+            status: "BLOCKED".to_owned(),
+            current_stage: None,
+            last_check_failure: None,
+            attempts_summary: Vec::new(),
+            decisions_summary: Vec::new(),
+        };
+
+        let mut offline_cfg = test_config(Some("key"));
+        offline_cfg.offline = true;
+        assert_eq!(
+            GeminiClient::new(offline_cfg).explain_task(&input, None),
+            Err(GeminiError::Offline)
+        );
+
+        let missing_cfg = test_config(None);
+        assert_eq!(
+            GeminiClient::new(missing_cfg).explain_task(&input, None),
+            Err(GeminiError::MissingApiKey)
+        );
+
+        let cooldown_cfg = test_config(Some("key"));
+        let future = now_epoch() + 120;
+        assert_eq!(
+            GeminiClient::new(cooldown_cfg).explain_task(&input, Some(future)),
+            Err(GeminiError::CooldownActive {
+                until_epoch: future
+            })
+        );
     }
 }

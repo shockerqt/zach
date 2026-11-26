@@ -26,6 +26,7 @@ const BACKEND_LIMIT: usize = 4 * 1024 * 1024;
 const MAX_CLIENTS: usize = 32;
 const MAX_SSE: usize = 8;
 const WAIT: Duration = Duration::from_secs(5);
+const EXPLAIN_WAIT: Duration = Duration::from_secs(12);
 const TICK: Duration = Duration::from_millis(50);
 
 const DEFAULT_DECISION_KINDS: &[&str] = &[
@@ -162,6 +163,7 @@ fn preflight(
 ) -> io::Result<()> {
     let method = match req.route.as_str() {
         "/api/snapshot" | "/api/events" => "GET",
+        route if route.starts_with("/api/tasks/") && route.ends_with("/explain") => "POST",
         route if route.starts_with("/api/tasks/") && route.len() > "/api/tasks/".len() => "GET",
         "/api/decide" => "POST",
         _ => return error(stream, 403, "preflight forbidden", stop, origin),
@@ -597,6 +599,12 @@ pub struct DecideRequestBody {
     #[serde(default)]
     pub note: Option<String>,
 }
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ExplainTaskRequestBody {
+    #[serde(default)]
+    pub refresh: bool,
+}
 struct Request {
     method: String,
     route: String,
@@ -633,6 +641,23 @@ fn decode(s: &str) -> io::Result<String> {
 }
 fn parse_task_detail_id(raw_route: &str) -> Option<Result<String, &'static str>> {
     let suffix = raw_route.strip_prefix("/api/tasks/")?;
+    let Ok(decoded) = decode(suffix) else {
+        return Some(Err("invalid task id"));
+    };
+    if decoded.is_empty()
+        || decoded.len() > 128
+        || decoded.contains('/')
+        || decoded.contains("..")
+        || decoded.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Some(Err("invalid task id"));
+    }
+    Some(Ok(decoded))
+}
+fn parse_task_explain_id(raw_route: &str) -> Option<Result<String, &'static str>> {
+    let suffix = raw_route
+        .strip_prefix("/api/tasks/")?
+        .strip_suffix("/explain")?;
     let Ok(decoded) = decode(suffix) else {
         return Some(Err("invalid task id"));
     };
@@ -1675,6 +1700,56 @@ fn serve(
                 }
             }
             Ok(())
+        }
+        ("POST", route) if route.starts_with("/api/tasks/") && route.ends_with("/explain") => {
+            let task_id = match parse_task_explain_id(route) {
+                Some(Ok(id)) => id,
+                Some(Err(msg)) => return error(stream, 400, msg, stop, origin),
+                None => return error(stream, 404, "not found", stop, origin),
+            };
+            let refresh = if req.body.is_empty() {
+                false
+            } else {
+                match serde_json::from_slice::<ExplainTaskRequestBody>(&req.body) {
+                    Ok(body) => body.refresh,
+                    Err(_) => return error(stream, 400, "invalid explain request", stop, origin),
+                }
+            };
+            let deadline = Instant::now() + EXPLAIN_WAIT;
+            let result = (|| {
+                let mut backend = Backend::connect(path, stop, deadline)?;
+                backend.send(
+                    &ClientCommand::ExplainTask { task_id, refresh },
+                    stop,
+                    deadline,
+                )?;
+                match backend.receive(stop, deadline)? {
+                    Some(ServerMessage::TaskExplanation {
+                        ok,
+                        explanation,
+                        error: err_msg,
+                        error_code,
+                        ..
+                    }) => Ok((ok, explanation, err_msg, error_code)),
+                    _ => Err(invalid("backend explanation unavailable")),
+                }
+            })();
+            match result {
+                Ok((true, Some(explanation), _, _)) => {
+                    response(stream, 200, &explanation, stop, origin)
+                }
+                Ok((false, _, _, Some(code))) if code == "NOT_FOUND" => {
+                    error(stream, 404, "task not found", stop, origin)
+                }
+                Ok((_, _, err_msg, _)) => error(
+                    stream,
+                    503,
+                    err_msg.as_deref().unwrap_or("explanation unavailable"),
+                    stop,
+                    origin,
+                ),
+                Err(e) => backend_error(stream, e, false, stop, origin),
+            }
         }
         ("GET", route) if route.starts_with("/api/tasks/") => {
             let task_id = match parse_task_detail_id(route) {
@@ -3181,5 +3256,134 @@ mod tests {
         ok_backend.join().unwrap();
         assert!(ok.starts_with("HTTP/1.1 200 OK\r\n"), "{ok}");
         assert!(ok.contains("\"task_id\":\"ZACH-090\""), "{ok}");
+    }
+
+    #[test]
+    fn post_task_explain_handles_preflight_400_404_503_and_200() {
+        let f = Fixture::new();
+
+        let pre = read_all(f.request(
+            "OPTIONS",
+            "/api/tasks/ZACH-091/explain",
+            &format!(
+                "Origin: http://{}\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: authorization, content-type\r\n",
+                f.addr
+            ),
+            "",
+        ));
+        assert!(pre.starts_with("HTTP/1.1 204 No Content\r\n"), "{pre}");
+
+        let bad_id = read_all(f.request("POST", "/api/tasks/bad%2Fid/explain", &f.auth(), "{}"));
+        assert!(
+            bad_id.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "{bad_id}"
+        );
+
+        let bad_body = read_all(f.request(
+            "POST",
+            "/api/tasks/ZACH-091/explain",
+            &f.auth(),
+            "{\"unknown\":1}",
+        ));
+        assert!(
+            bad_body.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "{bad_body}"
+        );
+
+        let missing_backend = f.backend(|mut stream| {
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            let cmd: ClientCommand = serde_json::from_str(&line).unwrap();
+            assert_eq!(
+                cmd,
+                ClientCommand::ExplainTask {
+                    task_id: "MISSING".into(),
+                    refresh: false
+                }
+            );
+            write_ndjson(
+                &mut stream,
+                &ServerMessage::TaskExplanation {
+                    ok: false,
+                    task_id: "MISSING".into(),
+                    explanation: None,
+                    error: Some("task not found".into()),
+                    error_code: Some("NOT_FOUND".into()),
+                },
+            )
+            .unwrap();
+        });
+        let not_found = read_all(f.request("POST", "/api/tasks/MISSING/explain", &f.auth(), ""));
+        missing_backend.join().unwrap();
+        assert!(
+            not_found.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "{not_found}"
+        );
+
+        let unavail_backend = f.backend(|mut stream| {
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            write_ndjson(
+                &mut stream,
+                &ServerMessage::TaskExplanation {
+                    ok: false,
+                    task_id: "ZACH-091".into(),
+                    explanation: None,
+                    error: Some("offline".into()),
+                    error_code: Some("OFFLINE".into()),
+                },
+            )
+            .unwrap();
+        });
+        let unavail = read_all(f.request("POST", "/api/tasks/ZACH-091/explain", &f.auth(), ""));
+        unavail_backend.join().unwrap();
+        assert!(
+            unavail.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+            "{unavail}"
+        );
+
+        let ok_backend = f.backend(|mut stream| {
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            let cmd: ClientCommand = serde_json::from_str(&line).unwrap();
+            assert_eq!(
+                cmd,
+                ClientCommand::ExplainTask {
+                    task_id: "ZACH-091".into(),
+                    refresh: true
+                }
+            );
+            write_ndjson(
+                &mut stream,
+                &ServerMessage::TaskExplanation {
+                    ok: true,
+                    task_id: "ZACH-091".into(),
+                    explanation: Some(crate::v2::store::TaskExplanationRecord {
+                        task_id: "ZACH-091".into(),
+                        updated_epoch: 100,
+                        open_decision_id: None,
+                        model: "gemini-decision-1".into(),
+                        task_goal: "Meta".into(),
+                        agent_actions: "Acciones".into(),
+                        failure_diagnosis: "Diagnóstico".into(),
+                        option_guide: vec!["Opción 1".into()],
+                        created_epoch: 101,
+                        cached: false,
+                    }),
+                    error: None,
+                    error_code: None,
+                },
+            )
+            .unwrap();
+        });
+        let ok = read_all(f.request(
+            "POST",
+            "/api/tasks/ZACH-091/explain",
+            &f.auth(),
+            "{\"refresh\":true}",
+        ));
+        ok_backend.join().unwrap();
+        assert!(ok.starts_with("HTTP/1.1 200 OK\r\n"), "{ok}");
+        assert!(ok.contains("\"task_goal\":\"Meta\""), "{ok}");
     }
 }

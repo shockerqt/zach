@@ -63,6 +63,7 @@ fn main() {
         "stage" => run_v2_stage(&args[2..]),
         "announce" => run_v2_announce(&args[2..]),
         "sessions" => run_v2_sessions(&args[2..]),
+        "explain" => run_v2_explain(&args[2..]),
         "daemon" | "zachd" => run_v2_daemon(&args[2..]),
         "attach" => run_v2_attach(&args[2..]),
         "events" => run_v2_events(&args[2..]),
@@ -1348,6 +1349,105 @@ fn run_v2_sessions(args: &[String]) {
     }
 }
 
+fn run_v2_explain(args: &[String]) {
+    let task_id = args
+        .first()
+        .filter(|v| !v.starts_with("--"))
+        .cloned()
+        .unwrap_or_else(|| usage_error("missing <TASK_ID>"));
+    let refresh = has_flag(args, "--refresh");
+    let json_out = has_flag(args, "--json");
+    let socket_path = flag_value(args, "--socket")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_socket_path);
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(&socket_path).unwrap_or_else(|error| {
+            eprintln!(
+                "zachd is offline or unreachable at {}: {error}",
+                socket_path.display()
+            );
+            std::process::exit(1)
+        });
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(12)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+    write_ndjson(
+        &mut stream,
+        &ClientCommand::ExplainTask {
+            task_id: task_id.clone(),
+            refresh,
+        },
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("send explain command: {error}");
+        std::process::exit(1)
+    });
+    use std::io::BufRead;
+    let mut line = String::new();
+    std::io::BufReader::new(stream)
+        .read_line(&mut line)
+        .unwrap_or_else(|error| {
+            eprintln!("read explain response: {error}");
+            std::process::exit(1)
+        });
+    let reply: serde_json::Value = serde_json::from_str(&line).unwrap_or_else(|error| {
+        eprintln!("invalid daemon response: {error}");
+        std::process::exit(1)
+    });
+    if reply["type"] == "ERROR" {
+        eprintln!(
+            "explain error: {}",
+            reply["error"].as_str().unwrap_or("unknown error")
+        );
+        std::process::exit(1);
+    }
+    let ok = reply["ok"].as_bool().unwrap_or(false);
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&reply).unwrap_or_default()
+        );
+        if !ok {
+            std::process::exit(1);
+        }
+        return;
+    }
+    if !ok {
+        eprintln!(
+            "explain failed ({}): {}",
+            reply["error_code"].as_str().unwrap_or("ERROR"),
+            reply["error"].as_str().unwrap_or("unknown error")
+        );
+        std::process::exit(1);
+    }
+    let exp = &reply["explanation"];
+    let cached_tag = if exp["cached"].as_bool().unwrap_or(false) {
+        " (caché)"
+    } else {
+        ""
+    };
+    println!(
+        "Explicación de {task_id}{cached_tag} [{}]:",
+        exp["model"].as_str().unwrap_or("gemini")
+    );
+    if let Some(goal) = exp["task_goal"].as_str().filter(|s| !s.is_empty()) {
+        println!("\nObjetivo:\n  {goal}");
+    }
+    if let Some(actions) = exp["agent_actions"].as_str().filter(|s| !s.is_empty()) {
+        println!("\nAcciones del agente:\n  {actions}");
+    }
+    if let Some(diag) = exp["failure_diagnosis"].as_str().filter(|s| !s.is_empty()) {
+        println!("\nDiagnóstico:\n  {diag}");
+    }
+    if let Some(opts) = exp["option_guide"].as_array().filter(|a| !a.is_empty()) {
+        println!("\nGuía de opciones:");
+        for opt in opts {
+            if let Some(s) = opt.as_str() {
+                println!("  - {s}");
+            }
+        }
+    }
+}
+
 fn run_v2_run(args: &[String]) {
     let dry_run = has_flag(args, "--dry-run");
     if !dry_run {
@@ -2020,6 +2120,7 @@ fn print_usage() {
         "       zach announce --intent <INTENT> [--task <TASK_ID>] [--repo <REPO>] [--stage <STAGE>] [--note <NOTE>] [--ttl <SECS>] [--json] [--socket <PATH>]"
     );
     println!("       zach sessions [--all] [--follow] [--json] [--socket <PATH>]");
+    println!("       zach explain <TASK_ID> [--refresh] [--json] [--socket <PATH>]");
     println!("       zach doctor [--json] [--worktree <PATH>]");
     println!(
         "       zach daemon [--socket <PATH>] [--db <PATH>] [--once] [--web] [--web-port <PORT>] [--web-bind <IP:PORT>]"
