@@ -458,3 +458,67 @@ test("decision context, failure diagnostics, and task detail modal render access
   const failures = await new AxeBuilder({ page }).analyze();
   expect(failures.violations).toEqual([]);
 });
+
+test("Base UI primitives (Switch, Tabs, Popover, Dialog) and resizable splitters persist lazily", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await fixture(page, { access: true });
+  await page.goto("/");
+
+  // Bootstrap must not touch localStorage
+  expect(await page.evaluate(() => localStorage.length)).toBe(0);
+
+  // Switch.Root toggles [data-checked] and data-density
+  const densitySwitch = page.getByRole("switch", { name: "Ultra-dense" });
+  await expect(densitySwitch).not.toHaveAttribute("data-checked", "");
+  await densitySwitch.click();
+  await expect(densitySwitch).toHaveAttribute("data-checked", "");
+  await expect(page.locator(".zcp2-root")).toHaveAttribute("data-density", "ultra");
+
+  // Tabs.Tab toggles [data-active]
+  const activeTab = page.getByRole("tab", { name: /En curso/ });
+  await activeTab.click();
+  await expect(activeTab).toHaveAttribute("data-active", "");
+
+  // Popover opens recent resolved decisions
+  const resolvedTrigger = page.getByRole("button", { name: /Resueltas/ });
+  await resolvedTrigger.click();
+  await expect(page.getByText("Decisiones resueltas recientes")).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  // Keyboard resize on vertical and horizontal splitters updates aria-valuenow and writes localStorage
+  const vSplit = page.getByRole("separator", {
+    name: "Redimensionar panel de decisiones y tareas",
+  });
+  const hSplit = page.getByRole("separator", {
+    name: "Redimensionar panel izquierdo y derecho",
+  });
+  await vSplit.focus();
+  await page.keyboard.press("ArrowDown");
+  const vAfter1 = Number(await vSplit.getAttribute("aria-valuenow"));
+  await page.keyboard.press("ArrowDown");
+  const nextV = Number(await vSplit.getAttribute("aria-valuenow"));
+  expect(nextV).toBeGreaterThan(vAfter1);
+
+  const initialH = Number(await hSplit.getAttribute("aria-valuenow"));
+  await hSplit.focus();
+  await page.keyboard.press("ArrowRight");
+  const nextH = Number(await hSplit.getAttribute("aria-valuenow"));
+  expect(nextH).toBeGreaterThan(initialH);
+
+  expect(
+    await page.evaluate(() => [
+      localStorage.getItem("zach.panel.decisionsHeightPx"),
+      localStorage.getItem("zach.panel.leftWidthPx"),
+    ]),
+  ).toEqual([String(nextV), String(nextH)]);
+
+  // Dark color-scheme is active
+  expect(
+    await page.evaluate(() => getComputedStyle(document.documentElement).colorScheme),
+  ).toContain("dark");
+
+  const failures = await new AxeBuilder({ page }).analyze();
+  expect(failures.violations).toEqual([]);
+});
