@@ -4,8 +4,8 @@ pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 use crate::v2::now_epoch;
 use crate::v2::store::{
-    DaemonStatusSummary, DecisionResolution, PendingDecisionRecord, ProviderCooldownRecord,
-    TaskEventRecord, TaskRecord, V2Store, V2StoreError,
+    AttemptAuditRecord, DaemonStatusSummary, DecisionResolution, PendingDecisionRecord,
+    ProviderCooldownRecord, StageAttemptRecord, TaskEventRecord, TaskRecord, V2Store, V2StoreError,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -43,6 +43,10 @@ pub enum ClientCommand {
     },
     GetDecision {
         decision_id: String,
+    },
+    #[serde(alias = "GET_TASK_DETAIL", alias = "GetTaskDetail")]
+    GetTaskDetail {
+        task_id: String,
     },
     #[serde(alias = "DECIDE", alias = "Decide")]
     Decide {
@@ -294,6 +298,13 @@ pub enum ServerMessage {
     #[serde(rename = "DECISION")]
     Decision {
         decision: Option<PendingDecisionRecord>,
+    },
+    #[serde(rename = "TASK_DETAIL")]
+    TaskDetail {
+        task: Option<TaskRecord>,
+        attempts: Vec<StageAttemptRecord>,
+        audits: Vec<AttemptAuditRecord>,
+        decisions: Vec<PendingDecisionRecord>,
     },
     #[serde(rename = "DECISION_RESULT")]
     DecisionResult {
@@ -685,6 +696,10 @@ impl DaemonServer {
                 Ok(ClientCommand::GetDecision { decision_id }) => {
                     let decision = store.get_decision(&decision_id)?;
                     let _ = write_ndjson(&mut sub.stream, &ServerMessage::Decision { decision });
+                }
+                Ok(ClientCommand::GetTaskDetail { task_id }) => {
+                    let msg = build_task_detail_message(store, &task_id)?;
+                    let _ = write_ndjson(&mut sub.stream, &msg);
                 }
                 Ok(ClientCommand::Decide {
                     decision_id,
@@ -1206,6 +1221,63 @@ impl DaemonServer {
         }
         outcome
     }
+}
+
+fn sanitize_detail_text(raw: &str) -> String {
+    let redacted = crate::v2::audit::redact_adr004_text(raw, crate::v2::runner::MAX_SUMMARY_BYTES);
+    crate::v2::runner::truncate_utf8_bytes(&redacted, crate::v2::runner::MAX_SUMMARY_BYTES)
+}
+
+pub(crate) fn build_task_detail_message(
+    store: &V2Store,
+    task_id: &str,
+) -> Result<ServerMessage, V2StoreError> {
+    let Some(mut task) = store.get_task(task_id)? else {
+        return Ok(ServerMessage::TaskDetail {
+            task: None,
+            attempts: Vec::new(),
+            audits: Vec::new(),
+            decisions: Vec::new(),
+        });
+    };
+    if let Some(ref mut failure) = task.memory.last_check_failure {
+        *failure = sanitize_detail_text(failure);
+    }
+    for entry in &mut task.memory.decisions_log {
+        *entry = sanitize_detail_text(entry);
+    }
+
+    let mut attempts = store.list_stage_attempts(task_id)?;
+    for attempt in &mut attempts {
+        if let Some(ref mut summary) = attempt.summary {
+            *summary = sanitize_detail_text(summary);
+        }
+    }
+
+    let mut audits = store.list_attempt_audits(task_id)?;
+    for audit in &mut audits {
+        if let Some(ref mut error_code) = audit.error_code {
+            *error_code = sanitize_detail_text(error_code);
+        }
+    }
+
+    let mut decisions = store.list_decisions_for_task(task_id)?;
+    for decision in &mut decisions {
+        decision.context_summary = sanitize_detail_text(&decision.context_summary);
+        if let Some(ref mut note) = decision.note {
+            *note = sanitize_detail_text(note);
+        }
+        if let Some(ref mut reason) = decision.retirement_reason {
+            *reason = sanitize_detail_text(reason);
+        }
+    }
+
+    Ok(ServerMessage::TaskDetail {
+        task: Some(task),
+        attempts,
+        audits,
+        decisions,
+    })
 }
 
 #[cfg(test)]

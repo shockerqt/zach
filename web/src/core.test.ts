@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { SSEParser } from "./sse";
-import { snapshot, event, integer, github, decision, task } from "./protocol";
+import { snapshot, event, integer, github, decision, task, taskDetail } from "./protocol";
 import {
   initial,
   acceptSnapshot,
@@ -453,6 +453,97 @@ describe("decision recommended_option and task approved_plan parsing", () => {
     ).toBe("Step 1\nStep 2");
     expect(() =>
       task({ ...sampleTask, memory: { approved_plan: 123 } }),
+    ).toThrow();
+  });
+});
+
+describe("taskDetail protocol decoder", () => {
+  it("decodes task detail with context_pack, stage attempts, audits, and decisions", () => {
+    const parsed = taskDetail({
+      task: {
+        ...sampleTask,
+        context_pack: {
+          weight: "M",
+          base_sha: "abc123def456",
+          network: "offline",
+          target_files: [
+            { path: "src/v2/store.rs", action: "modify", summary: "Add query" },
+          ],
+          forbidden_paths: [".github/workflows/**"],
+          worker_checks: ["cargo test --locked"],
+          gate_checks: ["git diff --check"],
+          human_operations: [],
+          verification_commands: [],
+          acceptance_criteria: [{ id: "AC-1", description: "Query works" }],
+        },
+      },
+      attempts: [
+        {
+          attempt_id: "att-1",
+          task_id: sampleTask.task_id,
+          stage: "impl",
+          model: "gpt-5.4",
+          effort: "medium",
+          started_epoch: 100,
+          ended_epoch: 120,
+          status: "PASSED",
+          summary: "Implemented",
+          input_tokens: 1000,
+          output_tokens: 500,
+          total_tokens: 1500,
+          phase: "FINISHED",
+          exit_code: 0,
+          retry_generation: 0,
+        },
+      ],
+      audits: [
+        {
+          attempt_id: "att-1",
+          task_id: sampleTask.task_id,
+          stage: "impl",
+          turn_count: 4,
+          tool_call_count: 9,
+          tool_error_count: 1,
+          edit_compile_fail_loops: 0,
+          redundant_read_count: 2,
+          cached_input_tokens: 300,
+          reasoning_tokens: 120,
+          check_divergence: false,
+          created_epoch: 120,
+        },
+      ],
+      decisions: [
+        {
+          decision_id: "dec-1",
+          task_id: sampleTask.task_id,
+          kind: "plan_approval",
+          question: "Approve?",
+          options: ["Approve", "Reject"],
+          context_summary: "ctx",
+          status: "RESOLVED",
+          choice: "Approve",
+          resolved_by: "operator",
+          note: "lgtm",
+        },
+      ],
+    });
+    expect(parsed.task.task_id).toBe("ZACH-030");
+    expect(parsed.context_pack.target_files[0].path).toBe("src/v2/store.rs");
+    expect(parsed.context_pack.acceptance_criteria[0].id).toBe("AC-1");
+    expect(parsed.attempts[0].attempt_id).toBe("att-1");
+    expect(parsed.audits[0].turn_count).toBe(4);
+    expect(parsed.decisions[0].resolved_by).toBe("operator");
+  });
+
+  it("rejects malformed taskDetail payloads", () => {
+    expect(() => taskDetail({ task: sampleTask, attempts: "bad", audits: [], decisions: [] })).toThrow();
+    expect(() =>
+      taskDetail({
+        task: sampleTask,
+        attempts: [],
+        audits: [{ attempt_id: "att-1", task_id: "ZACH-030", stage: "impl", turn_count: -1 }],
+        decisions: [],
+      }),
     ).toThrow();
   });
 });

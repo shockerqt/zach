@@ -1,6 +1,8 @@
 //! Bounded, owner-local HTTP adapter. The coordinator socket owns all state.
 use crate::v2::socket::{ClientCommand, ServerMessage, current_euid, verify_peer_uid};
-use crate::v2::store::{DaemonStatusSummary, PendingDecisionRecord, TaskRecord};
+use crate::v2::store::{
+    AttemptAuditRecord, DaemonStatusSummary, PendingDecisionRecord, StageAttemptRecord, TaskRecord,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{DirBuilder, File, OpenOptions};
@@ -160,6 +162,7 @@ fn preflight(
 ) -> io::Result<()> {
     let method = match req.route.as_str() {
         "/api/snapshot" | "/api/events" => "GET",
+        route if route.starts_with("/api/tasks/") && route.len() > "/api/tasks/".len() => "GET",
         "/api/decide" => "POST",
         _ => return error(stream, 403, "preflight forbidden", stop, origin),
     };
@@ -577,6 +580,13 @@ pub struct SnapshotResponse {
     pub status: DaemonStatusSummary,
     pub as_of_seq: i64,
 }
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TaskDetailResponse {
+    pub task: TaskRecord,
+    pub attempts: Vec<StageAttemptRecord>,
+    pub audits: Vec<AttemptAuditRecord>,
+    pub decisions: Vec<PendingDecisionRecord>,
+}
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DecideRequestBody {
@@ -620,6 +630,21 @@ fn decode(s: &str) -> io::Result<String> {
         }
     }
     String::from_utf8(bytes).map_err(|_| invalid("invalid query"))
+}
+fn parse_task_detail_id(raw_route: &str) -> Option<Result<String, &'static str>> {
+    let suffix = raw_route.strip_prefix("/api/tasks/")?;
+    let Ok(decoded) = decode(suffix) else {
+        return Some(Err("invalid task id"));
+    };
+    if decoded.is_empty()
+        || decoded.len() > 128
+        || decoded.contains('/')
+        || decoded.contains("..")
+        || decoded.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Some(Err("invalid task id"));
+    }
+    Some(Ok(decoded))
 }
 fn read_request(stream: &mut TcpStream, stop: &AtomicBool) -> io::Result<Request> {
     let deadline = Instant::now() + WAIT;
@@ -1650,6 +1675,37 @@ fn serve(
                 }
             }
             Ok(())
+        }
+        ("GET", route) if route.starts_with("/api/tasks/") => {
+            let task_id = match parse_task_detail_id(route) {
+                Some(Ok(id)) => id,
+                Some(Err(msg)) => return error(stream, 400, msg, stop, origin),
+                None => return error(stream, 404, "not found", stop, origin),
+            };
+            let deadline = Instant::now() + WAIT;
+            let result = (|| {
+                let mut backend = Backend::connect(path, stop, deadline)?;
+                backend.send(&ClientCommand::GetTaskDetail { task_id }, stop, deadline)?;
+                match backend.receive(stop, deadline)? {
+                    Some(ServerMessage::TaskDetail {
+                        task,
+                        attempts,
+                        audits,
+                        decisions,
+                    }) => Ok(task.map(|task| TaskDetailResponse {
+                        task,
+                        attempts,
+                        audits,
+                        decisions,
+                    })),
+                    _ => Err(invalid("backend task detail unavailable")),
+                }
+            })();
+            match result {
+                Ok(Some(data)) => response(stream, 200, &data, stop, origin),
+                Ok(None) => error(stream, 404, "task not found", stop, origin),
+                Err(e) => backend_error(stream, e, false, stop, origin),
+            }
         }
         _ => error(stream, 404, "not found", stop, origin),
     }
@@ -3021,5 +3077,109 @@ mod tests {
         assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
         assert!(reply.contains("SESSION_ANNOUNCEMENT"), "{reply}");
         assert!(reply.contains("CLAIM_CHANGED"), "{reply}");
+    }
+
+    #[test]
+    fn task_detail_endpoint_handles_200_404_400_and_preflight() {
+        let f = Fixture::new();
+        let bad = read_all(f.request("GET", "/api/tasks/foo%2Fbar", &f.auth(), ""));
+        assert!(bad.starts_with("HTTP/1.1 400 "), "{bad}");
+
+        let dotdot = read_all(f.request("GET", "/api/tasks/..", &f.auth(), ""));
+        assert!(dotdot.starts_with("HTTP/1.1 400 "), "{dotdot}");
+
+        let preflight = read_all(f.request(
+            "OPTIONS",
+            "/api/tasks/ZACH-090",
+            &format!(
+                "Origin: http://{}\r\nAccess-Control-Request-Method: GET\r\nAccess-Control-Request-Headers: Authorization\r\n",
+                f.addr
+            ),
+            "",
+        ));
+        assert!(
+            preflight.starts_with("HTTP/1.1 204 No Content\r\n"),
+            "{preflight}"
+        );
+
+        let missing_backend = f.backend(|mut stream| {
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            let cmd: ClientCommand = serde_json::from_str(&line).unwrap();
+            assert_eq!(
+                cmd,
+                ClientCommand::GetTaskDetail {
+                    task_id: "UNKNOWN-1".into()
+                }
+            );
+            write_ndjson(
+                &mut stream,
+                &ServerMessage::TaskDetail {
+                    task: None,
+                    attempts: vec![],
+                    audits: vec![],
+                    decisions: vec![],
+                },
+            )
+            .unwrap();
+        });
+        let not_found = read_all(f.request("GET", "/api/tasks/UNKNOWN-1", &f.auth(), ""));
+        missing_backend.join().unwrap();
+        assert!(not_found.starts_with("HTTP/1.1 404 "), "{not_found}");
+
+        let ok_backend = f.backend(|mut stream| {
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            let cmd: ClientCommand = serde_json::from_str(&line).unwrap();
+            assert_eq!(
+                cmd,
+                ClientCommand::GetTaskDetail {
+                    task_id: "ZACH-090".into()
+                }
+            );
+            write_ndjson(
+                &mut stream,
+                &ServerMessage::TaskDetail {
+                    task: Some(TaskRecord {
+                        task_id: "ZACH-090".into(),
+                        task_group: "default".into(),
+                        title: "Expose task detail".into(),
+                        repository: "zach".into(),
+                        github_repo: Some("shockerqt/zach".into()),
+                        issue_number: Some(181),
+                        weight: "M".into(),
+                        status: "In Progress".into(),
+                        worktree_path: None,
+                        branch: None,
+                        context_pack: Default::default(),
+                        depends_on: vec![],
+                        required_stages: vec!["plan".into(), "impl".into()],
+                        stages_completed: vec!["plan".into()],
+                        current_stage: Some("impl".into()),
+                        active_attempt_id: None,
+                        plan_base_sha: None,
+                        reviewed_sha: None,
+                        pr_number: None,
+                        executor: None,
+                        autonomous_consent: false,
+                        retry_count: 0,
+                        next_retry_epoch: 0,
+                        lease_owner: None,
+                        lease_expires_epoch: None,
+                        memory: Default::default(),
+                        version: 1,
+                        updated_epoch: 100,
+                    }),
+                    attempts: vec![],
+                    audits: vec![],
+                    decisions: vec![],
+                },
+            )
+            .unwrap();
+        });
+        let ok = read_all(f.request("GET", "/api/tasks/ZACH-090", &f.auth(), ""));
+        ok_backend.join().unwrap();
+        assert!(ok.starts_with("HTTP/1.1 200 OK\r\n"), "{ok}");
+        assert!(ok.contains("\"task_id\":\"ZACH-090\""), "{ok}");
     }
 }
