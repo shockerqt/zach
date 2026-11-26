@@ -504,6 +504,165 @@ pub fn publish_plan_stage(
     stage_operation(task, key, "plan", path, None, sha, "zach")
 }
 
+pub fn infer_pack_weight_floor(paths: &[String], has_new_file: bool) -> &'static str {
+    let mut floor = "XS";
+    for raw in paths {
+        let p = raw
+            .trim()
+            .trim_start_matches("./")
+            .trim_start_matches('/')
+            .to_ascii_lowercase();
+        if p.starts_with("infrastructure/")
+            || p.starts_with(".github/workflows/")
+            || p.starts_with("migrations/")
+            || p.contains("/migrations/")
+            || p.ends_with(".sql")
+            || p == "governance-manifest.yaml"
+        {
+            return "L";
+        }
+        if matches!(
+            p.rsplit('/').next().unwrap_or(""),
+            "cargo.toml" | "cargo.lock" | "package.json" | "pyproject.toml" | "go.mod"
+        ) {
+            floor = "M";
+        }
+    }
+    if floor == "M" || has_new_file || paths.len() > 4 {
+        "M"
+    } else if paths.len() > 2 {
+        "S"
+    } else {
+        floor
+    }
+}
+
+pub fn draft_context_pack_yaml(repo_root: &Path, candidate_paths: &[String]) -> String {
+    let (mut norm_paths, mut entries, mut has_new) = (Vec::new(), Vec::new(), false);
+    for raw in candidate_paths {
+        let norm = raw
+            .trim()
+            .trim_start_matches("./")
+            .trim_start_matches('/')
+            .to_owned();
+        if norm.is_empty() {
+            continue;
+        }
+        let action = if repo_root.join(&norm).exists() {
+            "modify"
+        } else {
+            has_new = true;
+            "create"
+        };
+        entries.push(format!(
+            "  - path: {norm}\n    action: {action}\n    summary: \"TODO: describe change\""
+        ));
+        norm_paths.push(norm);
+    }
+    let weight = infer_pack_weight_floor(&norm_paths, has_new);
+    let files_block = if entries.is_empty() {
+        " []".to_owned()
+    } else {
+        format!("\n{}", entries.join("\n"))
+    };
+    format!(
+        "network: none\nweight: {weight}\ntarget_files:{files_block}\nforbidden_paths:\n  - \".github/workflows/**\"\nworker_checks:\n  - \"cargo test --locked\"\ngate_checks:\n  - \"git diff --check\"\nverification_commands:\n  - \"cargo test --locked\"\nacceptance_criteria:\n  - id: AC-1\n    description: \"TODO: describe acceptance criterion\"\n"
+    )
+}
+
+pub fn validate_context_pack_yaml(yaml_text: &str) -> Result<(), Vec<String>> {
+    let strip_q = |s: &str| s.trim().trim_matches('"').trim_matches('\'').to_owned();
+    let push_pair = |list: &mut Vec<(String, String)>, line: &str, k1: &str, k2: &str| {
+        if let Some(rest) = line.strip_prefix("- ") {
+            list.push((String::new(), String::new()));
+            if let Some(v) = rest.trim().strip_prefix(k1) {
+                list.last_mut().unwrap().0 = strip_q(v);
+            }
+        } else if let Some(last) = list.last_mut() {
+            if let Some(v) = line.strip_prefix(k1) {
+                last.0 = strip_q(v);
+            } else if let Some(v) = line.strip_prefix(k2) {
+                last.1 = strip_q(v);
+            }
+        }
+    };
+    let (mut section, mut seen, mut check_count) = ("", std::collections::HashSet::new(), 0usize);
+    let (mut target_files, mut acs) = (Vec::new(), Vec::new());
+    for raw in yaml_text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("```") {
+            continue;
+        }
+        if !raw.starts_with(' ') && !raw.starts_with('\t') {
+            if let Some((k, _)) = line.split_once(':') {
+                section = k.trim();
+                seen.insert(section.to_owned());
+                continue;
+            }
+        }
+        match section {
+            "target_files" => push_pair(&mut target_files, line, "path:", "action:"),
+            "acceptance_criteria" => push_pair(&mut acs, line, "id:", "description:"),
+            "worker_checks" | "gate_checks" | "verification_commands"
+                if line
+                    .strip_prefix("- ")
+                    .is_some_and(|v| !strip_q(v).is_empty()) =>
+            {
+                check_count += 1
+            }
+            _ => {}
+        }
+    }
+    let mut errs = Vec::new();
+    for req in [
+        "target_files",
+        "forbidden_paths",
+        "worker_checks",
+        "gate_checks",
+        "verification_commands",
+        "acceptance_criteria",
+    ] {
+        if !seen.contains(req) {
+            errs.push(format!("missing required section: {req}"));
+        }
+    }
+    if target_files.is_empty() {
+        errs.push("target_files must be a non-empty list".into());
+    }
+    for (i, (p, a)) in target_files.iter().enumerate() {
+        if p.is_empty() {
+            errs.push(format!("target_files[{i}].path must be non-empty"));
+        }
+        if !matches!(a.as_str(), "modify" | "create" | "delete") {
+            errs.push(format!(
+                "target_files[{i}].action must be modify|create|delete, got '{a}'"
+            ));
+        }
+    }
+    if check_count == 0 {
+        errs.push("at least one check in worker_checks, gate_checks, or verification_commands is required".into());
+    }
+    if acs.is_empty() {
+        errs.push("acceptance_criteria must be a non-empty list".into());
+    }
+    for (i, (id, desc)) in acs.iter().enumerate() {
+        if !id
+            .strip_prefix("AC-")
+            .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        {
+            errs.push(format!(
+                "acceptance_criteria[{i}].id must be numbered like AC-1, got '{id}'"
+            ));
+        }
+        if desc.is_empty() {
+            errs.push(format!(
+                "acceptance_criteria[{i}].description must be non-empty"
+            ));
+        }
+    }
+    if errs.is_empty() { Ok(()) } else { Err(errs) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,5 +950,39 @@ mod tests {
         let cancelled = store.get_task("ZACH-021").unwrap().unwrap();
         assert_eq!(cancelled.status, "Cancelled");
         assert_eq!(cancelled.title, "Cancelled title");
+    }
+
+    #[test]
+    fn pack_draft_infers_actions_floor_weight_and_validates_read_only() {
+        let tmp = std::env::temp_dir().join(format!("zach-pack-draft-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::write(tmp.join("src/a.rs"), "// existing\n").unwrap();
+
+        let xs = draft_context_pack_yaml(&tmp, &["src/a.rs".into()]);
+        assert!(xs.contains("weight: XS\n") && xs.contains("action: modify"));
+        assert!(validate_context_pack_yaml(&xs).is_ok());
+
+        let m = draft_context_pack_yaml(&tmp, &["src/a.rs".into(), "src/new.rs".into()]);
+        assert!(m.contains("weight: M\n") && m.contains("action: create"));
+        assert!(validate_context_pack_yaml(&m).is_ok());
+
+        assert_eq!(
+            infer_pack_weight_floor(&["a.rs".into(), "b.rs".into(), "c.rs".into()], false),
+            "S"
+        );
+        for p in [
+            "infrastructure/main.tf",
+            ".github/workflows/ci.yml",
+            "db/001.sql",
+        ] {
+            assert_eq!(infer_pack_weight_floor(&[p.into()], false), "L");
+        }
+
+        let bad = "target_files:\n  - path: src/a.rs\n    action: bogus\nacceptance_criteria:\n  - id: bad\n    description: \"\"\n";
+        let errs = validate_context_pack_yaml(bad).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("forbidden_paths")));
+        assert!(errs.iter().any(|e| e.contains("modify|create|delete")));
+        assert!(errs.iter().any(|e| e.contains("AC-1")));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
