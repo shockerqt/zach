@@ -593,12 +593,13 @@ pub fn validate_context_pack_yaml(yaml_text: &str) -> Result<(), Vec<String>> {
         if line.is_empty() || line.starts_with('#') || line.starts_with("```") {
             continue;
         }
-        if !raw.starts_with(' ') && !raw.starts_with('\t') {
-            if let Some((k, _)) = line.split_once(':') {
-                section = k.trim();
-                seen.insert(section.to_owned());
-                continue;
-            }
+        if !raw.starts_with(' ')
+            && !raw.starts_with('\t')
+            && let Some((k, _)) = line.split_once(':')
+        {
+            section = k.trim();
+            seen.insert(section.to_owned());
+            continue;
         }
         match section {
             "target_files" => push_pair(&mut target_files, line, "path:", "action:"),
