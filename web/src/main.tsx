@@ -1,5 +1,10 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { Dialog } from "@base-ui/react/dialog";
+import { Popover } from "@base-ui/react/popover";
+import { Switch } from "@base-ui/react/switch";
+import { Tabs } from "@base-ui/react/tabs";
+import { Tooltip } from "@base-ui/react/tooltip";
 import "@fontsource/inter/latin-400.css";
 import "@fontsource/inter/latin-500.css";
 import "@fontsource/inter/latin-600.css";
@@ -78,15 +83,15 @@ function AiExplanationPanel({
       <div className="zcp2-ai-actions">
         <button
           type="button"
-          className="zcp2-btn zcp2-ai-btn"
+          className="zcp2-btn zcp2-btn-ai"
           disabled={loading || !connection.active}
           onClick={() => void requestExplain(Boolean(explanation))}
         >
           {loading
             ? "Analizando con Gemini…"
             : explanation
-              ? "Regenerar"
-              : "Explicar con IA"}
+              ? "↻ Regenerar"
+              : "✦ Explicar con IA"}
         </button>
         {explanation && (
           <span className="zcp2-ai-badge zcp2-mono">
@@ -101,34 +106,36 @@ function AiExplanationPanel({
       )}
       {explanation && (
         <div className="zcp2-ai-panel" aria-label={`Explicación IA de ${taskId}`}>
-          {explanation.task_goal && (
-            <div className="zcp2-ai-section">
-              <div className="zcp2-ai-label">Objetivo</div>
-              <p>{explanation.task_goal}</p>
-            </div>
-          )}
-          {explanation.agent_actions && (
-            <div className="zcp2-ai-section">
-              <div className="zcp2-ai-label">Acciones del agente</div>
-              <p>{explanation.agent_actions}</p>
-            </div>
-          )}
-          {explanation.failure_diagnosis && (
-            <div className="zcp2-ai-section">
-              <div className="zcp2-ai-label">Diagnóstico</div>
-              <p>{explanation.failure_diagnosis}</p>
-            </div>
-          )}
-          {explanation.option_guide.length > 0 && (
-            <div className="zcp2-ai-section">
-              <div className="zcp2-ai-label">Guía de opciones</div>
-              <ul>
-                {explanation.option_guide.map((opt, idx) => (
-                  <li key={idx}>{opt}</li>
-                ))}
-              </ul>
-            </div>
-          )}
+          <div className="zcp2-ai-grid">
+            {explanation.task_goal && (
+              <div className="zcp2-ai-section">
+                <div className="zcp2-ai-k">1. Qué pide la tarea</div>
+                <p>{explanation.task_goal}</p>
+              </div>
+            )}
+            {explanation.agent_actions && (
+              <div className="zcp2-ai-section">
+                <div className="zcp2-ai-k">2. Qué hicieron los agentes</div>
+                <p>{explanation.agent_actions}</p>
+              </div>
+            )}
+            {explanation.failure_diagnosis && (
+              <div className="zcp2-ai-section">
+                <div className="zcp2-ai-k">3. Diagnóstico</div>
+                <p>{explanation.failure_diagnosis}</p>
+              </div>
+            )}
+            {explanation.option_guide.length > 0 && (
+              <div className="zcp2-ai-section">
+                <div className="zcp2-ai-k">4. Guía de opciones</div>
+                <ul className="zcp2-ai-options">
+                  {explanation.option_guide.map((opt, idx) => (
+                    <li key={idx}>{opt}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
         </div>
       )}
     </div>
@@ -225,7 +232,7 @@ function DecisionRow({
         </details>
       )}
       <AiExplanationPanel taskId={d.task_id} connection={connection} />
-      <div className="zcp2-dec-bottom">
+      <div className="zcp2-dec-footer">
         <label className="zcp2-note-label">
           <span>Nota (opcional)</span>
           <input
@@ -245,13 +252,14 @@ function DecisionRow({
               <button
                 key={choice}
                 type="button"
-                className={`zcp2-btn ${i === 0 ? "zcp2-btn-ok" : choice === "Reject" ? "zcp2-btn-err" : ""} ${isRecommended ? "is-recommended" : ""}`}
+                className={`zcp2-btn ${isRecommended ? "zcp2-btn-rec is-recommended" : i === 0 ? "zcp2-btn-ok" : choice === "Reject" ? "zcp2-btn-err" : ""}`}
                 data-recommended={isRecommended ? "true" : undefined}
                 title={isRecommended ? "Opción recomendada" : undefined}
                 aria-description={isRecommended ? "Opción recomendada" : undefined}
                 disabled={pending || unknown || !connection.active}
                 onClick={() => void choose(choice)}
               >
+                {isRecommended && <span aria-hidden="true">★ </span>}
                 {plan && choice === "Approve"
                   ? "Aprobar"
                   : plan && choice === "Reject"
@@ -407,6 +415,28 @@ export function ConnectionBar({
   );
 }
 
+const SPLIT_X_KEY = "zach.panel.leftWidthPx";
+const SPLIT_Y_KEY = "zach.panel.decisionsHeightPx";
+
+function readStoredNumber(key: string): number | null {
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (!raw) return null;
+    const num = Number(raw);
+    return Number.isFinite(num) && num > 0 ? num : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredNumber(key: string, value: number): void {
+  try {
+    window.localStorage.setItem(key, String(Math.round(value)));
+  } catch {
+    // ignore storage errors
+  }
+}
+
 function App() {
   const [s, setS] = useState(initial),
     [notice, setNotice] = useState("Desconectado"),
@@ -422,10 +452,19 @@ function App() {
     [selectedTask, setSelectedTask] = useState<Task | null>(null),
     [taskDetail, setTaskDetail] = useState<TaskDetail | null>(null),
     [detailLoading, setDetailLoading] = useState(false),
-    [detailError, setDetailError] = useState("");
+    [detailError, setDetailError] = useState(""),
+    [leftPaneWidth, setLeftPaneWidth] = useState<number | null>(() =>
+      typeof window !== "undefined" ? readStoredNumber(SPLIT_X_KEY) : null,
+    ),
+    [decisionsHeight, setDecisionsHeight] = useState<number | null>(() =>
+      typeof window !== "undefined" ? readStoredNumber(SPLIT_Y_KEY) : null,
+    );
   const input = useRef<HTMLInputElement>(null),
     sound = useRef(new Sound()),
-    connection = useRef<Connection | null>(null);
+    connection = useRef<Connection | null>(null),
+    gridRef = useRef<HTMLElement>(null),
+    leftColRef = useRef<HTMLElement>(null),
+    decisionsRef = useRef<HTMLElement>(null);
   if (!connection.current)
     connection.current = new Connection(
       setS,
@@ -528,93 +567,201 @@ function App() {
     () => filterEvents(s.feed, query, eventFilter),
     [s.feed, query, eventFilter],
   );
+  const resolvedDecisions = useMemo(
+    () => s.feed.filter((e) => e.event_type === "DECISION_RESOLVED").slice(0, 12),
+    [s.feed],
+  );
   const connected = notice.includes("SSE") || notice.startsWith("Resincronizado");
 
+  function clampDecisionsHeight(next: number): number {
+    const colHeight = leftColRef.current?.getBoundingClientRect().height ?? 720;
+    const maxH = Math.max(220, Math.round(colHeight - 160));
+    return Math.min(maxH, Math.max(120, Math.round(next)));
+  }
+
+  function clampLeftWidth(next: number): number {
+    const gridWidth = gridRef.current?.getBoundingClientRect().width ?? 1200;
+    const maxW = Math.max(360, Math.round(gridWidth - 340));
+    return Math.min(maxW, Math.max(320, Math.round(next)));
+  }
+
+  function startVerticalResize(e: React.PointerEvent<HTMLDivElement>) {
+    e.preventDefault();
+    const startY = e.clientY;
+    const startH =
+      decisionsRef.current?.getBoundingClientRect().height ??
+      decisionsHeight ??
+      260;
+    let latest = clampDecisionsHeight(startH);
+    const onMove = (ev: PointerEvent) => {
+      latest = clampDecisionsHeight(startH + (ev.clientY - startY));
+      setDecisionsHeight(latest);
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      writeStoredNumber(SPLIT_Y_KEY, latest);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
+  function onVerticalSplitterKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
+    const cur =
+      decisionsHeight ??
+      Math.round(decisionsRef.current?.getBoundingClientRect().height ?? 260);
+    let next: number | null = null;
+    if (e.key === "ArrowDown") next = clampDecisionsHeight(cur + 24);
+    else if (e.key === "ArrowUp") next = clampDecisionsHeight(cur - 24);
+    else if (e.key === "Home") next = 120;
+    else if (e.key === "End") next = clampDecisionsHeight(9999);
+    if (next !== null) {
+      e.preventDefault();
+      setDecisionsHeight(next);
+      writeStoredNumber(SPLIT_Y_KEY, next);
+    }
+  }
+
+  function startHorizontalResize(e: React.PointerEvent<HTMLDivElement>) {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW =
+      leftColRef.current?.getBoundingClientRect().width ??
+      leftPaneWidth ??
+      720;
+    let latest = clampLeftWidth(startW);
+    const onMove = (ev: PointerEvent) => {
+      latest = clampLeftWidth(startW + (ev.clientX - startX));
+      setLeftPaneWidth(latest);
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      writeStoredNumber(SPLIT_X_KEY, latest);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
+  function onHorizontalSplitterKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
+    const cur =
+      leftPaneWidth ??
+      Math.round(leftColRef.current?.getBoundingClientRect().width ?? 720);
+    let next: number | null = null;
+    if (e.key === "ArrowRight") next = clampLeftWidth(cur + 24);
+    else if (e.key === "ArrowLeft") next = clampLeftWidth(cur - 24);
+    else if (e.key === "Home") next = 320;
+    else if (e.key === "End") next = clampLeftWidth(9999);
+    if (next !== null) {
+      e.preventDefault();
+      setLeftPaneWidth(next);
+      writeStoredNumber(SPLIT_X_KEY, next);
+    }
+  }
+
   return (
-    <div className="zcp2-root" data-density={ultraDense ? "ultra" : "compact"}>
-      <a className="skip" href="#main">
-        Ir al contenido
-      </a>
-      <header className="zcp2-topbar">
-        <div className="zcp2-brand">
-          <Mascot mood={currentMood} small />
-          <h1 className="zcp2-title">Zach</h1>
-          <span className={`zcp2-pill ${connected ? "is-live" : ""}`}>
-            <span className="zcp2-dot" />
-            {s.status
-              ? `Latido ${Math.max(0, Math.floor(now / 1000 - s.status.heartbeat_epoch))}s`
-              : "Latido —"}
-            {s.status
-              ? ` · ${s.status.running_task_slots}/${s.status.max_parallel_tasks}`
-              : ""}
-          </span>
-        </div>
+    <Tooltip.Provider delay={220}>
+      <div className="zcp2-root" data-density={ultraDense ? "ultra" : "compact"}>
+        <a className="skip" href="#main">
+          Ir al contenido
+        </a>
+        <header className="zcp2-topbar">
+          <div className="zcp2-brand">
+            <Mascot mood={currentMood} small />
+            <h1 className="zcp2-title">Zach</h1>
+            <Tooltip.Root>
+              <Tooltip.Trigger
+                type="button"
+                className={`zcp2-pill ${connected ? "is-live" : ""}`}
+              >
+                <span className="zcp2-dot" />
+                {s.status
+                  ? `Latido ${Math.max(0, Math.floor(now / 1000 - s.status.heartbeat_epoch))}s`
+                  : "Latido —"}
+                {s.status
+                  ? ` · ${s.status.running_task_slots}/${s.status.max_parallel_tasks}`
+                  : ""}
+              </Tooltip.Trigger>
+              <Tooltip.Portal>
+                <Tooltip.Positioner sideOffset={6}>
+                  <Tooltip.Popup className="zcp2-tooltip">
+                    {connected
+                      ? "Stream SSE conectado al daemon Zach"
+                      : "Sin conexión activa al stream SSE"}
+                  </Tooltip.Popup>
+                </Tooltip.Positioner>
+              </Tooltip.Portal>
+            </Tooltip.Root>
+          </div>
 
-        <div className="zcp2-kpis">
-          <button
-            type="button"
-            className="zcp2-kpi-btn"
-            aria-pressed={activeTab === "active"}
-            onClick={() => setActiveTab(activeTab === "active" ? "all" : "active")}
-          >
-            <span>En curso</span>
-            <span className="zcp2-kpi-num">{active.length}</span>
-          </button>
-          <button
-            type="button"
-            className="zcp2-kpi-btn"
-            aria-pressed={activeTab === "queued"}
-            onClick={() => setActiveTab(activeTab === "queued" ? "all" : "queued")}
-          >
-            <span>En cola</span>
-            <span className="zcp2-kpi-num">{queued.length}</span>
-          </button>
-          <span className="zcp2-pill">Merge {candidates.length}</span>
-        </div>
+          <div className="zcp2-kpis">
+            <button
+              type="button"
+              className="zcp2-kpi-btn"
+              aria-pressed={activeTab === "active"}
+              onClick={() => setActiveTab(activeTab === "active" ? "all" : "active")}
+            >
+              <span>En curso</span>
+              <span className="zcp2-kpi-num">{active.length}</span>
+            </button>
+            <button
+              type="button"
+              className="zcp2-kpi-btn"
+              aria-pressed={activeTab === "queued"}
+              onClick={() => setActiveTab(activeTab === "queued" ? "all" : "queued")}
+            >
+              <span>En cola</span>
+              <span className="zcp2-kpi-num">{queued.length}</span>
+            </button>
+            <span className="zcp2-pill">Merge {candidates.length}</span>
+          </div>
 
-        <div className="zcp2-controls">
-          <input
-            type="search"
-            className="zcp2-search zcp2-mono"
-            aria-label="Filtrar tareas y eventos"
-            placeholder="Filtrar tarea, repo, evento..."
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-          />
-          <select
-            className="zcp2-select"
-            aria-label="Filtrar repositorio"
-            value={repoFilter}
-            onChange={(e) => setRepoFilter(e.target.value)}
-          >
-            <option value="all">Todos los repos</option>
-            {repos.map((r) => (
-              <option key={r} value={r}>
-                {r}
-              </option>
-            ))}
-          </select>
-          <button
-            type="button"
-            className="zcp2-btn"
-            aria-pressed={ultraDense}
-            onClick={() => setUltraDense((u) => !u)}
-          >
-            {ultraDense ? "Ultra-dense" : "Compact"}
-          </button>
-          <button
-            type="button"
-            className="zcp2-btn"
-            aria-pressed={on}
-            onClick={async () => {
-              await sound.current.toggle();
-              setOn(sound.current.enabled);
-            }}
-          >
-            {on ? "Silenciar sonidos" : "Activar sonidos"}
-          </button>
-        </div>
-      </header>
+          <div className="zcp2-controls">
+            <input
+              type="search"
+              className="zcp2-search zcp2-mono"
+              aria-label="Filtrar tareas y eventos"
+              placeholder="Filtrar tarea, repo, evento..."
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+            />
+            <select
+              className="zcp2-select"
+              aria-label="Filtrar repositorio"
+              value={repoFilter}
+              onChange={(e) => setRepoFilter(e.target.value)}
+            >
+              <option value="all">Todos los repos</option>
+              {repos.map((r) => (
+                <option key={r} value={r}>
+                  {r}
+                </option>
+              ))}
+            </select>
+            <label className="zcp2-density">
+              <span>Ultra-dense</span>
+              <Switch.Root
+                className="zcp2-switch"
+                checked={ultraDense}
+                onCheckedChange={setUltraDense}
+                aria-label="Ultra-dense"
+              >
+                <Switch.Thumb className="zcp2-switch-thumb" />
+              </Switch.Root>
+            </label>
+            <button
+              type="button"
+              className="zcp2-btn"
+              aria-pressed={on}
+              onClick={async () => {
+                await sound.current.toggle();
+                setOn(sound.current.enabled);
+              }}
+            >
+              {on ? "Silenciar sonidos" : "Activar sonidos"}
+            </button>
+          </div>
+        </header>
 
       <ConnectionBar
         authMode={authMode}
@@ -642,9 +789,22 @@ function App() {
         }}
       />
 
-      <main id="main" className="zcp2-grid">
+      <main
+        id="main"
+        ref={gridRef}
+        className="zcp2-grid"
+        style={
+          leftPaneWidth != null
+            ? ({ "--z2-left-col": `${leftPaneWidth}px` } as React.CSSProperties)
+            : undefined
+        }
+      >
         {/* Left Pane: Pending Decisions Strip + Tabbed Dense Task Table */}
-        <section className="zcp2-col" aria-label="Decisiones pendientes y Tareas">
+        <section
+          ref={leftColRef}
+          className="zcp2-col"
+          aria-label="Decisiones pendientes y Tareas"
+        >
           <div className="zcp2-sec-head">
             <span className="zcp2-sec-title">
               Decisiones pendientes
@@ -655,7 +815,16 @@ function App() {
             </span>
           </div>
 
-          <section aria-label="Decisiones pendientes" className="zcp2-decisions">
+          <section
+            ref={decisionsRef}
+            aria-label="Decisiones pendientes"
+            className="zcp2-decisions"
+            style={
+              decisionsHeight != null && s.decisions.length > 0
+                ? { height: `${decisionsHeight}px`, maxHeight: "none" }
+                : undefined
+            }
+          >
             {s.decisions.length ? (
               s.decisions.map((d) => (
                 <DecisionRow
@@ -674,75 +843,91 @@ function App() {
             )}
           </section>
 
-          <div className="zcp2-tabs-list" role="tablist" aria-label="Filtro de tareas">
-            <button
-              type="button"
-              role="tab"
-              aria-selected={activeTab === "all"}
-              className="zcp2-tab"
-              onClick={() => setActiveTab("all")}
-            >
-              Todas ({active.length + queued.length})
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={activeTab === "active"}
-              className="zcp2-tab"
-              onClick={() => setActiveTab("active")}
-            >
-              En curso ({active.length})
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={activeTab === "queued"}
-              className="zcp2-tab"
-              onClick={() => setActiveTab("queued")}
-            >
-              En cola ({queued.length})
-            </button>
-          </div>
+          <div
+            role="separator"
+            tabIndex={0}
+            aria-orientation="horizontal"
+            aria-label="Redimensionar panel de decisiones y tareas"
+            aria-valuenow={decisionsHeight ?? 260}
+            aria-valuemin={120}
+            aria-valuemax={600}
+            className="zcp2-splitter zcp2-splitter-h"
+            onPointerDown={startVerticalResize}
+            onKeyDown={onVerticalSplitterKeyDown}
+          />
 
-          <section className="zcp2-tab-panel" aria-label="Tareas">
-            <div className="zcp2-table-head">
-              <span>Task</span>
-              <span>Repo</span>
-              <span>W</span>
-              <span>Title</span>
-              <span>Stages</span>
-              <span style={{ textAlign: "right" }}>Age</span>
-            </div>
-            {activeTab !== "queued" && (
-              <div>
-                <h2 className="zcp2-group-label">En curso ({active.length})</h2>
-                {active.length ? (
-                  active.map((t) => (
-                    <TaskRow key={t.task_id} t={t} s={s} now={now} onSelect={setSelectedTask} />
-                  ))
-                ) : (
-                  <p style={{ padding: "6px 10px", color: "var(--z2-muted)", margin: 0 }}>
-                    No hay tareas en curso en el último estado recibido.
-                  </p>
+          <Tabs.Root
+            className="zcp2-tabs-root"
+            value={activeTab}
+            onValueChange={(val) => setActiveTab(val as "all" | "active" | "queued")}
+          >
+            <Tabs.List className="zcp2-tabs-list" aria-label="Filtro de tareas">
+              <Tabs.Tab className="zcp2-tab" value="all">
+                Todas ({active.length + queued.length})
+              </Tabs.Tab>
+              <Tabs.Tab className="zcp2-tab" value="active">
+                En curso ({active.length})
+              </Tabs.Tab>
+              <Tabs.Tab className="zcp2-tab" value="queued">
+                En cola ({queued.length})
+              </Tabs.Tab>
+            </Tabs.List>
+
+            <Tabs.Panel className="zcp2-tab-panel-wrap" value={activeTab}>
+              <section className="zcp2-tab-panel" aria-label="Tareas">
+                <div className="zcp2-table-head">
+                  <span>Task</span>
+                  <span>Repo</span>
+                  <span>W</span>
+                  <span>Title</span>
+                  <span>Stages</span>
+                  <span style={{ textAlign: "right" }}>Age</span>
+                </div>
+                {activeTab !== "queued" && (
+                  <div>
+                    <h2 className="zcp2-group-label">En curso ({active.length})</h2>
+                    {active.length ? (
+                      active.map((t) => (
+                        <TaskRow key={t.task_id} t={t} s={s} now={now} onSelect={setSelectedTask} />
+                      ))
+                    ) : (
+                      <p style={{ padding: "6px 10px", color: "var(--z2-muted)", margin: 0 }}>
+                        No hay tareas en curso en el último estado recibido.
+                      </p>
+                    )}
+                  </div>
                 )}
-              </div>
-            )}
-            {activeTab !== "active" && (
-              <div>
-                <h2 className="zcp2-group-label">En cola ({queued.length})</h2>
-                {queued.length ? (
-                  queued.map((t) => (
-                    <TaskRow key={t.task_id} t={t} s={s} now={now} onSelect={setSelectedTask} />
-                  ))
-                ) : (
-                  <p style={{ padding: "6px 10px", color: "var(--z2-muted)", margin: 0 }}>
-                    No hay tareas en cola en el último estado recibido.
-                  </p>
+                {activeTab !== "active" && (
+                  <div>
+                    <h2 className="zcp2-group-label">En cola ({queued.length})</h2>
+                    {queued.length ? (
+                      queued.map((t) => (
+                        <TaskRow key={t.task_id} t={t} s={s} now={now} onSelect={setSelectedTask} />
+                      ))
+                    ) : (
+                      <p style={{ padding: "6px 10px", color: "var(--z2-muted)", margin: 0 }}>
+                        No hay tareas en cola en el último estado recibido.
+                      </p>
+                    )}
+                  </div>
                 )}
-              </div>
-            )}
-          </section>
+              </section>
+            </Tabs.Panel>
+          </Tabs.Root>
         </section>
+
+        <div
+          role="separator"
+          tabIndex={0}
+          aria-orientation="vertical"
+          aria-label="Redimensionar panel izquierdo y derecho"
+          aria-valuenow={leftPaneWidth ?? 720}
+          aria-valuemin={320}
+          aria-valuemax={1100}
+          className="zcp2-splitter zcp2-splitter-v"
+          onPointerDown={startHorizontalResize}
+          onKeyDown={onHorizontalSplitterKeyDown}
+        />
 
         {/* Right Pane: Merge Queue Strip + Dense Live Event Stream */}
         <aside className="zcp2-col" aria-label="Cola de merge y Eventos">
@@ -751,6 +936,39 @@ function App() {
               Cola de merge
               <span className="zcp2-count">{candidates.length}</span>
             </h2>
+            <Popover.Root>
+              <Popover.Trigger className="zcp2-btn zcp2-btn-ghost zcp2-mono">
+                Resueltas ({resolvedDecisions.length})
+              </Popover.Trigger>
+              <Popover.Portal>
+                <Popover.Positioner sideOffset={6} align="end">
+                  <Popover.Popup className="zcp2-popover">
+                    <div style={{ fontWeight: 700, fontSize: 11, marginBottom: 6 }}>
+                      Decisiones resueltas recientes
+                    </div>
+                    {resolvedDecisions.length > 0 ? (
+                      resolvedDecisions.map((ev) => (
+                        <div key={ev.seq_id} className="zcp2-hist-item zcp2-mono">
+                          <div>
+                            <strong>{ev.task_id}</strong>{" "}
+                            <span style={{ color: "var(--z2-faint)" }}>
+                              ({formatAge(now, ev.ts_epoch)})
+                            </span>
+                          </div>
+                          {ev.detail && (
+                            <div style={{ color: "var(--z2-muted)" }}>{ev.detail}</div>
+                          )}
+                        </div>
+                      ))
+                    ) : (
+                      <div className="zcp2-mono" style={{ color: "var(--z2-muted)", fontSize: 11 }}>
+                        Sin decisiones resueltas en el stream actual.
+                      </div>
+                    )}
+                  </Popover.Popup>
+                </Popover.Positioner>
+              </Popover.Portal>
+            </Popover.Root>
           </div>
           <div className="zcp2-merge-list">
             {candidates.length ? (
@@ -851,7 +1069,8 @@ function App() {
           }}
         />
       )}
-    </div>
+      </div>
+    </Tooltip.Provider>
   );
 }
 
@@ -923,131 +1142,130 @@ export function TaskDetailModal({
         cp.base_sha ||
         cp.network),
   );
-  return (
-    <div className="zcp2-dialog-backdrop" onClick={onClose}>
-      <div
-        className="zcp2-dialog-popup"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="task-dialog-title"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="zcp2-dialog-head">
-          <div>
-            <div className="zcp2-mono" style={{ color: "var(--z2-accent)", fontSize: 11 }}>
-              {activeTask.task_id} · {activeTask.repository} · Peso {activeTask.weight}
-            </div>
-            <h2 id="task-dialog-title" style={{ margin: "2px 0 0", fontSize: 14 }}>
+  const isBrowser = typeof document !== "undefined";
+  const body = (
+    <>
+      <div className="zcp2-dialog-head">
+        <div>
+          <div className="zcp2-mono" style={{ color: "var(--z2-accent)", fontSize: 11 }}>
+            {activeTask.task_id} · {activeTask.repository} · Peso {activeTask.weight}
+          </div>
+          {isBrowser ? (
+            <Dialog.Title style={{ margin: "2px 0 0", fontSize: 15, fontWeight: 700 }}>
+              {activeTask.title}
+            </Dialog.Title>
+          ) : (
+            <h2 style={{ margin: "2px 0 0", fontSize: 15, fontWeight: 700 }}>
               {activeTask.title}
             </h2>
-          </div>
+          )}
+        </div>
+        {isBrowser ? (
+          <Dialog.Close className="zcp2-btn">Cerrar</Dialog.Close>
+        ) : (
           <button type="button" className="zcp2-btn" onClick={onClose}>
             Cerrar
           </button>
-        </div>
-        <div className="zcp2-dialog-meta zcp2-mono">
-          <div>Estado: {activeTask.status}</div>
-          <div>GitHub: {activeTask.board_status ?? "Desconocido"}</div>
-          <div>Etapa actual: {activeTask.current_stage ?? "—"}</div>
-          <div>Actualizado: {formatAge(now, activeTask.updated_epoch)}</div>
-        </div>
-        <div className="zcp2-dialog-tabs" role="tablist" aria-label="Secciones de la tarea">
-          <button
-            type="button"
-            role="tab"
-            id="tab-summary"
-            aria-selected={tab === "summary"}
-            aria-controls="panel-summary"
-            className={`zcp2-dialog-tab ${tab === "summary" ? "is-active" : ""}`}
-            onClick={() => setTab("summary")}
+        )}
+      </div>
+      {isBrowser ? (
+        <Dialog.Description className="zcp2-sr-only">
+          Diagnóstico detallado, Context Pack e historial de intentos para {activeTask.task_id}.
+        </Dialog.Description>
+      ) : (
+        <p className="zcp2-sr-only">
+          Diagnóstico detallado, Context Pack e historial de intentos para {activeTask.task_id}.
+        </p>
+      )}
+          <div className="zcp2-dialog-meta zcp2-mono">
+            <div>Estado: {activeTask.status}</div>
+            <div>GitHub: {activeTask.board_status ?? "Desconocido"}</div>
+            <div>Etapa actual: {activeTask.current_stage ?? "—"}</div>
+            <div>Actualizado: {formatAge(now, activeTask.updated_epoch)}</div>
+          </div>
+          <div
+            className="zcp2-stage-strip zcp2-mono"
+            aria-label={`Pipeline de ${activeTask.task_id}`}
           >
-            Resumen &amp; Context Pack
-          </button>
-          <button
-            type="button"
-            role="tab"
-            id="tab-attempts"
-            aria-selected={tab === "attempts"}
-            aria-controls="panel-attempts"
-            className={`zcp2-dialog-tab ${tab === "attempts" ? "is-active" : ""}`}
-            onClick={() => setTab("attempts")}
+            {activeTask.required_stages.length ? (
+              activeTask.required_stages.map((stage) => {
+                const st = state.stages[activeTask.task_id + ":" + stage];
+                const done = activeTask.stages_completed.includes(stage);
+                const fail =
+                  !done && Boolean(st && /FAIL|ERROR/.test(st.status));
+                const running =
+                  !done &&
+                  !fail &&
+                  (st?.status === "RUNNING" ||
+                    activeTask.current_stage === stage);
+                const stateClass = done
+                  ? "is-done"
+                  : fail
+                    ? "is-failed"
+                    : running
+                      ? "is-running"
+                      : "is-pending";
+                const stateText = done
+                  ? "done"
+                  : fail
+                    ? "failed"
+                    : running
+                      ? "running"
+                      : "pending";
+                return (
+                  <div
+                    key={stage}
+                    className={`zcp2-stage-pill ${stateClass}`}
+                    title={`${stage}: ${stateText}`}
+                  >
+                    <span className={`zcp2-pip ${stateClass}`} aria-hidden="true" />
+                    <span>{stage}</span>
+                    <span className="zcp2-stage-st">{stateText}</span>
+                  </div>
+                );
+              })
+            ) : (
+              <span className="zcp2-mono" style={{ color: "var(--z2-muted)", fontSize: 11 }}>
+                Sin etapas requeridas
+              </span>
+            )}
+          </div>
+          <Tabs.Root
+            className="zcp2-modal-tabs"
+            value={tab}
+            onValueChange={(v) => setTab(v as "summary" | "attempts")}
           >
-            Intentos &amp; Auditoría{detail ? ` (${detail.attempts.length})` : ""}
-          </button>
-        </div>
+            <Tabs.List className="zcp2-tabs-list" aria-label="Secciones de la tarea">
+              <Tabs.Tab className="zcp2-tab" value="summary">
+                Resumen &amp; Context Pack
+              </Tabs.Tab>
+              <Tabs.Tab className="zcp2-tab" value="attempts">
+                Intentos &amp; Auditoría{detail ? ` (${detail.attempts.length})` : ""}
+              </Tabs.Tab>
+            </Tabs.List>
 
-        {tab === "summary" && (
-          <div id="panel-summary" role="tabpanel" aria-labelledby="tab-summary">
-            {connection && (
-              <div className="zcp2-dialog-section">
-                <div className="zcp2-dialog-label">Asistente IA</div>
-                <AiExplanationPanel
-                  taskId={activeTask.task_id}
-                  connection={connection}
-                />
-              </div>
-            )}
-            <div className="zcp2-dialog-section">
-              <div className="zcp2-dialog-label">Pipeline de etapas</div>
-              <div
-                className="zcp2-stage-pipeline"
-                aria-label={`Pipeline de ${activeTask.task_id}`}
-              >
-                {activeTask.required_stages.length ? (
-                  activeTask.required_stages.map((stage) => {
-                    const st = state.stages[activeTask.task_id + ":" + stage];
-                    const done = activeTask.stages_completed.includes(stage);
-                    const fail =
-                      !done && Boolean(st && /FAIL|ERROR/.test(st.status));
-                    const running =
-                      !done &&
-                      !fail &&
-                      (st?.status === "RUNNING" ||
-                        activeTask.current_stage === stage);
-                    const stateClass = done
-                      ? "is-done"
-                      : fail
-                        ? "is-failed"
-                        : running
-                          ? "is-running"
-                          : "is-pending";
-                    const stateText = done
-                      ? "Completada"
-                      : fail
-                        ? "Fallida"
-                        : running
-                          ? "En curso"
-                          : "Pendiente";
-                    return (
-                      <span
-                        key={stage}
-                        className={`zcp2-stage-step zcp2-mono ${stateClass}`}
-                        title={`${stage}: ${stateText}`}
-                      >
-                        <span className="zcp2-stage-dot" aria-hidden="true" />
-                        <span>{stage}</span>
-                      </span>
-                    );
-                  })
-                ) : (
-                  <span className="zcp2-mono" style={{ color: "var(--z2-muted)", fontSize: 11 }}>
-                    Sin etapas requeridas
-                  </span>
-                )}
-              </div>
-            </div>
-            {openDec && (
-              <div className="zcp2-dialog-section zcp2-dialog-decision">
-                <div style={{ color: "var(--z2-accent)", fontSize: 11.5, fontWeight: 600 }}>
-                  Decisión abierta: {openDec.question}
+            <Tabs.Panel className="zcp2-modal-panel" value="summary">
+              {connection && (
+                <div className="zcp2-dialog-section">
+                  <div className="zcp2-dialog-label">Asistente IA</div>
+                  <AiExplanationPanel
+                    taskId={activeTask.task_id}
+                    connection={connection}
+                  />
                 </div>
-                {openDec.context_summary && (
-                  <p className="zcp2-dec-context" style={{ marginTop: 4 }}>
-                    {openDec.context_summary}
-                  </p>
-                )}
-              </div>
-            )}
+              )}
+              {openDec && (
+                <div className="zcp2-dialog-section zcp2-dialog-decision">
+                  <div style={{ color: "var(--z2-accent)", fontSize: 11.5, fontWeight: 600 }}>
+                    Decisión abierta: {openDec.question}
+                  </div>
+                  {openDec.context_summary && (
+                    <p className="zcp2-dec-context" style={{ marginTop: 4 }}>
+                      {openDec.context_summary}
+                    </p>
+                  )}
+                </div>
+              )}
             {lastCheckFailure && (
               <div className="zcp2-dialog-section zcp2-dialog-err">
                 <div className="zcp2-dialog-label">Último fallo de verificación</div>
@@ -1166,112 +1384,126 @@ export function TaskDetailModal({
                 )}
               </div>
             )}
-          </div>
-        )}
+            </Tabs.Panel>
 
-        {tab === "attempts" && (
-          <div id="panel-attempts" role="tabpanel" aria-labelledby="tab-attempts">
-            {detailLoading ? (
-              <div className="zcp2-dialog-section zcp2-mono zcp2-detail-note">
-                Cargando intentos y auditoría…
-              </div>
-            ) : detailError ? (
-              <div className="zcp2-dialog-section zcp2-dialog-err">
-                <div className="zcp2-dialog-label">Error al cargar intentos</div>
-                <div className="zcp2-mono" style={{ fontSize: 11 }}>{detailError}</div>
-              </div>
-            ) : !detail || detail.attempts.length === 0 ? (
-              <div className="zcp2-dialog-section zcp2-mono zcp2-detail-note">
-                Sin intentos registrados para esta tarea.
-              </div>
-            ) : (
-              <div className="zcp2-attempts-list">
-                {detail.attempts.map((att) => {
-                  const audit = auditByAttempt.get(att.attempt_id);
-                  const tone = /PASS|SUCCEED|DONE|OK/.test(att.status)
-                    ? "is-ok"
-                    : /FAIL|ERROR|KILL|TIMEOUT/.test(att.status)
-                      ? "is-err"
-                      : "is-warn";
-                  return (
-                    <article key={att.attempt_id} className="zcp2-attempt-card">
-                      <div className="zcp2-attempt-head zcp2-mono">
-                        <span className={`zcp2-badge ${tone}`}>{att.status}</span>
-                        <strong>{att.stage}</strong>
-                        <span>{att.model} ({att.effort})</span>
-                        <span>{formatDuration(att.started_epoch, att.ended_epoch)}</span>
-                      </div>
-                      <div className="zcp2-attempt-meta zcp2-mono">
-                        <span>ID: {att.attempt_id}</span>
-                        <span>Fase: {att.phase}</span>
-                        <span>Tokens: {formatTokens(att.total_tokens)} (in {formatTokens(att.input_tokens)} / out {formatTokens(att.output_tokens)})</span>
-                        {att.exit_code != null && (
-                          <span>Exit: {att.exit_code}{att.exit_code_kind ? ` (${att.exit_code_kind})` : ""}</span>
-                        )}
-                        {att.failure_class && <span>Fallo: {att.failure_class}</span>}
-                      </div>
-                      {audit && (
-                        <div className="zcp2-audit-grid zcp2-mono">
-                          <span>Turnos: {audit.turn_count}</span>
-                          <span>Tools: {audit.tool_call_count} (err {audit.tool_error_count})</span>
-                          <span>Bucles edit/fail: {audit.edit_compile_fail_loops}</span>
-                          <span>Lecturas redund.: {audit.redundant_read_count}</span>
-                          {audit.cached_input_tokens != null && (
-                            <span>Cache in: {formatTokens(audit.cached_input_tokens)}</span>
-                          )}
-                          {audit.reasoning_tokens != null && (
-                            <span>Reasoning: {formatTokens(audit.reasoning_tokens)}</span>
-                          )}
-                          {audit.check_divergence && (
-                            <span className="is-err">Divergencia check</span>
-                          )}
-                          {audit.error_code && (
-                            <span className="is-err">Código: {audit.error_code}</span>
-                          )}
+            <Tabs.Panel className="zcp2-modal-panel" value="attempts">
+              {detailLoading ? (
+                <div className="zcp2-dialog-section zcp2-mono zcp2-detail-note">
+                  Cargando intentos y auditoría…
+                </div>
+              ) : detailError ? (
+                <div className="zcp2-dialog-section zcp2-dialog-err">
+                  <div className="zcp2-dialog-label">Error al cargar intentos</div>
+                  <div className="zcp2-mono" style={{ fontSize: 11 }}>{detailError}</div>
+                </div>
+              ) : !detail || detail.attempts.length === 0 ? (
+                <div className="zcp2-dialog-section zcp2-mono zcp2-detail-note">
+                  Sin intentos registrados para esta tarea.
+                </div>
+              ) : (
+                <div className="zcp2-attempts-list">
+                  {detail.attempts.map((att) => {
+                    const audit = auditByAttempt.get(att.attempt_id);
+                    const tone = /PASS|SUCCEED|DONE|OK/.test(att.status)
+                      ? "is-ok"
+                      : /FAIL|ERROR|KILL|TIMEOUT/.test(att.status)
+                        ? "is-err"
+                        : "is-warn";
+                    return (
+                      <article key={att.attempt_id} className="zcp2-attempt-card">
+                        <div className="zcp2-attempt-head zcp2-mono">
+                          <span className={`zcp2-badge ${tone}`}>{att.status}</span>
+                          <strong>{att.stage}</strong>
+                          <span>{att.model} ({att.effort})</span>
+                          <span>{formatDuration(att.started_epoch, att.ended_epoch)}</span>
                         </div>
-                      )}
-                      {att.summary && (
-                        <pre className="zcp2-pre zcp2-mono">{att.summary}</pre>
-                      )}
-                    </article>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-        )}
+                        <div className="zcp2-attempt-meta zcp2-mono">
+                          <span>ID: {att.attempt_id}</span>
+                          <span>Fase: {att.phase}</span>
+                          <span>Tokens: {formatTokens(att.total_tokens)} (in {formatTokens(att.input_tokens)} / out {formatTokens(att.output_tokens)})</span>
+                          {att.exit_code != null && (
+                            <span>Exit: {att.exit_code}{att.exit_code_kind ? ` (${att.exit_code_kind})` : ""}</span>
+                          )}
+                          {att.failure_class && <span>Fallo: {att.failure_class}</span>}
+                        </div>
+                        {audit && (
+                          <div className="zcp2-audit-grid zcp2-mono">
+                            <span>Turnos: {audit.turn_count}</span>
+                            <span>Tools: {audit.tool_call_count} (err {audit.tool_error_count})</span>
+                            <span>Bucles edit/fail: {audit.edit_compile_fail_loops}</span>
+                            <span>Lecturas redund.: {audit.redundant_read_count}</span>
+                            {audit.cached_input_tokens != null && (
+                              <span>Cache in: {formatTokens(audit.cached_input_tokens)}</span>
+                            )}
+                            {audit.reasoning_tokens != null && (
+                              <span>Reasoning: {formatTokens(audit.reasoning_tokens)}</span>
+                            )}
+                            {audit.check_divergence && (
+                              <span className="is-err">Divergencia check</span>
+                            )}
+                            {audit.error_code && (
+                              <span className="is-err">Código: {audit.error_code}</span>
+                            )}
+                          </div>
+                        )}
+                        {att.summary && (
+                          <pre className="zcp2-pre zcp2-mono">{att.summary}</pre>
+                        )}
+                      </article>
+                    );
+                  })}
+                </div>
+              )}
+            </Tabs.Panel>
+          </Tabs.Root>
 
-        <div style={{ display: "flex", gap: 6, justifyContent: "flex-end", marginTop: 10, flexWrap: "wrap" }}>
-          {issueUrl && (
-            <a
-              className="zcp2-btn zcp2-link"
-              href={issueUrl}
-              target="_blank"
-              rel="noreferrer"
+          <div style={{ display: "flex", gap: 6, justifyContent: "flex-end", marginTop: 10, flexWrap: "wrap" }}>
+            {issueUrl && (
+              <a
+                className="zcp2-btn zcp2-link"
+                href={issueUrl}
+                target="_blank"
+                rel="noreferrer"
+              >
+                Issue ↗
+              </a>
+            )}
+            {pullUrl && (
+              <a
+                className="zcp2-btn zcp2-link"
+                href={pullUrl}
+                target="_blank"
+                rel="noreferrer"
+              >
+                PR #{activeTask.pr_number} ↗
+              </a>
+            )}
+            <button
+              type="button"
+              className="zcp2-btn"
+              onClick={() => onFilterEvents(activeTask.task_id)}
             >
-              Issue ↗
-            </a>
-          )}
-          {pullUrl && (
-            <a
-              className="zcp2-btn zcp2-link"
-              href={pullUrl}
-              target="_blank"
-              rel="noreferrer"
-            >
-              PR #{activeTask.pr_number} ↗
-            </a>
-          )}
-          <button
-            type="button"
-            className="zcp2-btn"
-            onClick={() => onFilterEvents(activeTask.task_id)}
-          >
-            Filtrar eventos
-          </button>
+              Filtrar eventos
+            </button>
+          </div>
+    </>
+  );
+  if (!isBrowser) {
+    return (
+      <div className="zcp2-dialog-backdrop">
+        <div className="zcp2-dialog-popup" role="dialog" aria-modal="true">
+          {body}
         </div>
       </div>
-    </div>
+    );
+  }
+  return (
+    <Dialog.Root open onOpenChange={(open) => { if (!open) onClose(); }}>
+      <Dialog.Portal>
+        <Dialog.Backdrop className="zcp2-dialog-backdrop" />
+        <Dialog.Popup className="zcp2-dialog-popup">{body}</Dialog.Popup>
+      </Dialog.Portal>
+    </Dialog.Root>
   );
 }
 
