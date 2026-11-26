@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use zach::ledger;
-use zach::v2::intake::{ingest_export_json, sync_from_ws_task};
+use zach::v2::intake::{
+    draft_context_pack_yaml, ingest_export_json, sync_from_ws_task, validate_context_pack_yaml,
+};
 use zach::v2::pipeline::plan_task_execution;
 use zach::v2::socket::{ClientCommand, DaemonServer, write_ndjson};
 use zach::v2::store::{DecisionResolution, V2Store};
@@ -66,6 +68,7 @@ fn main() {
         "events" => run_v2_events(&args[2..]),
         "web" => run_v2_web(&args[2..]),
         "audit" => run_v2_audit(&args[2..]),
+        "pack-draft" => run_v2_pack_draft(&args[2..]),
         "--help" | "-h" => print_usage(),
         unknown => {
             eprintln!("unknown option: {unknown}");
@@ -96,6 +99,48 @@ fn run_doctor(args: &[String]) {
     if !report.ok {
         std::process::exit(1);
     }
+}
+
+fn run_v2_pack_draft(args: &[String]) {
+    if has_flag(args, "--help") || has_flag(args, "-h") {
+        print_usage();
+        return;
+    }
+    let raw_opt = flag_value(args, "--validate")
+        .map(|f| fs::read_to_string(&f))
+        .or_else(|| has_flag(args, "--stdin").then(|| std::io::read_to_string(std::io::stdin())));
+    if let Some(res) = raw_opt {
+        let raw = res.unwrap_or_else(|e| {
+            eprintln!("pack-draft: {e}");
+            std::process::exit(1);
+        });
+        if let Err(errs) = validate_context_pack_yaml(&raw) {
+            for e in errs {
+                eprintln!("invalid context pack: {e}");
+            }
+            std::process::exit(1);
+        }
+        println!("context pack valid");
+        return;
+    }
+    let repo = flag_value(args, "--repo")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let (mut paths, mut i) = (Vec::new(), 0);
+    while i < args.len() {
+        if args[i] == "--repo" {
+            i += 2;
+            continue;
+        }
+        if !args[i].starts_with('-') {
+            paths.push(args[i].clone());
+        }
+        i += 1;
+    }
+    if paths.is_empty() {
+        usage_error("pack-draft requires candidate file paths, --validate <FILE>, or --stdin");
+    }
+    print!("{}", draft_context_pack_yaml(&repo, &paths));
 }
 
 fn open_store(args: &[String]) -> V2Store {
@@ -1991,6 +2036,7 @@ fn print_usage() {
         "       zach events [--group <GROUP>] [--since-seq <N>] [--wait] [--socket <PATH>] [--db <PATH>]"
     );
     println!("       zach audit <TASK_ID> --json [--db <PATH>]");
+    println!("       zach pack-draft [--repo <PATH>] [--validate <FILE> | --stdin] [<FILE>...]");
 }
 
 #[cfg(test)]
