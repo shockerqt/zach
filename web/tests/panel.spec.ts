@@ -388,3 +388,73 @@ test("Access JWT mode connects automatically to snapshot and SSE without token p
   expect(f.snapshots()).toBe(1);
   expect(f.requests.every((r) => r.authorization === undefined)).toBe(true);
 });
+
+test("decision context, failure diagnostics, and task detail modal render accessibly", async ({
+  page,
+}) => {
+  const richTask = {
+    ...task,
+    memory: {
+      last_check_failure: "cargo test failed: assertion error",
+      approved_plan: "1. Update protocol\n2. Render diagnostics",
+    },
+  };
+  const mergeDecision = {
+    decision_id: "decision-merge",
+    task_id: richTask.task_id,
+    kind: "merge_approval",
+    question: "¿Mergear PR #90?",
+    options: ["Approve", "Reject"],
+    context_summary: "CI verde tras corrección.",
+    recommended_option: 0,
+    linked_unverified_delivery: true,
+    status: "OPEN",
+  };
+  await page.route("**/api/**", async (route) => {
+    const req = route.request();
+    if (req.url().endsWith("/snapshot")) {
+      return route.fulfill({
+        json: {
+          tasks: [richTask],
+          open_decisions: [mergeDecision],
+          as_of_seq: 10,
+          status: data.status,
+        },
+      });
+    }
+    return route.fulfill({
+      contentType: "text/event-stream",
+      body: `event: snapshot\ndata: ${JSON.stringify({ tasks: [richTask], open_decisions: [mergeDecision], as_of_seq: 10 })}\n\n`,
+    });
+  });
+
+  await page.goto("/");
+  const dec = page.locator('section[aria-label="Decisiones pendientes"] > :first-child');
+  await expect(dec.getByText("CI verde tras corrección.")).toBeVisible();
+  await expect(dec.getByText(/Entrega vinculada sin verificar/)).toBeVisible();
+  await expect(dec.getByRole("link", { name: "Issue ↗" })).toBeVisible();
+  await expect(dec.getByRole("link", { name: "PR #90 ↗" })).toBeVisible();
+  await expect(dec.getByRole("button", { name: "Approve", exact: true })).toHaveAttribute(
+    "data-recommended",
+    "true",
+  );
+
+  const failureToggle = dec.getByText("Último fallo de verificación");
+  await expect(dec.getByText("cargo test failed: assertion error")).toBeHidden();
+  await failureToggle.click();
+  await expect(dec.getByText("cargo test failed: assertion error")).toBeVisible();
+
+  await page.locator(".zcp2-task-row").first().click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByLabel(`Pipeline de ${richTask.task_id}`)).toBeVisible();
+  await expect(dialog.getByText("cargo test failed: assertion error")).toBeVisible();
+  await expect(dialog.getByText("CI verde tras corrección.")).toBeVisible();
+  await expect(dialog.getByRole("link", { name: "Issue ↗" })).toBeVisible();
+  await expect(dialog.getByRole("link", { name: "PR #90 ↗" })).toBeVisible();
+  await dialog.getByText("Plan aprobado").click();
+  await expect(dialog.getByText(/1\. Update protocol/)).toBeVisible();
+
+  const failures = await new AxeBuilder({ page }).analyze();
+  expect(failures.violations).toEqual([]);
+});

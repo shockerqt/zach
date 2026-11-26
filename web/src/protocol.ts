@@ -47,6 +47,7 @@ export interface Decision {
   question: string;
   options: string[];
   context_summary: string;
+  recommended_option?: number;
   status: string;
   choice?: string;
   created_seq?: number;
@@ -100,6 +101,8 @@ export function decision(v: unknown, eventTask?: string): Decision {
       o.context_summary == null
         ? "Contexto no disponible"
         : string(o.context_summary),
+    recommended_option:
+      o.recommended_option == null ? undefined : integer(o.recommended_option),
     status: o.status == null ? "OPEN" : string(o.status),
     choice: optional(o.choice),
     created_seq: o.created_seq == null ? undefined : integer(o.created_seq),
@@ -170,6 +173,8 @@ function displayMemory(value: unknown): Obj {
   const result: Obj = {};
   if (m.last_check_failure != null)
     result.last_check_failure = string(m.last_check_failure);
+  if (m.approved_plan != null)
+    result.approved_plan = string(m.approved_plan);
   if (m.merge_checkpoint != null) {
     const c = object(m.merge_checkpoint);
     result.merge_checkpoint = { phase: string(c.phase) };
