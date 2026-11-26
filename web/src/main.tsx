@@ -20,7 +20,13 @@ import {
   type EventFilterKind,
   type State,
 } from "./state";
-import { github, type Task, type Decision } from "./protocol";
+import {
+  github,
+  type Task,
+  type Decision,
+  type TaskDetail,
+  type AttemptAudit,
+} from "./protocol";
 import { Mascot, moodText } from "./Mascot";
 import { Sound } from "./sound";
 
@@ -322,7 +328,10 @@ function App() {
     [ultraDense, setUltraDense] = useState(false),
     [activeTab, setActiveTab] = useState<"all" | "active" | "queued">("all"),
     [eventFilter, setEventFilter] = useState<EventFilterKind>("ALL"),
-    [selectedTask, setSelectedTask] = useState<Task | null>(null);
+    [selectedTask, setSelectedTask] = useState<Task | null>(null),
+    [taskDetail, setTaskDetail] = useState<TaskDetail | null>(null),
+    [detailLoading, setDetailLoading] = useState(false),
+    [detailError, setDetailError] = useState("");
   const input = useRef<HTMLInputElement>(null),
     sound = useRef(new Sound()),
     connection = useRef<Connection | null>(null);
@@ -344,6 +353,41 @@ function App() {
       setAuthMode,
     );
   const c = connection.current;
+  const selectedTaskId = selectedTask?.task_id;
+  useEffect(() => {
+    if (!selectedTaskId) {
+      setTaskDetail(null);
+      setDetailLoading(false);
+      setDetailError("");
+      return;
+    }
+    let cancelled = false;
+    setTaskDetail(null);
+    setDetailError("");
+    if (!c.active) {
+      setDetailLoading(false);
+      return;
+    }
+    setDetailLoading(true);
+    c.fetchTaskDetail(selectedTaskId)
+      .then((detail) => {
+        if (cancelled) return;
+        setTaskDetail(detail);
+        setDetailLoading(false);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setDetailLoading(false);
+        setDetailError(
+          err instanceof Error && err.message
+            ? err.message
+            : "No se pudo cargar el detalle",
+        );
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedTaskId, c]);
   useEffect(() => {
     const boot = setTimeout(() => {
       void c.connectAuto();
@@ -696,164 +740,434 @@ function App() {
         </aside>
       </main>
 
-      {selectedTask && (() => {
-        const activeTask =
-          s.tasks.find((t) => t.task_id === selectedTask.task_id) ?? selectedTask;
-        const openDec = taskDecision(s, activeTask);
-        const lastCheckFailure =
-          typeof activeTask.memory.last_check_failure === "string"
-            ? activeTask.memory.last_check_failure
-            : undefined;
-        const approvedPlan =
-          typeof activeTask.memory.approved_plan === "string"
-            ? activeTask.memory.approved_plan
-            : undefined;
-        const issueUrl = github(activeTask, "issue");
-        const pullUrl = github(activeTask, "pull");
-        return (
-          <div
-            className="zcp2-dialog-backdrop"
-            onClick={() => setSelectedTask(null)}
+      {selectedTask && (
+        <TaskDetailModal
+          key={selectedTask.task_id}
+          task={
+            s.tasks.find((t) => t.task_id === selectedTask.task_id) ??
+            selectedTask
+          }
+          state={s}
+          detail={taskDetail}
+          detailLoading={detailLoading}
+          detailError={detailError}
+          now={now}
+          onClose={() => setSelectedTask(null)}
+          onFilterEvents={(taskId) => {
+            setQuery(taskId);
+            setSelectedTask(null);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function formatDuration(startEpoch: number, endEpoch?: number): string {
+  if (!endEpoch || endEpoch < startEpoch) return "En curso";
+  const secs = endEpoch - startEpoch;
+  if (secs < 60) return `${secs}s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m ${secs % 60}s`;
+  return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
+}
+
+function formatTokens(n?: number): string {
+  if (n == null) return "—";
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return String(n);
+}
+
+export function TaskDetailModal({
+  task,
+  state,
+  detail,
+  detailLoading,
+  detailError,
+  now,
+  onClose,
+  onFilterEvents,
+}: {
+  task: Task;
+  state: State;
+  detail: TaskDetail | null;
+  detailLoading: boolean;
+  detailError: string;
+  now: number;
+  onClose: () => void;
+  onFilterEvents: (taskId: string) => void;
+}) {
+  const [tab, setTab] = useState<"summary" | "attempts">("summary");
+  const activeTask = detail?.task ?? task;
+  const openDec = taskDecision(state, activeTask);
+  const lastCheckFailure =
+    typeof activeTask.memory.last_check_failure === "string"
+      ? activeTask.memory.last_check_failure
+      : undefined;
+  const approvedPlan =
+    typeof activeTask.memory.approved_plan === "string"
+      ? activeTask.memory.approved_plan
+      : undefined;
+  const issueUrl = github(activeTask, "issue");
+  const pullUrl = github(activeTask, "pull");
+  const auditByAttempt = useMemo(() => {
+    const map = new Map<string, AttemptAudit>();
+    for (const audit of detail?.audits ?? []) {
+      map.set(audit.attempt_id, audit);
+    }
+    return map;
+  }, [detail]);
+  const cp = detail?.context_pack;
+  const hasContextPack = Boolean(
+    cp &&
+      (cp.target_files.length ||
+        cp.forbidden_paths.length ||
+        cp.worker_checks.length ||
+        cp.gate_checks.length ||
+        cp.human_operations.length ||
+        cp.verification_commands.length ||
+        cp.acceptance_criteria.length ||
+        cp.base_sha ||
+        cp.network),
+  );
+  return (
+    <div className="zcp2-dialog-backdrop" onClick={onClose}>
+      <div
+        className="zcp2-dialog-popup"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="task-dialog-title"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="zcp2-dialog-head">
+          <div>
+            <div className="zcp2-mono" style={{ color: "var(--z2-accent)", fontSize: 11 }}>
+              {activeTask.task_id} · {activeTask.repository} · Peso {activeTask.weight}
+            </div>
+            <h2 id="task-dialog-title" style={{ margin: "2px 0 0", fontSize: 14 }}>
+              {activeTask.title}
+            </h2>
+          </div>
+          <button type="button" className="zcp2-btn" onClick={onClose}>
+            Cerrar
+          </button>
+        </div>
+        <div className="zcp2-dialog-meta zcp2-mono">
+          <div>Estado: {activeTask.status}</div>
+          <div>GitHub: {activeTask.board_status ?? "Desconocido"}</div>
+          <div>Etapa actual: {activeTask.current_stage ?? "—"}</div>
+          <div>Actualizado: {formatAge(now, activeTask.updated_epoch)}</div>
+        </div>
+        <div className="zcp2-dialog-tabs" role="tablist" aria-label="Secciones de la tarea">
+          <button
+            type="button"
+            role="tab"
+            id="tab-summary"
+            aria-selected={tab === "summary"}
+            aria-controls="panel-summary"
+            className={`zcp2-dialog-tab ${tab === "summary" ? "is-active" : ""}`}
+            onClick={() => setTab("summary")}
           >
-            <div
-              className="zcp2-dialog-popup"
-              role="dialog"
-              aria-modal="true"
-              aria-labelledby="task-dialog-title"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <div className="zcp2-dialog-head">
-                <div>
-                  <div className="zcp2-mono" style={{ color: "var(--z2-accent)", fontSize: 11 }}>
-                    {activeTask.task_id} · {activeTask.repository} · Peso {activeTask.weight}
-                  </div>
-                  <h2 id="task-dialog-title" style={{ margin: "2px 0 0", fontSize: 14 }}>
-                    {activeTask.title}
-                  </h2>
-                </div>
-                <button
-                  type="button"
-                  className="zcp2-btn"
-                  onClick={() => setSelectedTask(null)}
-                >
-                  Cerrar
-                </button>
-              </div>
-              <div className="zcp2-dialog-meta zcp2-mono">
-                <div>Estado: {activeTask.status}</div>
-                <div>GitHub: {activeTask.board_status ?? "Desconocido"}</div>
-                <div>Etapa actual: {activeTask.current_stage ?? "—"}</div>
-                <div>Actualizado: {formatAge(now, activeTask.updated_epoch)}</div>
-              </div>
-              <div className="zcp2-dialog-section">
-                <div className="zcp2-dialog-label">Pipeline de etapas</div>
-                <div
-                  className="zcp2-stage-pipeline"
-                  aria-label={`Pipeline de ${activeTask.task_id}`}
-                >
-                  {activeTask.required_stages.length ? (
-                    activeTask.required_stages.map((stage) => {
-                      const st = s.stages[activeTask.task_id + ":" + stage];
-                      const done = activeTask.stages_completed.includes(stage);
-                      const fail =
-                        !done && Boolean(st && /FAIL|ERROR/.test(st.status));
-                      const running =
-                        !done &&
-                        !fail &&
-                        (st?.status === "RUNNING" ||
-                          activeTask.current_stage === stage);
-                      const stateClass = done
-                        ? "is-done"
-                        : fail
-                          ? "is-failed"
-                          : running
-                            ? "is-running"
-                            : "is-pending";
-                      const stateText = done
-                        ? "Completada"
-                        : fail
-                          ? "Fallida"
-                          : running
-                            ? "En curso"
-                            : "Pendiente";
-                      return (
-                        <span
-                          key={stage}
-                          className={`zcp2-stage-step zcp2-mono ${stateClass}`}
-                          title={`${stage}: ${stateText}`}
-                        >
-                          <span className="zcp2-stage-dot" aria-hidden="true" />
-                          <span>{stage}</span>
-                        </span>
-                      );
-                    })
-                  ) : (
-                    <span className="zcp2-mono" style={{ color: "var(--z2-muted)", fontSize: 11 }}>
-                      Sin etapas requeridas
-                    </span>
-                  )}
-                </div>
-              </div>
-              {openDec && (
-                <div className="zcp2-dialog-section zcp2-dialog-decision">
-                  <div style={{ color: "var(--z2-accent)", fontSize: 11.5, fontWeight: 600 }}>
-                    Decisión abierta: {openDec.question}
-                  </div>
-                  {openDec.context_summary && (
-                    <p className="zcp2-dec-context" style={{ marginTop: 4 }}>
-                      {openDec.context_summary}
-                    </p>
-                  )}
-                </div>
-              )}
-              {lastCheckFailure && (
-                <div className="zcp2-dialog-section zcp2-dialog-err">
-                  <div className="zcp2-dialog-label">Último fallo de verificación</div>
-                  <pre className="zcp2-pre zcp2-mono">{lastCheckFailure}</pre>
-                </div>
-              )}
-              {approvedPlan && (
-                <details className="zcp2-details zcp2-dialog-section">
-                  <summary>Plan aprobado</summary>
-                  <pre className="zcp2-pre zcp2-mono">{approvedPlan}</pre>
-                </details>
-              )}
-              <div style={{ display: "flex", gap: 6, justifyContent: "flex-end", marginTop: 10, flexWrap: "wrap" }}>
-                {issueUrl && (
-                  <a
-                    className="zcp2-btn zcp2-link"
-                    href={issueUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    Issue ↗
-                  </a>
+            Resumen &amp; Context Pack
+          </button>
+          <button
+            type="button"
+            role="tab"
+            id="tab-attempts"
+            aria-selected={tab === "attempts"}
+            aria-controls="panel-attempts"
+            className={`zcp2-dialog-tab ${tab === "attempts" ? "is-active" : ""}`}
+            onClick={() => setTab("attempts")}
+          >
+            Intentos &amp; Auditoría{detail ? ` (${detail.attempts.length})` : ""}
+          </button>
+        </div>
+
+        {tab === "summary" && (
+          <div id="panel-summary" role="tabpanel" aria-labelledby="tab-summary">
+            <div className="zcp2-dialog-section">
+              <div className="zcp2-dialog-label">Pipeline de etapas</div>
+              <div
+                className="zcp2-stage-pipeline"
+                aria-label={`Pipeline de ${activeTask.task_id}`}
+              >
+                {activeTask.required_stages.length ? (
+                  activeTask.required_stages.map((stage) => {
+                    const st = state.stages[activeTask.task_id + ":" + stage];
+                    const done = activeTask.stages_completed.includes(stage);
+                    const fail =
+                      !done && Boolean(st && /FAIL|ERROR/.test(st.status));
+                    const running =
+                      !done &&
+                      !fail &&
+                      (st?.status === "RUNNING" ||
+                        activeTask.current_stage === stage);
+                    const stateClass = done
+                      ? "is-done"
+                      : fail
+                        ? "is-failed"
+                        : running
+                          ? "is-running"
+                          : "is-pending";
+                    const stateText = done
+                      ? "Completada"
+                      : fail
+                        ? "Fallida"
+                        : running
+                          ? "En curso"
+                          : "Pendiente";
+                    return (
+                      <span
+                        key={stage}
+                        className={`zcp2-stage-step zcp2-mono ${stateClass}`}
+                        title={`${stage}: ${stateText}`}
+                      >
+                        <span className="zcp2-stage-dot" aria-hidden="true" />
+                        <span>{stage}</span>
+                      </span>
+                    );
+                  })
+                ) : (
+                  <span className="zcp2-mono" style={{ color: "var(--z2-muted)", fontSize: 11 }}>
+                    Sin etapas requeridas
+                  </span>
                 )}
-                {pullUrl && (
-                  <a
-                    className="zcp2-btn zcp2-link"
-                    href={pullUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    PR #{activeTask.pr_number} ↗
-                  </a>
-                )}
-                <button
-                  type="button"
-                  className="zcp2-btn"
-                  onClick={() => {
-                    setQuery(activeTask.task_id);
-                    setSelectedTask(null);
-                  }}
-                >
-                  Filtrar eventos
-                </button>
               </div>
             </div>
+            {openDec && (
+              <div className="zcp2-dialog-section zcp2-dialog-decision">
+                <div style={{ color: "var(--z2-accent)", fontSize: 11.5, fontWeight: 600 }}>
+                  Decisión abierta: {openDec.question}
+                </div>
+                {openDec.context_summary && (
+                  <p className="zcp2-dec-context" style={{ marginTop: 4 }}>
+                    {openDec.context_summary}
+                  </p>
+                )}
+              </div>
+            )}
+            {lastCheckFailure && (
+              <div className="zcp2-dialog-section zcp2-dialog-err">
+                <div className="zcp2-dialog-label">Último fallo de verificación</div>
+                <pre className="zcp2-pre zcp2-mono">{lastCheckFailure}</pre>
+              </div>
+            )}
+            {approvedPlan && (
+              <details className="zcp2-details zcp2-dialog-section">
+                <summary>Plan aprobado</summary>
+                <pre className="zcp2-pre zcp2-mono">{approvedPlan}</pre>
+              </details>
+            )}
+            {detailLoading && (
+              <div className="zcp2-dialog-section zcp2-mono zcp2-detail-note">
+                Cargando Context Pack e historial…
+              </div>
+            )}
+            {detailError && (
+              <div className="zcp2-dialog-section zcp2-dialog-err">
+                <div className="zcp2-dialog-label">Error de detalle</div>
+                <div className="zcp2-mono" style={{ fontSize: 11 }}>{detailError}</div>
+              </div>
+            )}
+            {cp && (
+              <div className="zcp2-dialog-section zcp2-context-pack">
+                <div className="zcp2-dialog-label">Context Pack</div>
+                {!hasContextPack ? (
+                  <div className="zcp2-mono zcp2-detail-note">Sin Context Pack registrado.</div>
+                ) : (
+                  <div className="zcp2-cp-body zcp2-mono">
+                    {(cp.weight || cp.network || cp.base_sha) && (
+                      <div className="zcp2-cp-meta">
+                        {cp.weight && <span>Peso: {cp.weight}</span>}
+                        {cp.network && <span>Red: {cp.network}</span>}
+                        {cp.base_sha && <span>Base SHA: {cp.base_sha.slice(0, 12)}</span>}
+                      </div>
+                    )}
+                    {cp.target_files.length > 0 && (
+                      <div className="zcp2-cp-group">
+                        <div className="zcp2-cp-sub">Archivos objetivo ({cp.target_files.length})</div>
+                        <ul className="zcp2-cp-list">
+                          {cp.target_files.map((f, i) => (
+                            <li key={`${f.path}-${i}`}>
+                              <span className="zcp2-cp-action">[{f.action || "modify"}]</span>{" "}
+                              <span>{f.path}</span>
+                              {f.summary && <span className="zcp2-cp-summary"> — {f.summary}</span>}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    {cp.forbidden_paths.length > 0 && (
+                      <div className="zcp2-cp-group">
+                        <div className="zcp2-cp-sub">Rutas prohibidas</div>
+                        <ul className="zcp2-cp-list">
+                          {cp.forbidden_paths.map((p, i) => (
+                            <li key={`${p}-${i}`}>{p}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    {cp.acceptance_criteria.length > 0 && (
+                      <div className="zcp2-cp-group">
+                        <div className="zcp2-cp-sub">Criterios de aceptación</div>
+                        <ul className="zcp2-cp-list">
+                          {cp.acceptance_criteria.map((ac) => (
+                            <li key={ac.id}>
+                              <strong>{ac.id}:</strong> {ac.description}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    {(cp.worker_checks.length > 0 || cp.gate_checks.length > 0 || cp.verification_commands.length > 0) && (
+                      <div className="zcp2-cp-group">
+                        <div className="zcp2-cp-sub">Verificaciones</div>
+                        <ul className="zcp2-cp-list">
+                          {[...cp.worker_checks, ...cp.gate_checks, ...cp.verification_commands].map((cmd, i) => (
+                            <li key={`${cmd}-${i}`}>{cmd}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+            {detail && (
+              <div className="zcp2-dialog-section">
+                <div className="zcp2-dialog-label">
+                  Historial de decisiones ({detail.decisions.length})
+                </div>
+                {detail.decisions.length === 0 ? (
+                  <div className="zcp2-mono zcp2-detail-note">Sin decisiones registradas.</div>
+                ) : (
+                  <ul className="zcp2-dec-history">
+                    {detail.decisions.map((dec) => (
+                      <li key={dec.decision_id} className="zcp2-dec-hist-item">
+                        <div className="zcp2-dec-hist-top zcp2-mono">
+                          <span className={`zcp2-badge zcp2-badge-${dec.status.toLowerCase()}`}>
+                            {dec.status}
+                          </span>
+                          <span>{dec.kind}</span>
+                          <span>{dec.decision_id}</span>
+                        </div>
+                        <div className="zcp2-dec-hist-q">{dec.question}</div>
+                        <div className="zcp2-dec-hist-meta zcp2-mono">
+                          {dec.choice && <span>Elección: {dec.choice}</span>}
+                          {dec.resolved_by && <span>Por: {dec.resolved_by}</span>}
+                          {dec.retirement_reason && <span>Retirada: {dec.retirement_reason}</span>}
+                          {dec.note && <span>Nota: {dec.note}</span>}
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
           </div>
-        );
-      })()}
+        )}
+
+        {tab === "attempts" && (
+          <div id="panel-attempts" role="tabpanel" aria-labelledby="tab-attempts">
+            {detailLoading ? (
+              <div className="zcp2-dialog-section zcp2-mono zcp2-detail-note">
+                Cargando intentos y auditoría…
+              </div>
+            ) : detailError ? (
+              <div className="zcp2-dialog-section zcp2-dialog-err">
+                <div className="zcp2-dialog-label">Error al cargar intentos</div>
+                <div className="zcp2-mono" style={{ fontSize: 11 }}>{detailError}</div>
+              </div>
+            ) : !detail || detail.attempts.length === 0 ? (
+              <div className="zcp2-dialog-section zcp2-mono zcp2-detail-note">
+                Sin intentos registrados para esta tarea.
+              </div>
+            ) : (
+              <div className="zcp2-attempts-list">
+                {detail.attempts.map((att) => {
+                  const audit = auditByAttempt.get(att.attempt_id);
+                  const tone = /PASS|SUCCEED|DONE|OK/.test(att.status)
+                    ? "is-ok"
+                    : /FAIL|ERROR|KILL|TIMEOUT/.test(att.status)
+                      ? "is-err"
+                      : "is-warn";
+                  return (
+                    <article key={att.attempt_id} className="zcp2-attempt-card">
+                      <div className="zcp2-attempt-head zcp2-mono">
+                        <span className={`zcp2-badge ${tone}`}>{att.status}</span>
+                        <strong>{att.stage}</strong>
+                        <span>{att.model} ({att.effort})</span>
+                        <span>{formatDuration(att.started_epoch, att.ended_epoch)}</span>
+                      </div>
+                      <div className="zcp2-attempt-meta zcp2-mono">
+                        <span>ID: {att.attempt_id}</span>
+                        <span>Fase: {att.phase}</span>
+                        <span>Tokens: {formatTokens(att.total_tokens)} (in {formatTokens(att.input_tokens)} / out {formatTokens(att.output_tokens)})</span>
+                        {att.exit_code != null && (
+                          <span>Exit: {att.exit_code}{att.exit_code_kind ? ` (${att.exit_code_kind})` : ""}</span>
+                        )}
+                        {att.failure_class && <span>Fallo: {att.failure_class}</span>}
+                      </div>
+                      {audit && (
+                        <div className="zcp2-audit-grid zcp2-mono">
+                          <span>Turnos: {audit.turn_count}</span>
+                          <span>Tools: {audit.tool_call_count} (err {audit.tool_error_count})</span>
+                          <span>Bucles edit/fail: {audit.edit_compile_fail_loops}</span>
+                          <span>Lecturas redund.: {audit.redundant_read_count}</span>
+                          {audit.cached_input_tokens != null && (
+                            <span>Cache in: {formatTokens(audit.cached_input_tokens)}</span>
+                          )}
+                          {audit.reasoning_tokens != null && (
+                            <span>Reasoning: {formatTokens(audit.reasoning_tokens)}</span>
+                          )}
+                          {audit.check_divergence && (
+                            <span className="is-err">Divergencia check</span>
+                          )}
+                          {audit.error_code && (
+                            <span className="is-err">Código: {audit.error_code}</span>
+                          )}
+                        </div>
+                      )}
+                      {att.summary && (
+                        <pre className="zcp2-pre zcp2-mono">{att.summary}</pre>
+                      )}
+                    </article>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        <div style={{ display: "flex", gap: 6, justifyContent: "flex-end", marginTop: 10, flexWrap: "wrap" }}>
+          {issueUrl && (
+            <a
+              className="zcp2-btn zcp2-link"
+              href={issueUrl}
+              target="_blank"
+              rel="noreferrer"
+            >
+              Issue ↗
+            </a>
+          )}
+          {pullUrl && (
+            <a
+              className="zcp2-btn zcp2-link"
+              href={pullUrl}
+              target="_blank"
+              rel="noreferrer"
+            >
+              PR #{activeTask.pr_number} ↗
+            </a>
+          )}
+          <button
+            type="button"
+            className="zcp2-btn"
+            onClick={() => onFilterEvents(activeTask.task_id)}
+          >
+            Filtrar eventos
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

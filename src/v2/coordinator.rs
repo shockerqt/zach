@@ -976,6 +976,10 @@ impl Coordinator {
                     .get_decision(&decision_id)
                     .map_err(|e| e.to_string())?,
             }],
+            ClientCommand::GetTaskDetail { task_id } => vec![
+                crate::v2::socket::build_task_detail_message(&self.store, &task_id)
+                    .map_err(|e| e.to_string())?,
+            ],
             ClientCommand::Decide {
                 decision_id,
                 choice,
@@ -13967,5 +13971,140 @@ mod tests {
         assert_eq!(open[0].kind, "scope_violation");
         assert_eq!(open[0].options, vec!["Retry stage", "Abort task"]);
         assert_eq!(open[0].recommended_option, Some(1));
+    }
+
+    #[test]
+    fn socket_command_get_task_detail_redacts_and_returns_attempts_audits_and_decisions() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        let mut t = task("ZACH-090-DETAIL");
+        t.status = "Blocked".into();
+        t.required_stages = vec!["plan".into(), "impl".into()];
+        t.memory.last_check_failure = Some("Bearer ghp_secret12345678901234567890".into());
+        t.memory.decisions_log = vec!["token=sk-1234567890abcdef1234567890abcdef".into()];
+        c.save(&t).unwrap();
+
+        c.store
+            .record_stage_attempt(&StageAttemptRecord {
+                attempt_id: "att-1".into(),
+                task_id: "ZACH-090-DETAIL".into(),
+                stage: "impl".into(),
+                model: "gpt-5.4".into(),
+                effort: "medium".into(),
+                systemd_unit: None,
+                invocation_id: None,
+                started_epoch: 100,
+                ended_epoch: Some(120),
+                status: "FAILED".into(),
+                failure_class: Some("check_failed".into()),
+                summary: Some("Prompt: raw\nAuthorization: Bearer super_secret_token_value".into()),
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                total_tokens: Some(15),
+                sha_before: Some("aaa".into()),
+                sha_after: Some("bbb".into()),
+                phase: "FINISHED".into(),
+                last_liveness_epoch: 120,
+                last_output_bytes: 42,
+                last_cpu_usage_usec: None,
+                control_group: None,
+                exit_code: Some(1),
+                exit_code_kind: Some("nonzero".into()),
+                retry_generation: 0,
+            })
+            .unwrap();
+        c.store
+            .record_attempt_audit(&crate::v2::store::AttemptAuditRecord {
+                attempt_id: "att-1".into(),
+                task_id: "ZACH-090-DETAIL".into(),
+                stage: "impl".into(),
+                turn_count: 3,
+                tool_call_count: 7,
+                tool_error_count: 1,
+                edit_compile_fail_loops: 1,
+                redundant_read_count: 0,
+                cached_input_tokens: Some(4),
+                reasoning_tokens: Some(2),
+                check_divergence: false,
+                error_code: Some("Bearer ghp_secret12345678901234567890".into()),
+                created_epoch: 120,
+            })
+            .unwrap();
+        c.store
+            .open_decision(
+                "dec-1",
+                "ZACH-090-DETAIL",
+                "test",
+                "plan_approval",
+                "Approve?",
+                &["Approve".into()],
+                Some(0),
+                "Authorization: Bearer another_secret_token_12345",
+                None,
+            )
+            .unwrap();
+
+        let msgs = c
+            .socket_command(ClientCommand::GetTaskDetail {
+                task_id: "ZACH-090-DETAIL".into(),
+            })
+            .unwrap();
+        assert_eq!(msgs.len(), 1);
+        let ServerMessage::TaskDetail {
+            task: Some(task),
+            attempts,
+            audits,
+            decisions,
+        } = &msgs[0]
+        else {
+            panic!("expected TaskDetail with Some(task)");
+        };
+        assert_eq!(task.task_id, "ZACH-090-DETAIL");
+        assert!(
+            !task
+                .memory
+                .last_check_failure
+                .as_deref()
+                .unwrap()
+                .contains("ghp_secret12345678901234567890")
+        );
+        assert!(!task.memory.decisions_log[0].contains("sk-1234567890abcdef1234567890abcdef"));
+        assert_eq!(attempts.len(), 1);
+        assert!(
+            !attempts[0]
+                .summary
+                .as_deref()
+                .unwrap()
+                .contains("super_secret_token_value")
+        );
+        assert_eq!(audits.len(), 1);
+        assert!(
+            !audits[0]
+                .error_code
+                .as_deref()
+                .unwrap()
+                .contains("ghp_secret12345678901234567890")
+        );
+        assert_eq!(decisions.len(), 1);
+        assert!(
+            !decisions[0]
+                .context_summary
+                .contains("another_secret_token_12345")
+        );
+
+        let missing = c
+            .socket_command(ClientCommand::GetTaskDetail {
+                task_id: "NO-SUCH-TASK".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            &missing[0],
+            ServerMessage::TaskDetail {
+                task: None,
+                attempts,
+                audits,
+                decisions,
+            } if attempts.is_empty() && audits.is_empty() && decisions.is_empty()
+        ));
     }
 }
