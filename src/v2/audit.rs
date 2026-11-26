@@ -318,7 +318,10 @@ fn match_authorization_bearer_end(s: &str, start: usize, allow_bare_bearer: bool
     }
     let rest = &s[start..];
     let bytes = rest.as_bytes();
-    if rest.len() >= 13 && rest[..13].eq_ignore_ascii_case("authorization") {
+    if bytes
+        .get(..13)
+        .is_some_and(|b| b.eq_ignore_ascii_case(b"authorization"))
+    {
         let mut i = 13;
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
@@ -330,7 +333,10 @@ fn match_authorization_bearer_end(s: &str, start: usize, allow_bare_bearer: bool
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
-        if i + 6 <= bytes.len() && rest[i..i + 6].eq_ignore_ascii_case("bearer") {
+        if bytes
+            .get(i..i + 6)
+            .is_some_and(|b| b.eq_ignore_ascii_case(b"bearer"))
+        {
             i += 6;
             let ws_start = i;
             while i < bytes.len() && bytes[i].is_ascii_whitespace() {
@@ -350,7 +356,12 @@ fn match_authorization_bearer_end(s: &str, start: usize, allow_bare_bearer: bool
         return None;
     }
 
-    if allow_bare_bearer && rest.len() >= 7 && rest[..6].eq_ignore_ascii_case("bearer") {
+    if allow_bare_bearer
+        && bytes.len() >= 7
+        && bytes
+            .get(..6)
+            .is_some_and(|b| b.eq_ignore_ascii_case(b"bearer"))
+    {
         let mut i = 6;
         let ws_start = i;
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
@@ -400,14 +411,20 @@ fn match_credential_assignment_end(s: &str, start: usize, include_extra: bool) -
 
     let mut matched_len = None;
     for key in BASE_KEYS {
-        if rest.len() >= key.len() && rest[..key.len()].eq_ignore_ascii_case(key) {
+        if bytes
+            .get(..key.len())
+            .is_some_and(|b| b.eq_ignore_ascii_case(key.as_bytes()))
+        {
             matched_len = Some(key.len());
             break;
         }
     }
     if matched_len.is_none() && include_extra {
         for key in EXTRA_KEYS {
-            if rest.len() >= key.len() && rest[..key.len()].eq_ignore_ascii_case(key) {
+            if bytes
+                .get(..key.len())
+                .is_some_and(|b| b.eq_ignore_ascii_case(key.as_bytes()))
+            {
                 matched_len = Some(key.len());
                 break;
             }
