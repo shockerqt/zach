@@ -825,6 +825,82 @@ pub fn truncate_utf8_bytes(input: &str, max_bytes: usize) -> String {
     format!("{}...", &input[..end])
 }
 
+const MAX_CHECK_STREAM_TAIL_BYTES: usize = 384;
+
+/// Returns the trailing UTF-8 slice of `input` with byte length `<= max_bytes` on a char boundary.
+fn tail_utf8_bytes(input: &str, max_bytes: usize) -> String {
+    let trimmed = input.trim();
+    if trimmed.len() <= max_bytes {
+        return trimmed.to_owned();
+    }
+    let keep = if max_bytes <= 3 {
+        max_bytes
+    } else {
+        max_bytes - 3
+    };
+    let mut start = trimmed.len().saturating_sub(keep);
+    while start < trimmed.len() && !trimmed.is_char_boundary(start) {
+        start += 1;
+    }
+    if max_bytes <= 3 {
+        trimmed[start..].to_owned()
+    } else {
+        format!("...{}", &trimmed[start..])
+    }
+}
+
+fn sanitize_check_stream_tail(raw: &[u8], strip_systemd: bool, max_bytes: usize) -> String {
+    let lossy = String::from_utf8_lossy(raw);
+    let filtered = if strip_systemd {
+        lossy
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                ![
+                    "Running as unit: ",
+                    "Finished with result: ",
+                    "Main processes terminated with: ",
+                    "Service runtime: ",
+                    "CPU time consumed: ",
+                    "Memory peak: ",
+                ]
+                .iter()
+                .any(|p| t.starts_with(p))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        lossy.into_owned()
+    };
+    let tail = tail_utf8_bytes(&filtered, max_bytes.saturating_mul(8).max(1024));
+    let redacted = crate::v2::audit::redact_adr004_text(&tail, usize::MAX);
+    tail_utf8_bytes(&redacted, max_bytes)
+}
+
+/// Formats a failing check's exit status with bounded, redacted `stdout`/`stderr` tails.
+fn format_check_failure(cmd: &str, out: &std::process::Output) -> String {
+    let stdout_tail = sanitize_check_stream_tail(&out.stdout, false, MAX_CHECK_STREAM_TAIL_BYTES);
+    let mut stderr_tail =
+        sanitize_check_stream_tail(&out.stderr, true, MAX_CHECK_STREAM_TAIL_BYTES);
+    if stdout_tail.is_empty() && stderr_tail.is_empty() {
+        stderr_tail = sanitize_check_stream_tail(&out.stderr, false, MAX_CHECK_STREAM_TAIL_BYTES);
+    }
+    let parts: Vec<String> = [("stdout", stdout_tail), ("stderr", stderr_tail)]
+        .into_iter()
+        .filter(|(_, s)| !s.is_empty())
+        .map(|(k, s)| format!("{k}: {s}"))
+        .collect();
+    if parts.is_empty() {
+        format!("check '{cmd}' failed ({})", out.status)
+    } else {
+        format!(
+            "check '{cmd}' failed ({}): {}",
+            out.status,
+            parts.join("; ")
+        )
+    }
+}
+
 /// Returns attempt directory retention from `ZACH_ATTEMPT_RETENTION_DAYS`
 /// (defaults to `DEFAULT_ATTEMPT_RETENTION_DAYS` = 7 days).
 pub fn attempt_retention_from_env() -> std::time::Duration {
@@ -1602,10 +1678,7 @@ impl StageExecutor for SystemdStageExecutor {
                 .output()
                 .map_err(|e| format!("failed to run check '{cmd}': {e}"))?;
             if !out.status.success() {
-                return Err(format!(
-                    "check '{cmd}' failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ));
+                return Err(format_check_failure(cmd, &out));
             }
         }
         Ok(())
@@ -1622,10 +1695,7 @@ impl StageExecutor for SystemdStageExecutor {
                 .output()
                 .map_err(|e| format!("failed to run check '{cmd}': {e}"))?;
             if !out.status.success() {
-                return Err(format!(
-                    "check '{cmd}' failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ));
+                return Err(format_check_failure(cmd, &out));
             }
         }
         Ok(())
@@ -6056,5 +6126,80 @@ Binary files /dev/null and b/assets/logo.bin differ
             "err={drift_err}"
         );
         drop_suspended_impl_snapshot_ref(wt.to_str().unwrap(), "att-snap-2");
+    }
+
+    #[test]
+    fn tail_utf8_bytes_handles_small_limits_and_multibyte_boundaries() {
+        assert_eq!(tail_utf8_bytes("hello", 10), "hello");
+        assert_eq!(tail_utf8_bytes("€abc", 5), "...bc");
+        assert_eq!(tail_utf8_bytes("€abc", 4), "...c");
+        assert_eq!(tail_utf8_bytes("€abc", 3), "abc");
+        assert_eq!(tail_utf8_bytes("abc€", 5), "...");
+        assert_eq!(tail_utf8_bytes("a€b", 2), "b");
+        assert_eq!(tail_utf8_bytes("€", 1), "");
+    }
+
+    #[test]
+    fn format_check_failure_captures_stdout_stderr_tail_and_strips_systemd_trailer() {
+        use std::os::unix::process::ExitStatusExt;
+        let stdout = format!(
+            "{}test failing_case ... FAILED\nassertion failed",
+            "ok line\n".repeat(120)
+        );
+        let stderr = "Running as unit: zach-stage-worker-checks-123-0.service\nwarning: unused\nerror[E0308]: mismatched types\nFinished with result: exit-code.\nMain processes terminated with: code=exited, status=1/FAILURE\nService runtime: 12ms\n";
+        let out = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: stdout.into_bytes(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        let msg = format_check_failure("cargo test --locked", &out);
+        assert!(
+            msg.contains("check 'cargo test --locked' failed (exit status: 1): "),
+            "{msg}"
+        );
+        assert!(msg.contains("test failing_case ... FAILED"), "{msg}");
+        assert!(msg.contains("error[E0308]: mismatched types"), "{msg}");
+        assert!(
+            !msg.contains("Running as unit:") && !msg.contains("Finished with result:"),
+            "{msg}"
+        );
+        assert!(msg.len() <= MAX_SUMMARY_BYTES, "len={}", msg.len());
+    }
+
+    #[test]
+    fn format_check_failure_redacts_credentials_and_truncates_utf8_boundaries() {
+        use std::os::unix::process::ExitStatusExt;
+        let stdout = format!(
+            "{} Authorization: Bearer supersecret_token_12345 api_key=sk_live_secretvalue999 tail_marker_🦀",
+            "€".repeat(200)
+        );
+        let stderr = "fatal: https://alice:s3cr3tpass@github.com/org/repo.git failed with ghp_1234567890abcdef1234567890abcdef1234";
+        let out = std::process::Output {
+            status: std::process::ExitStatus::from_raw(2 << 8),
+            stdout: stdout.into_bytes(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        let msg = format_check_failure("cargo check", &out);
+        assert!(
+            msg.contains("exit status: 2") && msg.contains("tail_marker_🦀"),
+            "{msg}"
+        );
+        for secret in [
+            "supersecret_token_12345",
+            "sk_live_secretvalue999",
+            "s3cr3tpass",
+            "ghp_1234567890abcdef1234567890abcdef1234",
+        ] {
+            assert!(!msg.contains(secret), "{msg}");
+        }
+        for marker in [
+            "[REDACTED_AUTH]",
+            "[REDACTED_CREDENTIAL]",
+            "[REDACTED_URI]",
+            "[REDACTED_TOKEN]",
+        ] {
+            assert!(msg.contains(marker), "{msg}");
+        }
+        assert!(msg.len() <= MAX_SUMMARY_BYTES, "len={}", msg.len());
     }
 }
