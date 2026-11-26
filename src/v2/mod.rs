@@ -1,6 +1,7 @@
 pub mod audit;
 pub mod coordinator;
 pub mod delivery;
+pub mod gemini;
 pub mod intake;
 pub mod isolation;
 pub mod merge_queue;

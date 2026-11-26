@@ -1014,6 +1014,9 @@ fn fail_entry_with_decision(
         persisted.version
     );
     let options = vec!["Retry merge".to_owned(), "Abandon".to_owned()];
+    let class = crate::v2::pipeline::classify_failure_class("merge", "FAILED", spec.context);
+    let recommended_option =
+        crate::v2::pipeline::compute_recommended_option(&options, class, false, false);
     store
         .open_decision(
             &dec_id,
@@ -1022,7 +1025,7 @@ fn fail_entry_with_decision(
             spec.kind,
             spec.question,
             &options,
-            Some(0),
+            recommended_option,
             spec.context,
             spec.sha,
         )
@@ -1132,6 +1135,9 @@ fn block_repo_with_decision(
         spec.kind.replace('_', "-"),
         persisted.version
     );
+    let class = crate::v2::pipeline::classify_failure_class("merge", "FAILED", spec.context);
+    let recommended_option =
+        crate::v2::pipeline::compute_recommended_option(options, class, false, true);
     store
         .open_decision(
             &dec_id,
@@ -1140,7 +1146,7 @@ fn block_repo_with_decision(
             spec.kind,
             spec.question,
             options,
-            Some(0),
+            recommended_option,
             spec.context,
             spec.sha,
         )

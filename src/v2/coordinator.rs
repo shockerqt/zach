@@ -294,6 +294,7 @@ pub enum WorkerResult {
     Harvested {
         attempt_id: String,
         result: Result<StageExecutionResult, String>,
+        failure_class: Option<String>,
     },
     UnitIdentity {
         attempt_id: String,
@@ -308,6 +309,12 @@ pub enum WorkerResult {
         attempt_id: String,
         step: PipelineStepResult,
     },
+    PipelineFailed {
+        task_id: String,
+        attempt_id: String,
+        error: String,
+        failure_class: String,
+    },
     LifecycleRecovered {
         operation_id: String,
         output: String,
@@ -320,6 +327,11 @@ pub enum WorkerResult {
     Merge {
         task_id: String,
         result: MergePhaseResult,
+    },
+    MergeFailed {
+        task_id: String,
+        error: String,
+        failure_class: String,
     },
     StartupReconciled {
         adopted: Vec<StageAttemptRecord>,
@@ -411,6 +423,7 @@ pub struct Coordinator {
     governance: WorkerPool,
     controller: Arc<dyn UnitController>,
     ws: Arc<dyn LifecycleWsTaskClient>,
+    gemini: crate::v2::gemini::GeminiClient,
     semaphore: HeavyCheckSemaphore,
     jobs: BTreeSet<String>,
     manifests: BTreeMap<String, AttemptManifest>,
@@ -476,6 +489,7 @@ impl Coordinator {
             ws: Arc::new(intake::SystemWsTaskClient {
                 bin: default_ws_task_bin(),
             }),
+            gemini: crate::v2::gemini::GeminiClient::from_env(),
             semaphore: HeavyCheckSemaphore::new(),
             jobs: BTreeSet::new(),
             manifests: BTreeMap::new(),
@@ -912,7 +926,7 @@ impl Coordinator {
                                     self.emit_task_audit_digest(&task.task_id)?;
                                 }
                             } else if key.starts_with("merge:") {
-                                self.merge_failed(&task_id, &error)?;
+                                self.merge_failed(&task_id, &error, None)?;
                             } else {
                                 self.fail_task(&task_id, &error, None)?;
                             }
@@ -1938,23 +1952,45 @@ impl Coordinator {
                 }
                 let state = self.state_dir.clone();
                 let sem = self.semaphore.clone();
+                let gemini = self.gemini.clone();
+                let gemini_cooldown = self.gemini_cooldown_until();
                 let id = cp.attempt_id.clone();
                 self.submit(
                     format!("pipeline:{id}"),
                     Some(task.task_id.clone()),
                     0,
                     Box::new(move || {
-                        Ok(WorkerResult::Pipeline {
-                            attempt_id: id,
-                            step: pipeline::run_supervised_pipeline_step(
-                                &state,
-                                &default_ws_task_bin(),
-                                task,
-                                &attempt,
-                                &cp.operation,
-                                &sem,
-                            )?,
-                        })
+                        let task_id = attempt.task_id.clone();
+                        let stage = attempt.stage.clone();
+                        match pipeline::run_supervised_pipeline_step(
+                            &state,
+                            &default_ws_task_bin(),
+                            task,
+                            &attempt,
+                            &cp.operation,
+                            &sem,
+                        ) {
+                            Ok(step) => Ok(WorkerResult::Pipeline {
+                                attempt_id: id,
+                                step,
+                            }),
+                            Err(error) => {
+                                let failure_class = pipeline::classify_failure_3tier(
+                                    &gemini,
+                                    &stage,
+                                    "FAILED",
+                                    &error,
+                                    gemini_cooldown,
+                                )
+                                .to_owned();
+                                Ok(WorkerResult::PipelineFailed {
+                                    task_id,
+                                    attempt_id: id,
+                                    error,
+                                    failure_class,
+                                })
+                            }
+                        }
                     }),
                 );
             }
@@ -2393,7 +2429,11 @@ impl Coordinator {
                 manifest,
                 recovery_error,
             )?,
-            WorkerResult::Harvested { attempt_id, result } => {
+            WorkerResult::Harvested {
+                attempt_id,
+                result,
+                failure_class,
+            } => {
                 let Some(mut attempt) = self
                     .store
                     .get_stage_attempt(&attempt_id)
@@ -2407,14 +2447,14 @@ impl Coordinator {
                     Ok(result) => {
                         attempt.status = result.status.clone();
                         if result.status != "PASSED" && attempt.failure_class.is_none() {
-                            attempt.failure_class = Some(
+                            attempt.failure_class = Some(failure_class.unwrap_or_else(|| {
                                 pipeline::classify_failure_class(
                                     &attempt.stage,
                                     &result.status,
                                     &result.summary,
                                 )
-                                .into(),
-                            );
+                                .into()
+                            }));
                         }
                         attempt.summary = Some(result.summary.clone());
                         attempt.input_tokens = result.input_tokens;
@@ -2445,10 +2485,10 @@ impl Coordinator {
                     Err(error) => {
                         attempt.status = "FAILED".into();
                         if attempt.failure_class.is_none() {
-                            attempt.failure_class = Some(
+                            attempt.failure_class = Some(failure_class.unwrap_or_else(|| {
                                 pipeline::classify_failure_class(&attempt.stage, "FAILED", &error)
-                                    .into(),
-                            );
+                                    .into()
+                            }));
                         }
                         attempt.summary = Some(error);
                     }
@@ -2633,6 +2673,27 @@ impl Coordinator {
                 output,
             } => self.lifecycle_ack(&operation_id, &output)?,
             WorkerResult::Merge { task_id, result } => self.merge_result(&task_id, result)?,
+            WorkerResult::PipelineFailed {
+                task_id,
+                attempt_id,
+                error,
+                failure_class,
+            } => {
+                self.error_event(
+                    Some(&task_id),
+                    Some(&format!("pipeline:{attempt_id}")),
+                    &error,
+                )?;
+                self.fail_task(&task_id, &error, Some(&failure_class))?;
+            }
+            WorkerResult::MergeFailed {
+                task_id,
+                error,
+                failure_class,
+            } => {
+                self.error_event(Some(&task_id), Some(&format!("merge:{task_id}")), &error)?;
+                self.merge_failed(&task_id, &error, Some(&failure_class))?;
+            }
         }
         Ok(())
     }
@@ -2787,14 +2848,41 @@ impl Coordinator {
                     match manifest {
                         Ok(manifest) => {
                             let id = id.to_owned();
+                            let gemini = self.gemini.clone();
+                            let gemini_cooldown = self.gemini_cooldown_until();
                             self.submit(
                                 format!("harvest:{id}"),
                                 Some(task.task_id),
                                 0,
                                 Box::new(move || {
+                                    let result = runner::harvest_detached(&manifest, &observation);
+                                    let failure_class = match &result {
+                                        Ok(res) if res.status != "PASSED" => Some(
+                                            pipeline::classify_failure_3tier(
+                                                &gemini,
+                                                &manifest.route.stage,
+                                                &res.status,
+                                                &res.summary,
+                                                gemini_cooldown,
+                                            )
+                                            .to_owned(),
+                                        ),
+                                        Err(err) => Some(
+                                            pipeline::classify_failure_3tier(
+                                                &gemini,
+                                                &manifest.route.stage,
+                                                "FAILED",
+                                                err,
+                                                gemini_cooldown,
+                                            )
+                                            .to_owned(),
+                                        ),
+                                        _ => None,
+                                    };
                                     Ok(WorkerResult::Harvested {
                                         attempt_id: id,
-                                        result: runner::harvest_detached(&manifest, &observation),
+                                        result,
+                                        failure_class,
                                     })
                                 }),
                             );
@@ -3034,6 +3122,15 @@ impl Coordinator {
         Ok(())
     }
 
+    fn gemini_cooldown_until(&self) -> Option<i64> {
+        let now = now_epoch();
+        self.store
+            .get_active_provider_cooldown("gemini", now)
+            .ok()
+            .flatten()
+            .map(|c| c.until_epoch)
+    }
+
     fn fail_task(&mut self, task_id: &str, error: &str, class: Option<&str>) -> Result<(), String> {
         let mut task = self.task(task_id)?;
         let stage = task.current_stage.clone().unwrap_or_else(|| "impl".into());
@@ -3215,6 +3312,9 @@ impl Coordinator {
         };
         let decision = if let Some(ref cleanup_err) = worktree_cleanup_error {
             task.status = "Blocked".into();
+            let options = vec!["Retry stage".into(), "Abort task".into()];
+            let recommended_option =
+                pipeline::compute_recommended_option(&options, class, false, false);
             Some(crate::v2::store::FailureDecision {
                 decision_id: format!(
                     "worktree-cleanup-{}-{}-{}",
@@ -3225,7 +3325,8 @@ impl Coordinator {
                     "{} worktree cleanup failed; manual inspection required before retrying",
                     task.task_id
                 ),
-                options: vec!["Retry stage".into(), "Abort task".into()],
+                options,
+                recommended_option,
                 context: runner::truncate_utf8_bytes(
                     &format!("{error}; worktree cleanup failed: {cleanup_err}"),
                     1024,
@@ -3257,6 +3358,8 @@ impl Coordinator {
                 options.push("Retry with fallback model".into());
             }
             options.push("Abort task".into());
+            let recommended_option =
+                pipeline::compute_recommended_option(&options, class, has_usable_fallback, false);
             Some(crate::v2::store::FailureDecision {
                 decision_id: format!(
                     "{kind}-{}-{}-{}",
@@ -3265,6 +3368,7 @@ impl Coordinator {
                 kind: kind.into(),
                 question: format!("{} failed; choose how to proceed", task.task_id),
                 options,
+                recommended_option,
                 context: error.into(),
                 sha: task.reviewed_sha.clone(),
             })
@@ -4640,21 +4744,36 @@ impl Coordinator {
             }
             let state = self.state_dir.clone();
             let sem = self.semaphore.clone();
+            let gemini = self.gemini.clone();
+            let gemini_cooldown = self.gemini_cooldown_until();
             let id = task.task_id.clone();
             if self.submit(
                 format!("merge:{id}"),
                 Some(id.clone()),
                 0,
                 Box::new(move || {
-                    Ok(WorkerResult::Merge {
-                        task_id: task.task_id.clone(),
-                        result: merge_queue::run_merge_phase(
-                            &state,
-                            &task,
-                            &mut SystemMergeDriver,
-                            &sem,
-                        )?,
-                    })
+                    match merge_queue::run_merge_phase(&state, &task, &mut SystemMergeDriver, &sem)
+                    {
+                        Ok(result) => Ok(WorkerResult::Merge {
+                            task_id: task.task_id.clone(),
+                            result,
+                        }),
+                        Err(error) => {
+                            let failure_class = pipeline::classify_failure_3tier(
+                                &gemini,
+                                "merge",
+                                "FAILED",
+                                &error,
+                                gemini_cooldown,
+                            )
+                            .to_owned();
+                            Ok(WorkerResult::MergeFailed {
+                                task_id: task.task_id.clone(),
+                                error,
+                                failure_class,
+                            })
+                        }
+                    }
                 }),
             ) {
                 self.merge_poll.insert(id, Instant::now());
@@ -4687,7 +4806,7 @@ impl Coordinator {
                             ),
                         );
                     }
-                    return self.merge_failed(id, "exact-SHA CI observation timed out");
+                    return self.merge_failed(id, "exact-SHA CI observation timed out", None);
                 }
                 task.memory.merge_checkpoint = Some(checkpoint);
                 self.save(&task)?;
@@ -4740,7 +4859,7 @@ impl Coordinator {
                     .filter(|s| s.starts_with("[MERGE_REREVIEW]"))
                     .count();
                 if cycles >= merge_queue::MAX_REREVIEW_CYCLES {
-                    return self.merge_failed(id, &reason);
+                    return self.merge_failed(id, &reason, None);
                 }
                 pipeline::push_bounded_recent_attempt(
                     &mut task,
@@ -4767,19 +4886,23 @@ impl Coordinator {
                 task.status = "Blocked".into();
                 task.memory.merge_lane_released = false;
                 let mut options = vec!["Manual reconciliation".into(), "Unblock lane".into()];
-                if task
+                let missing_sha = task
                     .memory
                     .merge_checkpoint
                     .as_ref()
-                    .is_some_and(|c| c.merge_sha.is_none())
-                {
+                    .is_some_and(|c| c.merge_sha.is_none());
+                if missing_sha {
                     options.insert(0, "Record merge SHA manually".into());
                 }
+                let class = pipeline::classify_failure_class("merge", "FAILED", &reason);
+                let recommended_option =
+                    pipeline::compute_recommended_option(&options, class, false, !missing_sha);
                 let decision = crate::v2::store::FailureDecision {
                     decision_id: format!("lane-{id}-{}", task.memory.merge_retry_generation),
                     kind: "post_merge_failure".into(),
                     question: "Repository lane requires manual reconciliation".into(),
                     options,
+                    recommended_option,
                     context: reason,
                     sha: task.reviewed_sha.clone(),
                 };
@@ -4795,7 +4918,7 @@ impl Coordinator {
         Ok(())
     }
 
-    fn merge_failed(&mut self, id: &str, error: &str) -> Result<(), String> {
+    fn merge_failed(&mut self, id: &str, error: &str, class: Option<&str>) -> Result<(), String> {
         let mut task = self.task(id)?;
         let close = task
             .memory
@@ -4809,7 +4932,8 @@ impl Coordinator {
                     "MERGE_PENDING" | "POST_MERGE_CI" | "LANE_BLOCKED"
                 )
         });
-        let class = pipeline::classify_failure_class("merge", "FAILED", error);
+        let class =
+            class.unwrap_or_else(|| pipeline::classify_failure_class("merge", "FAILED", error));
         if !close
             && !uncertain
             && task.weight != "L"
@@ -4846,6 +4970,8 @@ impl Coordinator {
         } else {
             vec!["Retry merge".into(), "Abort task".into()]
         };
+        let recommended_option =
+            pipeline::compute_recommended_option(&options, class, false, uncertain);
         let decision = crate::v2::store::FailureDecision {
             decision_id: format!(
                 "merge-error-{id}-{}-{}-{}",
@@ -4861,6 +4987,7 @@ impl Coordinator {
             .into(),
             question: "Merge operation failed".into(),
             options,
+            recommended_option,
             context: error.into(),
             sha: task.reviewed_sha.clone(),
         };
@@ -12842,6 +12969,7 @@ mod tests {
                 sha_after: Some("abc".into()),
                 diff_files: Vec::new(),
             }),
+            failure_class: None,
         })
         .unwrap();
 
@@ -13785,5 +13913,59 @@ mod tests {
         assert!(after2.memory.suspended_impl_snapshot_sha.is_none());
         assert!(after2.memory.post_impl_escalation.is_none());
         assert!(git_porcelain(&wt).trim().is_empty());
+    }
+
+    #[test]
+    fn worker_result_uses_precomputed_failure_class_and_dynamic_recommended_option() {
+        let dir = TestDirectory::new();
+        let mut c = coordinator(&dir.0);
+        let mut task = task("ZACH-073-COORD");
+        task.status = "In Progress".into();
+        task.current_stage = Some("impl".into());
+        let attempt = seed_attempt(&mut c, task.clone(), "att-073-1");
+
+        // Precomputed semantic failure class from WorkerPool is preserved by Harvested
+        c.worker_result(WorkerResult::Harvested {
+            attempt_id: attempt.attempt_id.clone(),
+            result: Ok(StageExecutionResult {
+                status: "FAILED".into(),
+                summary: "ambiguous failure".into(),
+                review_markdown: None,
+                review_output: None,
+                stage_output: None,
+                invocation_id: None,
+                input_tokens: None,
+                output_tokens: None,
+                total_tokens: None,
+                duration_seconds: None,
+                sha_before: None,
+                sha_after: None,
+                diff_files: Vec::new(),
+            }),
+            failure_class: Some(pipeline::FAILURE_CLASS_SEMANTIC.into()),
+        })
+        .unwrap();
+        let saved = c
+            .store
+            .get_stage_attempt(&attempt.attempt_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved.failure_class.as_deref(),
+            Some(pipeline::FAILURE_CLASS_SEMANTIC)
+        );
+
+        // Policy failure in fail_task recommends Abort task (index 1), not hardcoded 0
+        c.fail_task(
+            "ZACH-073-COORD",
+            "scope_violation: out-of-scope file",
+            Some(pipeline::FAILURE_CLASS_POLICY),
+        )
+        .unwrap();
+        let open = c.store.list_decisions(true, None).unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].kind, "scope_violation");
+        assert_eq!(open[0].options, vec!["Retry stage", "Abort task"]);
+        assert_eq!(open[0].recommended_option, Some(1));
     }
 }
