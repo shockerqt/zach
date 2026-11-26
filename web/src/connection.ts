@@ -5,7 +5,9 @@ import {
   string,
   integer,
   decision,
+  taskDetail,
   type Decision,
+  type TaskDetail,
 } from "./protocol";
 import { acceptSnapshot, applyEvent, initial, type State } from "./state";
 import { SSEParser } from "./sse";
@@ -35,6 +37,26 @@ export class Connection {
   }
   get authMode(): AuthMode {
     return this.mode;
+  }
+  async fetchTaskDetail(taskId: string): Promise<TaskDetail | null> {
+    const gen = this.generation;
+    if (!this.active || !this.controller) return null;
+    const response = await fetch(
+      `/api/tasks/${encodeURIComponent(taskId)}`,
+      this.options(this.controller.signal),
+    );
+    if (gen !== this.generation) throw new Halt();
+    if (response.status === 401 || response.status === 403) {
+      this.disconnect(
+        "Acceso denegado. Vuelve a conectar con una credencial válida.",
+      );
+      throw new Halt();
+    }
+    if (response.status === 404) return null;
+    const r = await this.checked(response, "application/json", gen);
+    const parsed = taskDetail(await r.json());
+    if (gen !== this.generation) throw new Halt();
+    return parsed;
   }
   private setMode(mode: AuthMode) {
     if (this.mode !== mode) {

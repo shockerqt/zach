@@ -3429,6 +3429,22 @@ impl V2Store {
         Ok(decisions)
     }
 
+    pub fn list_decisions_for_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<PendingDecisionRecord>, V2StoreError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{} WHERE d.task_id = ?1 ORDER BY d.created_seq DESC",
+            Self::DECISION_HISTORY_SELECT,
+        ))?;
+        let rows = stmt.query_map([task_id], Self::map_decision_row)?;
+        let mut decisions = Vec::new();
+        for row in rows {
+            decisions.push(row?);
+        }
+        Ok(decisions)
+    }
+
     pub fn record_stage_attempt(
         &mut self,
         attempt: &StageAttemptRecord,
@@ -7961,5 +7977,71 @@ mod tests {
             next.memory.post_impl_escalation,
             synced.memory.post_impl_escalation
         );
+    }
+
+    #[test]
+    fn list_decisions_for_task_returns_open_resolved_and_retired_in_desc_seq_order() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        store
+            .upsert_task(&sample_task("ZACH-090-T1", "Ready", vec!["impl".into()]))
+            .unwrap();
+        store
+            .upsert_task(&sample_task("ZACH-090-T2", "Ready", vec!["impl".into()]))
+            .unwrap();
+
+        store
+            .open_decision(
+                "d-1",
+                "ZACH-090-T1",
+                "g",
+                "plan_approval",
+                "Q1?",
+                &["Approve".into()],
+                Some(0),
+                "ctx1",
+                None,
+            )
+            .unwrap();
+        store
+            .resolve_decision("d-1", "Approve", "op", Some("ok"))
+            .unwrap();
+        store
+            .open_decision(
+                "d-2",
+                "ZACH-090-T1",
+                "g",
+                "merge_approval",
+                "Q2?",
+                &["Merge".into()],
+                Some(0),
+                "ctx2",
+                None,
+            )
+            .unwrap();
+        store
+            .open_decision(
+                "d-other",
+                "ZACH-090-T2",
+                "g",
+                "plan_approval",
+                "Other?",
+                &["Approve".into()],
+                Some(0),
+                "other",
+                None,
+            )
+            .unwrap();
+
+        let for_t1 = store.list_decisions_for_task("ZACH-090-T1").unwrap();
+        assert_eq!(
+            for_t1
+                .iter()
+                .map(|d| d.decision_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["d-2", "d-1"]
+        );
+        assert_eq!(for_t1[0].status, "OPEN");
+        assert_eq!(for_t1[1].status, "RESOLVED");
+        assert_eq!(for_t1[1].note.as_deref(), Some("ok"));
     }
 }

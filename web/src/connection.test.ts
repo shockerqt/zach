@@ -2,7 +2,9 @@ import { afterEach, describe, it, expect, vi } from "vitest";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { Connection } from "./connection";
-import { ConnectionBar } from "./main";
+import { ConnectionBar, TaskDetailModal } from "./main";
+import { initial } from "./state";
+import { task } from "./protocol";
 const snap = {
   tasks: [],
   open_decisions: [],
@@ -380,5 +382,114 @@ describe("ConnectionBar in access mode", () => {
     expect(c.authMode).toBe("access");
     expect(calls.some((u) => u.endsWith("snapshot"))).toBe(true);
     c.disconnect();
+  });
+});
+
+describe("Connection.fetchTaskDetail and TaskDetailModal", () => {
+  it("fetches /api/tasks/:id for 200, returns null for 404, and respects generation/auth", async () => {
+    const detailPayload = {
+      task: {
+        task_id: "ZACH-090",
+        title: "Expose details",
+        repository: "zach",
+        weight: "M",
+        status: "In Progress",
+        required_stages: ["plan", "impl"],
+        stages_completed: ["plan"],
+        current_stage: "impl",
+        memory: {},
+        context_pack: {
+          weight: "M",
+          target_files: [{ path: "src/v2/store.rs", action: "modify", summary: "query" }],
+          forbidden_paths: [],
+          worker_checks: ["cargo test --locked"],
+          gate_checks: [],
+          human_operations: [],
+          verification_commands: [],
+          acceptance_criteria: [{ id: "AC-1", description: "Done" }],
+        },
+      },
+      attempts: [],
+      audits: [],
+      decisions: [
+        {
+          decision_id: "dec-1",
+          task_id: "ZACH-090",
+          kind: "plan_approval",
+          question: "Approve?",
+          options: ["Approve"],
+          context_summary: "summary",
+          status: "RESOLVED",
+          choice: "Approve",
+          resolved_by: "op",
+        },
+      ],
+    };
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        if (url.endsWith("snapshot")) return Response.json(snap);
+        if (url === "/api/tasks/ZACH-090") return Response.json(detailPayload);
+        if (url === "/api/tasks/MISSING-1")
+          return new Response(JSON.stringify({ error: "not found" }), {
+            status: 404,
+            headers: { "content-type": "application/json" },
+          });
+        return new Response(frame("snapshot", { ...snap, status: undefined }), {
+          headers: { "content-type": "text/event-stream" },
+        });
+      }),
+    );
+
+    const c = new Connection(() => {}, () => {});
+    await c.connect("token-123");
+    const ok = await c.fetchTaskDetail("ZACH-090");
+    expect(ok?.task.task_id).toBe("ZACH-090");
+    expect(ok?.context_pack.target_files[0].path).toBe("src/v2/store.rs");
+    expect(await c.fetchTaskDetail("MISSING-1")).toBeNull();
+
+    const html = renderToStaticMarkup(
+      React.createElement(TaskDetailModal, {
+        task: task(detailPayload.task),
+        state: initial,
+        detail: ok,
+        detailLoading: false,
+        detailError: "",
+        now: 1000,
+        onClose: () => {},
+        onFilterEvents: () => {},
+      }),
+    );
+    expect(html).toContain("Resumen &amp; Context Pack");
+    expect(html).toContain("Intentos &amp; Auditoría (0)");
+    expect(html).toContain("src/v2/store.rs");
+    expect(html).toContain("Historial de decisiones (1)");
+
+    c.disconnect();
+    expect(await c.fetchTaskDetail("ZACH-090")).toBeNull();
+  });
+
+  it("disconnects on 401 from fetchTaskDetail", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        if (url.endsWith("snapshot")) return Response.json(snap);
+        if (url.startsWith("/api/tasks/"))
+          return new Response(JSON.stringify({ error: "unauthorized" }), {
+            status: 401,
+            headers: { "content-type": "application/json" },
+          });
+        return new Response(frame("snapshot", { ...snap, status: undefined }), {
+          headers: { "content-type": "text/event-stream" },
+        });
+      }),
+    );
+    const notices: string[] = [];
+    const c = new Connection(() => {}, (m) => notices.push(m));
+    await c.connect("token-123");
+    await expect(c.fetchTaskDetail("ZACH-090")).rejects.toThrow();
+    expect(c.active).toBe(false);
+    expect(notices.some((n) => n.includes("Acceso denegado"))).toBe(true);
   });
 });
