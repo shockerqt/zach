@@ -11,6 +11,7 @@ use crate::v2::pipeline::{FAILURE_CLASS_INFRA, FAILURE_CLASS_POLICY, FAILURE_CLA
 
 pub const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 pub const DEFAULT_GEMINI_DECISION_MODEL: &str = "gemini-decision-1";
+pub const DEFAULT_GEMINI_EXPLAIN_MODEL: &str = "gemini-2.5-flash";
 pub const MAX_GEMINI_PROMPT_CHARS: usize = 1024;
 pub const MAX_GEMINI_SYSTEM_CHARS: usize = 512;
 pub const MAX_GEMINI_ERROR_CHARS: usize = 256;
@@ -478,8 +479,13 @@ impl GeminiClient {
         provider_cooldown_until: Option<i64>,
     ) -> Result<TaskExplanationOutput, GeminiError> {
         let prompt = build_task_explain_prompt(input);
+        let explain_model = env::var("ZACH_GEMINI_EXPLAIN_MODEL")
+            .ok()
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| DEFAULT_GEMINI_EXPLAIN_MODEL.to_owned());
         let resp = self.generate_content(&GenerateContentRequest {
-            model: None,
+            model: Some(explain_model),
             system_instruction: Some(
                 "Eres un asistente técnico de diagnóstico. Responde únicamente en español con JSON válido con las claves: task_goal (string), agent_actions (string), failure_diagnosis (string), option_guide (array de strings). Sé conciso y preciso."
                     .to_owned(),
@@ -668,6 +674,7 @@ mod tests {
 
     struct MockTransport {
         calls: AtomicUsize,
+        captured_urls: Mutex<Vec<String>>,
         captured_prompts: Mutex<Vec<String>>,
         captured_keys: Mutex<Vec<String>>,
         responder: MockResponder,
@@ -680,6 +687,7 @@ mod tests {
         {
             Self {
                 calls: AtomicUsize::new(0),
+                captured_urls: Mutex::new(Vec::new()),
                 captured_prompts: Mutex::new(Vec::new()),
                 captured_keys: Mutex::new(Vec::new()),
                 responder: Box::new(f),
@@ -690,13 +698,14 @@ mod tests {
     impl GeminiTransport for MockTransport {
         fn post_json(
             &self,
-            _url: &str,
+            url: &str,
             api_key: &str,
             body: &Value,
             _connect_timeout_secs: u64,
             _max_timeout_secs: u64,
         ) -> Result<GeminiHttpResponse, GeminiError> {
             let idx = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.captured_urls.lock().unwrap().push(url.to_owned());
             if let Some(text) = body["contents"][0]["parts"][0]["text"].as_str() {
                 self.captured_prompts.lock().unwrap().push(text.to_owned());
             }
@@ -914,6 +923,8 @@ mod tests {
         let prompts = transport.captured_prompts.lock().unwrap();
         assert_eq!(prompts.len(), 1);
         assert!(!prompts[0].contains("supersecret"));
+        let urls = transport.captured_urls.lock().unwrap();
+        assert!(urls[0].ends_with("/models/gemini-2.5-flash:generateContent"));
     }
 
     #[test]
