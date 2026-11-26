@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { SSEParser } from "./sse";
-import { snapshot, event, integer, github } from "./protocol";
+import { snapshot, event, integer, github, decision, task } from "./protocol";
 import {
   initial,
   acceptSnapshot,
@@ -421,5 +421,38 @@ describe("compact UI filters", () => {
     expect(filterEvents(feed, "", "DECISION").map((e) => e.seq_id)).toEqual([2]);
     expect(filterEvents(feed, "", "ERR").map((e) => e.seq_id)).toEqual([1]);
     expect(filterEvents(feed, "zach-085", "ALL").map((e) => e.seq_id)).toEqual([3]);
+  });
+});
+
+describe("decision recommended_option and task approved_plan parsing", () => {
+  it("parses optional recommended_option as non-negative safe integer", () => {
+    const base = {
+      decision_id: "d-rec",
+      task_id: sampleTask.task_id,
+      kind: "merge_approval",
+      question: "Merge PR?",
+      options: ["Approve", "Reject"],
+    };
+    expect(decision(base).recommended_option).toBeUndefined();
+    expect(decision({ ...base, recommended_option: null }).recommended_option).toBeUndefined();
+    expect(decision({ ...base, recommended_option: 0 }).recommended_option).toBe(0);
+    expect(decision({ ...base, recommended_option: 1 }).recommended_option).toBe(1);
+    expect(() => decision({ ...base, recommended_option: -1 })).toThrow();
+    expect(() => decision({ ...base, recommended_option: 1.5 })).toThrow();
+    expect(() => decision({ ...base, recommended_option: "0" })).toThrow();
+  });
+
+  it("preserves approved_plan string in task memory when present", () => {
+    expect(task(sampleTask).memory.approved_plan).toBeUndefined();
+    expect(
+      task({ ...sampleTask, memory: { approved_plan: null } }).memory.approved_plan,
+    ).toBeUndefined();
+    expect(
+      task({ ...sampleTask, memory: { approved_plan: "Step 1\nStep 2" } }).memory
+        .approved_plan,
+    ).toBe("Step 1\nStep 2");
+    expect(() =>
+      task({ ...sampleTask, memory: { approved_plan: 123 } }),
+    ).toThrow();
   });
 });
