@@ -341,6 +341,14 @@ pub enum WorkerResult {
     DeliveryPolled,
     LifecycleSkipped,
     AttemptsPruned(usize),
+    Explained {
+        key: String,
+        task_id: String,
+        updated_epoch: i64,
+        open_decision_id: Option<String>,
+        model: String,
+        result: Result<crate::v2::gemini::TaskExplanationOutput, (String, String)>,
+    },
 }
 
 type DeliveryStoreOperation = Box<dyn FnOnce(&mut V2Store) + Send>;
@@ -432,6 +440,7 @@ pub struct Coordinator {
     last_poll: BTreeMap<String, Instant>,
     observation_faults: BTreeMap<String, u32>,
     merge_poll: BTreeMap<String, Instant>,
+    explain_waiters: BTreeMap<String, Vec<usize>>,
     ready: bool,
     preflight: bool,
     reconciled: bool,
@@ -498,6 +507,7 @@ impl Coordinator {
             last_poll: BTreeMap::new(),
             observation_faults: BTreeMap::new(),
             merge_poll: BTreeMap::new(),
+            explain_waiters: BTreeMap::new(),
             ready: false,
             preflight: false,
             reconciled: false,
@@ -828,15 +838,39 @@ impl Coordinator {
                 })?;
             }
             CoordinatorEvent::Socket { client_id, command } => {
-                let result = self.socket_command(command);
-                let messages = match result {
-                    Ok(messages) => messages,
-                    Err(error) => vec![ServerMessage::Error { error }],
-                };
-                self.send_delivery(SocketDelivery::Reply {
-                    client_id,
-                    messages,
-                })?;
+                if let ClientCommand::ExplainTask { task_id, refresh } = command {
+                    match self.handle_explain_task(client_id, &task_id, refresh) {
+                        Ok(Some(messages)) => {
+                            self.send_delivery(SocketDelivery::Reply {
+                                client_id,
+                                messages,
+                            })?;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            self.send_delivery(SocketDelivery::Reply {
+                                client_id,
+                                messages: vec![ServerMessage::TaskExplanation {
+                                    ok: false,
+                                    task_id,
+                                    explanation: None,
+                                    error: Some(error),
+                                    error_code: Some("INTERNAL".into()),
+                                }],
+                            })?;
+                        }
+                    }
+                } else {
+                    let result = self.socket_command(command);
+                    let messages = match result {
+                        Ok(messages) => messages,
+                        Err(error) => vec![ServerMessage::Error { error }],
+                    };
+                    self.send_delivery(SocketDelivery::Reply {
+                        client_id,
+                        messages,
+                    })?;
+                }
             }
             CoordinatorEvent::Completed {
                 key,
@@ -849,6 +883,22 @@ impl Coordinator {
                     Ok(()) => {}
                     Err(error) => {
                         self.error_event(task_id.as_deref(), Some(&key), &error)?;
+                        if let Some(waiters) = self.explain_waiters.remove(&key) {
+                            let tid = task_id.unwrap_or_default();
+                            for waiter_id in waiters {
+                                self.send_delivery(SocketDelivery::Reply {
+                                    client_id: waiter_id,
+                                    messages: vec![ServerMessage::TaskExplanation {
+                                        ok: false,
+                                        task_id: tid.clone(),
+                                        explanation: None,
+                                        error: Some(error.clone()),
+                                        error_code: Some("INTERNAL".into()),
+                                    }],
+                                })?;
+                            }
+                            return Ok(());
+                        }
                         if key == "preflight" {
                             return Err(error);
                         }
@@ -1258,7 +1308,100 @@ impl Coordinator {
                     as_of_seq,
                 }]
             }
+            ClientCommand::ExplainTask { .. } => Vec::new(),
         })
+    }
+
+    fn handle_explain_task(
+        &mut self,
+        client_id: usize,
+        task_id: &str,
+        refresh: bool,
+    ) -> Result<Option<Vec<ServerMessage>>, String> {
+        let Some((input, updated_epoch, open_decision_id)) =
+            crate::v2::socket::build_task_explain_input(&self.store, task_id)
+                .map_err(|e| e.to_string())?
+        else {
+            return Ok(Some(vec![ServerMessage::TaskExplanation {
+                ok: false,
+                task_id: task_id.to_owned(),
+                explanation: None,
+                error: Some(format!("task not found: {task_id}")),
+                error_code: Some("NOT_FOUND".to_owned()),
+            }]));
+        };
+
+        if !refresh
+            && let Some(cached) = self
+                .store
+                .get_cached_explanation(task_id, updated_epoch, open_decision_id.as_deref())
+                .map_err(|e| e.to_string())?
+        {
+            return Ok(Some(vec![ServerMessage::TaskExplanation {
+                ok: true,
+                task_id: task_id.to_owned(),
+                explanation: Some(cached),
+                error: None,
+                error_code: None,
+            }]));
+        }
+
+        let key = format!("explain:{task_id}");
+        if self.jobs.contains(&key) {
+            self.explain_waiters.entry(key).or_default().push(client_id);
+            return Ok(None);
+        }
+
+        let cooldown_until = self
+            .store
+            .get_active_provider_cooldown("gemini", now_epoch())
+            .map_err(|e| e.to_string())?
+            .map(|c| c.until_epoch);
+        let gemini = self.gemini.clone();
+        let model = gemini.config().default_model.clone();
+        let tid = task_id.to_owned();
+        let key_clone = key.clone();
+        let open_dec = open_decision_id.clone();
+
+        let accepted = self.submit(
+            key.clone(),
+            Some(tid.clone()),
+            1,
+            Box::new(move || {
+                let result = gemini.explain_task(&input, cooldown_until).map_err(|err| {
+                    let code = match &err {
+                        crate::v2::gemini::GeminiError::Offline => "OFFLINE",
+                        crate::v2::gemini::GeminiError::MissingApiKey => "MISSING_API_KEY",
+                        crate::v2::gemini::GeminiError::CooldownActive { .. } => "COOLDOWN_ACTIVE",
+                        crate::v2::gemini::GeminiError::CircuitOpen { .. } => "CIRCUIT_OPEN",
+                        crate::v2::gemini::GeminiError::Transport(_) => "TRANSPORT",
+                        crate::v2::gemini::GeminiError::Parse(_) => "PARSE",
+                    };
+                    (code.to_owned(), err.to_string())
+                });
+                Ok(WorkerResult::Explained {
+                    key: key_clone,
+                    task_id: tid,
+                    updated_epoch,
+                    open_decision_id: open_dec,
+                    model,
+                    result,
+                })
+            }),
+        );
+
+        if accepted {
+            self.explain_waiters.entry(key).or_default().push(client_id);
+            Ok(None)
+        } else {
+            Ok(Some(vec![ServerMessage::TaskExplanation {
+                ok: false,
+                task_id: task_id.to_owned(),
+                explanation: None,
+                error: Some("monitor worker pool is busy".to_owned()),
+                error_code: Some("POOL_FULL".to_owned()),
+            }]))
+        }
     }
 
     fn invalidate_tasks_cache(&mut self) {
@@ -2697,6 +2840,55 @@ impl Coordinator {
             } => {
                 self.error_event(Some(&task_id), Some(&format!("merge:{task_id}")), &error)?;
                 self.merge_failed(&task_id, &error, Some(&failure_class))?;
+            }
+            WorkerResult::Explained {
+                key,
+                task_id,
+                updated_epoch,
+                open_decision_id,
+                model,
+                result,
+            } => {
+                let waiters = self.explain_waiters.remove(&key).unwrap_or_default();
+                let msg = match result {
+                    Ok(output) => {
+                        let record = crate::v2::store::TaskExplanationRecord {
+                            task_id: task_id.clone(),
+                            updated_epoch,
+                            open_decision_id,
+                            model,
+                            task_goal: output.task_goal,
+                            agent_actions: output.agent_actions,
+                            failure_diagnosis: output.failure_diagnosis,
+                            option_guide: output.option_guide,
+                            created_epoch: now_epoch(),
+                            cached: false,
+                        };
+                        self.store
+                            .upsert_cached_explanation(&record)
+                            .map_err(|e| e.to_string())?;
+                        ServerMessage::TaskExplanation {
+                            ok: true,
+                            task_id,
+                            explanation: Some(record),
+                            error: None,
+                            error_code: None,
+                        }
+                    }
+                    Err((error_code, error_msg)) => ServerMessage::TaskExplanation {
+                        ok: false,
+                        task_id,
+                        explanation: None,
+                        error: Some(error_msg),
+                        error_code: Some(error_code),
+                    },
+                };
+                for waiter_id in waiters {
+                    self.send_delivery(SocketDelivery::Reply {
+                        client_id: waiter_id,
+                        messages: vec![msg.clone()],
+                    })?;
+                }
             }
         }
         Ok(())
@@ -14106,5 +14298,163 @@ mod tests {
                 decisions,
             } if attempts.is_empty() && audits.is_empty() && decisions.is_empty()
         ));
+    }
+
+    #[test]
+    fn explain_task_caches_and_deduplicates_waiters_and_handles_pool_full() {
+        let dir = TestDirectory::new();
+        let (mut c, handle) =
+            Coordinator::create(V2Store::open_in_memory().unwrap(), dir.0.clone());
+        let mut t = task("ZACH-091-EXPLAIN");
+        t.status = "Blocked".into();
+        t.updated_epoch = 777;
+        c.save(&t).unwrap();
+
+        // 1. Missing task returns NOT_FOUND immediately.
+        c.handle_event(CoordinatorEvent::Socket {
+            client_id: 1,
+            command: ClientCommand::ExplainTask {
+                task_id: "NO-SUCH-TASK".into(),
+                refresh: false,
+            },
+        })
+        .unwrap();
+        match handle.deliveries.try_recv().unwrap() {
+            SocketDelivery::Reply {
+                client_id,
+                messages,
+            } => {
+                assert_eq!(client_id, 1);
+                assert!(matches!(
+                    &messages[0],
+                    ServerMessage::TaskExplanation {
+                        ok: false,
+                        error_code: Some(code),
+                        ..
+                    } if code == "NOT_FOUND"
+                ));
+            }
+            _ => panic!("unexpected delivery"),
+        }
+
+        // 2. Pool-full rejection (via submission_probe) replies immediately with POOL_FULL and leaves no pending waiters.
+        c.submission_probe = Some(BTreeMap::new());
+        c.handle_event(CoordinatorEvent::Socket {
+            client_id: 2,
+            command: ClientCommand::ExplainTask {
+                task_id: "ZACH-091-EXPLAIN".into(),
+                refresh: false,
+            },
+        })
+        .unwrap();
+        assert!(c.explain_waiters.is_empty());
+        match handle.deliveries.try_recv().unwrap() {
+            SocketDelivery::Reply {
+                client_id,
+                messages,
+            } => {
+                assert_eq!(client_id, 2);
+                assert!(matches!(
+                    &messages[0],
+                    ServerMessage::TaskExplanation {
+                        ok: false,
+                        error_code: Some(code),
+                        ..
+                    } if code == "POOL_FULL"
+                ));
+            }
+            _ => panic!("unexpected delivery"),
+        }
+        c.submission_probe = None;
+
+        // 3. In-flight job deduplicates waiters and WorkerResult::Explained upserts cache and notifies all waiters.
+        c.jobs.insert("explain:ZACH-091-EXPLAIN".into());
+        c.handle_event(CoordinatorEvent::Socket {
+            client_id: 10,
+            command: ClientCommand::ExplainTask {
+                task_id: "ZACH-091-EXPLAIN".into(),
+                refresh: false,
+            },
+        })
+        .unwrap();
+        c.handle_event(CoordinatorEvent::Socket {
+            client_id: 11,
+            command: ClientCommand::ExplainTask {
+                task_id: "ZACH-091-EXPLAIN".into(),
+                refresh: false,
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            c.explain_waiters.get("explain:ZACH-091-EXPLAIN").unwrap(),
+            &vec![10, 11]
+        );
+
+        c.handle_event(CoordinatorEvent::Completed {
+            key: "explain:ZACH-091-EXPLAIN".into(),
+            task_id: Some("ZACH-091-EXPLAIN".into()),
+            result: Box::new(Ok(WorkerResult::Explained {
+                key: "explain:ZACH-091-EXPLAIN".into(),
+                task_id: "ZACH-091-EXPLAIN".into(),
+                updated_epoch: 777,
+                open_decision_id: None,
+                model: "gemini-decision-1".into(),
+                result: Ok(crate::v2::gemini::TaskExplanationOutput {
+                    task_goal: "Meta".into(),
+                    agent_actions: "Acciones".into(),
+                    failure_diagnosis: "Diagnóstico".into(),
+                    option_guide: vec!["Opción 1".into()],
+                }),
+            })),
+        })
+        .unwrap();
+        assert!(c.explain_waiters.is_empty());
+
+        for expected_cid in [10, 11] {
+            match handle.deliveries.try_recv().unwrap() {
+                SocketDelivery::Reply {
+                    client_id,
+                    messages,
+                } => {
+                    assert_eq!(client_id, expected_cid);
+                    assert!(matches!(
+                        &messages[0],
+                        ServerMessage::TaskExplanation {
+                            ok: true,
+                            explanation: Some(rec),
+                            ..
+                        } if rec.task_goal == "Meta" && !rec.cached
+                    ));
+                }
+                _ => panic!("unexpected delivery"),
+            }
+        }
+
+        // 4. Subsequent non-refresh request hits SQLite cache immediately.
+        c.handle_event(CoordinatorEvent::Socket {
+            client_id: 12,
+            command: ClientCommand::ExplainTask {
+                task_id: "ZACH-091-EXPLAIN".into(),
+                refresh: false,
+            },
+        })
+        .unwrap();
+        match handle.deliveries.try_recv().unwrap() {
+            SocketDelivery::Reply {
+                client_id,
+                messages,
+            } => {
+                assert_eq!(client_id, 12);
+                assert!(matches!(
+                    &messages[0],
+                    ServerMessage::TaskExplanation {
+                        ok: true,
+                        explanation: Some(rec),
+                        ..
+                    } if rec.cached && rec.task_goal == "Meta"
+                ));
+            }
+            _ => panic!("unexpected delivery"),
+        }
     }
 }

@@ -104,6 +104,18 @@ export interface TaskDetail {
   audits: AttemptAudit[];
   decisions: Decision[];
 }
+export interface TaskExplanation {
+  task_id: string;
+  updated_epoch: number;
+  open_decision_id?: string;
+  model: string;
+  task_goal: string;
+  agent_actions: string;
+  failure_diagnosis: string;
+  option_guide: string[];
+  created_epoch: number;
+  cached: boolean;
+}
 export interface Decision {
   decision_id: string;
   task_id: string;
@@ -348,6 +360,21 @@ export function taskDetail(v: unknown): TaskDetail {
     attempts: o.attempts.map(stageAttempt),
     audits: o.audits.map(attemptAudit),
     decisions: o.decisions.map((item) => decision(item)),
+  };
+}
+export function taskExplanation(v: unknown): TaskExplanation {
+  const o = object(v);
+  return {
+    task_id: identity(o.task_id),
+    updated_epoch: integer(o.updated_epoch),
+    open_decision_id: optional(o.open_decision_id),
+    model: string(o.model),
+    task_goal: string(o.task_goal),
+    agent_actions: string(o.agent_actions),
+    failure_diagnosis: string(o.failure_diagnosis),
+    option_guide: o.option_guide == null ? [] : strings(o.option_guide),
+    created_epoch: integer(o.created_epoch),
+    cached: o.cached === true,
   };
 }
 

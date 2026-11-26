@@ -1087,3 +1087,64 @@ select:focus-visible,
     scroll-behavior: auto !important;
   }
 }
+
+/* ---------- AI Task & Decision Explainer ---------- */
+.zcp2-ai-box {
+  margin: 8px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.zcp2-ai-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.zcp2-ai-btn {
+  border-color: var(--z2-info);
+  color: var(--z2-info);
+}
+
+.zcp2-ai-badge {
+  font-size: 10.5px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--z2-border);
+  background: var(--z2-bg);
+  color: var(--z2-muted);
+}
+
+.zcp2-ai-error {
+  color: var(--z2-err, #f87171);
+  margin: 0;
+}
+
+.zcp2-ai-panel {
+  border: 1px solid var(--z2-border);
+  border-radius: 6px;
+  background: var(--z2-bg);
+  padding: 8px 10px;
+  display: grid;
+  gap: 8px;
+}
+
+.zcp2-ai-section p {
+  margin: 2px 0 0;
+  white-space: pre-wrap;
+}
+
+.zcp2-ai-section ul {
+  margin: 4px 0 0;
+  padding-left: 16px;
+}
+
+.zcp2-ai-label {
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--z2-accent, var(--z2-info));
+}

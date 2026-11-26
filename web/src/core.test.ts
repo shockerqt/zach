@@ -547,3 +547,26 @@ describe("taskDetail protocol decoder", () => {
     ).toThrow();
   });
 });
+
+describe("taskExplanation parser", () => {
+  it("parses valid TaskExplanation payloads and rejects malformed ones", async () => {
+    const { taskExplanation } = await import("./protocol");
+    const parsed = taskExplanation({
+      task_id: "ZACH-091",
+      updated_epoch: 120,
+      open_decision_id: "dec-1",
+      model: "gemini-decision-1",
+      task_goal: "Agregar explicador",
+      agent_actions: "Corrió pruebas",
+      failure_diagnosis: "Falló lint",
+      option_guide: ["Retry: reintentar"],
+      created_epoch: 121,
+      cached: true,
+    });
+    expect(parsed.task_id).toBe("ZACH-091");
+    expect(parsed.cached).toBe(true);
+    expect(parsed.option_guide).toEqual(["Retry: reintentar"]);
+
+    expect(() => taskExplanation({ task_id: "" })).toThrow();
+  });
+});

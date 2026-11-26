@@ -492,4 +492,44 @@ describe("Connection.fetchTaskDetail and TaskDetailModal", () => {
     expect(c.active).toBe(false);
     expect(notices.some((n) => n.includes("Acceso denegado"))).toBe(true);
   });
+
+  it("posts to /api/tasks/:id/explain with refresh flag and handles 200/503", async () => {
+    const calls: { url: string; method?: string; body?: string }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        calls.push({
+          url,
+          method: init?.method,
+          body: typeof init?.body === "string" ? init.body : undefined,
+        });
+        if (url.endsWith("snapshot")) return Response.json(snap);
+        if (url === "/api/tasks/ZACH-091/explain") {
+          return Response.json({
+            task_id: "ZACH-091",
+            updated_epoch: 100,
+            model: "gemini-decision-1",
+            task_goal: "Meta",
+            agent_actions: "Acciones",
+            failure_diagnosis: "Diagnóstico",
+            option_guide: ["Opción 1"],
+            created_epoch: 101,
+            cached: false,
+          });
+        }
+        return new Response(frame("snapshot", { ...snap, status: undefined }), {
+          headers: { "content-type": "text/event-stream" },
+        });
+      }),
+    );
+    const c = new Connection(() => {}, () => {});
+    await c.connect("token-123");
+    const exp = await c.explainTask("ZACH-091", true);
+    expect(exp.task_goal).toBe("Meta");
+    expect(exp.cached).toBe(false);
+    const postCall = calls.find((x) => x.url === "/api/tasks/ZACH-091/explain");
+    expect(postCall?.method).toBe("POST");
+    expect(postCall?.body).toBe('{"refresh":true}');
+    c.disconnect();
+  });
 });

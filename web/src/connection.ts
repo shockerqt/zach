@@ -6,8 +6,10 @@ import {
   integer,
   decision,
   taskDetail,
+  taskExplanation,
   type Decision,
   type TaskDetail,
+  type TaskExplanation,
 } from "./protocol";
 import { acceptSnapshot, applyEvent, initial, type State } from "./state";
 import { SSEParser } from "./sse";
@@ -55,6 +57,52 @@ export class Connection {
     if (response.status === 404) return null;
     const r = await this.checked(response, "application/json", gen);
     const parsed = taskDetail(await r.json());
+    if (gen !== this.generation) throw new Halt();
+    return parsed;
+  }
+  async explainTask(
+    taskId: string,
+    refresh = false,
+  ): Promise<TaskExplanation> {
+    const gen = this.generation;
+    if (!this.active || !this.controller) {
+      throw Error("Sin conexión activa con el gateway");
+    }
+    const response = await fetch(
+      `/api/tasks/${encodeURIComponent(taskId)}/explain`,
+      this.options(this.controller.signal, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refresh }),
+      }),
+    );
+    if (gen !== this.generation) throw new Halt();
+    if (response.status === 401 || response.status === 403) {
+      this.disconnect(
+        "Acceso denegado. Vuelve a conectar con una credencial válida.",
+      );
+      throw new Halt();
+    }
+    if (response.status === 404) {
+      throw Error("Tarea no encontrada");
+    }
+    if (!response.ok) {
+      let errText =
+        response.status === 503
+          ? "Explicador IA no disponible temporalmente"
+          : "No se pudo generar la explicación";
+      try {
+        const body = object(await response.json());
+        if (typeof body.error === "string" && body.error.trim()) {
+          errText = body.error;
+        }
+      } catch {
+        // ignore non-JSON error body
+      }
+      throw Error(errText);
+    }
+    const r = await this.checked(response, "application/json", gen);
+    const parsed = taskExplanation(await r.json());
     if (gen !== this.generation) throw new Halt();
     return parsed;
   }
