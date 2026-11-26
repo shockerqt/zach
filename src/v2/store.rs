@@ -320,6 +320,7 @@ pub struct FailureDecision {
     pub kind: String,
     pub question: String,
     pub options: Vec<String>,
+    pub recommended_option: Option<usize>,
     pub context: String,
     pub sha: Option<String>,
 }
@@ -3616,15 +3617,18 @@ impl V2Store {
                 |r| r.get(0),
             )?;
             if !exists {
+                let recommended_option = decision
+                    .recommended_option
+                    .filter(|&idx| idx < decision.options.len());
                 let seq = Self::insert_event_tx(
                     &tx,
                     &task.task_id,
                     &task.task_group,
                     now_epoch(),
                     "DECISION_REQUIRED",
-                    &serde_json::json!({"decision_id":decision.decision_id,"kind":decision.kind,"question":decision.question,"options":decision.options,"sha":decision.sha}),
+                    &serde_json::json!({"decision_id":decision.decision_id,"kind":decision.kind,"question":decision.question,"options":decision.options,"recommended_option":recommended_option,"sha":decision.sha}),
                 )?;
-                tx.execute("INSERT INTO pending_decisions(decision_id,task_id,task_group,kind,question,options_json,recommended_option,context_summary,sha,status,created_seq) VALUES(?1,?2,?3,?4,?5,?6,0,?7,?8,'OPEN',?9)",params![decision.decision_id,task.task_id,task.task_group,decision.kind,decision.question,serde_json::to_string(&decision.options)?,crate::v2::runner::truncate_utf8_bytes(&decision.context,1024),decision.sha,seq])?;
+                tx.execute("INSERT INTO pending_decisions(decision_id,task_id,task_group,kind,question,options_json,recommended_option,context_summary,sha,status,created_seq) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'OPEN',?10)",params![decision.decision_id,task.task_id,task.task_group,decision.kind,decision.question,serde_json::to_string(&decision.options)?,recommended_option.map(|v| v as i64),crate::v2::runner::truncate_utf8_bytes(&decision.context,1024),decision.sha,seq])?;
             }
         }
         tx.commit()?;
@@ -7977,6 +7981,59 @@ mod tests {
             next.memory.post_impl_escalation,
             synced.memory.post_impl_escalation
         );
+    }
+
+    #[test]
+    fn transition_task_persists_dynamic_recommended_option() {
+        let mut store = V2Store::open_in_memory().unwrap();
+        let mut task = sample_task("ZACH-073-REC", "In Progress", vec![]);
+        store.upsert_task(&task).unwrap();
+        task.status = "Blocked".into();
+        let decision = FailureDecision {
+            decision_id: "dec-rec-1".into(),
+            kind: "retries_exhausted".into(),
+            question: "choose".into(),
+            options: vec![
+                "Retry stage".into(),
+                "Retry with fallback model".into(),
+                "Abort task".into(),
+            ],
+            recommended_option: Some(1),
+            context: "transient error".into(),
+            sha: None,
+        };
+        store
+            .transition_task(&task, None, true, Some(&decision))
+            .unwrap();
+        let open = store.list_decisions(true, None).unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].recommended_option, Some(1));
+
+        let events = store.list_events_since(None, 0, 100).unwrap();
+        let req_ev = events
+            .iter()
+            .find(|e| e.event_type == "DECISION_REQUIRED")
+            .expect("DECISION_REQUIRED event");
+        assert_eq!(req_ev.payload["recommended_option"], serde_json::json!(1));
+
+        // Out-of-bounds recommended_option is clamped to None instead of panicking or persisting invalid index
+        let mut task2 = sample_task("ZACH-073-REC-2", "In Progress", vec![]);
+        store.upsert_task(&task2).unwrap();
+        task2.status = "Blocked".into();
+        let oob_decision = FailureDecision {
+            decision_id: "dec-rec-2".into(),
+            kind: "scope_violation".into(),
+            question: "choose".into(),
+            options: vec!["Retry stage".into(), "Abort task".into()],
+            recommended_option: Some(99),
+            context: "policy violation".into(),
+            sha: None,
+        };
+        store
+            .transition_task(&task2, None, true, Some(&oob_decision))
+            .unwrap();
+        let stored2 = store.get_decision("dec-rec-2").unwrap().unwrap();
+        assert_eq!(stored2.recommended_option, None);
     }
 
     #[test]

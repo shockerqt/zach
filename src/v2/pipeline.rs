@@ -2483,33 +2483,34 @@ pub fn is_quota_or_usage_limit_error(message: &str) -> bool {
         || lower.contains("status: 429")
 }
 
-/// Maps a failed stage, execution error, or gate violation to `"infra"`, `"semantic"`, or `"policy"`.
-pub fn classify_failure_class(stage: &str, status: &str, message: &str) -> &'static str {
+/// Tier 1 deterministic fast-path for security, policy, quota, and infra invariants.
+/// Returns `Some(class)` when the failure is non-delegable; `None` when ambiguous.
+pub fn classify_failure_tier1(stage: &str, status: &str, message: &str) -> Option<&'static str> {
     if message.starts_with("ISOLATION_PREFLIGHT_FAILED") {
-        return FAILURE_CLASS_INFRA;
+        return Some(FAILURE_CLASS_INFRA);
     }
     let lower_msg = message.to_ascii_lowercase();
     let lower_status = status.trim().to_ascii_lowercase();
     let lower_stage = stage.trim().to_ascii_lowercase();
 
     if lower_status == "stalled" || lower_status == "lost" || lower_status == "timeout" {
-        return FAILURE_CLASS_INFRA;
+        return Some(FAILURE_CLASS_INFRA);
     }
     if lower_msg.contains("impl_validation_failed:") {
-        return FAILURE_CLASS_SEMANTIC;
+        return Some(FAILURE_CLASS_SEMANTIC);
     }
     if is_quota_or_usage_limit_error(message) {
-        return FAILURE_CLASS_INFRA;
+        return Some(FAILURE_CLASS_INFRA);
     }
     if lower_msg.trim_start().starts_with("agy_") {
-        return FAILURE_CLASS_INFRA;
+        return Some(FAILURE_CLASS_INFRA);
     }
     if matches!(lower_stage.as_str(), "plan-review" | "pr-review")
         && (lower_msg.contains("schema")
             || lower_msg.contains("review verdict")
             || lower_msg.contains("citation"))
     {
-        return FAILURE_CLASS_SEMANTIC;
+        return Some(FAILURE_CLASS_SEMANTIC);
     }
     if lower_msg.contains("forbidden path")
         || lower_msg.contains("plan target is forbidden")
@@ -2526,9 +2527,19 @@ pub fn classify_failure_class(stage: &str, status: &str, message: &str) -> &'sta
         || lower_msg.contains("approval rejected")
         || lower_msg.contains("autonomous_consent")
         || lower_msg.contains("context_pack.network")
+        || lower_msg.contains("sha mismatch")
     {
-        return FAILURE_CLASS_POLICY;
+        return Some(FAILURE_CLASS_POLICY);
     }
+    None
+}
+
+/// Tier 3 deterministic heuristic fallback when Tier 2 (`gemini-decision-1`) is
+/// bypassed, unavailable, timed out, or returns an unparseable response.
+pub fn classify_failure_tier3(stage: &str, status: &str, message: &str) -> &'static str {
+    let lower_msg = message.to_ascii_lowercase();
+    let lower_status = status.trim().to_ascii_lowercase();
+    let lower_stage = stage.trim().to_ascii_lowercase();
 
     if lower_status == "timeout"
         || lower_status == "lost"
@@ -2579,6 +2590,62 @@ pub fn classify_failure_class(stage: &str, status: &str, message: &str) -> &'sta
     }
 
     FAILURE_CLASS_INFRA
+}
+
+/// Maps a failed stage, execution error, or gate violation to `"infra"`, `"semantic"`, or `"policy"`
+/// using Tier 1 deterministic invariants followed by Tier 3 heuristics.
+pub fn classify_failure_class(stage: &str, status: &str, message: &str) -> &'static str {
+    classify_failure_tier1(stage, status, message)
+        .unwrap_or_else(|| classify_failure_tier3(stage, status, message))
+}
+
+/// 3-tier failure classifier:
+/// - Tier 1: non-delegable deterministic policy/security/quota/infra invariants
+/// - Tier 2: `gemini-decision-1` (`maxOutputTokens: 0`) for ambiguous failures
+/// - Tier 3: deterministic heuristic fallback on Tier 2 bypass/error/timeout
+pub fn classify_failure_3tier(
+    gemini: &crate::v2::gemini::GeminiClient,
+    stage: &str,
+    status: &str,
+    message: &str,
+    provider_cooldown_until: Option<i64>,
+) -> &'static str {
+    if let Some(class) = classify_failure_tier1(stage, status, message) {
+        return class;
+    }
+    if let Ok(Some(class)) =
+        gemini.classify_decision_1(stage, status, message, provider_cooldown_until)
+    {
+        return class;
+    }
+    classify_failure_tier3(stage, status, message)
+}
+
+/// Computes a bounded `recommended_option` index (`< options.len()`) for a failure decision.
+pub fn compute_recommended_option(
+    options: &[String],
+    class: &str,
+    prefer_fallback: bool,
+    prefer_manual: bool,
+) -> Option<usize> {
+    if options.is_empty() {
+        return None;
+    }
+    let find = |needle: &str| options.iter().position(|o| o.eq_ignore_ascii_case(needle));
+    if class == FAILURE_CLASS_POLICY
+        && let Some(idx) = find("Abort task")
+            .or_else(|| find("Abandon"))
+            .or_else(|| find("Manual reconciliation"))
+    {
+        return Some(idx);
+    }
+    if prefer_manual && let Some(idx) = find("Manual reconciliation") {
+        return Some(idx);
+    }
+    if prefer_fallback && let Some(idx) = find("Retry with fallback model") {
+        return Some(idx);
+    }
+    Some(0)
 }
 
 fn apply_stage_result_usage(
@@ -9900,5 +9967,146 @@ raise SystemExit(f"no matching fixture for repo={{repo}} paths={{paths}} lines={
             assert!(prompt.contains("src/v2/coordinator.rs (M, +180, -12)"));
             assert!(prompt.contains("snapshot_sha: deadbeef1234"));
         }
+    }
+
+    #[test]
+    fn classify_failure_3tier_never_delegates_tier1_and_falls_back_to_tier3() {
+        use crate::v2::gemini::{
+            DEFAULT_GEMINI_BASE_URL, DEFAULT_GEMINI_DECISION_MODEL, GeminiClient, GeminiConfig,
+            GeminiError, GeminiHttpResponse, GeminiTransport,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingTransport {
+            calls: AtomicUsize,
+            response: Result<serde_json::Value, GeminiError>,
+        }
+
+        impl GeminiTransport for CountingTransport {
+            fn post_json(
+                &self,
+                _url: &str,
+                _api_key: &str,
+                _body: &serde_json::Value,
+                _connect_timeout_secs: u64,
+                _max_timeout_secs: u64,
+            ) -> Result<GeminiHttpResponse, GeminiError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                match &self.response {
+                    Ok(val) => Ok(GeminiHttpResponse {
+                        body: serde_json::to_vec(val).unwrap(),
+                    }),
+                    Err(err) => Err(err.clone()),
+                }
+            }
+        }
+
+        let cfg = GeminiConfig {
+            api_key: Some("AIzaFakeKeyForTest".into()),
+            base_url: DEFAULT_GEMINI_BASE_URL.into(),
+            default_model: DEFAULT_GEMINI_DECISION_MODEL.into(),
+            connect_timeout_secs: 1,
+            max_timeout_secs: 2,
+            offline: false,
+            circuit_breaker_threshold: 3,
+            circuit_breaker_cooldown_secs: 60,
+        };
+
+        // Tier 1 invariants must NEVER invoke Gemini even when transport would return "infra"
+        let tier1_transport = Arc::new(CountingTransport {
+            calls: AtomicUsize::new(0),
+            response: Ok(serde_json::json!({
+                "candidates": [{"content": {"parts": [{"text": "infra"}]}}]
+            })),
+        });
+        let tier1_client = GeminiClient::with_transport(cfg.clone(), tier1_transport.clone());
+        for (stage, status, msg, expected) in [
+            (
+                "impl",
+                "FAILED",
+                "scope_violation: out-of-scope file",
+                FAILURE_CLASS_POLICY,
+            ),
+            (
+                "impl",
+                "FAILED",
+                "forbidden path violation: .github/workflows/ci.yml",
+                FAILURE_CLASS_POLICY,
+            ),
+            (
+                "impl",
+                "FAILED",
+                "policy violation: budget",
+                FAILURE_CLASS_POLICY,
+            ),
+            (
+                "merge",
+                "FAILED",
+                "sha mismatch on head",
+                FAILURE_CLASS_POLICY,
+            ),
+            (
+                "impl",
+                "FAILED",
+                "ISOLATION_PREFLIGHT_FAILED: dirty",
+                FAILURE_CLASS_INFRA,
+            ),
+            (
+                "impl",
+                "FAILED",
+                "resource_exhausted 429",
+                FAILURE_CLASS_INFRA,
+            ),
+            (
+                "impl",
+                "FAILED",
+                "AGY_TIMEOUT: worker stalled",
+                FAILURE_CLASS_INFRA,
+            ),
+            (
+                "plan-review",
+                "FAILED",
+                "invalid schema in review",
+                FAILURE_CLASS_SEMANTIC,
+            ),
+        ] {
+            assert_eq!(
+                classify_failure_3tier(&tier1_client, stage, status, msg, None),
+                expected
+            );
+        }
+        assert_eq!(tier1_transport.calls.load(Ordering::SeqCst), 0);
+
+        // Tier 2 classifies ambiguous failures via Gemini Decision 1
+        let tier2_transport = Arc::new(CountingTransport {
+            calls: AtomicUsize::new(0),
+            response: Ok(serde_json::json!({
+                "candidates": [{"content": {"parts": [{"text": "semantic"}]}}]
+            })),
+        });
+        let tier2_client = GeminiClient::with_transport(cfg.clone(), tier2_transport.clone());
+        assert_eq!(
+            classify_failure_3tier(&tier2_client, "impl", "FAILED", "unexpected exit 17", None),
+            FAILURE_CLASS_SEMANTIC
+        );
+        assert_eq!(tier2_transport.calls.load(Ordering::SeqCst), 1);
+
+        // Tier 3 heuristic fallback triggers when Tier 2 errors/times out
+        let tier3_transport = Arc::new(CountingTransport {
+            calls: AtomicUsize::new(0),
+            response: Err(GeminiError::Transport("timed out".into())),
+        });
+        let tier3_client = GeminiClient::with_transport(cfg, tier3_transport);
+        assert_eq!(
+            classify_failure_3tier(
+                &tier3_client,
+                "impl",
+                "FAILED",
+                "check 'cargo test' did not pass",
+                None
+            ),
+            FAILURE_CLASS_SEMANTIC
+        );
     }
 }
