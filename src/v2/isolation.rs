@@ -980,6 +980,12 @@ fn serve_connect(
 }
 
 fn relay(mut unix: UnixStream, mut tcp: TcpStream) -> std::io::Result<()> {
+    // Clear handshake I/O timeouts before streaming so long-lived HTTP/2 / gRPC
+    // pauses (> IO_TIMEOUT) do not trigger TimedOut -> Shutdown::Both.
+    unix.set_read_timeout(None)?;
+    unix.set_write_timeout(None)?;
+    tcp.set_read_timeout(None)?;
+    tcp.set_write_timeout(None)?;
     let mut unix_copy = unix.try_clone()?;
     let mut tcp_copy = tcp.try_clone()?;
     thread::scope(|scope| {
@@ -2224,5 +2230,46 @@ mod tests {
         fs::remove_dir_all(&expected_dst).unwrap();
         symlink(primary_web.join("node_modules"), &expected_dst).unwrap();
         assert!(SandboxLayout::inspect(&temp.0, &linked, true).is_err());
+    }
+
+    #[test]
+    fn relay_clears_handshake_timeouts_for_long_idle_streams() {
+        let (mut unix_client, unix_server) = UnixStream::pair().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tcp_client = TcpStream::connect(addr).unwrap();
+        let (mut tcp_server, _) = listener.accept().unwrap();
+
+        let short_handshake_timeout = Duration::from_millis(50);
+        unix_server
+            .set_read_timeout(Some(short_handshake_timeout))
+            .unwrap();
+        unix_server
+            .set_write_timeout(Some(short_handshake_timeout))
+            .unwrap();
+        tcp_client
+            .set_read_timeout(Some(short_handshake_timeout))
+            .unwrap();
+        tcp_client
+            .set_write_timeout(Some(short_handshake_timeout))
+            .unwrap();
+
+        let handle = thread::spawn(move || relay(unix_server, tcp_client));
+
+        // Pause longer than the handshake timeout before the remote replies.
+        thread::sleep(Duration::from_millis(180));
+        tcp_server.write_all(b"pong").unwrap();
+        tcp_server.shutdown(Shutdown::Write).unwrap();
+
+        let mut received = String::new();
+        unix_client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        unix_client.read_to_string(&mut received).unwrap();
+        assert_eq!(received, "pong");
+
+        unix_client.shutdown(Shutdown::Both).unwrap();
+        drop(tcp_server);
+        handle.join().unwrap().unwrap();
     }
 }
